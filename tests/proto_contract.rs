@@ -39,6 +39,20 @@ fn control_proto_exposes_update_voice_context_and_reason_codes() {
     let proto = std::fs::read_to_string("proto/discordvoice/v1/control.proto").unwrap();
     assert!(proto.contains("rpc UpdateVoiceContext"));
     assert!(proto.contains("enum SessionEventReason"));
+    assert!(proto.contains("SessionEventReason reason = 8;"));
     assert!(proto.contains("VOICE_RECONNECTING"));
-    assert!(proto.contains("JOIN_TIMEOUT"));
+    for reason in [
+        "SESSION_EVENT_REASON_UNSPECIFIED",
+        "JOIN_TIMEOUT",
+        "JOIN_FAILED",
+        "INVALID_VOICE_TOKEN",
+        "VOICE_RESUME_FAILED",
+        "DAVE_TRANSITION_FAILED",
+        "UNSUPPORTED_ENCRYPTION_MODE",
+        "UDP_DISCOVERY_FAILED",
+        "UPSTREAM_URL_STALE",
+        "PLAYBACK_SOURCE_UNSUPPORTED",
+    ] {
+        assert!(proto.contains(reason), "missing reason variant: {reason}");
+    }
 }
