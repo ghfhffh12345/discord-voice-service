@@ -22,11 +22,7 @@ pub struct VoiceUdpTransport {
 }
 
 impl VoiceUdpTransport {
-    pub async fn connect(server: SocketAddr) -> Result<Self, AppError> {
-        Self::connect_with_ssrc(server, 0).await
-    }
-
-    pub(crate) async fn connect_with_ssrc(server: SocketAddr, ssrc: u32) -> Result<Self, AppError> {
+    pub async fn connect(server: SocketAddr, ssrc: u32) -> Result<Self, AppError> {
         let bind_addr = match server {
             SocketAddr::V4(_) => SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
             SocketAddr::V6(_) => "[::]:0"

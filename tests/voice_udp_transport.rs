@@ -6,16 +6,23 @@ use discord_voice_service::discord_voice::crypto::{EncryptionMode, choose_mode};
 use discord_voice_service::discord_voice::discovery::{
     build_ip_discovery_packet, discover_ip, parse_ip_discovery_response,
 };
-use discord_voice_service::discord_voice::speaking::ConnectedVoiceSession;
-use discord_voice_service::discord_voice::speaking::OPUS_SILENCE_FRAME;
+use discord_voice_service::discord_voice::gateway::VoiceGatewayClient;
+use discord_voice_service::discord_voice::speaking::{OPUS_SILENCE_FRAME, send_speaking};
 use discord_voice_service::discord_voice::udp::VoiceUdpTransport;
+use discord_voice_service::error::AppError;
 use futures::StreamExt;
 use serde_json::Value;
-use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::Mutex;
+use tokio::net::{TcpListener, UdpSocket, lookup_host};
+use tokio::sync::{Mutex, Notify};
 use tokio::time::{Duration, Instant, sleep};
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
+
+enum DiscoveryBehavior {
+    Valid,
+    ForeignSourceFirst,
+    WrongSsrc,
+}
 
 struct FakeUdpPeer {
     addr: SocketAddr,
@@ -27,6 +34,10 @@ struct FakeUdpPeer {
 
 impl FakeUdpPeer {
     async fn spawn() -> Self {
+        Self::spawn_with_behavior(DiscoveryBehavior::Valid).await
+    }
+
+    async fn spawn_with_behavior(behavior: DiscoveryBehavior) -> Self {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = socket.local_addr().unwrap();
         let advertised_ip = "127.0.0.1".to_owned();
@@ -48,11 +59,23 @@ impl FakeUdpPeer {
                     let mut response = [0u8; 74];
                     response[..2].copy_from_slice(&2u16.to_be_bytes());
                     response[2..4].copy_from_slice(&70u16.to_be_bytes());
-                    response[4..8].copy_from_slice(&packet[4..8]);
+                    let echoed_ssrc = match behavior {
+                        DiscoveryBehavior::WrongSsrc => 999u32.to_be_bytes(),
+                        _ => packet[4..8].try_into().unwrap(),
+                    };
+                    response[4..8].copy_from_slice(&echoed_ssrc);
                     response[8..8 + advertised_ip_state.len()]
                         .copy_from_slice(advertised_ip_state.as_bytes());
                     response[72..74].copy_from_slice(&advertised_port.to_be_bytes());
-                    socket.send_to(&response, from).await.unwrap();
+                    match behavior {
+                        DiscoveryBehavior::ForeignSourceFirst => {
+                            let foreign = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                            foreign.send_to(&response, from).await.unwrap();
+                        }
+                        _ => {
+                            socket.send_to(&response, from).await.unwrap();
+                        }
+                    }
                     continue;
                 }
 
@@ -96,6 +119,7 @@ struct FakeVoiceGateway {
     url: String,
     speaking_index: Arc<Mutex<Option<usize>>>,
     audio_index: Arc<Mutex<Option<usize>>>,
+    speaking_observed: Arc<Notify>,
 }
 
 impl FakeVoiceGateway {
@@ -106,9 +130,11 @@ impl FakeVoiceGateway {
         let udp_addr = udp_socket.local_addr().unwrap();
         let speaking_index = Arc::new(Mutex::new(None));
         let audio_index = Arc::new(Mutex::new(None));
+        let speaking_observed = Arc::new(Notify::new());
         let next_index = Arc::new(Mutex::new(0usize));
         let speaking_state = Arc::clone(&speaking_index);
         let audio_state = Arc::clone(&audio_index);
+        let speaking_notify_state = Arc::clone(&speaking_observed);
         let udp_order_state = Arc::clone(&next_index);
         let ws_order_state = Arc::clone(&next_index);
 
@@ -154,6 +180,7 @@ impl FakeVoiceGateway {
                         let mut speaking = speaking_state.lock().await;
                         if speaking.is_none() {
                             *speaking = Some(current);
+                            speaking_notify_state.notify_waiters();
                         }
                     }
                 }
@@ -164,6 +191,7 @@ impl FakeVoiceGateway {
             url: format!("ws://{ws_addr}/?udp={udp_addr}&ssrc=7"),
             speaking_index,
             audio_index,
+            speaking_observed,
         }
     }
 
@@ -185,6 +213,56 @@ impl FakeVoiceGateway {
             sleep(Duration::from_millis(10)).await;
         }
     }
+
+    fn speaking_observed(&self) -> Arc<Notify> {
+        Arc::clone(&self.speaking_observed)
+    }
+}
+
+struct TestConnectedVoiceSession {
+    gateway: VoiceGatewayClient,
+    transport: VoiceUdpTransport,
+    ssrc: u32,
+    speaking_started: bool,
+    speaking_observed: Arc<Notify>,
+}
+
+impl TestConnectedVoiceSession {
+    async fn new(url: &str, speaking_observed: Arc<Notify>) -> Result<Self, AppError> {
+        let uri: http::Uri = url.parse()?;
+        let query = uri
+            .path_and_query()
+            .and_then(|path_and_query| path_and_query.query())
+            .ok_or(AppError::InvalidState("voice session test query missing"))?;
+        let udp = query_param(query, "udp")
+            .ok_or(AppError::InvalidState("voice session test udp missing"))?;
+        let ssrc = query_param(query, "ssrc")
+            .ok_or(AppError::InvalidState("voice session test ssrc missing"))?
+            .parse::<u32>()
+            .map_err(|_| AppError::InvalidState("voice session test ssrc invalid"))?;
+        let server = lookup_host(udp)
+            .await?
+            .next()
+            .ok_or(AppError::InvalidState("voice session test udp unresolved"))?;
+
+        Ok(Self {
+            gateway: VoiceGatewayClient::connect(url).await?,
+            transport: VoiceUdpTransport::connect(server, ssrc).await?,
+            ssrc,
+            speaking_started: false,
+            speaking_observed,
+        })
+    }
+
+    async fn send_audio_frame(&mut self, frame: Bytes) -> Result<(), AppError> {
+        if !self.speaking_started {
+            let observed = self.speaking_observed.notified();
+            send_speaking(&mut self.gateway, self.ssrc).await?;
+            observed.await;
+            self.speaking_started = true;
+        }
+        self.transport.send_audio_frame(frame).await
+    }
 }
 
 async fn wait_for_value<T, F>(slot: &Arc<Mutex<T>>, ready: F) -> T
@@ -205,7 +283,7 @@ where
 #[tokio::test]
 async fn voice_udp_transport_stop_sends_five_opus_silence_frames() {
     let fake = FakeUdpPeer::spawn().await;
-    let mut transport = VoiceUdpTransport::connect(fake.addr()).await.unwrap();
+    let mut transport = VoiceUdpTransport::connect(fake.addr(), 77).await.unwrap();
 
     transport.stop_audio().await.unwrap();
 
@@ -215,7 +293,9 @@ async fn voice_udp_transport_stop_sends_five_opus_silence_frames() {
 #[tokio::test]
 async fn voice_udp_transport_speaking_is_sent_before_first_audio_packet() {
     let fake = FakeVoiceGateway::spawn().await;
-    let mut session = ConnectedVoiceSession::for_test(fake.url()).await.unwrap();
+    let mut session = TestConnectedVoiceSession::new(fake.url(), fake.speaking_observed())
+        .await
+        .unwrap();
 
     session
         .send_audio_frame(Bytes::from_static(b"opus"))
@@ -240,7 +320,7 @@ async fn voice_udp_transport_discover_ip_returns_local_ip_and_port_from_udp_hand
 async fn voice_udp_transport_connect_performs_discovery_and_captures_discovered_addr() {
     let fake = FakeUdpPeer::spawn().await;
 
-    let transport = VoiceUdpTransport::connect(fake.addr()).await.unwrap();
+    let transport = VoiceUdpTransport::connect(fake.addr(), 77).await.unwrap();
 
     assert_eq!(fake.discovery_count().await, 1);
     assert_eq!(
@@ -248,6 +328,26 @@ async fn voice_udp_transport_connect_performs_discovery_and_captures_discovered_
         fake.advertised_ip()
     );
     assert_eq!(transport.local_addr().port(), fake.advertised_port());
+}
+
+#[tokio::test]
+async fn voice_udp_transport_rejects_foreign_discovery_reply() {
+    let fake = FakeUdpPeer::spawn_with_behavior(DiscoveryBehavior::ForeignSourceFirst).await;
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+    let err = discover_ip(&socket, fake.addr(), 77).await.unwrap_err();
+
+    assert!(err.to_string().contains("source"));
+}
+
+#[tokio::test]
+async fn voice_udp_transport_rejects_discovery_reply_with_wrong_ssrc() {
+    let fake = FakeUdpPeer::spawn_with_behavior(DiscoveryBehavior::WrongSsrc).await;
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+    let err = discover_ip(&socket, fake.addr(), 77).await.unwrap_err();
+
+    assert!(err.to_string().contains("ssrc"));
 }
 
 #[test]
@@ -281,4 +381,11 @@ fn voice_udp_transport_chooses_supported_encryption_modes_in_priority_order() {
 
     let fallback = choose_mode(&["aead_xchacha20_poly1305_rtpsize".to_owned()]).unwrap();
     assert_eq!(fallback, EncryptionMode::AeadXChaCha20Poly1305Rtpsize);
+}
+
+fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+    query.split('&').find_map(|pair| {
+        let (candidate, value) = pair.split_once('=')?;
+        (candidate == key).then_some(value)
+    })
 }

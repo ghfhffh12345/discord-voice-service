@@ -23,7 +23,23 @@ pub async fn discover_ip(
     socket.send_to(&packet, server).await?;
 
     let mut buf = [0u8; DISCOVERY_PACKET_LEN];
-    let (len, _) = socket.recv_from(&mut buf).await?;
+    let (len, from) = socket.recv_from(&mut buf).await?;
+    if from != server {
+        return Err(AppError::InvalidState(
+            "ip discovery response source did not match server",
+        ));
+    }
+    if len < 8 {
+        return Err(AppError::InvalidState(
+            "ip discovery response shorter than expected",
+        ));
+    }
+    let echoed_ssrc = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    if echoed_ssrc != ssrc {
+        return Err(AppError::InvalidState(
+            "ip discovery response ssrc did not match request",
+        ));
+    }
     parse_ip_discovery_response(&buf[..len])
 }
 
