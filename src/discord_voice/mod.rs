@@ -1,5 +1,6 @@
 pub mod crypto;
 pub mod dave;
+pub(crate) mod dave_ffi;
 pub mod discovery;
 pub mod gateway;
 pub mod resume;

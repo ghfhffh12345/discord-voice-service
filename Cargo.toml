@@ -23,5 +23,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 webm-iterable = "0.6.4"
 
 [build-dependencies]
+cc = "1.2"
 protoc-bin-vendored = "3.2.0"
 tonic-build = "0.12"
+
+[dev-dependencies]
+hex = "0.4"
