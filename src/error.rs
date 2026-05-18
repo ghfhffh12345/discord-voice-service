@@ -8,6 +8,8 @@ pub enum AppError {
     InvalidEnv(&'static str),
     #[error("media parse error: {0}")]
     MediaParse(&'static str),
+    #[error("media parse error: {0}")]
+    MediaParseDetail(String),
     #[error("unsupported format")]
     UnsupportedFormat,
     #[error("buffer is full")]
@@ -15,7 +17,11 @@ pub enum AppError {
     #[error("invalid state: {0}")]
     InvalidState(&'static str),
     #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
     InvalidUri(#[from] http::uri::InvalidUri),
+    #[error(transparent)]
+    Http(#[from] reqwest::Error),
     #[error(transparent)]
     Transport(#[from] tonic::transport::Error),
     #[error(transparent)]

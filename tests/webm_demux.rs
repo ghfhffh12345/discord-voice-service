@@ -1,16 +1,17 @@
-use bytes::Bytes;
-use discord_voice_service::media::webm_demux::extract_mock_opus_packets;
+#[path = "support/fixtures.rs"]
+mod fixtures;
+
+use discord_voice_service::media::webm_demux::WebmOpusDemux;
+
+use self::fixtures::load_fixture_bytes;
 
 #[test]
-fn extracts_audio_packets_in_order_from_fixture_bytes() {
-    let fixture = Bytes::from_static(b"mock-webm-opus-fixture");
-    let packets = extract_mock_opus_packets(&fixture).expect("fixture should parse");
-    assert_eq!(
-        packets,
-        vec![
-            Bytes::from_static(b"opus-0"),
-            Bytes::from_static(b"opus-1"),
-            Bytes::from_static(b"opus-2"),
-        ]
-    );
+fn demux_extracts_multiple_opus_packets_from_fixture() {
+    let fixture = load_fixture_bytes("tests/fixtures/audio-itag250.webm");
+    let mut demux = WebmOpusDemux::default();
+    demux.push_bytes(fixture);
+
+    let packets = demux.drain_packets().unwrap();
+    assert!(packets.len() > 10);
+    assert!(packets.iter().all(|packet| !packet.data.is_empty()));
 }
