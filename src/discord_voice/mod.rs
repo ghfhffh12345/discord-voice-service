@@ -1,8 +1,5 @@
 pub mod crypto;
+pub mod dave;
+pub mod gateway;
 pub mod rtp;
-
-pub mod dave {}
-
-pub mod gateway {}
-
-pub mod udp {}
+pub mod udp;
