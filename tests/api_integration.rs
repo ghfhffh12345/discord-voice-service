@@ -1,10 +1,11 @@
 use discord_voice_service::api::service::{ControlService, map_play_request};
 use discord_voice_service::proto::discordvoice::v1::discord_voice_control_server::DiscordVoiceControl;
 use discord_voice_service::proto::discordvoice::v1::{
-    JoinVoiceRequest, PauseRequest, PlayRequest, ResumeRequest, SubscribeEventsRequest,
-    join_voice_request,
+    JoinVoiceRequest, PauseRequest, PlayRequest, ResumeRequest, SessionEventKind,
+    SubscribeEventsRequest, UpdateVoiceContextRequest, join_voice_request,
 };
 use discord_voice_service::session::supervisor::Supervisor;
+use futures::StreamExt;
 use tonic::{Code, Request};
 
 #[test]
@@ -225,17 +226,44 @@ async fn duplicate_join_voice_returns_failed_precondition_without_clobbering_ses
 }
 
 #[tokio::test]
-async fn subscribe_events_returns_unimplemented() {
-    let service = ControlService {
-        supervisor: Supervisor::new(),
-    };
-
-    let error = service
+async fn subscribe_events_streams_runtime_events() {
+    let harness = ApiHarness::spawn().await;
+    let response = harness
+        .service
         .subscribe_events(Request::new(SubscribeEventsRequest {}))
         .await
-        .unwrap_err();
+        .unwrap();
+    let mut stream = response.into_inner();
 
-    assert_eq!(error.code(), Code::Unimplemented);
+    harness.join_voice().await.unwrap();
+    harness.play("video-1").await.unwrap();
+
+    let first = stream
+        .next()
+        .await
+        .transpose()
+        .unwrap()
+        .unwrap();
+    let second = stream
+        .next()
+        .await
+        .transpose()
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(first.kind, SessionEventKind::VoiceConnecting as i32);
+    assert_eq!(second.kind, SessionEventKind::TrackResolving as i32);
+}
+
+#[tokio::test]
+async fn update_voice_context_is_accepted_during_playback() {
+    let harness = ApiHarness::spawn().await;
+    harness.join_voice().await.unwrap();
+    harness.play("video-1").await.unwrap();
+
+    let result = harness.update_voice_context(test_voice_context_rotated()).await;
+
+    assert!(result.is_ok());
 }
 
 #[tokio::test]
@@ -273,4 +301,68 @@ async fn join_voice_then_play_updates_supervisor_snapshot_through_service() {
             .as_deref(),
         Some("video123")
     );
+}
+
+struct ApiHarness {
+    service: ControlService,
+}
+
+impl ApiHarness {
+    async fn spawn() -> Self {
+        Self {
+            service: ControlService {
+                supervisor: Supervisor::new(),
+            },
+        }
+    }
+
+    async fn join_voice(&self) -> Result<(), tonic::Status> {
+        self.service
+            .join_voice(Request::new(JoinVoiceRequest {
+                voice: Some(test_voice_context()),
+            }))
+            .await
+            .map(|_| ())
+    }
+
+    async fn play(&self, video_id: &str) -> Result<(), tonic::Status> {
+        self.service
+            .play(Request::new(PlayRequest {
+                video_id: video_id.into(),
+            }))
+            .await
+            .map(|_| ())
+    }
+
+    async fn update_voice_context(
+        &self,
+        voice: join_voice_request::VoiceContext,
+    ) -> Result<(), tonic::Status> {
+        self.service
+            .update_voice_context(Request::new(UpdateVoiceContextRequest {
+                voice: Some(voice),
+            }))
+            .await
+            .map(|_| ())
+    }
+}
+
+fn test_voice_context() -> join_voice_request::VoiceContext {
+    join_voice_request::VoiceContext {
+        guild_id: "1".into(),
+        channel_id: "2".into(),
+        session_id: "3".into(),
+        endpoint: "voice.example".into(),
+        token: "token".into(),
+    }
+}
+
+fn test_voice_context_rotated() -> join_voice_request::VoiceContext {
+    join_voice_request::VoiceContext {
+        guild_id: "1".into(),
+        channel_id: "9".into(),
+        session_id: "rotated-session".into(),
+        endpoint: "rotated.voice.example".into(),
+        token: "rotated-token".into(),
+    }
 }

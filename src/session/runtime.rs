@@ -1,5 +1,6 @@
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{Mutex, RwLock, broadcast};
 
+use crate::discord_voice::session::ConnectedVoiceSession;
 use crate::error::AppError;
 use crate::session::events::{EventBus, SessionEventKind, SessionEventRecord};
 use crate::session::readiness::{
@@ -10,101 +11,156 @@ use crate::session::state::{SessionState, Snapshot};
 use crate::session::supervisor::{Command, VoiceContext};
 
 pub struct VoiceSessionRuntime {
-    snapshot: RwLock<Snapshot>,
-    voice: RwLock<Option<VoiceContext>>,
+    state: RwLock<Snapshot>,
     events: EventBus,
+    voice: Mutex<Option<ConnectedVoiceSession>>,
 }
 
 impl VoiceSessionRuntime {
     pub fn new() -> Self {
         Self {
-            snapshot: RwLock::new(Snapshot::default()),
-            voice: RwLock::new(None),
+            state: RwLock::new(Snapshot::default()),
             events: EventBus::new(64),
+            voice: Mutex::new(None),
         }
     }
 
     pub async fn handle_command(&self, command: Command) -> Result<(), AppError> {
-        let event = {
-            let mut snapshot = self.snapshot.write().await;
-            let mut current_voice = self.voice.write().await;
-            match command {
-                Command::JoinVoice { voice } => {
-                    ensure_joinable_session(&snapshot)?;
-                    apply_voice_context(&mut snapshot, &voice);
-                    *current_voice = Some(voice);
-                    snapshot.current_video_id = None;
-                    snapshot.selected_itag = None;
-                    snapshot.queue_depth = 0;
-                    snapshot.position_ms = 0;
-                    snapshot.recovering = false;
-                    snapshot.voice_reconnecting = false;
-                    snapshot.last_reason = None;
-                    snapshot.state = SessionState::ConnectingVoice;
-                    Some(SessionEventRecord::new(SessionEventKind::VoiceConnecting))
-                }
-                Command::UpdateVoiceContext { voice } => {
-                    ensure_active_voice_session(&snapshot, "update_voice_context")?;
-                    apply_voice_context(&mut snapshot, &voice);
-                    *current_voice = Some(voice);
-                    None
-                }
-                Command::Play { video_id } => {
-                    ensure_active_voice_session(&snapshot, "play")?;
-                    snapshot.current_video_id = Some(video_id);
-                    snapshot.selected_itag = None;
-                    snapshot.position_ms = 0;
-                    snapshot.state = SessionState::ResolvingTrack;
-                    Some(SessionEventRecord::new(SessionEventKind::TrackResolving))
-                }
-                Command::Pause => {
-                    ensure_pauseable_track(&snapshot)?;
-                    snapshot.state = SessionState::Paused;
-                    Some(SessionEventRecord::new(SessionEventKind::Paused))
-                }
-                Command::Resume => {
-                    ensure_resumable_track(&snapshot)?;
-                    snapshot.state = SessionState::Playing;
-                    Some(SessionEventRecord::new(SessionEventKind::Playing))
-                }
-                Command::Stop => {
-                    ensure_active_voice_session(&snapshot, "stop")?;
-                    snapshot.current_video_id = None;
-                    snapshot.selected_itag = None;
-                    snapshot.queue_depth = 0;
-                    snapshot.position_ms = 0;
-                    snapshot.state = SessionState::VoiceReady;
-                    Some(SessionEventRecord::new(SessionEventKind::Stopped))
-                }
-                Command::LeaveVoice => {
-                    *snapshot = Snapshot::default();
-                    *current_voice = None;
-                    None
-                }
-            }
-        };
-
-        if let Some(event) = event {
-            self.events.emit(event);
+        match command {
+            Command::JoinVoice { voice } => self.join_voice(voice).await,
+            Command::UpdateVoiceContext { voice } => self.update_voice_context(voice).await,
+            Command::Play { video_id } => self.play(video_id).await,
+            Command::Pause => self.pause().await,
+            Command::Resume => self.resume().await,
+            Command::Stop => self.stop().await,
+            Command::LeaveVoice => self.leave_voice().await,
         }
-
-        Ok(())
     }
 
     pub async fn snapshot(&self) -> Snapshot {
-        self.snapshot.read().await.clone()
+        self.state.read().await.clone()
     }
 
     pub async fn current_voice_context(&self) -> Option<VoiceContext> {
-        self.voice.read().await.clone()
+        self.voice
+            .lock()
+            .await
+            .as_ref()
+            .map(|session| session.voice_context().clone())
     }
 
     pub fn subscribe_events(&self) -> broadcast::Receiver<SessionEventRecord> {
         self.events.subscribe()
+    }
+
+    async fn join_voice(&self, voice: VoiceContext) -> Result<(), AppError> {
+        let event = {
+            let mut state = self.state.write().await;
+            ensure_joinable_session(&state)?;
+
+            let session = ConnectedVoiceSession::new(voice);
+            apply_voice_context(&mut state, session.voice_context());
+            apply_rollover_state(&mut state, &session);
+            state.current_video_id = None;
+            state.selected_itag = None;
+            state.queue_depth = 0;
+            state.position_ms = 0;
+            state.last_reason = None;
+            state.state = SessionState::ConnectingVoice;
+
+            *self.voice.lock().await = Some(session);
+            SessionEventRecord::new(SessionEventKind::VoiceConnecting)
+        };
+
+        self.events.emit(event);
+        Ok(())
+    }
+
+    async fn update_voice_context(&self, voice: VoiceContext) -> Result<(), AppError> {
+        let mut state = self.state.write().await;
+        ensure_active_voice_session(&state, "update_voice_context")?;
+
+        let mut current_voice = self.voice.lock().await;
+        let Some(session) = current_voice.as_mut() else {
+            return Err(AppError::InvalidState(
+                "update_voice_context requires active voice session",
+            ));
+        };
+
+        session.update_voice_context(voice);
+        apply_voice_context(&mut state, session.voice_context());
+        apply_rollover_state(&mut state, session);
+        Ok(())
+    }
+
+    async fn play(&self, video_id: String) -> Result<(), AppError> {
+        let event = {
+            let mut state = self.state.write().await;
+            ensure_active_voice_session(&state, "play")?;
+            state.current_video_id = Some(video_id);
+            state.selected_itag = None;
+            state.position_ms = 0;
+            state.state = SessionState::ResolvingTrack;
+            SessionEventRecord::new(SessionEventKind::TrackResolving)
+        };
+
+        self.events.emit(event);
+        Ok(())
+    }
+
+    async fn pause(&self) -> Result<(), AppError> {
+        let event = {
+            let mut state = self.state.write().await;
+            ensure_pauseable_track(&state)?;
+            state.state = SessionState::Paused;
+            SessionEventRecord::new(SessionEventKind::Paused)
+        };
+
+        self.events.emit(event);
+        Ok(())
+    }
+
+    async fn resume(&self) -> Result<(), AppError> {
+        let event = {
+            let mut state = self.state.write().await;
+            ensure_resumable_track(&state)?;
+            state.state = SessionState::Playing;
+            SessionEventRecord::new(SessionEventKind::Playing)
+        };
+
+        self.events.emit(event);
+        Ok(())
+    }
+
+    async fn stop(&self) -> Result<(), AppError> {
+        let event = {
+            let mut state = self.state.write().await;
+            ensure_active_voice_session(&state, "stop")?;
+            state.current_video_id = None;
+            state.selected_itag = None;
+            state.queue_depth = 0;
+            state.position_ms = 0;
+            state.state = SessionState::VoiceReady;
+            SessionEventRecord::new(SessionEventKind::Stopped)
+        };
+
+        self.events.emit(event);
+        Ok(())
+    }
+
+    async fn leave_voice(&self) -> Result<(), AppError> {
+        *self.state.write().await = Snapshot::default();
+        *self.voice.lock().await = None;
+        Ok(())
     }
 }
 
 fn apply_voice_context(snapshot: &mut Snapshot, voice: &VoiceContext) {
     snapshot.guild_id = Some(voice.guild_id.clone());
     snapshot.channel_id = Some(voice.channel_id.clone());
+}
+
+fn apply_rollover_state(snapshot: &mut Snapshot, session: &ConnectedVoiceSession) {
+    snapshot.recovering = session.rollover().recovering();
+    snapshot.voice_reconnecting = session.rollover().voice_reconnecting();
 }

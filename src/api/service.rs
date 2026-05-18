@@ -1,7 +1,10 @@
-use tokio_stream::Empty;
+use std::pin::Pin;
+
+use futures::{Stream, stream};
 use tonic::{Request, Response, Status};
 
 use crate::proto::discordvoice::v1::discord_voice_control_server::DiscordVoiceControl;
+use crate::proto::discordvoice::v1::join_voice_request;
 use crate::proto::discordvoice::v1::{
     GetStateRequest, JoinVoiceRequest, JoinVoiceResponse, LeaveVoiceRequest, LeaveVoiceResponse,
     PauseRequest, PauseResponse, PlayRequest, PlayResponse, ResumeRequest, ResumeResponse,
@@ -21,31 +24,21 @@ pub struct ControlService {
 
 #[tonic::async_trait]
 impl DiscordVoiceControl for ControlService {
-    type SubscribeEventsStream = Empty<Result<SessionEvent, Status>>;
+    type SubscribeEventsStream =
+        Pin<Box<dyn Stream<Item = Result<SessionEvent, Status>> + Send + 'static>>;
 
     async fn join_voice(
         &self,
         request: Request<JoinVoiceRequest>,
     ) -> Result<Response<JoinVoiceResponse>, Status> {
-        let voice = request
-            .into_inner()
-            .voice
-            .ok_or_else(|| Status::invalid_argument("missing voice context"))?;
-        validate_non_empty("guild_id", &voice.guild_id)?;
-        validate_non_empty("channel_id", &voice.channel_id)?;
-        validate_non_empty("session_id", &voice.session_id)?;
-        validate_non_empty("endpoint", &voice.endpoint)?;
-        validate_non_empty("token", &voice.token)?;
-
         self.supervisor
             .send(Command::JoinVoice {
-                voice: VoiceContext {
-                    guild_id: voice.guild_id,
-                    channel_id: voice.channel_id,
-                    session_id: voice.session_id,
-                    endpoint: voice.endpoint,
-                    token: voice.token,
-                },
+                voice: map_voice_context(
+                    request
+                        .into_inner()
+                        .voice
+                        .ok_or_else(|| Status::invalid_argument("missing voice context"))?,
+                )?,
             })
             .await
             .map_err(map_app_error)?;
@@ -55,11 +48,19 @@ impl DiscordVoiceControl for ControlService {
 
     async fn update_voice_context(
         &self,
-        _request: Request<UpdateVoiceContextRequest>,
+        request: Request<UpdateVoiceContextRequest>,
     ) -> Result<Response<UpdateVoiceContextResponse>, Status> {
-        Err(Status::unimplemented(
-            "update_voice_context is not implemented",
-        ))
+        let voice = request
+            .into_inner()
+            .voice
+            .ok_or_else(|| Status::invalid_argument("missing voice context"))?;
+        self.supervisor
+            .send(Command::UpdateVoiceContext {
+                voice: map_voice_context(voice)?,
+            })
+            .await
+            .map_err(map_app_error)?;
+        Ok(Response::new(UpdateVoiceContextResponse {}))
     }
 
     async fn play(&self, request: Request<PlayRequest>) -> Result<Response<PlayResponse>, Status> {
@@ -137,7 +138,17 @@ impl DiscordVoiceControl for ControlService {
         &self,
         _request: Request<SubscribeEventsRequest>,
     ) -> Result<Response<Self::SubscribeEventsStream>, Status> {
-        Err(Status::unimplemented("subscribe_events is not implemented"))
+        let rx = self.supervisor.subscribe_events();
+        let stream = stream::unfold(rx, |mut rx| async move {
+            loop {
+                match rx.recv().await {
+                    Ok(event) => return Some((Ok(event.into_proto()), rx)),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        });
+        Ok(Response::new(Box::pin(stream)))
     }
 }
 
@@ -151,6 +162,22 @@ fn validate_non_empty(field: &'static str, value: &str) -> Result<(), Status> {
     } else {
         Ok(())
     }
+}
+
+fn map_voice_context(voice: join_voice_request::VoiceContext) -> Result<VoiceContext, Status> {
+    validate_non_empty("guild_id", &voice.guild_id)?;
+    validate_non_empty("channel_id", &voice.channel_id)?;
+    validate_non_empty("session_id", &voice.session_id)?;
+    validate_non_empty("endpoint", &voice.endpoint)?;
+    validate_non_empty("token", &voice.token)?;
+
+    Ok(VoiceContext {
+        guild_id: voice.guild_id,
+        channel_id: voice.channel_id,
+        session_id: voice.session_id,
+        endpoint: voice.endpoint,
+        token: voice.token,
+    })
 }
 
 fn map_session_state(state: SessionState) -> ProtoSessionState {
