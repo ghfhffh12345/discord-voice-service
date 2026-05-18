@@ -5,8 +5,9 @@ use crate::proto::discordvoice::v1::discord_voice_control_server::DiscordVoiceCo
 use crate::proto::discordvoice::v1::{
     GetStateRequest, JoinVoiceRequest, JoinVoiceResponse, LeaveVoiceRequest, LeaveVoiceResponse,
     PauseRequest, PauseResponse, PlayRequest, PlayResponse, ResumeRequest, ResumeResponse,
-    SessionEvent, SessionState as ProtoSessionState, SessionStateSnapshot, StopRequest,
-    StopResponse, SubscribeEventsRequest,
+    SessionEvent, SessionState as ProtoSessionState, SessionStateSnapshot,
+    StopRequest, StopResponse, SubscribeEventsRequest, UpdateVoiceContextRequest,
+    UpdateVoiceContextResponse,
 };
 use crate::session::state::SessionState;
 use crate::session::supervisor::{Command, Supervisor};
@@ -49,6 +50,13 @@ impl DiscordVoiceControl for ControlService {
             .map_err(map_app_error)?;
 
         Ok(Response::new(JoinVoiceResponse {}))
+    }
+
+    async fn update_voice_context(
+        &self,
+        _request: Request<UpdateVoiceContextRequest>,
+    ) -> Result<Response<UpdateVoiceContextResponse>, Status> {
+        Err(Status::unimplemented("update_voice_context is not implemented"))
     }
 
     async fn play(&self, request: Request<PlayRequest>) -> Result<Response<PlayResponse>, Status> {
