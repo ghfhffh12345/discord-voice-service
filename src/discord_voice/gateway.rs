@@ -1,4 +1,5 @@
 use serde_json::{Value, json};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::discord_voice::resume::GatewayEvent;
 use crate::discord_voice::ws::{self, VoiceWebSocket};
@@ -46,7 +47,7 @@ impl VoiceGatewayClient {
         self.send_json(json!({
             "op": 3,
             "d": {
-                "t": chrono::Utc::now().timestamp_millis(),
+                "t": heartbeat_timestamp_millis()?,
                 "seq_ack": self.seq_ack,
             }
         }))
@@ -74,4 +75,12 @@ impl VoiceGatewayClient {
     async fn send_json(&mut self, payload: Value) -> Result<(), AppError> {
         ws::send_json(&mut self.ws, payload).await
     }
+}
+
+fn heartbeat_timestamp_millis() -> Result<u64, AppError> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| AppError::InvalidState("system clock before unix epoch"))?;
+    u64::try_from(duration.as_millis())
+        .map_err(|_| AppError::InvalidState("heartbeat timestamp overflow"))
 }
