@@ -23,6 +23,8 @@ pub enum AppError {
     #[error(transparent)]
     Http(#[from] reqwest::Error),
     #[error(transparent)]
+    WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
+    #[error(transparent)]
     Transport(#[from] tonic::transport::Error),
     #[error(transparent)]
     GrpcStatus(#[from] tonic::Status),
