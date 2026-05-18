@@ -14,4 +14,10 @@ pub enum AppError {
     BufferFull,
     #[error("invalid state: {0}")]
     InvalidState(&'static str),
+    #[error(transparent)]
+    InvalidUri(#[from] http::uri::InvalidUri),
+    #[error(transparent)]
+    Transport(#[from] tonic::transport::Error),
+    #[error(transparent)]
+    GrpcStatus(#[from] tonic::Status),
 }

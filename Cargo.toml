@@ -13,7 +13,7 @@ prost = "0.13"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["net"] }
 tonic = { version = "0.12", features = ["transport"] }
 tonic-health = "0.12"
 tracing = "0.1"
