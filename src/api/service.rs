@@ -5,12 +5,11 @@ use crate::proto::discordvoice::v1::discord_voice_control_server::DiscordVoiceCo
 use crate::proto::discordvoice::v1::{
     GetStateRequest, JoinVoiceRequest, JoinVoiceResponse, LeaveVoiceRequest, LeaveVoiceResponse,
     PauseRequest, PauseResponse, PlayRequest, PlayResponse, ResumeRequest, ResumeResponse,
-    SessionEvent, SessionState as ProtoSessionState, SessionStateSnapshot,
-    StopRequest, StopResponse, SubscribeEventsRequest, UpdateVoiceContextRequest,
-    UpdateVoiceContextResponse,
+    SessionEvent, SessionState as ProtoSessionState, SessionStateSnapshot, StopRequest,
+    StopResponse, SubscribeEventsRequest, UpdateVoiceContextRequest, UpdateVoiceContextResponse,
 };
 use crate::session::state::SessionState;
-use crate::session::supervisor::{Command, Supervisor};
+use crate::session::supervisor::{Command, Supervisor, VoiceContext};
 
 pub fn map_play_request(request: PlayRequest) -> String {
     request.video_id
@@ -40,11 +39,13 @@ impl DiscordVoiceControl for ControlService {
 
         self.supervisor
             .send(Command::JoinVoice {
-                guild_id: voice.guild_id,
-                channel_id: voice.channel_id,
-                session_id: voice.session_id,
-                endpoint: voice.endpoint,
-                token: voice.token,
+                voice: VoiceContext {
+                    guild_id: voice.guild_id,
+                    channel_id: voice.channel_id,
+                    session_id: voice.session_id,
+                    endpoint: voice.endpoint,
+                    token: voice.token,
+                },
             })
             .await
             .map_err(map_app_error)?;
@@ -56,7 +57,9 @@ impl DiscordVoiceControl for ControlService {
         &self,
         _request: Request<UpdateVoiceContextRequest>,
     ) -> Result<Response<UpdateVoiceContextResponse>, Status> {
-        Err(Status::unimplemented("update_voice_context is not implemented"))
+        Err(Status::unimplemented(
+            "update_voice_context is not implemented",
+        ))
     }
 
     async fn play(&self, request: Request<PlayRequest>) -> Result<Response<PlayResponse>, Status> {

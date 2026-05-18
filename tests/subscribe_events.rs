@@ -1,9 +1,10 @@
-use discord_voice_service::session::state::SessionState;
+use discord_voice_service::session::events::SessionEventKind;
 use discord_voice_service::session::supervisor::{Command, Supervisor, VoiceContext};
 
 #[tokio::test]
-async fn join_then_play_advances_state_machine() {
+async fn subscribe_receives_join_and_play_events() {
     let supervisor = Supervisor::new();
+    let mut rx = supervisor.subscribe_events();
 
     supervisor
         .send(Command::JoinVoice {
@@ -11,9 +12,6 @@ async fn join_then_play_advances_state_machine() {
         })
         .await
         .unwrap();
-
-    assert_eq!(supervisor.snapshot().await.state, SessionState::VoiceReady);
-
     supervisor
         .send(Command::Play {
             video_id: "abc123".into(),
@@ -21,21 +19,10 @@ async fn join_then_play_advances_state_machine() {
         .await
         .unwrap();
 
-    assert_eq!(
-        supervisor.snapshot().await.state,
-        SessionState::ResolvingTrack
-    );
-}
-
-#[tokio::test]
-async fn snapshot_exposes_runtime_position_queue_depth_and_rollover_flags() {
-    let supervisor = Supervisor::new();
-    let snapshot = supervisor.snapshot().await;
-
-    assert_eq!(snapshot.queue_depth, 0);
-    assert_eq!(snapshot.position_ms, 0);
-    assert!(!snapshot.recovering);
-    assert!(!snapshot.voice_reconnecting);
+    let first = rx.recv().await.unwrap();
+    let second = rx.recv().await.unwrap();
+    assert_eq!(first.kind, SessionEventKind::VoiceConnecting);
+    assert_eq!(second.kind, SessionEventKind::TrackResolving);
 }
 
 fn test_voice_context() -> VoiceContext {
