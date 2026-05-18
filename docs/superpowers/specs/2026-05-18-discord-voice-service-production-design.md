@@ -40,7 +40,7 @@ This version includes:
 
 - real `ytmusic-service` RPC integration
 - real Discord voice transport implementation
-- DAVE/E2EE-aware voice session handling
+- mandatory DAVE/E2EE-compatible voice session handling
 - real WebM/Opus demux and bounded prebuffering
 - paced Discord RTP send
 - authoritative event streaming
@@ -70,9 +70,9 @@ The core structure is:
 - `Voice Transport`
   - owns Discord voice WebSocket communication
   - owns UDP discovery and media transport
-  - owns encryption mode handling
-  - owns DAVE/E2EE negotiation and re-establishment
-  - owns speaking state and paced RTP send output
+  - owns transport encryption mode negotiation and packet protection
+  - owns DAVE/E2EE negotiation, transitions, and re-establishment
+  - owns speaking state, silence termination behavior, and paced RTP send output
 - `Playback Pipeline`
   - owns `ytmusic-service` RPC interaction
   - owns format filtering and selection
@@ -89,6 +89,63 @@ The service boundary remains:
 - `discord-voice-service` decides how to play it reliably
 
 Once the bot sends `Play(videoId)`, this service owns resolve, prebuffer, send, recover, stop, and event reporting for that track.
+
+## Discord protocol requirements
+
+The production implementation must follow the latest official Discord voice requirements as documented on 2026-05-18.
+
+### Voice gateway version
+
+- the voice WebSocket must connect with `?v=8`
+- versions below 4 are not allowed
+- the implementation should treat version 8 as mandatory rather than optional because buffered resume behavior is part of the recovery design for this service
+
+### UDP transport
+
+- Discord voice uses a separate UDP transport for media
+- the service must be able to both send and receive UDP packets
+- the deployment model must allow inbound UDP replies from Discord voice servers through container, firewall, NAT, and Podman networking
+- the implementation must perform Discord IP discovery and keep the discovered local UDP address available for protocol selection and reconnect flows
+
+### Voice resume and sequence acknowledgement
+
+- because the design depends on recovery and transport rollover, voice gateway resume support is required
+- when using voice gateway version 8, the service must track the last sequence-numbered gateway message received
+- the service must include `seq_ack` in:
+  - Opcode 3 Heartbeat payloads
+  - Opcode 7 Resume payloads
+- if resume fails, the implementation must fall back to a full reconnect path
+
+### Speaking and stop behavior
+
+- the service must send at least one Opcode 5 Speaking payload before sending any audio packets
+- the service must use a non-zero speaking mode when transmitting audio
+- the `delay` field should be `0` for bot usage
+- before stopping transmission, the service must send five Opus silence frames (`0xF8, 0xFF, 0xFE`) to avoid interpolation artifacts in Discord playback
+
+These behaviors are mandatory protocol requirements, not optional polish.
+
+### Transport encryption modes
+
+- the service must support `aead_xchacha20_poly1305_rtpsize`
+- the service should prefer `aead_aes256_gcm_rtpsize` when the voice server reports it as available
+- the implementation must not rely on deprecated transport encryption modes
+- the selected transport encryption mode must be sent in Opcode 1 Select Protocol
+
+### DAVE / E2EE
+
+- DAVE support is required for this version of the service
+- the implementation must treat DAVE as first-class protocol scope, not as an optional enhancement
+- the implementation must support the voice gateway opcodes and transitions required for the currently supported DAVE protocol versions
+- because Discord documents some DAVE opcodes as binary WebSocket messages and points to the DAVE whitepaper for exact payload formats, the implementation should use `libdave` or a functionally equivalent implementation strategy rather than attempting an ad hoc partial implementation
+- the implementation must support:
+  - advertising supported DAVE protocol version in Identify
+  - consuming `dave_protocol_version` from Session Description
+  - DAVE protocol transition readiness and execution
+  - MLS group membership changes
+  - external sender package handling as required by Discord's MLS group model
+
+The implementation plan should assume that transport encryption and DAVE frame-level encryption both exist and both must be handled correctly.
 
 ## Runtime state model
 
@@ -139,9 +196,11 @@ Behavior:
 
 - `JoinVoice`
   - installs the initial voice context for an idle session
+  - should only be considered successful after the service receives enough forwarded context from the bot to begin a voice connection attempt
 - `UpdateVoiceContext`
   - applies refreshed `session_id`, `endpoint`, `token`, and channel updates after the initial join
   - is valid both while idle-in-voice and during active playback
+  - is the only supported path for forwarded voice token, endpoint, or session refreshes after initial join
 - `Play`
   - starts a new playback lifecycle for a single `videoId`
 - `Pause`
@@ -157,6 +216,12 @@ Behavior:
 - `SubscribeEvents`
   - exposes the authoritative lifecycle stream for the bot
 
+The bot-to-service contract must also define failure semantics for missing forwarded voice context:
+
+- if the main bot never receives the required Discord `VOICE_STATE_UPDATE` and `VOICE_SERVER_UPDATE` pair, it cannot provide a usable voice context
+- the service must therefore expose a deterministic join-timeout or join-failed path instead of waiting indefinitely
+- the failure model must account for the documented case where a bot cannot join a full voice channel and therefore receives neither update event unless it bypasses the limit
+
 ## Event model
 
 `SubscribeEvents` is the authoritative playback lifecycle stream. The main bot should treat this stream as the primary source of truth for queue progression and recovery awareness.
@@ -170,6 +235,8 @@ Behavior:
 The production event set includes at least:
 
 - `voice-connecting`
+- `join-timeout`
+- `join-failed`
 - `voice-ready`
 - `track-resolving`
 - `buffering`
@@ -194,6 +261,17 @@ Each event should include:
 - playback position in milliseconds when meaningful
 - machine-readable reason or error code
 - optional operator-facing message text
+
+Relevant machine-readable reasons should include at least:
+
+- channel full / no forwarded voice context
+- invalid or expired voice token
+- voice resume failed
+- DAVE transition failed
+- unsupported encryption mode
+- UDP discovery failed
+- upstream playback URL stale
+- playback source unsupported
 
 `GetState` should expose at least:
 
@@ -234,6 +312,15 @@ The playback path is:
 
 `Play(videoId)` -> `GetSong` -> format filtering and selection -> `Decipher(signatureCipher)` -> playable URL open -> incremental HTTP read -> WebM/Opus demux -> bounded Opus prebuffer -> paced 20 ms RTP send
 
+Discord transport requirements for the media path:
+
+- outgoing voice must be Opus
+- audio must be stereo
+- audio must be 48 kHz
+- media packets must be sent in RTP with Discord-compatible sequence and timestamp progression
+- the service must send Speaking before first packet emission
+- the service must terminate active transmission with five silence frames before stopping
+
 The service calls `ytmusic-service` internally for:
 
 - `GetSong`
@@ -269,6 +356,8 @@ Operationally:
 - the fetch and demux side reads ahead from the playable URL
 - the bounded Opus queue decouples upstream timing from Discord send timing
 - the pacer emits RTP payloads at a stable 20 ms cadence
+- the transport layer applies the selected Discord transport encryption mode to each packet
+- when DAVE is active, the media path must also apply the correct frame-level E2EE context before packet protection
 
 The service should preserve low and predictable memory use by bounding the queue. Recovery and startup policy may temporarily increase the target within configured limits, but the queue remains bounded.
 
@@ -297,6 +386,13 @@ If voice transport must be refreshed because the bot forwards updated voice cont
 3. preserve the playback pipeline if possible
 4. if packet emission is interrupted, continue from buffered or recovered position
 5. emit `voice-reconnected` on success
+
+If the transport WebSocket is severed without a new forwarded voice context:
+
+1. attempt voice gateway resume using version 8 semantics and `seq_ack`
+2. if resume succeeds, continue the active transport lifecycle
+3. if resume fails, reconnect using the latest valid forwarded voice context
+4. if reconnect cannot be completed, emit a deterministic failure event
 
 ### Tight continuation target
 
@@ -355,9 +451,15 @@ Use a fake Discord voice peer to exercise:
 
 - voice WebSocket negotiation
 - UDP discovery
+- UDP receive path behavior
+- version 8 heartbeat and `seq_ack` handling
+- version 8 resume behavior
 - encryption mode selection
 - DAVE/E2EE handshakes
+- DAVE transition execution
 - paced packet delivery
+- Speaking before audio
+- silence frame termination before stop
 - transport rollover behavior
 
 ### Live verification
@@ -380,9 +482,15 @@ Required observability:
 - readiness semantics based on runtime initialization and `ytmusic-service` reachability
 - useful `GetState` snapshots for operator inspection
 - counters and timings for:
+  - join timeouts
+  - missing forwarded voice context failures
   - recoveries
   - buffer underruns
   - transport reconnects
+  - transport resume attempts
+  - transport resume failures
+  - UDP discovery failures
+  - DAVE transition failures
   - stream reopen attempts
   - re-resolution attempts
   - fatal playback failures
@@ -395,6 +503,12 @@ This version is considered complete when it satisfies all of the following:
 
 - can join voice using forwarded bot context
 - can accept subsequent forwarded voice context updates
+- can connect to Discord voice with gateway version 8
+- can perform UDP discovery and receive UDP traffic required by Discord voice
+- can send Speaking before audio and five silence frames before stopping
+- can support `aead_xchacha20_poly1305_rtpsize` and prefer `aead_aes256_gcm_rtpsize` when available
+- can handle required DAVE/E2EE protocol setup and transitions for a live voice session
+- can resume or reconnect voice transport using documented version 8 semantics when feasible
 - can call `ytmusic-service` `GetSong` and `Decipher` for real playback startup
 - can select a valid low-bitrate Discord-safe Opus source using the agreed priority rules
 - can fetch, demux, prebuffer, and send a real YouTube Music Opus stream to Discord end to end
