@@ -1,9 +1,13 @@
-FROM rust:1.88-bookworm AS build
+FROM docker.io/library/rust:1.88-bookworm AS builder
 WORKDIR /app
-COPY . .
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY proto ./proto
+COPY src ./src
 RUN cargo build --release
 
-FROM debian:bookworm-slim
+FROM gcr.io/distroless/cc-debian12
 WORKDIR /app
-COPY --from=build /app/target/release/discord-voice-service /usr/local/bin/discord-voice-service
-CMD ["discord-voice-service"]
+COPY --from=builder /app/target/release/discord-voice-service /app/discord-voice-service
+USER nonroot:nonroot
+EXPOSE 55051
+ENTRYPOINT ["/app/discord-voice-service"]

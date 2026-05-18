@@ -1,0 +1,128 @@
+name: Release Image
+
+on:
+  release:
+    types:
+      - published
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+concurrency:
+  group: release-image-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-push:
+    name: Build and Push GHCR Image
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install QEMU for cross-architecture RUN support
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static
+
+      - name: Derive image metadata
+        id: meta
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          IS_PRERELEASE: ${{ github.event.release.prerelease }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+
+          owner="${REPOSITORY_OWNER,,}"
+          image_name="discord-voice-service"
+          registry_namespace="ghcr.io/${owner}"
+          image_ref="${registry_namespace}/${image_name}"
+
+          release_tag="${RELEASE_TAG}"
+          stripped_tag="${release_tag#v}"
+          prerelease="${IS_PRERELEASE}"
+
+          declare -a tag_candidates=()
+          declare -A seen=()
+
+          add_tag() {
+            local candidate="$1"
+            if [[ -n "${candidate}" && -z "${seen[$candidate]:-}" ]]; then
+              tag_candidates+=("${candidate}")
+              seen["$candidate"]=1
+            fi
+          }
+
+          add_tag "${stripped_tag}"
+
+          if [[ "${prerelease}" != "true" && "${stripped_tag}" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            add_tag "${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+            add_tag "${BASH_REMATCH[1]}"
+            add_tag "latest"
+          fi
+
+          {
+            echo "registry_namespace=${registry_namespace}"
+            echo "image_name=${image_name}"
+            echo "image_ref=${image_ref}"
+            echo "release_version=${stripped_tag}"
+            echo "is_prerelease=${prerelease}"
+            echo "tags=${tag_candidates[*]}"
+            echo "oci_labels<<EOF"
+            echo "org.opencontainers.image.title=discord-voice-service"
+            echo "org.opencontainers.image.description=Rust microservice for direct Discord Voice playback from YouTube Music streams"
+            echo "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}"
+            echo "org.opencontainers.image.revision=${GITHUB_SHA}"
+            echo "org.opencontainers.image.version=${stripped_tag}"
+            echo "org.opencontainers.image.url=https://github.com/${GITHUB_REPOSITORY}/releases/tag/${release_tag}"
+            echo "org.opencontainers.image.documentation=https://github.com/${GITHUB_REPOSITORY}#readme"
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Log in to GHCR
+        uses: redhat-actions/podman-login@v1
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build multi-arch image manifest
+        id: build-image
+        uses: redhat-actions/buildah-build@v2
+        with:
+          image: ${{ steps.meta.outputs.image_name }}
+          tags: ${{ steps.meta.outputs.tags }}
+          context: .
+          containerfiles: |
+            ./Containerfile
+          platforms: linux/amd64,linux/arm64
+          oci: true
+          labels: ${{ steps.meta.outputs.oci_labels }}
+
+      - name: Push image manifest to GHCR
+        id: push-image
+        uses: redhat-actions/push-to-registry@v2
+        with:
+          image: ${{ steps.build-image.outputs.image }}
+          tags: ${{ steps.build-image.outputs.tags }}
+          registry: ${{ steps.meta.outputs.registry_namespace }}
+
+      - name: Summarize published image tags
+        shell: bash
+        run: |
+          {
+            echo "## Published GHCR image"
+            echo
+            echo "- Image: \`${{ steps.meta.outputs.image_ref }}\`"
+            echo "- Release tag: \`${{ github.event.release.tag_name }}\`"
+            echo "- Prerelease: \`${{ steps.meta.outputs.is_prerelease }}\`"
+            echo "- Tags: \`${{ steps.build-image.outputs.tags }}\`"
+            echo "- Registry paths: \`${{ steps.push-image.outputs.registry-paths }}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
