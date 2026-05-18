@@ -17,6 +17,10 @@ pub enum Command {
     Play {
         video_id: String,
     },
+    Pause,
+    Resume,
+    Stop,
+    LeaveVoice,
 }
 
 #[derive(Clone, Default)]
@@ -39,12 +43,23 @@ impl Supervisor {
             } => {
                 snapshot.guild_id = Some(guild_id);
                 snapshot.channel_id = Some(channel_id);
+                snapshot.current_video_id = None;
                 snapshot.state = SessionState::VoiceReady;
             }
             Command::Play { video_id } => {
+                if snapshot.guild_id.is_none() {
+                    return Err(AppError::InvalidState("play requires active voice session"));
+                }
                 snapshot.current_video_id = Some(video_id);
                 snapshot.state = SessionState::ResolvingTrack;
             }
+            Command::Pause => snapshot.state = SessionState::Paused,
+            Command::Resume => snapshot.state = SessionState::Playing,
+            Command::Stop => {
+                snapshot.current_video_id = None;
+                snapshot.state = SessionState::VoiceReady;
+            }
+            Command::LeaveVoice => *snapshot = Snapshot::default(),
         }
         Ok(())
     }
