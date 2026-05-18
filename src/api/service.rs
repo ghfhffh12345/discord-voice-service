@@ -1,4 +1,4 @@
-use tokio_stream::{Empty, empty};
+use tokio_stream::Empty;
 use tonic::{Request, Response, Status};
 
 use crate::proto::discordvoice::v1::discord_voice_control_server::DiscordVoiceControl;
@@ -31,6 +31,11 @@ impl DiscordVoiceControl for ControlService {
             .into_inner()
             .voice
             .ok_or_else(|| Status::invalid_argument("missing voice context"))?;
+        validate_non_empty("guild_id", &voice.guild_id)?;
+        validate_non_empty("channel_id", &voice.channel_id)?;
+        validate_non_empty("session_id", &voice.session_id)?;
+        validate_non_empty("endpoint", &voice.endpoint)?;
+        validate_non_empty("token", &voice.token)?;
 
         self.supervisor
             .send(Command::JoinVoice {
@@ -47,12 +52,15 @@ impl DiscordVoiceControl for ControlService {
     }
 
     async fn play(&self, request: Request<PlayRequest>) -> Result<Response<PlayResponse>, Status> {
+        let request = request.into_inner();
+        validate_non_empty("video_id", &request.video_id)?;
+
         self.supervisor
             .send(Command::Play {
-                video_id: request.into_inner().video_id,
+                video_id: request.video_id,
             })
             .await
-            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+            .map_err(map_app_error)?;
 
         Ok(Response::new(PlayResponse {}))
     }
@@ -118,12 +126,20 @@ impl DiscordVoiceControl for ControlService {
         &self,
         _request: Request<SubscribeEventsRequest>,
     ) -> Result<Response<Self::SubscribeEventsStream>, Status> {
-        Ok(Response::new(empty()))
+        Err(Status::unimplemented("subscribe_events is not implemented"))
     }
 }
 
 fn map_app_error(error: crate::error::AppError) -> Status {
     Status::failed_precondition(error.to_string())
+}
+
+fn validate_non_empty(field: &'static str, value: &str) -> Result<(), Status> {
+    if value.trim().is_empty() {
+        Err(Status::invalid_argument(format!("{field} is required")))
+    } else {
+        Ok(())
+    }
 }
 
 fn map_session_state(state: SessionState) -> ProtoSessionState {

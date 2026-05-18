@@ -15,7 +15,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let settings = Settings::from_env()?;
     let supervisor = Supervisor::new();
     let control_service = ControlService { supervisor };
-    let (_health_reporter, health_service) = tonic_health::server::health_reporter();
+    let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
+    health_reporter
+        .set_serving::<DiscordVoiceControlServer<ControlService>>()
+        .await;
 
     Server::builder()
         .add_service(health_service)

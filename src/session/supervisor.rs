@@ -52,11 +52,11 @@ impl Supervisor {
                 snapshot.state = SessionState::ResolvingTrack;
             }
             Command::Pause => {
-                ensure_active_voice_session(&snapshot, "pause")?;
+                ensure_track_loaded(&snapshot, "pause")?;
                 snapshot.state = SessionState::Paused;
             }
             Command::Resume => {
-                ensure_active_voice_session(&snapshot, "resume")?;
+                ensure_resumable_track(&snapshot)?;
                 snapshot.state = SessionState::Playing;
             }
             Command::Stop => {
@@ -85,5 +85,31 @@ fn ensure_active_voice_session(snapshot: &Snapshot, action: &'static str) -> Res
             "stop" => "stop requires active voice session",
             _ => "command requires active voice session",
         }))
+    }
+}
+
+fn ensure_track_loaded(snapshot: &Snapshot, action: &'static str) -> Result<(), AppError> {
+    ensure_active_voice_session(snapshot, action)?;
+
+    if snapshot.current_video_id.is_some() {
+        Ok(())
+    } else {
+        Err(AppError::InvalidState(match action {
+            "pause" => "pause requires an active track",
+            "resume" => "resume requires an active track",
+            _ => "command requires an active track",
+        }))
+    }
+}
+
+fn ensure_resumable_track(snapshot: &Snapshot) -> Result<(), AppError> {
+    ensure_track_loaded(snapshot, "resume")?;
+
+    if matches!(snapshot.state, SessionState::Paused | SessionState::Playing) {
+        Ok(())
+    } else {
+        Err(AppError::InvalidState(
+            "resume requires a paused or playing track",
+        ))
     }
 }
