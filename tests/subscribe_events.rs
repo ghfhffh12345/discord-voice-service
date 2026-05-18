@@ -14,7 +14,7 @@ async fn subscribe_receives_join_and_play_events() {
         .unwrap();
     assert_eq!(
         supervisor.snapshot().await.state,
-        discord_voice_service::session::state::SessionState::VoiceReady
+        discord_voice_service::session::state::SessionState::ConnectingVoice
     );
     supervisor
         .send(Command::Play {
@@ -25,7 +25,7 @@ async fn subscribe_receives_join_and_play_events() {
 
     let first = rx.recv().await.unwrap();
     let second = rx.recv().await.unwrap();
-    assert_eq!(first.kind, SessionEventKind::VoiceReady);
+    assert_eq!(first.kind, SessionEventKind::VoiceConnecting);
     assert_eq!(second.kind, SessionEventKind::TrackResolving);
 }
 

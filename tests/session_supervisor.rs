@@ -12,7 +12,10 @@ async fn join_then_play_advances_state_machine() {
         .await
         .unwrap();
 
-    assert_eq!(supervisor.snapshot().await.state, SessionState::VoiceReady);
+    assert_eq!(
+        supervisor.snapshot().await.state,
+        SessionState::ConnectingVoice
+    );
 
     supervisor
         .send(Command::Play {

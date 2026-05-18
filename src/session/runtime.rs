@@ -40,8 +40,8 @@ impl VoiceSessionRuntime {
                     snapshot.recovering = false;
                     snapshot.voice_reconnecting = false;
                     snapshot.last_reason = None;
-                    snapshot.state = SessionState::VoiceReady;
-                    Some(SessionEventRecord::new(SessionEventKind::VoiceReady))
+                    snapshot.state = SessionState::ConnectingVoice;
+                    Some(SessionEventRecord::new(SessionEventKind::VoiceConnecting))
                 }
                 Command::UpdateVoiceContext { voice } => {
                     ensure_active_voice_session(&snapshot, "update_voice_context")?;
