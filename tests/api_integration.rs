@@ -1,7 +1,7 @@
 use discord_voice_service::api::service::{ControlService, map_play_request};
 use discord_voice_service::proto::discordvoice::v1::discord_voice_control_server::DiscordVoiceControl;
 use discord_voice_service::proto::discordvoice::v1::{
-    JoinVoiceRequest, PlayRequest, join_voice_request,
+    JoinVoiceRequest, PauseRequest, PlayRequest, join_voice_request,
 };
 use discord_voice_service::session::supervisor::Supervisor;
 use tonic::{Code, Request};
@@ -25,6 +25,20 @@ async fn play_before_join_voice_returns_failed_precondition() {
         .play(Request::new(PlayRequest {
             video_id: "video123".into(),
         }))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code(), Code::FailedPrecondition);
+}
+
+#[tokio::test]
+async fn pause_before_join_voice_returns_failed_precondition() {
+    let service = ControlService {
+        supervisor: Supervisor::new(),
+    };
+
+    let error = service
+        .pause(Request::new(PauseRequest {}))
         .await
         .unwrap_err();
 

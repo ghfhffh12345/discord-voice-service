@@ -47,15 +47,20 @@ impl Supervisor {
                 snapshot.state = SessionState::VoiceReady;
             }
             Command::Play { video_id } => {
-                if snapshot.guild_id.is_none() {
-                    return Err(AppError::InvalidState("play requires active voice session"));
-                }
+                ensure_active_voice_session(&snapshot, "play")?;
                 snapshot.current_video_id = Some(video_id);
                 snapshot.state = SessionState::ResolvingTrack;
             }
-            Command::Pause => snapshot.state = SessionState::Paused,
-            Command::Resume => snapshot.state = SessionState::Playing,
+            Command::Pause => {
+                ensure_active_voice_session(&snapshot, "pause")?;
+                snapshot.state = SessionState::Paused;
+            }
+            Command::Resume => {
+                ensure_active_voice_session(&snapshot, "resume")?;
+                snapshot.state = SessionState::Playing;
+            }
             Command::Stop => {
+                ensure_active_voice_session(&snapshot, "stop")?;
                 snapshot.current_video_id = None;
                 snapshot.state = SessionState::VoiceReady;
             }
@@ -66,5 +71,19 @@ impl Supervisor {
 
     pub async fn snapshot(&self) -> Snapshot {
         self.snapshot.read().await.clone()
+    }
+}
+
+fn ensure_active_voice_session(snapshot: &Snapshot, action: &'static str) -> Result<(), AppError> {
+    if snapshot.guild_id.is_some() && snapshot.channel_id.is_some() {
+        Ok(())
+    } else {
+        Err(AppError::InvalidState(match action {
+            "play" => "play requires active voice session",
+            "pause" => "pause requires active voice session",
+            "resume" => "resume requires active voice session",
+            "stop" => "stop requires active voice session",
+            _ => "command requires active voice session",
+        }))
     }
 }
