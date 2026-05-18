@@ -1,10 +1,11 @@
 use discord_voice_service::api::service::{ControlService, map_play_request};
 use discord_voice_service::proto::discordvoice::v1::discord_voice_control_server::DiscordVoiceControl;
 use discord_voice_service::proto::discordvoice::v1::{
-    JoinVoiceRequest, PauseRequest, PlayRequest, ResumeRequest, SessionEventKind,
+    GetStateRequest, JoinVoiceRequest, PauseRequest, PlayRequest, ResumeRequest, SessionEventKind,
+    SessionStateSnapshot,
     SubscribeEventsRequest, UpdateVoiceContextRequest, join_voice_request,
 };
-use discord_voice_service::session::supervisor::Supervisor;
+use discord_voice_service::session::supervisor::{Supervisor, VoiceContext};
 use futures::StreamExt;
 use tonic::{Code, Request};
 
@@ -252,7 +253,10 @@ async fn subscribe_events_streams_runtime_events() {
         .unwrap();
 
     assert_eq!(first.kind, SessionEventKind::VoiceConnecting as i32);
+    assert_eq!(first.guild_id, "1");
+    assert_eq!(first.channel_id, "2");
     assert_eq!(second.kind, SessionEventKind::TrackResolving as i32);
+    assert_eq!(second.current_video_id, "video-1");
 }
 
 #[tokio::test]
@@ -260,10 +264,23 @@ async fn update_voice_context_is_accepted_during_playback() {
     let harness = ApiHarness::spawn().await;
     harness.join_voice().await.unwrap();
     harness.play("video-1").await.unwrap();
+    let rotated = test_voice_context_rotated();
 
-    let result = harness.update_voice_context(test_voice_context_rotated()).await;
+    let result = harness.update_voice_context(rotated.clone()).await;
 
     assert!(result.is_ok());
+
+    let state = harness.get_state().await;
+    assert_eq!(state.guild_id, rotated.guild_id);
+    assert_eq!(state.channel_id, rotated.channel_id);
+    assert_eq!(state.current_video_id, "video-1");
+
+    let voice = harness.current_voice_context().await.unwrap();
+    assert_eq!(voice.guild_id, rotated.guild_id);
+    assert_eq!(voice.channel_id, rotated.channel_id);
+    assert_eq!(voice.session_id, rotated.session_id);
+    assert_eq!(voice.endpoint, rotated.endpoint);
+    assert_eq!(voice.token, rotated.token);
 }
 
 #[tokio::test]
@@ -344,6 +361,18 @@ impl ApiHarness {
             }))
             .await
             .map(|_| ())
+    }
+
+    async fn get_state(&self) -> SessionStateSnapshot {
+        self.service
+            .get_state(Request::new(GetStateRequest {}))
+            .await
+            .unwrap()
+            .into_inner()
+    }
+
+    async fn current_voice_context(&self) -> Option<VoiceContext> {
+        self.service.supervisor.current_voice_context().await
     }
 }
 

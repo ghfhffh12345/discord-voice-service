@@ -143,6 +143,8 @@ impl DiscordVoiceControl for ControlService {
             loop {
                 match rx.recv().await {
                     Ok(event) => return Some((Ok(event.into_proto()), rx)),
+                    // Broadcast channels drop the oldest retained events for lagging
+                    // receivers; continue from the oldest event still available.
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
                 }

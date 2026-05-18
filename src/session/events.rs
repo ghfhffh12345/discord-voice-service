@@ -3,6 +3,7 @@ use tokio::sync::broadcast;
 use crate::proto::discordvoice::v1::{
     SessionEvent, SessionEventKind as ProtoSessionEventKind, SessionEventReason,
 };
+use crate::session::state::Snapshot;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEventKind {
@@ -23,18 +24,44 @@ pub enum SessionEventKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionEventRecord {
     pub kind: SessionEventKind,
-    pub reason: Option<String>,
+    pub guild_id: Option<String>,
+    pub channel_id: Option<String>,
+    pub current_video_id: Option<String>,
+    pub selected_itag: Option<u32>,
+    pub message: Option<String>,
 }
 
 impl SessionEventRecord {
     pub fn new(kind: SessionEventKind) -> Self {
-        Self { kind, reason: None }
+        Self {
+            kind,
+            guild_id: None,
+            channel_id: None,
+            current_video_id: None,
+            selected_itag: None,
+            message: None,
+        }
+    }
+
+    pub fn from_snapshot(kind: SessionEventKind, snapshot: &Snapshot) -> Self {
+        Self {
+            kind,
+            guild_id: snapshot.guild_id.clone(),
+            channel_id: snapshot.channel_id.clone(),
+            current_video_id: snapshot.current_video_id.clone(),
+            selected_itag: snapshot.selected_itag,
+            message: snapshot.last_reason.clone(),
+        }
     }
 
     pub fn into_proto(self) -> SessionEvent {
         SessionEvent {
             kind: map_session_event_kind(self.kind) as i32,
-            message: self.reason.unwrap_or_default(),
+            guild_id: self.guild_id.unwrap_or_default(),
+            channel_id: self.channel_id.unwrap_or_default(),
+            current_video_id: self.current_video_id.unwrap_or_default(),
+            selected_itag: self.selected_itag.unwrap_or_default(),
+            message: self.message.unwrap_or_default(),
             reason: SessionEventReason::Unspecified as i32,
             ..Default::default()
         }

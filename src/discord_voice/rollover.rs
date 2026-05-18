@@ -1,15 +1,15 @@
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct VoiceSessionRollover {
+pub(crate) struct VoiceSessionRollover {
     recovering: bool,
     voice_reconnecting: bool,
 }
 
 impl VoiceSessionRollover {
-    pub fn recovering(&self) -> bool {
+    pub(crate) fn recovering(&self) -> bool {
         self.recovering
     }
 
-    pub fn voice_reconnecting(&self) -> bool {
+    pub(crate) fn voice_reconnecting(&self) -> bool {
         self.voice_reconnecting
     }
 }

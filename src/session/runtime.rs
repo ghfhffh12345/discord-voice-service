@@ -69,7 +69,7 @@ impl VoiceSessionRuntime {
             state.state = SessionState::ConnectingVoice;
 
             *self.voice.lock().await = Some(session);
-            SessionEventRecord::new(SessionEventKind::VoiceConnecting)
+            SessionEventRecord::from_snapshot(SessionEventKind::VoiceConnecting, &state)
         };
 
         self.events.emit(event);
@@ -101,7 +101,7 @@ impl VoiceSessionRuntime {
             state.selected_itag = None;
             state.position_ms = 0;
             state.state = SessionState::ResolvingTrack;
-            SessionEventRecord::new(SessionEventKind::TrackResolving)
+            SessionEventRecord::from_snapshot(SessionEventKind::TrackResolving, &state)
         };
 
         self.events.emit(event);
@@ -113,7 +113,7 @@ impl VoiceSessionRuntime {
             let mut state = self.state.write().await;
             ensure_pauseable_track(&state)?;
             state.state = SessionState::Paused;
-            SessionEventRecord::new(SessionEventKind::Paused)
+            SessionEventRecord::from_snapshot(SessionEventKind::Paused, &state)
         };
 
         self.events.emit(event);
@@ -125,7 +125,7 @@ impl VoiceSessionRuntime {
             let mut state = self.state.write().await;
             ensure_resumable_track(&state)?;
             state.state = SessionState::Playing;
-            SessionEventRecord::new(SessionEventKind::Playing)
+            SessionEventRecord::from_snapshot(SessionEventKind::Playing, &state)
         };
 
         self.events.emit(event);
@@ -141,7 +141,7 @@ impl VoiceSessionRuntime {
             state.queue_depth = 0;
             state.position_ms = 0;
             state.state = SessionState::VoiceReady;
-            SessionEventRecord::new(SessionEventKind::Stopped)
+            SessionEventRecord::from_snapshot(SessionEventKind::Stopped, &state)
         };
 
         self.events.emit(event);
