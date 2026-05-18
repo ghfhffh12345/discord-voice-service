@@ -1,0 +1,16 @@
+target
+.git
+.env
+.env.*
+.worktrees
+.serena
+.idea
+.vscode
+.DS_Store
+*.log
+tmp
+tmp/**
+coverage
+coverage/**
+node_modules
+node_modules/**

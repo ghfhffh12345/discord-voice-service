@@ -41,6 +41,7 @@ impl Supervisor {
                 channel_id,
                 ..
             } => {
+                ensure_joinable_session(&snapshot)?;
                 snapshot.guild_id = Some(guild_id);
                 snapshot.channel_id = Some(channel_id);
                 snapshot.current_video_id = None;
@@ -52,7 +53,7 @@ impl Supervisor {
                 snapshot.state = SessionState::ResolvingTrack;
             }
             Command::Pause => {
-                ensure_track_loaded(&snapshot, "pause")?;
+                ensure_pauseable_track(&snapshot)?;
                 snapshot.state = SessionState::Paused;
             }
             Command::Resume => {
@@ -71,6 +72,20 @@ impl Supervisor {
 
     pub async fn snapshot(&self) -> Snapshot {
         self.snapshot.read().await.clone()
+    }
+}
+
+fn ensure_joinable_session(snapshot: &Snapshot) -> Result<(), AppError> {
+    if matches!(snapshot.state, SessionState::Idle)
+        && snapshot.guild_id.is_none()
+        && snapshot.channel_id.is_none()
+        && snapshot.current_video_id.is_none()
+    {
+        Ok(())
+    } else {
+        Err(AppError::InvalidState(
+            "join_voice requires an idle session",
+        ))
     }
 }
 
@@ -99,6 +114,16 @@ fn ensure_track_loaded(snapshot: &Snapshot, action: &'static str) -> Result<(), 
             "resume" => "resume requires an active track",
             _ => "command requires an active track",
         }))
+    }
+}
+
+fn ensure_pauseable_track(snapshot: &Snapshot) -> Result<(), AppError> {
+    ensure_track_loaded(snapshot, "pause")?;
+
+    if matches!(snapshot.state, SessionState::Playing) {
+        Ok(())
+    } else {
+        Err(AppError::InvalidState("pause requires a playing track"))
     }
 }
 

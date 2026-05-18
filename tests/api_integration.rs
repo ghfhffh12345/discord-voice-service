@@ -47,6 +47,40 @@ async fn pause_before_join_voice_returns_failed_precondition() {
 }
 
 #[tokio::test]
+async fn pause_while_resolving_track_returns_failed_precondition() {
+    let service = ControlService {
+        supervisor: Supervisor::new(),
+    };
+
+    service
+        .join_voice(Request::new(JoinVoiceRequest {
+            voice: Some(join_voice_request::VoiceContext {
+                guild_id: "1".into(),
+                channel_id: "2".into(),
+                session_id: "3".into(),
+                endpoint: "voice.example".into(),
+                token: "token".into(),
+            }),
+        }))
+        .await
+        .unwrap();
+
+    service
+        .play(Request::new(PlayRequest {
+            video_id: "video123".into(),
+        }))
+        .await
+        .unwrap();
+
+    let error = service
+        .pause(Request::new(PauseRequest {}))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code(), Code::FailedPrecondition);
+}
+
+#[tokio::test]
 async fn join_voice_rejects_empty_required_fields() {
     let service = ControlService {
         supervisor: Supervisor::new(),
@@ -141,6 +175,53 @@ async fn resume_after_join_voice_before_play_returns_failed_precondition() {
         .unwrap_err();
 
     assert_eq!(error.code(), Code::FailedPrecondition);
+}
+
+#[tokio::test]
+async fn duplicate_join_voice_returns_failed_precondition_without_clobbering_session() {
+    let service = ControlService {
+        supervisor: Supervisor::new(),
+    };
+
+    service
+        .join_voice(Request::new(JoinVoiceRequest {
+            voice: Some(join_voice_request::VoiceContext {
+                guild_id: "1".into(),
+                channel_id: "2".into(),
+                session_id: "3".into(),
+                endpoint: "voice.example".into(),
+                token: "token".into(),
+            }),
+        }))
+        .await
+        .unwrap();
+
+    service
+        .play(Request::new(PlayRequest {
+            video_id: "video123".into(),
+        }))
+        .await
+        .unwrap();
+
+    let error = service
+        .join_voice(Request::new(JoinVoiceRequest {
+            voice: Some(join_voice_request::VoiceContext {
+                guild_id: "9".into(),
+                channel_id: "8".into(),
+                session_id: "7".into(),
+                endpoint: "voice.other".into(),
+                token: "other-token".into(),
+            }),
+        }))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code(), Code::FailedPrecondition);
+
+    let snapshot = service.supervisor.snapshot().await;
+    assert_eq!(snapshot.guild_id.as_deref(), Some("1"));
+    assert_eq!(snapshot.channel_id.as_deref(), Some("2"));
+    assert_eq!(snapshot.current_video_id.as_deref(), Some("video123"));
 }
 
 #[tokio::test]
