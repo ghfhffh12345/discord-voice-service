@@ -34,6 +34,64 @@ fn prefers_250_then_249_then_lower_only() {
 }
 
 #[test]
+fn falls_back_to_249_when_250_is_absent() {
+    let formats = vec![
+        StreamFormat::new(
+            251,
+            "audio/webm; codecs=\"opus\"",
+            160_000,
+            Some(48_000),
+            Some(2),
+            false,
+        ),
+        StreamFormat::new(
+            249,
+            "audio/webm; codecs=\"opus\"",
+            50_000,
+            Some(48_000),
+            Some(2),
+            false,
+        ),
+    ];
+
+    let selected = select_format(&formats).expect("format should be selected");
+    assert_eq!(selected.itag, 249);
+}
+
+#[test]
+fn falls_back_to_lower_bitrate_webm_opus_when_250_and_249_are_absent() {
+    let formats = vec![
+        StreamFormat::new(
+            251,
+            "audio/webm; codecs=\"opus\"",
+            160_000,
+            Some(48_000),
+            Some(2),
+            false,
+        ),
+        StreamFormat::new(
+            248,
+            "audio/webm; codecs=\"opus\"",
+            49_000,
+            Some(48_000),
+            Some(2),
+            false,
+        ),
+        StreamFormat::new(
+            247,
+            "audio/webm; codecs=\"opus\"",
+            40_000,
+            Some(48_000),
+            Some(2),
+            false,
+        ),
+    ];
+
+    let selected = select_format(&formats).expect("format should be selected");
+    assert_eq!(selected.itag, 248);
+}
+
+#[test]
 fn rejects_aac_and_video_formats() {
     let formats = vec![
         StreamFormat::new(
