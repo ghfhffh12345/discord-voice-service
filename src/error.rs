@@ -14,6 +14,8 @@ pub enum AppError {
     UnsupportedFormat,
     #[error("buffer is full")]
     BufferFull,
+    #[error("unsupported encryption mode")]
+    UnsupportedEncryptionMode,
     #[error("invalid state: {0}")]
     InvalidState(&'static str),
     #[error(transparent)]

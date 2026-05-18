@@ -72,7 +72,7 @@ impl VoiceGatewayClient {
         .await
     }
 
-    async fn send_json(&mut self, payload: Value) -> Result<(), AppError> {
+    pub(crate) async fn send_json(&mut self, payload: Value) -> Result<(), AppError> {
         ws::send_json(&mut self.ws, payload).await
     }
 }
