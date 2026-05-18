@@ -1,3 +1,4 @@
+pub mod api;
 pub mod config;
 pub mod discord_voice;
 pub mod error;
