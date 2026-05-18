@@ -1,6 +1,7 @@
-use std::ffi::{CString, NulError, c_void};
+use std::ffi::{CStr, CString, NulError, c_char, c_void};
 use std::ptr;
 use std::slice;
+use std::sync::Mutex;
 use std::sync::mpsc::{self, Sender};
 use std::time::Duration;
 
@@ -22,6 +23,12 @@ pub enum DaveError {
     EmptyOutput(&'static str),
     #[error("DAVE string contains an interior null byte")]
     InteriorNull(#[from] NulError),
+    #[error("DAVE MLS failure during {context}: {mls_source}: {reason}")]
+    MlsFailure {
+        context: &'static str,
+        mls_source: String,
+        reason: String,
+    },
     #[error("DAVE pairwise fingerprint callback timed out")]
     FingerprintTimeout,
     #[error("DAVE encryption failed with result code {0}")]
@@ -47,6 +54,7 @@ impl DaveMediaType {
 
 pub struct DaveSession {
     handle: dave_ffi::DaveSessionHandle,
+    failure_state: Box<SessionFailureState>,
 }
 
 impl DaveSession {
@@ -55,18 +63,25 @@ impl DaveSession {
         let auth_session_id_ptr = auth_session_id
             .as_ref()
             .map_or(ptr::null(), |value| value.as_ptr());
+        let failure_state = Box::new(SessionFailureState::default());
+        let failure_state_ptr = (&*failure_state as *const SessionFailureState)
+            .cast_mut()
+            .cast::<c_void>();
         let handle = unsafe {
             dave_ffi::daveSessionCreate(
                 ptr::null_mut(),
                 auth_session_id_ptr,
                 Some(session_failure_callback),
-                ptr::null_mut(),
+                failure_state_ptr,
             )
         };
         if handle.is_null() {
             return Err(DaveError::NullHandle("session"));
         }
-        Ok(Self { handle })
+        Ok(Self {
+            handle,
+            failure_state,
+        })
     }
 
     pub fn max_supported_protocol_version() -> u16 {
@@ -88,6 +103,9 @@ impl DaveSession {
                 self_user_id.as_ptr(),
             );
         }
+        if let Some(err) = self.take_failure("init") {
+            return Err(err);
+        }
         Ok(())
     }
 
@@ -98,6 +116,9 @@ impl DaveSession {
                 external_sender.as_ptr(),
                 external_sender.len(),
             );
+        }
+        if let Some(err) = self.take_failure("set external sender") {
+            return Err(err);
         }
         Ok(())
     }
@@ -111,7 +132,7 @@ impl DaveSession {
         let mut len = 0;
         unsafe {
             dave_ffi::daveSessionGetMarshalledKeyPackage(self.handle, &mut data, &mut len);
-            take_dave_bytes(data, len, "key package")
+            self.take_dave_bytes(data, len, "key package")
         }
     }
 
@@ -134,7 +155,7 @@ impl DaveSession {
                 &mut data,
                 &mut len,
             );
-            take_dave_bytes(data, len, "commit welcome")
+            self.take_dave_bytes(data, len, "commit welcome")
         }
     }
 
@@ -143,7 +164,15 @@ impl DaveSession {
             dave_ffi::daveSessionProcessCommit(self.handle, commit.as_ptr(), commit.len())
         };
         if handle.is_null() {
-            return Err(DaveError::NullHandle("commit result"));
+            return Err(self
+                .take_failure("process commit")
+                .unwrap_or(DaveError::NullHandle("commit result")));
+        }
+        if let Some(err) = self.take_failure("process commit") {
+            unsafe {
+                dave_ffi::daveCommitResultDestroy(handle);
+            }
+            return Err(err);
         }
         Ok(DaveCommitResult { handle })
     }
@@ -165,7 +194,15 @@ impl DaveSession {
             )
         };
         if handle.is_null() {
-            return Err(DaveError::NullHandle("welcome result"));
+            return Err(self
+                .take_failure("process welcome")
+                .unwrap_or(DaveError::NullHandle("welcome result")));
+        }
+        if let Some(err) = self.take_failure("process welcome") {
+            unsafe {
+                dave_ffi::daveWelcomeResultDestroy(handle);
+            }
+            return Err(err);
         }
         Ok(DaveWelcomeResult { handle })
     }
@@ -175,7 +212,7 @@ impl DaveSession {
         let mut len = 0;
         unsafe {
             dave_ffi::daveSessionGetLastEpochAuthenticator(self.handle, &mut data, &mut len);
-            take_dave_bytes(data, len, "last epoch authenticator")
+            self.take_dave_bytes(data, len, "last epoch authenticator")
         }
     }
 
@@ -211,9 +248,48 @@ impl DaveSession {
         let user_id = CString::new(user_id)?;
         let handle = unsafe { dave_ffi::daveSessionGetKeyRatchet(self.handle, user_id.as_ptr()) };
         if handle.is_null() {
-            return Err(DaveError::NullHandle("key ratchet"));
+            return Err(self
+                .take_failure("key ratchet")
+                .unwrap_or(DaveError::NullHandle("key ratchet")));
+        }
+        if let Some(err) = self.take_failure("key ratchet") {
+            unsafe {
+                dave_ffi::daveKeyRatchetDestroy(handle);
+            }
+            return Err(err);
         }
         Ok(DaveKeyRatchet { handle })
+    }
+
+    fn take_failure(&self, context: &'static str) -> Option<DaveError> {
+        self.failure_state
+            .take()
+            .map(|failure| DaveError::MlsFailure {
+                context,
+                mls_source: failure.source,
+                reason: failure.reason,
+            })
+    }
+
+    unsafe fn take_dave_bytes(
+        &self,
+        data: *mut u8,
+        len: usize,
+        context: &'static str,
+    ) -> Result<Vec<u8>, DaveError> {
+        if data.is_null() || len == 0 {
+            return Err(self
+                .take_failure(context)
+                .unwrap_or(DaveError::EmptyOutput(context)));
+        }
+        let bytes = unsafe { slice::from_raw_parts(data, len).to_vec() };
+        unsafe {
+            dave_ffi::daveFree(data.cast::<c_void>());
+        }
+        if let Some(err) = self.take_failure(context) {
+            return Err(err);
+        }
+        Ok(bytes)
     }
 }
 
@@ -500,11 +576,43 @@ impl Drop for DaveExternalSender {
     }
 }
 
+#[derive(Debug, Clone)]
+struct MlsFailure {
+    source: String,
+    reason: String,
+}
+
+#[derive(Debug, Default)]
+struct SessionFailureState {
+    latest: Mutex<Option<MlsFailure>>,
+}
+
+impl SessionFailureState {
+    fn record(&self, source: String, reason: String) {
+        *self.latest.lock().expect("session failure mutex poisoned") =
+            Some(MlsFailure { source, reason });
+    }
+
+    fn take(&self) -> Option<MlsFailure> {
+        self.latest
+            .lock()
+            .expect("session failure mutex poisoned")
+            .take()
+    }
+}
+
 unsafe extern "C" fn session_failure_callback(
-    _source: *const std::ffi::c_char,
-    _reason: *const std::ffi::c_char,
-    _user_data: *mut c_void,
+    source: *const c_char,
+    reason: *const c_char,
+    user_data: *mut c_void,
 ) {
+    if user_data.is_null() {
+        return;
+    }
+    let failure_state = unsafe { &*user_data.cast::<SessionFailureState>() };
+    failure_state.record(unsafe { c_string_lossy(source) }, unsafe {
+        c_string_lossy(reason)
+    });
 }
 
 unsafe extern "C" fn pairwise_fingerprint_callback(
@@ -557,6 +665,16 @@ fn c_string_list(values: &[&str]) -> Result<Vec<CString>, DaveError> {
         .collect()
 }
 
-fn c_string_ptrs(values: &[CString]) -> Vec<*const std::ffi::c_char> {
+fn c_string_ptrs(values: &[CString]) -> Vec<*const c_char> {
     values.iter().map(|value| value.as_ptr()).collect()
+}
+
+unsafe fn c_string_lossy(value: *const c_char) -> String {
+    if value.is_null() {
+        "<null>".to_string()
+    } else {
+        unsafe { CStr::from_ptr(value) }
+            .to_string_lossy()
+            .into_owned()
+    }
 }

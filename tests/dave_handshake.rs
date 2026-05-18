@@ -1,5 +1,5 @@
 use discord_voice_service::discord_voice::dave::{
-    DaveDecryptor, DaveEncryptor, DaveExternalSender, DaveMediaType, DaveSession,
+    DaveDecryptor, DaveEncryptor, DaveError, DaveExternalSender, DaveMediaType, DaveSession,
 };
 
 #[test]
@@ -95,4 +95,26 @@ fn dave_handshake_establishes_matching_epoch_and_encrypts_audio() {
         .decrypt(DaveMediaType::Audio, &encrypted)
         .expect("decrypt audio");
     assert_eq!(decrypted, audio_frame);
+}
+
+#[test]
+fn dave_session_surfaces_mls_failure_callback_diagnostics() {
+    let mut session = DaveSession::new(None).expect("session");
+
+    let err = session
+        .set_external_sender(&[0xff])
+        .expect_err("invalid external sender should fail");
+
+    match err {
+        DaveError::MlsFailure {
+            context,
+            mls_source,
+            reason,
+        } => {
+            assert_eq!(context, "set external sender");
+            assert_eq!(mls_source, "SetExternalSender");
+            assert!(!reason.is_empty());
+        }
+        other => panic!("expected MLS failure diagnostics, got {other:?}"),
+    }
 }

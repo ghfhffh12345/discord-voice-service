@@ -103,9 +103,6 @@ fn build_vendored_openssl(source: &Path) -> PathBuf {
     let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("out dir"));
     let build_dir = out_dir.join("openssl-build");
     let libcrypto = build_dir.join("libcrypto.a");
-    if libcrypto.exists() {
-        return build_dir;
-    }
 
     if build_dir.exists() {
         fs::remove_dir_all(&build_dir)
