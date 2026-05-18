@@ -1,4 +1,4 @@
-use discord_voice_service::discord_voice::crypto::{pick_mode, PREFERRED_MODE, REQUIRED_MODE};
+use discord_voice_service::discord_voice::crypto::{PREFERRED_MODE, REQUIRED_MODE, pick_mode};
 use discord_voice_service::discord_voice::rtp::RtpPacketBuilder;
 
 #[test]

@@ -25,5 +25,8 @@ async fn join_then_play_advances_state_machine() {
         .await
         .unwrap();
 
-    assert_eq!(supervisor.snapshot().await.state, SessionState::ResolvingTrack);
+    assert_eq!(
+        supervisor.snapshot().await.state,
+        SessionState::ResolvingTrack
+    );
 }

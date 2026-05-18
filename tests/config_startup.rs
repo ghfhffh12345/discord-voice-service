@@ -31,3 +31,10 @@ fn rejects_invalid_ytmusic_endpoint() {
         AppError::InvalidEnv("DISCORD_VOICE_SERVICE_YTMUSIC_ADDR")
     ));
 }
+
+#[test]
+fn env_example_mentions_required_addresses() {
+    let env_file = std::fs::read_to_string(".env.example").expect("env example");
+    assert!(env_file.contains("DISCORD_VOICE_SERVICE_ADDR="));
+    assert!(env_file.contains("DISCORD_VOICE_SERVICE_YTMUSIC_ADDR="));
+}
