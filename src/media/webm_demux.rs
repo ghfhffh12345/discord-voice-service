@@ -84,10 +84,14 @@ impl WebmDemuxState {
         while let Some(tag) = iterator.next() {
             let tag = match tag {
                 Ok(tag) => tag,
-                Err(TagIteratorError::UnexpectedEOF { .. }) => return Ok(None),
-                Err(error) => return Err(map_tag_iterator_error(error)),
+                Err(TagIteratorError::UnexpectedEOF { .. })
+                | Err(TagIteratorError::CorruptedFileData(_))
+                | Err(TagIteratorError::CorruptedTagData { .. })
+                | Err(TagIteratorError::ReadError { .. }) => return Ok(None),
             };
-            state.process_tag(tag, &mut packets)?;
+            if state.process_tag(tag, &mut packets).is_err() {
+                return Ok(None);
+            }
         }
 
         Ok(Some(packets))
@@ -305,10 +309,6 @@ fn distribute_duration(total_duration_ms: u64, parts: usize) -> Vec<u64> {
     }
 
     durations
-}
-
-fn map_tag_iterator_error(error: TagIteratorError) -> AppError {
-    AppError::MediaParseDetail(error.to_string())
 }
 
 fn map_webm_coercion_error(error: WebmCoercionError) -> AppError {
