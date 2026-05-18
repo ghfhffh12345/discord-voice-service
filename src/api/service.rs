@@ -127,9 +127,9 @@ impl DiscordVoiceControl for ControlService {
             guild_id: snapshot.guild_id.unwrap_or_default(),
             channel_id: snapshot.channel_id.unwrap_or_default(),
             current_video_id: snapshot.current_video_id.unwrap_or_default(),
-            queue_depth: 0,
-            selected_itag: 0,
-            message: String::new(),
+            queue_depth: u32::try_from(snapshot.queue_depth).unwrap_or(u32::MAX),
+            selected_itag: snapshot.selected_itag.unwrap_or_default(),
+            message: snapshot.last_reason.unwrap_or_default(),
         }))
     }
 

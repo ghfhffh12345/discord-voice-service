@@ -11,6 +11,7 @@ use crate::session::supervisor::{Command, VoiceContext};
 
 pub struct VoiceSessionRuntime {
     snapshot: RwLock<Snapshot>,
+    voice: RwLock<Option<VoiceContext>>,
     events: EventBus,
 }
 
@@ -18,6 +19,7 @@ impl VoiceSessionRuntime {
     pub fn new() -> Self {
         Self {
             snapshot: RwLock::new(Snapshot::default()),
+            voice: RwLock::new(None),
             events: EventBus::new(64),
         }
     }
@@ -25,10 +27,12 @@ impl VoiceSessionRuntime {
     pub async fn handle_command(&self, command: Command) -> Result<(), AppError> {
         let event = {
             let mut snapshot = self.snapshot.write().await;
+            let mut current_voice = self.voice.write().await;
             match command {
                 Command::JoinVoice { voice } => {
                     ensure_joinable_session(&snapshot)?;
-                    apply_voice_context(&mut snapshot, voice);
+                    apply_voice_context(&mut snapshot, &voice);
+                    *current_voice = Some(voice);
                     snapshot.current_video_id = None;
                     snapshot.selected_itag = None;
                     snapshot.queue_depth = 0;
@@ -37,11 +41,12 @@ impl VoiceSessionRuntime {
                     snapshot.voice_reconnecting = false;
                     snapshot.last_reason = None;
                     snapshot.state = SessionState::VoiceReady;
-                    Some(SessionEventRecord::new(SessionEventKind::VoiceConnecting))
+                    Some(SessionEventRecord::new(SessionEventKind::VoiceReady))
                 }
                 Command::UpdateVoiceContext { voice } => {
                     ensure_active_voice_session(&snapshot, "update_voice_context")?;
-                    apply_voice_context(&mut snapshot, voice);
+                    apply_voice_context(&mut snapshot, &voice);
+                    *current_voice = Some(voice);
                     None
                 }
                 Command::Play { video_id } => {
@@ -73,6 +78,7 @@ impl VoiceSessionRuntime {
                 }
                 Command::LeaveVoice => {
                     *snapshot = Snapshot::default();
+                    *current_voice = None;
                     None
                 }
             }
@@ -89,12 +95,16 @@ impl VoiceSessionRuntime {
         self.snapshot.read().await.clone()
     }
 
+    pub async fn current_voice_context(&self) -> Option<VoiceContext> {
+        self.voice.read().await.clone()
+    }
+
     pub fn subscribe_events(&self) -> broadcast::Receiver<SessionEventRecord> {
         self.events.subscribe()
     }
 }
 
-fn apply_voice_context(snapshot: &mut Snapshot, voice: VoiceContext) {
-    snapshot.guild_id = Some(voice.guild_id);
-    snapshot.channel_id = Some(voice.channel_id);
+fn apply_voice_context(snapshot: &mut Snapshot, voice: &VoiceContext) {
+    snapshot.guild_id = Some(voice.guild_id.clone());
+    snapshot.channel_id = Some(voice.channel_id.clone());
 }

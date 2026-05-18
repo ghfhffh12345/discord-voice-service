@@ -47,6 +47,10 @@ impl Supervisor {
         self.runtime.snapshot().await
     }
 
+    pub async fn current_voice_context(&self) -> Option<VoiceContext> {
+        self.runtime.current_voice_context().await
+    }
+
     pub fn subscribe_events(&self) -> broadcast::Receiver<SessionEventRecord> {
         self.runtime.subscribe_events()
     }

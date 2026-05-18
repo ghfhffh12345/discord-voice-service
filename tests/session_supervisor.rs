@@ -38,6 +38,36 @@ async fn snapshot_exposes_runtime_position_queue_depth_and_rollover_flags() {
     assert!(!snapshot.voice_reconnecting);
 }
 
+#[tokio::test]
+async fn update_voice_context_replaces_full_runtime_voice_context() {
+    let supervisor = Supervisor::new();
+    let joined = test_voice_context();
+    let updated = VoiceContext {
+        guild_id: "1".into(),
+        channel_id: "9".into(),
+        session_id: "updated-session".into(),
+        endpoint: "updated.voice.example".into(),
+        token: "updated-token".into(),
+    };
+
+    supervisor
+        .send(Command::JoinVoice {
+            voice: joined.clone(),
+        })
+        .await
+        .unwrap();
+    supervisor
+        .send(Command::UpdateVoiceContext {
+            voice: updated.clone(),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(supervisor.current_voice_context().await, Some(updated));
+    assert_eq!(supervisor.snapshot().await.channel_id, Some("9".into()));
+    assert_ne!(supervisor.current_voice_context().await, Some(joined));
+}
+
 fn test_voice_context() -> VoiceContext {
     VoiceContext {
         guild_id: "1".into(),
