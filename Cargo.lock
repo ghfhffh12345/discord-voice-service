@@ -162,6 +162,7 @@ dependencies = [
  "bytes",
  "futures",
  "http",
+ "prost",
  "protoc-bin-vendored",
  "reqwest",
  "serde",

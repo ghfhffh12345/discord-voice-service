@@ -1,0 +1,88 @@
+syntax = "proto3";
+
+package discordvoice.v1;
+
+service DiscordVoiceControl {
+  rpc JoinVoice(JoinVoiceRequest) returns (JoinVoiceResponse);
+  rpc Play(PlayRequest) returns (PlayResponse);
+  rpc Pause(PauseRequest) returns (PauseResponse);
+  rpc Resume(ResumeRequest) returns (ResumeResponse);
+  rpc Stop(StopRequest) returns (StopResponse);
+  rpc LeaveVoice(LeaveVoiceRequest) returns (LeaveVoiceResponse);
+  rpc GetState(GetStateRequest) returns (SessionStateSnapshot);
+  rpc SubscribeEvents(SubscribeEventsRequest) returns (stream SessionEvent);
+}
+
+message JoinVoiceRequest {
+  message VoiceContext {
+    string guild_id = 1;
+    string channel_id = 2;
+    string session_id = 3;
+    string endpoint = 4;
+    string token = 5;
+  }
+
+  VoiceContext voice = 1;
+}
+
+message JoinVoiceResponse {}
+message PlayRequest { string video_id = 1; }
+message PlayResponse {}
+message PauseRequest {}
+message PauseResponse {}
+message ResumeRequest {}
+message ResumeResponse {}
+message StopRequest {}
+message StopResponse {}
+message LeaveVoiceRequest {}
+message LeaveVoiceResponse {}
+message GetStateRequest {}
+message SubscribeEventsRequest {}
+
+enum SessionEventKind {
+  SESSION_EVENT_KIND_UNSPECIFIED = 0;
+  VOICE_CONNECTING = 1;
+  VOICE_READY = 2;
+  TRACK_RESOLVING = 3;
+  BUFFERING = 4;
+  PLAYING = 5;
+  PAUSED = 6;
+  STOPPED = 7;
+  TRACK_ENDED = 8;
+  PLAYBACK_INTERRUPTED = 9;
+  RECOVERABLE_WARNING = 10;
+  FATAL_ERROR = 11;
+}
+
+enum SessionState {
+  SESSION_STATE_UNSPECIFIED = 0;
+  IDLE = 1;
+  CONNECTING_VOICE = 2;
+  VOICE_READY_STATE = 3;
+  RESOLVING_TRACK = 4;
+  BUFFERING_STATE = 5;
+  PLAYING_STATE = 6;
+  PAUSED_STATE = 7;
+  STOPPING = 8;
+  ERROR_STATE = 9;
+}
+
+message SessionStateSnapshot {
+  SessionState state = 1;
+  string guild_id = 2;
+  string channel_id = 3;
+  string current_video_id = 4;
+  uint32 queue_depth = 5;
+  uint32 selected_itag = 6;
+  string message = 7;
+}
+
+message SessionEvent {
+  SessionEventKind kind = 1;
+  string guild_id = 2;
+  string channel_id = 3;
+  string current_video_id = 4;
+  uint32 selected_itag = 5;
+  string message = 6;
+  string error_code = 7;
+}
