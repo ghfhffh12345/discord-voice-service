@@ -18,6 +18,7 @@ pub struct DemuxedPacket {
 #[derive(Default)]
 pub struct WebmOpusDemux {
     pending: BytesMut,
+    emitted_packets: usize,
 }
 
 impl WebmOpusDemux {
@@ -30,9 +31,20 @@ impl WebmOpusDemux {
             return Ok(Vec::new());
         }
 
-        let packets = WebmDemuxState::parse(self.pending.as_ref())?;
-        self.pending.clear();
-        Ok(packets)
+        match WebmDemuxState::parse(self.pending.as_ref())? {
+            Some(packets) => {
+                if self.emitted_packets > packets.len() {
+                    return Err(AppError::MediaParse(
+                        "demux packet cursor exceeded parsed packet count",
+                    ));
+                }
+
+                let new_packets = packets[self.emitted_packets..].to_vec();
+                self.emitted_packets = packets.len();
+                Ok(new_packets)
+            }
+            None => Ok(Vec::new()),
+        }
     }
 }
 
@@ -60,7 +72,7 @@ impl Default for WebmDemuxState {
 }
 
 impl WebmDemuxState {
-    fn parse(input: &[u8]) -> Result<Vec<DemuxedPacket>, AppError> {
+    fn parse(input: &[u8]) -> Result<Option<Vec<DemuxedPacket>>, AppError> {
         let tags_to_buffer = [
             MatroskaSpec::TrackEntry(Master::Start),
             MatroskaSpec::BlockGroup(Master::Start),
@@ -70,11 +82,15 @@ impl WebmDemuxState {
         let mut packets = Vec::new();
 
         while let Some(tag) = iterator.next() {
-            let tag = tag.map_err(map_tag_iterator_error)?;
+            let tag = match tag {
+                Ok(tag) => tag,
+                Err(TagIteratorError::UnexpectedEOF { .. }) => return Ok(None),
+                Err(error) => return Err(map_tag_iterator_error(error)),
+            };
             state.process_tag(tag, &mut packets)?;
         }
 
-        Ok(packets)
+        Ok(Some(packets))
     }
 
     fn process_tag(

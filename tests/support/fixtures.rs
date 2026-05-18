@@ -13,6 +13,14 @@ pub fn load_fixture_bytes(path: &str) -> Bytes {
 }
 
 pub async fn spawn_range_server() -> RangeServer {
+    spawn_test_server(ServerBehavior::HonorRange).await
+}
+
+pub async fn spawn_non_range_server() -> RangeServer {
+    spawn_test_server(ServerBehavior::IgnoreRange).await
+}
+
+async fn spawn_test_server(behavior: ServerBehavior) -> RangeServer {
     let payload = load_fixture_bytes("tests/fixtures/audio-itag250.webm");
     let payload = payload.repeat(4);
     let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
@@ -51,16 +59,29 @@ pub async fn spawn_range_server() -> RangeServer {
                 .as_deref()
                 .and_then(parse_range_start)
                 .unwrap_or(0);
-            let body = payload.get(start as usize..).unwrap_or(&[]);
-            let status = if start == 0 {
-                "HTTP/1.1 200 OK"
-            } else {
-                "HTTP/1.1 206 Partial Content"
+            let (body, status, content_range) = match behavior {
+                ServerBehavior::HonorRange if start > 0 => (
+                    payload.get(start as usize..).unwrap_or(&[]),
+                    "HTTP/1.1 206 Partial Content",
+                    Some(format!(
+                        "bytes {start}-{}/*",
+                        payload.len().saturating_sub(1)
+                    )),
+                ),
+                _ => (payload.as_slice(), "HTTP/1.1 200 OK", None),
             };
-            let response = format!(
-                "{status}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
+            let headers = if let Some(content_range) = content_range {
+                format!(
+                    "Content-Length: {}\r\nAccept-Ranges: bytes\r\nContent-Range: {content_range}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+            } else {
+                format!(
+                    "Content-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+            };
+            let response = format!("{status}\r\n{headers}",);
 
             if stream.write_all(response.as_bytes()).is_err() {
                 continue;
@@ -91,6 +112,12 @@ impl RangeServer {
             .expect("range header mutex should lock")
             .clone()
     }
+}
+
+#[derive(Clone, Copy)]
+enum ServerBehavior {
+    HonorRange,
+    IgnoreRange,
 }
 
 fn parse_range_start(header: &str) -> Option<u64> {
