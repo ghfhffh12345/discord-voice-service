@@ -161,6 +161,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "futures",
+ "http",
  "protoc-bin-vendored",
  "reqwest",
  "serde",
