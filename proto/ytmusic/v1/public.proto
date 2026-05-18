@@ -1,0 +1,532 @@
+syntax = "proto3";
+
+package ytmusic.v1;
+
+service YtMusicPublic {
+  rpc Search(SearchRequest) returns (SearchResponse);
+  rpc SearchContinuation(SearchContinuationRequest) returns (SearchResponse);
+  rpc GetWatchPlaylist(GetWatchPlaylistRequest) returns (WatchPlaylistResponse);
+  rpc GetWatchPlaylistContinuation(GetWatchPlaylistContinuationRequest) returns (WatchPlaylistResponse);
+  rpc GetSong(GetSongRequest) returns (GetSongResponse);
+  rpc GetLibraryPlaylists(Empty) returns (LibraryPlaylistsResponse);
+  rpc GetLibraryPlaylistsContinuation(GetLibraryPlaylistsContinuationRequest) returns (LibraryPlaylistsResponse);
+  rpc GetAccountInfo(Empty) returns (AccountInfoResponse);
+  rpc GetLibraryArtists(Empty) returns (LibraryArtistsResponse);
+  rpc GetLibraryArtistsContinuation(GetLibraryArtistsContinuationRequest) returns (LibraryArtistsResponse);
+  rpc GetLibraryAlbums(Empty) returns (LibraryAlbumsResponse);
+  rpc GetLibraryAlbumsContinuation(GetLibraryAlbumsContinuationRequest) returns (LibraryAlbumsResponse);
+  rpc GetLibrarySubscriptions(Empty) returns (LibrarySubscriptionsResponse);
+  rpc GetLibrarySubscriptionsContinuation(GetLibrarySubscriptionsContinuationRequest) returns (LibrarySubscriptionsResponse);
+  rpc GetLibraryChannels(Empty) returns (LibraryChannelsResponse);
+  rpc GetLibraryChannelsContinuation(GetLibraryChannelsContinuationRequest) returns (LibraryChannelsResponse);
+  rpc GetLibraryPodcasts(Empty) returns (LibraryPodcastsResponse);
+  rpc GetLibraryPodcastsContinuation(GetLibraryPodcastsContinuationRequest) returns (LibraryPodcastsResponse);
+  rpc GetLibrarySongs(Empty) returns (LibrarySongsResponse);
+  rpc GetLibrarySongsContinuation(GetLibrarySongsContinuationRequest) returns (LibrarySongsResponse);
+  rpc GetLikedSongs(Empty) returns (LikedSongsResponse);
+  rpc GetLikedSongsContinuation(GetLikedSongsContinuationRequest) returns (LikedSongsResponse);
+  rpc GetSavedEpisodes(Empty) returns (SavedEpisodesResponse);
+  rpc GetSavedEpisodesContinuation(GetSavedEpisodesContinuationRequest) returns (SavedEpisodesResponse);
+  rpc Decipher(DecipherRequest) returns (DecipherResponse);
+}
+
+message Empty {}
+
+message SearchRequest {
+  string query = 1;
+  optional SearchFilter filter = 2;
+  bool ignore_spelling = 3;
+}
+
+message SearchContinuationRequest {
+  string token = 1;
+}
+
+message GetWatchPlaylistRequest {
+  optional string video_id = 1;
+  optional string playlist_id = 2;
+  bool radio = 3;
+  bool shuffle = 4;
+}
+
+message GetWatchPlaylistContinuationRequest {
+  string token = 1;
+}
+
+message GetSongRequest {
+  string video_id = 1;
+}
+
+message GetLibraryPlaylistsContinuationRequest {
+  string token = 1;
+}
+
+message GetLibraryArtistsContinuationRequest {
+  string token = 1;
+}
+
+message GetLibraryAlbumsContinuationRequest {
+  string token = 1;
+}
+
+message GetLibrarySubscriptionsContinuationRequest {
+  string token = 1;
+}
+
+message GetLibraryChannelsContinuationRequest {
+  string token = 1;
+}
+
+message GetLibraryPodcastsContinuationRequest {
+  string token = 1;
+}
+
+message GetLibrarySongsContinuationRequest {
+  string token = 1;
+}
+
+message GetLikedSongsContinuationRequest {
+  string token = 1;
+}
+
+message GetSavedEpisodesContinuationRequest {
+  string token = 1;
+}
+
+message DecipherRequest {
+  string signature_cipher = 1;
+}
+
+message DecipherResponse {
+  string playable_url = 1;
+}
+
+message Thumbnail {
+  string url = 1;
+  uint32 width = 2;
+  uint32 height = 3;
+}
+
+message ArtistRef {
+  string id = 1;
+  string name = 2;
+}
+
+message AlbumRef {
+  string id = 1;
+  string name = 2;
+}
+
+message SearchContinuationToken {
+  string value = 1;
+}
+
+message WatchPlaylistContinuationToken {
+  string value = 1;
+}
+
+message LibraryPlaylistsContinuationToken {
+  string value = 1;
+}
+
+message LibraryArtistsContinuationToken {
+  string value = 1;
+}
+
+message LibraryAlbumsContinuationToken {
+  string value = 1;
+}
+
+message LibrarySubscriptionsContinuationToken {
+  string value = 1;
+}
+
+message LibraryChannelsContinuationToken {
+  string value = 1;
+}
+
+message LibraryPodcastsContinuationToken {
+  string value = 1;
+}
+
+message LibrarySongsContinuationToken {
+  string value = 1;
+}
+
+message LikedSongsContinuationToken {
+  string value = 1;
+}
+
+message SavedEpisodesContinuationToken {
+  string value = 1;
+}
+
+enum SearchResultType {
+  SEARCH_RESULT_TYPE_UNSPECIFIED = 0;
+  SEARCH_RESULT_TYPE_SONG = 1;
+  SEARCH_RESULT_TYPE_VIDEO = 2;
+  SEARCH_RESULT_TYPE_ALBUM = 3;
+  SEARCH_RESULT_TYPE_ARTIST = 4;
+  SEARCH_RESULT_TYPE_PROFILE = 5;
+  SEARCH_RESULT_TYPE_PLAYLIST = 6;
+  SEARCH_RESULT_TYPE_EPISODE = 7;
+  SEARCH_RESULT_TYPE_PODCAST = 8;
+}
+
+enum SearchFilter {
+  SEARCH_FILTER_UNSPECIFIED = 0;
+  SEARCH_FILTER_SONGS = 1;
+  SEARCH_FILTER_VIDEOS = 2;
+  SEARCH_FILTER_ALBUMS = 3;
+  SEARCH_FILTER_ARTISTS = 4;
+  SEARCH_FILTER_PLAYLISTS = 5;
+}
+
+enum LibraryLikeStatus {
+  LIBRARY_LIKE_STATUS_UNSPECIFIED = 0;
+  LIBRARY_LIKE_STATUS_LIKE = 1;
+  LIBRARY_LIKE_STATUS_INDIFFERENT = 2;
+  LIBRARY_LIKE_STATUS_DISLIKE = 3;
+}
+
+message SongSearchResult {
+  optional string category = 1;
+  SearchResultType result_type = 2;
+  string video_id = 3;
+  string title = 4;
+  repeated ArtistRef artists = 5;
+  optional AlbumRef album = 6;
+  optional string duration = 7;
+  repeated Thumbnail thumbnails = 8;
+  bool is_explicit = 9;
+}
+
+message VideoSearchResult {
+  optional string category = 1;
+  SearchResultType result_type = 2;
+  string title = 3;
+  string video_id = 4;
+  optional string video_type = 5;
+  repeated ArtistRef artists = 6;
+  repeated Thumbnail thumbnails = 7;
+  optional string duration = 8;
+  optional string views = 9;
+  optional string date = 10;
+  optional AlbumRef podcast = 11;
+  optional bool live = 12;
+}
+
+message AlbumSearchResult {
+  optional string category = 1;
+  SearchResultType result_type = 2;
+  string browse_id = 3;
+  optional string playlist_id = 4;
+  string title = 5;
+  string type_label = 6;
+  optional string year = 7;
+  optional string duration = 8;
+  bool is_explicit = 9;
+  repeated ArtistRef artists = 10;
+  repeated Thumbnail thumbnails = 11;
+}
+
+message ArtistSearchResult {
+  optional string category = 1;
+  SearchResultType result_type = 2;
+  optional string artist = 3;
+  repeated ArtistRef artists = 4;
+  optional string subscribers = 5;
+  optional string browse_id = 6;
+  optional string radio_id = 7;
+  optional string shuffle_id = 8;
+  repeated Thumbnail thumbnails = 9;
+}
+
+message ProfileSearchResult {
+  optional string category = 1;
+  SearchResultType result_type = 2;
+  string browse_id = 3;
+  string name = 4;
+  string handle = 5;
+  repeated Thumbnail thumbnails = 6;
+}
+
+message PlaylistSearchResult {
+  optional string category = 1;
+  SearchResultType result_type = 2;
+  string browse_id = 3;
+  string title = 4;
+  optional string author = 5;
+  optional string item_count = 6;
+  repeated Thumbnail thumbnails = 7;
+}
+
+message SearchResultItem {
+  oneof item {
+    SongSearchResult song = 1;
+    VideoSearchResult video = 2;
+    VideoSearchResult episode = 3;
+    AlbumSearchResult album = 4;
+    ArtistSearchResult artist = 5;
+    ProfileSearchResult profile = 6;
+    PlaylistSearchResult playlist = 7;
+    PlaylistSearchResult podcast = 8;
+  }
+}
+
+message SearchResponse {
+  repeated SearchResultItem items = 1;
+  SearchContinuationToken continuation = 2;
+}
+
+message WatchTrackItem {
+  string video_id = 1;
+  string title = 2;
+  optional string duration = 3;
+  repeated Thumbnail thumbnails = 4;
+  repeated ArtistRef artists = 5;
+  optional AlbumRef album = 6;
+  optional LibraryLikeStatus like_status = 7;
+  optional string video_type = 8;
+  optional string year = 9;
+  optional string views = 10;
+  optional bool is_in_library = 11;
+  optional WatchTrackItem counterpart = 12;
+}
+
+message WatchPlaylistResponse {
+  repeated WatchTrackItem items = 1;
+  WatchPlaylistContinuationToken continuation = 2;
+}
+
+message SongByteRange {
+  string start = 1;
+  string end = 2;
+}
+
+message SongColorInfo {
+  optional string primaries = 1;
+  optional string transfer_characteristics = 2;
+  optional string matrix_coefficients = 3;
+}
+
+message SongStreamFormat {
+  uint32 itag = 1;
+  string mime_type = 2;
+  uint64 bitrate = 3;
+  optional uint64 average_bitrate = 4;
+  optional uint64 content_length = 5;
+  optional string last_modified = 6;
+  optional string quality = 7;
+  optional string quality_label = 8;
+  optional string quality_ordinal = 9;
+  optional string projection_type = 10;
+  optional uint32 width = 11;
+  optional uint32 height = 12;
+  optional uint32 fps = 13;
+  optional SongColorInfo color_info = 14;
+  optional string audio_quality = 15;
+  optional uint32 audio_sample_rate = 16;
+  optional uint32 audio_channels = 17;
+  optional double loudness_db = 18;
+  optional double track_absolute_loudness_lkfs = 19;
+  optional uint64 approx_duration_ms = 20;
+  optional bool high_replication = 21;
+  optional string xtags = 22;
+  optional SongByteRange init_range = 23;
+  optional SongByteRange index_range = 24;
+  string signature_cipher = 25;
+}
+
+message SongVideoDetails {
+  string video_id = 1;
+  string title = 2;
+  uint32 length_seconds = 3;
+  string channel_id = 4;
+  string author = 5;
+  repeated Thumbnail thumbnails = 6;
+  bool allow_ratings = 7;
+  string view_count = 8;
+  bool is_owner_viewing = 9;
+  bool is_crawlable = 10;
+  bool is_private = 11;
+  bool is_unplugged_corpus = 12;
+  bool is_live_content = 13;
+  bool is_tvfilm_video = 14;
+  optional string music_video_type = 15;
+}
+
+message SongPlayabilityStatus {
+  string status = 1;
+  bool playable_in_embed = 2;
+  optional string reason = 3;
+  optional string context_params = 4;
+  optional string audio_only_availability = 5;
+  optional string playback_mode = 6;
+}
+
+message SongStreamingData {
+  uint64 expires_in_seconds = 1;
+  optional string server_abr_streaming_url = 2;
+  repeated SongStreamFormat formats = 3;
+  repeated SongStreamFormat adaptive_formats = 4;
+}
+
+message SongMicroformat {
+  optional string url_canonical = 1;
+  optional string description = 2;
+  optional string category = 3;
+  optional string publish_date = 4;
+  optional string upload_date = 5;
+  optional string view_count = 6;
+  repeated string available_countries = 7;
+  repeated string tags = 8;
+  optional bool noindex = 9;
+  optional bool unlisted = 10;
+  optional bool family_safe = 11;
+}
+
+message GetSongResponse {
+  SongVideoDetails video_details = 1;
+  SongPlayabilityStatus playability_status = 2;
+  SongStreamingData streaming_data = 3;
+  SongMicroformat microformat = 4;
+}
+
+message LibraryPlaylistItem {
+  string playlist_id = 1;
+  optional string title = 2;
+  repeated ArtistRef authors = 3;
+  optional uint32 item_count = 4;
+  repeated Thumbnail thumbnails = 5;
+}
+
+message LibraryPlaylistsResponse {
+  repeated LibraryPlaylistItem items = 1;
+  LibraryPlaylistsContinuationToken continuation = 2;
+}
+
+message AccountInfoResponse {
+  string account_name = 1;
+  optional string channel_handle = 2;
+  string account_photo_url = 3;
+}
+
+message LibraryArtistItem {
+  string browse_id = 1;
+  string artist = 2;
+  optional string subscribers = 3;
+  repeated Thumbnail thumbnails = 4;
+}
+
+message LibraryArtistsResponse {
+  repeated LibraryArtistItem items = 1;
+  LibraryArtistsContinuationToken continuation = 2;
+}
+
+message LibraryAlbumItem {
+  string browse_id = 1;
+  optional string playlist_id = 2;
+  string title = 3;
+  optional string type_label = 4;
+  repeated ArtistRef artists = 5;
+  optional string year = 6;
+  repeated Thumbnail thumbnails = 7;
+}
+
+message LibraryAlbumsResponse {
+  repeated LibraryAlbumItem items = 1;
+  LibraryAlbumsContinuationToken continuation = 2;
+}
+
+message LibrarySubscriptionItem {
+  string browse_id = 1;
+  string name = 2;
+  optional string subscribers = 3;
+  repeated Thumbnail thumbnails = 4;
+}
+
+message LibrarySubscriptionsResponse {
+  repeated LibrarySubscriptionItem items = 1;
+  LibrarySubscriptionsContinuationToken continuation = 2;
+}
+
+message LibraryChannelItem {
+  string browse_id = 1;
+  string name = 2;
+  optional string subscribers = 3;
+  repeated Thumbnail thumbnails = 4;
+}
+
+message LibraryChannelsResponse {
+  repeated LibraryChannelItem items = 1;
+  LibraryChannelsContinuationToken continuation = 2;
+}
+
+message LibraryPodcastChannel {
+  optional string id = 1;
+  string name = 2;
+}
+
+message LibraryPodcastItem {
+  string title = 1;
+  string browse_id = 2;
+  string podcast_id = 3;
+  LibraryPodcastChannel channel = 4;
+  repeated Thumbnail thumbnails = 5;
+}
+
+message LibraryPodcastsResponse {
+  repeated LibraryPodcastItem items = 1;
+  LibraryPodcastsContinuationToken continuation = 2;
+}
+
+message LibrarySongItem {
+  string video_id = 1;
+  string title = 2;
+  repeated ArtistRef artists = 3;
+  AlbumRef album = 4;
+  optional string duration = 5;
+  repeated Thumbnail thumbnails = 6;
+  optional LibraryLikeStatus like_status = 7;
+}
+
+message LibrarySongsResponse {
+  repeated LibrarySongItem items = 1;
+  LibrarySongsContinuationToken continuation = 2;
+}
+
+message LikedSongItem {
+  string video_id = 1;
+  string title = 2;
+  repeated ArtistRef artists = 3;
+  AlbumRef album = 4;
+  optional string duration = 5;
+  repeated Thumbnail thumbnails = 6;
+  optional LibraryLikeStatus like_status = 7;
+}
+
+message LikedSongsResponse {
+  string playlist_id = 1;
+  string title = 2;
+  repeated LikedSongItem items = 3;
+  repeated Thumbnail thumbnails = 4;
+  LikedSongsContinuationToken continuation = 5;
+}
+
+message SavedEpisodeItem {
+  string video_id = 1;
+  string title = 2;
+  string channel = 3;
+  string podcast = 4;
+  optional string duration = 5;
+  repeated Thumbnail thumbnails = 6;
+}
+
+message SavedEpisodesResponse {
+  string playlist_id = 1;
+  string title = 2;
+  repeated SavedEpisodeItem items = 3;
+  repeated Thumbnail thumbnails = 4;
+  SavedEpisodesContinuationToken continuation = 5;
+}

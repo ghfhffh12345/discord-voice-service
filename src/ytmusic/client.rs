@@ -33,11 +33,6 @@ impl YtMusicClient {
         })
     }
 
-    pub async fn healthcheck(&self) -> Result<(), AppError> {
-        let _ = &self.inner;
-        Ok(())
-    }
-
     pub async fn resolve_playback_source(
         &mut self,
         video_id: &str,
