@@ -1,3 +1,4 @@
+use discord_voice_service::discord_voice::crypto::{pick_mode, PREFERRED_MODE, REQUIRED_MODE};
 use discord_voice_service::discord_voice::rtp::RtpPacketBuilder;
 
 #[test]
@@ -9,4 +10,13 @@ fn builds_rtp_header_for_discord_voice() {
             0x80, 0x78, 0x00, 0x01, 0x00, 0x00, 0x03, 0xC0, 0x00, 0x00, 0x00, 0x07, 0xAA, 0xBB,
         ]
     );
+}
+
+#[test]
+fn prefers_aes_gcm_but_accepts_required_xchacha_mode() {
+    let preferred = pick_mode(&[REQUIRED_MODE.to_owned(), PREFERRED_MODE.to_owned()]).unwrap();
+    assert_eq!(preferred, PREFERRED_MODE);
+
+    let fallback = pick_mode(&[REQUIRED_MODE.to_owned()]).unwrap();
+    assert_eq!(fallback, REQUIRED_MODE);
 }
