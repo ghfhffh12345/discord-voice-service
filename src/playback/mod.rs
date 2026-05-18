@@ -1,2 +1,2 @@
 pub mod pacer;
-pub mod worker {}
+pub mod worker;
