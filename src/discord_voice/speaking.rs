@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use bytes::Bytes;
 use http::Uri;
@@ -74,7 +75,7 @@ impl ConnectedVoiceSession {
     pub async fn send_audio_frame(&mut self, frame: Bytes) -> Result<(), AppError> {
         self.start_speaking().await?;
         if !self.speaking_flushed {
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
             self.speaking_flushed = true;
         }
         self.transport.send_audio_frame(frame).await

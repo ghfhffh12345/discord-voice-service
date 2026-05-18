@@ -1,8 +1,9 @@
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 
 use bytes::Bytes;
 use tokio::net::UdpSocket;
 
+use crate::discord_voice::discovery::discover_ip;
 use crate::discord_voice::rtp::{RtpPacketBuilder, RtpSequenceState};
 use crate::error::AppError;
 
@@ -33,7 +34,14 @@ impl VoiceUdpTransport {
                 .map_err(|_| AppError::InvalidState("voice udp bind address invalid"))?,
         };
         let socket = UdpSocket::bind(bind_addr).await?;
-        let local_addr = socket.local_addr()?;
+        let discovered_addr = discover_ip(&socket, server, ssrc).await?;
+        let local_addr = SocketAddr::new(
+            discovered_addr
+                .ip
+                .parse::<IpAddr>()
+                .map_err(|_| AppError::InvalidState("discovered udp ip invalid"))?,
+            discovered_addr.port,
+        );
 
         Ok(Self {
             socket,

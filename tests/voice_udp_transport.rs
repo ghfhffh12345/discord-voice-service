@@ -19,6 +19,9 @@ use tokio_tungstenite::tungstenite::Message;
 
 struct FakeUdpPeer {
     addr: SocketAddr,
+    advertised_ip: String,
+    advertised_port: u16,
+    discovery_count: Arc<Mutex<usize>>,
     silence_frame_count: Arc<Mutex<usize>>,
 }
 
@@ -26,8 +29,13 @@ impl FakeUdpPeer {
     async fn spawn() -> Self {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = socket.local_addr().unwrap();
+        let advertised_ip = "127.0.0.1".to_owned();
+        let advertised_port: u16 = 54_321;
+        let discovery_count = Arc::new(Mutex::new(0usize));
         let silence_frame_count = Arc::new(Mutex::new(0usize));
+        let discovery_count_state = Arc::clone(&discovery_count);
         let silence_frame_count_state = Arc::clone(&silence_frame_count);
+        let advertised_ip_state = advertised_ip.clone();
 
         tokio::spawn(async move {
             let mut buf = [0u8; 512];
@@ -35,13 +43,15 @@ impl FakeUdpPeer {
                 let (len, from) = socket.recv_from(&mut buf).await.unwrap();
                 let packet = &buf[..len];
 
-                if packet.len() == 74 {
+                if packet.len() == 74 && &packet[..2] == &1u16.to_be_bytes() {
+                    *discovery_count_state.lock().await += 1;
                     let mut response = [0u8; 74];
                     response[..2].copy_from_slice(&2u16.to_be_bytes());
                     response[2..4].copy_from_slice(&70u16.to_be_bytes());
                     response[4..8].copy_from_slice(&packet[4..8]);
-                    response[8..17].copy_from_slice(b"127.0.0.1");
-                    response[72..74].copy_from_slice(&from.port().to_be_bytes());
+                    response[8..8 + advertised_ip_state.len()]
+                        .copy_from_slice(advertised_ip_state.as_bytes());
+                    response[72..74].copy_from_slice(&advertised_port.to_be_bytes());
                     socket.send_to(&response, from).await.unwrap();
                     continue;
                 }
@@ -54,6 +64,9 @@ impl FakeUdpPeer {
 
         Self {
             addr,
+            advertised_ip,
+            advertised_port,
+            discovery_count,
             silence_frame_count,
         }
     }
@@ -64,6 +77,18 @@ impl FakeUdpPeer {
 
     async fn silence_frame_count(&self) -> usize {
         wait_for_value(&self.silence_frame_count, |count| *count >= 5).await
+    }
+
+    async fn discovery_count(&self) -> usize {
+        wait_for_value(&self.discovery_count, |count| *count >= 1).await
+    }
+
+    fn advertised_ip(&self) -> &str {
+        &self.advertised_ip
+    }
+
+    fn advertised_port(&self) -> u16 {
+        self.advertised_port
     }
 }
 
@@ -90,7 +115,18 @@ impl FakeVoiceGateway {
         tokio::spawn(async move {
             let mut buf = [0u8; 512];
             loop {
-                let (len, _) = udp_socket.recv_from(&mut buf).await.unwrap();
+                let (len, from) = udp_socket.recv_from(&mut buf).await.unwrap();
+                if len == 74 && &buf[..2] == &1u16.to_be_bytes() {
+                    let mut response = [0u8; 74];
+                    response[..2].copy_from_slice(&2u16.to_be_bytes());
+                    response[2..4].copy_from_slice(&70u16.to_be_bytes());
+                    response[4..8].copy_from_slice(&buf[4..8]);
+                    response[8..17].copy_from_slice(b"127.0.0.1");
+                    response[72..74].copy_from_slice(&from.port().to_be_bytes());
+                    udp_socket.send_to(&response, from).await.unwrap();
+                    continue;
+                }
+
                 if len >= 12 {
                     let mut index = udp_order_state.lock().await;
                     let current = *index;
@@ -181,7 +217,6 @@ async fn voice_udp_transport_speaking_is_sent_before_first_audio_packet() {
     let fake = FakeVoiceGateway::spawn().await;
     let mut session = ConnectedVoiceSession::for_test(fake.url()).await.unwrap();
 
-    session.start_speaking().await.unwrap();
     session
         .send_audio_frame(Bytes::from_static(b"opus"))
         .await
@@ -194,12 +229,25 @@ async fn voice_udp_transport_speaking_is_sent_before_first_audio_packet() {
 async fn voice_udp_transport_discover_ip_returns_local_ip_and_port_from_udp_handshake() {
     let fake = FakeUdpPeer::spawn().await;
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let local_addr = socket.local_addr().unwrap();
 
     let discovered = discover_ip(&socket, fake.addr(), 77).await.unwrap();
 
-    assert_eq!(discovered.ip, "127.0.0.1");
-    assert_eq!(discovered.port, local_addr.port());
+    assert_eq!(discovered.ip, fake.advertised_ip());
+    assert_eq!(discovered.port, fake.advertised_port());
+}
+
+#[tokio::test]
+async fn voice_udp_transport_connect_performs_discovery_and_captures_discovered_addr() {
+    let fake = FakeUdpPeer::spawn().await;
+
+    let transport = VoiceUdpTransport::connect(fake.addr()).await.unwrap();
+
+    assert_eq!(fake.discovery_count().await, 1);
+    assert_eq!(
+        transport.local_addr().ip().to_string(),
+        fake.advertised_ip()
+    );
+    assert_eq!(transport.local_addr().port(), fake.advertised_port());
 }
 
 #[test]
