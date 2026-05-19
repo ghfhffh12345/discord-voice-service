@@ -60,7 +60,7 @@ async fn prepare_buffers_real_packets_and_returns_selected_itag() {
     );
     let mut queue = OpusFrameQueue::new(32);
 
-    let source = worker
+    let mut source = worker
         .prepare("video-1", &mut queue)
         .await
         .expect("source should be prepared");
@@ -68,6 +68,10 @@ async fn prepare_buffers_real_packets_and_returns_selected_itag() {
     assert_eq!(source.selected_itag(), 250);
     assert!(source.position().timestamp_ms() > 0);
     assert_eq!(source.position().sent_duration_ms(), 0);
+
+    source.record_sent_packet(20);
+    assert_eq!(source.position().sent_duration_ms(), 20);
+
     assert!(queue.len() > 0);
     assert_ne!(
         queue.pop(),
