@@ -1,5 +1,12 @@
 pub mod crypto;
 pub mod dave;
+pub(crate) mod dave_ffi;
+pub mod discovery;
 pub mod gateway;
+pub mod resume;
+pub(crate) mod rollover;
 pub mod rtp;
+pub(crate) mod session;
+pub mod speaking;
 pub mod udp;
+pub mod ws;

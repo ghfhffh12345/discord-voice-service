@@ -1,12 +1,31 @@
 pub const REQUIRED_MODE: &str = "aead_xchacha20_poly1305_rtpsize";
 pub const PREFERRED_MODE: &str = "aead_aes256_gcm_rtpsize";
 
-pub fn pick_mode(modes: &[String]) -> Option<&'static str> {
-    if modes.iter().any(|mode| mode == PREFERRED_MODE) {
-        Some(PREFERRED_MODE)
-    } else if modes.iter().any(|mode| mode == REQUIRED_MODE) {
-        Some(REQUIRED_MODE)
-    } else {
-        None
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncryptionMode {
+    AeadAes256GcmRtpsize,
+    AeadXChaCha20Poly1305Rtpsize,
+}
+
+impl EncryptionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AeadAes256GcmRtpsize => PREFERRED_MODE,
+            Self::AeadXChaCha20Poly1305Rtpsize => REQUIRED_MODE,
+        }
     }
+}
+
+pub fn choose_mode(modes: &[String]) -> Result<EncryptionMode, crate::error::AppError> {
+    if modes.iter().any(|mode| mode == PREFERRED_MODE) {
+        Ok(EncryptionMode::AeadAes256GcmRtpsize)
+    } else if modes.iter().any(|mode| mode == REQUIRED_MODE) {
+        Ok(EncryptionMode::AeadXChaCha20Poly1305Rtpsize)
+    } else {
+        Err(crate::error::AppError::UnsupportedEncryptionMode)
+    }
+}
+
+pub fn pick_mode(modes: &[String]) -> Option<&'static str> {
+    choose_mode(modes).ok().map(EncryptionMode::as_str)
 }

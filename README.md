@@ -6,15 +6,13 @@ The main bot is expected to keep user-facing music features such as search, radi
 
 ## Current status
 
-This repository is in an early implementation stage.
+This repository now has a real single-session join/play path wired through the runtime.
 
-- The gRPC control contract is present.
-- Startup config, health checks, container packaging, and the basic single-session state machine are implemented.
-- The YouTube Music format-selection policy for Discord-friendly WebM/Opus sources is implemented.
-- `SubscribeEvents` is defined in the protobuf API but currently returns `UNIMPLEMENTED`.
-- The full production voice transport, DAVE/E2EE flow, and real WebM/Opus streaming pipeline are not finished yet.
-
-Treat the current codebase as a scaffold for the planned service, not as a production-ready Discord audio replacement yet.
+- The gRPC control surface is implemented, including `SubscribeEvents` and `UpdateVoiceContext`.
+- Startup config, health checks, container packaging, and the single-session supervisor/runtime are in place.
+- Playback resolves Discord-compatible WebM/Opus sources through `ytmusic-service`, performs the runtime join path, and emits session events as state changes occur.
+- Integration coverage includes a fake Discord gateway/UDP peer that verifies voice join, speaking notification, RTP/UDP audio emission, and gRPC event streaming end to end.
+- Recovery and broader production hardening are still in progress, so treat this as an actively maturing service rather than a finished drop-in replacement for a general-purpose music bot.
 
 ## Intended responsibility
 
@@ -33,8 +31,9 @@ The main bot should continue to own commands and high-level playback decisions. 
 
 - One gRPC listener on `DISCORD_VOICE_SERVICE_ADDR`
 - Standard gRPC health checks on the same listener
-- `discordvoice.v1.DiscordVoiceControl` with these RPCs: `JoinVoice`, `Play`, `Pause`, `Resume`, `Stop`, `LeaveVoice`, `GetState`
-- `SubscribeEvents` (currently unimplemented)
+- `discordvoice.v1.DiscordVoiceControl` with these RPCs: `JoinVoice`, `UpdateVoiceContext`, `Play`, `Pause`, `Resume`, `Stop`, `LeaveVoice`, `GetState`, `SubscribeEvents`
+- Runtime event emission for voice/session state transitions such as `VoiceConnecting`, `VoiceReady`, `TrackResolving`, `Playing`, and `TrackEnded`
+- A real runtime playback path that connects to a Discord voice endpoint, performs UDP discovery, sends speaking updates, and emits Opus RTP frames for supported sources
 - Distroless container packaging in [`Containerfile`](Containerfile)
 - A release-triggered GHCR image workflow in [`.github/workflows/release-image.yml`](.github/workflows/release-image.yml)
 
@@ -171,14 +170,25 @@ grpcurl -plaintext \
 
 Replace `Pause` with `Resume`, `Stop`, or `LeaveVoice` as needed.
 
+Stream session events:
+
+```bash
+grpcurl -plaintext \
+  -import-path proto \
+  -proto proto/discordvoice/v1/control.proto \
+  -d '{}' \
+  127.0.0.1:55051 \
+  discordvoice.v1.DiscordVoiceControl/SubscribeEvents
+```
+
 ## Troubleshooting
 
 - Missing environment variables: startup fails if either `DISCORD_VOICE_SERVICE_ADDR` or `DISCORD_VOICE_SERVICE_YTMUSIC_ADDR` is not set.
 - Invalid `ytmusic-service` endpoint: startup fails unless `DISCORD_VOICE_SERVICE_YTMUSIC_ADDR` is a valid `http://` or `https://` URI.
 - Port already in use: choose a different value for `DISCORD_VOICE_SERVICE_ADDR` or free the port.
 - `grpcurl list` fails: reflection is not registered, so use `-import-path` and `-proto` instead.
-- `SubscribeEvents` fails: this RPC is present in the contract but not implemented yet.
-- Playback behavior is incomplete: the current repo still contains placeholder pieces for the real voice transport and media pipeline.
+- Voice playback only accepts Discord-friendly WebM/Opus formats that satisfy the selector policy; unsupported formats fail instead of transcoding.
+- The join/play path is real, but recovery and resilience work is still evolving, so expect behavior to keep tightening as the service matures.
 
 ## Further reference
 

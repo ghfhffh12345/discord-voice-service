@@ -18,3 +18,31 @@ impl RtpPacketBuilder {
         packet
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RtpSequenceState {
+    sequence: u16,
+    timestamp: u32,
+}
+
+impl Default for RtpSequenceState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RtpSequenceState {
+    pub fn new() -> Self {
+        Self {
+            sequence: 0,
+            timestamp: 0,
+        }
+    }
+
+    pub fn advance(&mut self) -> (u16, u32) {
+        let current = (self.sequence, self.timestamp);
+        self.sequence = self.sequence.wrapping_add(1);
+        self.timestamp = self.timestamp.wrapping_add(960);
+        current
+    }
+}

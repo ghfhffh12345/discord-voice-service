@@ -1,20 +1,45 @@
+#[path = "support/fake_ytmusic.rs"]
+mod fake_ytmusic;
+#[path = "support/fixtures.rs"]
+mod fixtures;
+
 use bytes::Bytes;
 use discord_voice_service::error::AppError;
-use discord_voice_service::media::opus_queue::OpusFrameQueue;
+use discord_voice_service::media::opus_queue::{OpusFrame, OpusFrameQueue};
 use discord_voice_service::playback::worker::PlaybackPlan;
 use discord_voice_service::playback::worker::PlaybackWorker;
-use discord_voice_service::ytmusic::client::{ResolvedPlaybackSource, YtMusicClient};
-use discord_voice_service::ytmusic::selector::StreamFormat;
+use discord_voice_service::ytmusic::client::YtMusicClient;
+use discord_voice_service::ytmusic::v1::SongStreamFormat;
+
+use self::fake_ytmusic::FakeYtMusic;
+use self::fixtures::{spawn_status_server, spawn_stream_server};
+
+fn stream_format(
+    itag: u32,
+    mime_type: &str,
+    bitrate: u64,
+    audio_sample_rate: Option<u32>,
+    audio_channels: Option<u32>,
+) -> SongStreamFormat {
+    SongStreamFormat {
+        itag,
+        mime_type: mime_type.to_owned(),
+        bitrate,
+        audio_sample_rate,
+        audio_channels,
+        signature_cipher: format!("cipher-{itag}"),
+        ..Default::default()
+    }
+}
 
 #[test]
 fn playback_plan_uses_selected_itag_and_decipher_path() {
-    let formats = vec![StreamFormat::new(
+    let formats = vec![stream_format(
         250,
         "audio/webm; codecs=\"opus\"",
         70_000,
         Some(48_000),
         Some(2),
-        false,
     )];
 
     let plan = PlaybackPlan::from_formats("video123", &formats).expect("plan should be built");
@@ -23,62 +48,131 @@ fn playback_plan_uses_selected_itag_and_decipher_path() {
 }
 
 #[tokio::test]
-async fn prepare_resolves_source_and_prefetches_one_frame() {
-    let worker = PlaybackWorker::new(YtMusicClient::new("https://ytmusic.example".to_owned()));
-    let formats = vec![
-        StreamFormat::new(
-            251,
-            "audio/webm; codecs=\"opus\"",
-            160_000,
-            Some(48_000),
-            Some(2),
-            false,
-        ),
-        StreamFormat::new(
-            250,
-            "audio/webm; codecs=\"opus\"",
-            70_000,
-            Some(48_000),
-            Some(2),
-            false,
-        ),
-    ];
-    let mut queue = OpusFrameQueue::new(2);
+async fn prepare_buffers_real_packets_and_returns_selected_itag() {
+    let fake_yt = FakeYtMusic::spawn().await;
+    let http = spawn_stream_server("tests/fixtures/audio-itag250.webm").await;
+    fake_yt.set_playable_url(http.url()).await;
+
+    let mut worker = PlaybackWorker::new(
+        YtMusicClient::connect(fake_yt.endpoint())
+            .await
+            .expect("client"),
+    );
+    let mut queue = OpusFrameQueue::new(32);
 
     let source = worker
-        .prepare("video123", &formats, &mut queue)
+        .prepare("video-1", &mut queue)
         .await
         .expect("source should be prepared");
 
-    assert_eq!(
-        source,
-        ResolvedPlaybackSource {
-            selected_itag: 250,
-            playable_url: "https://ytmusic.example/deciphered/video123".to_owned(),
-        }
+    assert_eq!(source.selected_itag(), 250);
+    assert!(source.position().byte_offset() > 0);
+    assert!(source.position().timestamp_ms() > 0);
+    assert_eq!(source.position().sent_duration_ms(), 0);
+
+    assert!(!queue.is_empty());
+    let first_packet = queue.pop().expect("queue should contain a packet");
+    assert_ne!(
+        first_packet.data,
+        Bytes::from_static(b"prefetched-opus-frame")
     );
-    assert_eq!(queue.len(), 1);
+
     assert_eq!(
-        queue.pop(),
-        Some(Bytes::from_static(b"prefetched-opus-frame"))
+        source.position().sent_duration_ms(),
+        first_packet.duration_ms
     );
-    assert_eq!(queue.pop(), None);
+}
+
+#[tokio::test]
+async fn prepare_reruns_resolution_when_initial_playable_url_is_stale() {
+    let fake = FakeYtMusic::spawn().await;
+    let http = spawn_stream_server("tests/fixtures/audio-itag250.webm").await;
+    let expired = spawn_status_server("HTTP/1.1 403 Forbidden").await;
+    fake.set_playable_url(http.url()).await;
+    fake.set_first_playable_url_once(expired.url()).await;
+
+    let mut worker = PlaybackWorker::new(
+        YtMusicClient::connect(fake.endpoint())
+            .await
+            .expect("client"),
+    );
+    let mut queue = OpusFrameQueue::new(32);
+
+    let source = worker.prepare("video-1", &mut queue).await.unwrap();
+
+    assert_eq!(source.selected_itag(), 250);
+    assert!(!queue.is_empty());
+    assert!(
+        fake.calls()
+            .iter()
+            .filter(|call| *call == "GetSong")
+            .count()
+            >= 2
+    );
+    assert!(
+        fake.calls()
+            .iter()
+            .filter(|call| *call == "Decipher")
+            .count()
+            >= 2
+    );
+}
+
+#[tokio::test]
+async fn prepare_preserves_current_track_position_when_recovering_same_video() {
+    let fake = FakeYtMusic::spawn().await;
+    let http = spawn_stream_server("tests/fixtures/audio-itag250.webm").await;
+    fake.set_playable_url(http.url()).await;
+
+    let mut worker = PlaybackWorker::new(
+        YtMusicClient::connect(fake.endpoint())
+            .await
+            .expect("client"),
+    );
+    let mut first_queue = OpusFrameQueue::new(32);
+
+    let first_source = worker.prepare("video-1", &mut first_queue).await.unwrap();
+    let first_packet = first_queue.pop().expect("queue should contain a packet");
+    assert_eq!(
+        first_source.position().sent_duration_ms(),
+        first_packet.duration_ms
+    );
+
+    let mut recovery_queue = OpusFrameQueue::new(32);
+    let recovered = worker
+        .prepare("video-1", &mut recovery_queue)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        recovered.position().sent_duration_ms(),
+        first_packet.duration_ms
+    );
+    assert!(!recovery_queue.is_empty());
+    assert!(recovered.position().timestamp_ms() >= first_packet.duration_ms);
+
+    let expected_next_packet = first_queue
+        .pop()
+        .expect("first queue should still contain the next packet");
+    let recovered_first_packet = recovery_queue
+        .pop()
+        .expect("recovery queue should contain the next packet");
+
+    assert_eq!(recovered_first_packet, expected_next_packet);
+    assert_ne!(recovered_first_packet, first_packet);
 }
 
 #[tokio::test]
 async fn prepare_rejects_unsupported_formats() {
-    let worker = PlaybackWorker::new(YtMusicClient::new("https://ytmusic.example".to_owned()));
-    let formats = vec![StreamFormat::new(
-        140,
-        "audio/mp4; codecs=\"mp4a.40.2\"",
-        128_000,
-        Some(44_100),
-        Some(2),
-        false,
-    )];
+    let fake = FakeYtMusic::spawn().await;
+    let mut worker = PlaybackWorker::new(
+        YtMusicClient::connect(fake.endpoint())
+            .await
+            .expect("client"),
+    );
     let mut queue = OpusFrameQueue::new(1);
 
-    let result = worker.prepare("video123", &formats, &mut queue).await;
+    let result = worker.prepare("missing-lower", &mut queue).await;
 
     assert!(matches!(result, Err(AppError::UnsupportedFormat)));
     assert_eq!(queue.len(), 0);
@@ -86,23 +180,25 @@ async fn prepare_rejects_unsupported_formats() {
 
 #[tokio::test]
 async fn prepare_rejects_full_queue() {
-    let worker = PlaybackWorker::new(YtMusicClient::new("https://ytmusic.example".to_owned()));
-    let formats = vec![StreamFormat::new(
-        250,
-        "audio/webm; codecs=\"opus\"",
-        70_000,
-        Some(48_000),
-        Some(2),
-        false,
-    )];
+    let fake = FakeYtMusic::spawn().await;
+    let http = spawn_stream_server("tests/fixtures/audio-itag250.webm").await;
+    fake.set_playable_url(http.url()).await;
+    let mut worker = PlaybackWorker::new(
+        YtMusicClient::connect(fake.endpoint())
+            .await
+            .expect("client"),
+    );
     let mut queue = OpusFrameQueue::new(1);
     queue
-        .push(Bytes::from_static(b"existing-frame"))
+        .push(OpusFrame::new(Bytes::from_static(b"existing-frame"), 20))
         .expect("queue should accept the initial frame");
 
-    let result = worker.prepare("video123", &formats, &mut queue).await;
+    let result = worker.prepare("video-1", &mut queue).await;
 
     assert!(matches!(result, Err(AppError::BufferFull)));
     assert_eq!(queue.len(), 1);
-    assert_eq!(queue.pop(), Some(Bytes::from_static(b"existing-frame")));
+    assert_eq!(
+        queue.pop(),
+        Some(OpusFrame::new(Bytes::from_static(b"existing-frame"), 20))
+    );
 }
