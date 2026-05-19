@@ -1,4 +1,5 @@
 use std::pin::Pin;
+use std::sync::Arc;
 
 use futures::{Stream, stream};
 use tonic::{Request, Response, Status};
@@ -21,6 +22,7 @@ pub fn map_play_request(request: PlayRequest) -> String {
 
 pub struct ControlService {
     pub supervisor: Supervisor,
+    pub readiness: Arc<Readiness>,
 }
 
 #[tonic::async_trait]
@@ -146,10 +148,9 @@ impl DiscordVoiceControl for ControlService {
         _request: Request<GetStateRequest>,
     ) -> Result<Response<SessionStateSnapshot>, Status> {
         let snapshot = self.supervisor.snapshot().await;
-        let readiness = Readiness::global().snapshot().await;
+        let readiness = self.readiness.snapshot().await;
         observability::global().record_state_query(&snapshot, readiness);
         observability::global().record_rpc("get_state", tonic::Code::Ok);
-        let message = observability::render_snapshot_message(&snapshot, readiness);
         Ok(Response::new(SessionStateSnapshot {
             state: map_session_state(snapshot.state) as i32,
             guild_id: snapshot.guild_id.unwrap_or_default(),
@@ -157,7 +158,7 @@ impl DiscordVoiceControl for ControlService {
             current_video_id: snapshot.current_video_id.unwrap_or_default(),
             queue_depth: u32::try_from(snapshot.queue_depth).unwrap_or(u32::MAX),
             selected_itag: snapshot.selected_itag.unwrap_or_default(),
-            message,
+            message: snapshot.last_reason.unwrap_or_default(),
         }))
     }
 

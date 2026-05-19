@@ -23,7 +23,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     readiness.mark_runtime_booted().await;
 
     let supervisor = Supervisor::new();
-    let control_service = ControlService { supervisor };
+    let control_service = ControlService {
+        supervisor,
+        readiness: readiness.clone(),
+    };
     let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
     set_serving_status(&mut health_reporter, false).await;
 

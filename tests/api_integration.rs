@@ -1,10 +1,12 @@
+use std::sync::Arc;
+
 use discord_voice_service::api::service::{ControlService, map_play_request};
 use discord_voice_service::proto::discordvoice::v1::discord_voice_control_server::DiscordVoiceControl;
 use discord_voice_service::proto::discordvoice::v1::{
     GetStateRequest, JoinVoiceRequest, PauseRequest, PlayRequest, ResumeRequest, SessionEventKind,
-    SessionStateSnapshot,
-    SubscribeEventsRequest, UpdateVoiceContextRequest, join_voice_request,
+    SessionStateSnapshot, SubscribeEventsRequest, UpdateVoiceContextRequest, join_voice_request,
 };
+use discord_voice_service::session::readiness::Readiness;
 use discord_voice_service::session::supervisor::{Supervisor, VoiceContext};
 use futures::StreamExt;
 use tonic::{Code, Request};
@@ -20,9 +22,7 @@ fn maps_proto_play_request_into_internal_video_id() {
 
 #[tokio::test]
 async fn play_before_join_voice_returns_failed_precondition() {
-    let service = ControlService {
-        supervisor: Supervisor::new(),
-    };
+    let service = test_service();
 
     let error = service
         .play(Request::new(PlayRequest {
@@ -36,9 +36,7 @@ async fn play_before_join_voice_returns_failed_precondition() {
 
 #[tokio::test]
 async fn pause_before_join_voice_returns_failed_precondition() {
-    let service = ControlService {
-        supervisor: Supervisor::new(),
-    };
+    let service = test_service();
 
     let error = service
         .pause(Request::new(PauseRequest {}))
@@ -50,9 +48,7 @@ async fn pause_before_join_voice_returns_failed_precondition() {
 
 #[tokio::test]
 async fn pause_while_resolving_track_returns_failed_precondition() {
-    let service = ControlService {
-        supervisor: Supervisor::new(),
-    };
+    let service = test_service();
 
     service
         .join_voice(Request::new(JoinVoiceRequest {
@@ -84,9 +80,7 @@ async fn pause_while_resolving_track_returns_failed_precondition() {
 
 #[tokio::test]
 async fn join_voice_rejects_empty_required_fields() {
-    let service = ControlService {
-        supervisor: Supervisor::new(),
-    };
+    let service = test_service();
 
     let cases = [
         join_voice_request::VoiceContext {
@@ -138,9 +132,7 @@ async fn join_voice_rejects_empty_required_fields() {
 
 #[tokio::test]
 async fn play_rejects_empty_video_id() {
-    let service = ControlService {
-        supervisor: Supervisor::new(),
-    };
+    let service = test_service();
 
     let error = service
         .play(Request::new(PlayRequest {
@@ -154,9 +146,7 @@ async fn play_rejects_empty_video_id() {
 
 #[tokio::test]
 async fn resume_after_join_voice_before_play_returns_failed_precondition() {
-    let service = ControlService {
-        supervisor: Supervisor::new(),
-    };
+    let service = test_service();
 
     service
         .join_voice(Request::new(JoinVoiceRequest {
@@ -181,9 +171,7 @@ async fn resume_after_join_voice_before_play_returns_failed_precondition() {
 
 #[tokio::test]
 async fn duplicate_join_voice_returns_failed_precondition_without_clobbering_session() {
-    let service = ControlService {
-        supervisor: Supervisor::new(),
-    };
+    let service = test_service();
 
     service
         .join_voice(Request::new(JoinVoiceRequest {
@@ -239,18 +227,8 @@ async fn subscribe_events_streams_runtime_events() {
     harness.join_voice().await.unwrap();
     harness.play("video-1").await.unwrap();
 
-    let first = stream
-        .next()
-        .await
-        .transpose()
-        .unwrap()
-        .unwrap();
-    let second = stream
-        .next()
-        .await
-        .transpose()
-        .unwrap()
-        .unwrap();
+    let first = stream.next().await.transpose().unwrap().unwrap();
+    let second = stream.next().await.transpose().unwrap().unwrap();
 
     assert_eq!(first.kind, SessionEventKind::VoiceConnecting as i32);
     assert_eq!(first.guild_id, "1");
@@ -284,10 +262,18 @@ async fn update_voice_context_is_accepted_during_playback() {
 }
 
 #[tokio::test]
+async fn get_state_keeps_message_empty_in_healthy_steady_state() {
+    let harness = ApiHarness::spawn().await;
+    harness.join_voice().await.unwrap();
+
+    let state = harness.get_state().await;
+
+    assert!(state.message.is_empty());
+}
+
+#[tokio::test]
 async fn join_voice_then_play_updates_supervisor_snapshot_through_service() {
-    let service = ControlService {
-        supervisor: Supervisor::new(),
-    };
+    let service = test_service();
 
     service
         .join_voice(Request::new(JoinVoiceRequest {
@@ -327,9 +313,7 @@ struct ApiHarness {
 impl ApiHarness {
     async fn spawn() -> Self {
         Self {
-            service: ControlService {
-                supervisor: Supervisor::new(),
-            },
+            service: test_service(),
         }
     }
 
@@ -383,6 +367,13 @@ fn test_voice_context() -> join_voice_request::VoiceContext {
         session_id: "3".into(),
         endpoint: "voice.example".into(),
         token: "token".into(),
+    }
+}
+
+fn test_service() -> ControlService {
+    ControlService {
+        supervisor: Supervisor::new(),
+        readiness: Arc::new(Readiness::default()),
     }
 }
 
