@@ -14,8 +14,8 @@ use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 struct FakeVoiceGateway {
     url: String,
     request_path: Arc<StdMutex<Option<String>>>,
-    heartbeat_seq_ack: Arc<Mutex<Option<u64>>>,
-    resume_seq_ack: Arc<Mutex<Option<u64>>>,
+    heartbeat_seq_ack: Arc<Mutex<Option<i64>>>,
+    resume_seq_ack: Arc<Mutex<Option<i64>>>,
 }
 
 impl FakeVoiceGateway {
@@ -46,7 +46,7 @@ impl FakeVoiceGateway {
                     let seq_ack = payload
                         .get("d")
                         .and_then(|data| data.get("seq_ack"))
-                        .and_then(Value::as_u64);
+                        .and_then(Value::as_i64);
 
                     match payload.get("op").and_then(Value::as_u64) {
                         Some(3) => *heartbeat_state.lock().await = seq_ack,
@@ -73,11 +73,11 @@ impl FakeVoiceGateway {
         wait_for_sync_value(&self.request_path).await
     }
 
-    async fn last_heartbeat_seq_ack(&self) -> Option<u64> {
+    async fn last_heartbeat_seq_ack(&self) -> Option<i64> {
         wait_for_value(&self.heartbeat_seq_ack).await
     }
 
-    async fn last_resume_seq_ack(&self) -> Option<u64> {
+    async fn last_resume_seq_ack(&self) -> Option<i64> {
         wait_for_value(&self.resume_seq_ack).await
     }
 }
@@ -122,4 +122,19 @@ async fn voice_gateway_v8_heartbeat_and_resume_include_seq_ack() {
     );
     assert_eq!(fake.last_heartbeat_seq_ack().await, Some(42));
     assert_eq!(fake.last_resume_seq_ack().await, Some(42));
+}
+
+#[tokio::test]
+async fn voice_gateway_v8_encodes_missing_seq_ack_as_minus_one() {
+    let fake = FakeVoiceGateway::spawn().await;
+    let mut client = VoiceGatewayClient::connect(fake.url()).await.unwrap();
+
+    client.send_heartbeat().await.unwrap();
+    client
+        .send_resume("server-id", "session-id", "token")
+        .await
+        .unwrap();
+
+    assert_eq!(fake.last_heartbeat_seq_ack().await, Some(-1));
+    assert_eq!(fake.last_resume_seq_ack().await, Some(-1));
 }

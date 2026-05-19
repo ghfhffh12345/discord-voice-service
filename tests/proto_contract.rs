@@ -13,11 +13,13 @@ fn generated_control_messages_expose_expected_fields() {
     let context = VoiceContext {
         guild_id: "1".into(),
         channel_id: "2".into(),
+        user_id: "user-1".into(),
         session_id: "abc".into(),
         endpoint: "voice.example.discord.gg".into(),
         token: "token".into(),
     };
     assert_eq!(context.guild_id, "1");
+    assert_eq!(context.user_id, "user-1");
 
     let event = SessionEvent {
         kind: SessionEventKind::VoiceReady as i32,

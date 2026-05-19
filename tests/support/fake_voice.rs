@@ -142,12 +142,14 @@ impl FakeVoiceEndpoint {
         &self,
         guild_id: &str,
         channel_id: &str,
+        user_id: &str,
         session_id: &str,
         token: &str,
     ) -> VoiceContext {
         VoiceContext {
             guild_id: guild_id.into(),
             channel_id: channel_id.into(),
+            user_id: user_id.into(),
             session_id: session_id.into(),
             endpoint: self.endpoint(),
             token: token.into(),

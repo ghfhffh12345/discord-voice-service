@@ -210,6 +210,7 @@ fn validate_non_empty(field: &'static str, value: &str) -> Result<(), Status> {
 fn map_voice_context(voice: join_voice_request::VoiceContext) -> Result<VoiceContext, Status> {
     validate_non_empty("guild_id", &voice.guild_id)?;
     validate_non_empty("channel_id", &voice.channel_id)?;
+    validate_non_empty("user_id", &voice.user_id)?;
     validate_non_empty("session_id", &voice.session_id)?;
     validate_non_empty("endpoint", &voice.endpoint)?;
     validate_non_empty("token", &voice.token)?;
@@ -217,6 +218,7 @@ fn map_voice_context(voice: join_voice_request::VoiceContext) -> Result<VoiceCon
     Ok(VoiceContext {
         guild_id: voice.guild_id,
         channel_id: voice.channel_id,
+        user_id: voice.user_id,
         session_id: voice.session_id,
         endpoint: voice.endpoint,
         token: voice.token,

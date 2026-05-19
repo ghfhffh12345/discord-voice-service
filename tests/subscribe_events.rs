@@ -33,6 +33,7 @@ fn test_voice_context() -> VoiceContext {
     VoiceContext {
         guild_id: "1".into(),
         channel_id: "2".into(),
+        user_id: "user-1".into(),
         session_id: "3".into(),
         endpoint: "voice-placeholder".into(),
         token: "token".into(),

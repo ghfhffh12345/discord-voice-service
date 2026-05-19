@@ -68,6 +68,7 @@ async fn pause_while_resolving_track_returns_failed_precondition() {
             voice: Some(join_voice_request::VoiceContext {
                 guild_id: "1".into(),
                 channel_id: "2".into(),
+                user_id: "user-1".into(),
                 session_id: "3".into(),
                 endpoint: "voice-placeholder".into(),
                 token: "token".into(),
@@ -99,6 +100,7 @@ async fn join_voice_rejects_empty_required_fields() {
         join_voice_request::VoiceContext {
             guild_id: String::new(),
             channel_id: "2".into(),
+            user_id: "user-1".into(),
             session_id: "3".into(),
             endpoint: "voice-placeholder".into(),
             token: "token".into(),
@@ -106,6 +108,7 @@ async fn join_voice_rejects_empty_required_fields() {
         join_voice_request::VoiceContext {
             guild_id: "1".into(),
             channel_id: String::new(),
+            user_id: "user-1".into(),
             session_id: "3".into(),
             endpoint: "voice-placeholder".into(),
             token: "token".into(),
@@ -113,6 +116,15 @@ async fn join_voice_rejects_empty_required_fields() {
         join_voice_request::VoiceContext {
             guild_id: "1".into(),
             channel_id: "2".into(),
+            user_id: String::new(),
+            session_id: "3".into(),
+            endpoint: "voice-placeholder".into(),
+            token: "token".into(),
+        },
+        join_voice_request::VoiceContext {
+            guild_id: "1".into(),
+            channel_id: "2".into(),
+            user_id: "user-1".into(),
             session_id: String::new(),
             endpoint: "voice-placeholder".into(),
             token: "token".into(),
@@ -120,6 +132,7 @@ async fn join_voice_rejects_empty_required_fields() {
         join_voice_request::VoiceContext {
             guild_id: "1".into(),
             channel_id: "2".into(),
+            user_id: "user-1".into(),
             session_id: "3".into(),
             endpoint: String::new(),
             token: "token".into(),
@@ -127,6 +140,7 @@ async fn join_voice_rejects_empty_required_fields() {
         join_voice_request::VoiceContext {
             guild_id: "1".into(),
             channel_id: "2".into(),
+            user_id: "user-1".into(),
             session_id: "3".into(),
             endpoint: "voice-placeholder".into(),
             token: String::new(),
@@ -166,6 +180,7 @@ async fn resume_after_join_voice_before_play_returns_failed_precondition() {
             voice: Some(join_voice_request::VoiceContext {
                 guild_id: "1".into(),
                 channel_id: "2".into(),
+                user_id: "user-1".into(),
                 session_id: "3".into(),
                 endpoint: "voice-placeholder".into(),
                 token: "token".into(),
@@ -191,6 +206,7 @@ async fn duplicate_join_voice_returns_failed_precondition_without_clobbering_ses
             voice: Some(join_voice_request::VoiceContext {
                 guild_id: "1".into(),
                 channel_id: "2".into(),
+                user_id: "user-1".into(),
                 session_id: "3".into(),
                 endpoint: "voice-placeholder".into(),
                 token: "token".into(),
@@ -211,6 +227,7 @@ async fn duplicate_join_voice_returns_failed_precondition_without_clobbering_ses
             voice: Some(join_voice_request::VoiceContext {
                 guild_id: "9".into(),
                 channel_id: "8".into(),
+                user_id: "user-9".into(),
                 session_id: "7".into(),
                 endpoint: "voice.other".into(),
                 token: "other-token".into(),
@@ -269,6 +286,7 @@ async fn join_voice_then_play_streams_end_to_end_playback_events_and_audio() {
             voice: Some(join_voice_request::VoiceContext {
                 guild_id: "1".into(),
                 channel_id: "2".into(),
+                user_id: "user-1".into(),
                 session_id: "session-1".into(),
                 endpoint: fake_discord.endpoint(),
                 token: "token-1".into(),
@@ -360,6 +378,7 @@ async fn join_voice_then_play_updates_supervisor_snapshot_through_service() {
             voice: Some(join_voice_request::VoiceContext {
                 guild_id: "1".into(),
                 channel_id: "2".into(),
+                user_id: "user-1".into(),
                 session_id: "3".into(),
                 endpoint: "voice-placeholder".into(),
                 token: "token".into(),
@@ -444,6 +463,7 @@ fn test_voice_context() -> join_voice_request::VoiceContext {
     join_voice_request::VoiceContext {
         guild_id: "1".into(),
         channel_id: "2".into(),
+        user_id: "user-1".into(),
         session_id: "3".into(),
         endpoint: "voice-placeholder".into(),
         token: "token".into(),
@@ -484,6 +504,7 @@ fn test_voice_context_rotated() -> join_voice_request::VoiceContext {
     join_voice_request::VoiceContext {
         guild_id: "1".into(),
         channel_id: "9".into(),
+        user_id: "user-1".into(),
         session_id: "rotated-session".into(),
         endpoint: "rotated-voice-placeholder".into(),
         token: "rotated-token".into(),

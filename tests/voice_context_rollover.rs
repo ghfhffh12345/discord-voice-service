@@ -17,7 +17,7 @@ async fn rollover_rebuilds_transport_and_preserves_track_identity() {
     let harness = VoiceRolloverHarness::spawn().await;
     harness
         .start_playing(
-            initial_voice.voice_context("1", "2", "3", "token"),
+            initial_voice.voice_context("1", "2", "user-1", "3", "token"),
             "video-1",
         )
         .await
@@ -27,6 +27,7 @@ async fn rollover_rebuilds_transport_and_preserves_track_identity() {
         .update_voice_context(replacement_voice.voice_context(
             "1",
             "9",
+            "user-1",
             "rotated-session",
             "rotated-token",
         ))
@@ -55,14 +56,15 @@ async fn rollover_keeps_snapshot_reconnecting_until_replacement_voice_is_ready()
     let harness = VoiceRolloverHarness::spawn().await;
     harness
         .start_playing(
-            initial_voice.voice_context("1", "2", "3", "token"),
+            initial_voice.voice_context("1", "2", "user-1", "3", "token"),
             "video-1",
         )
         .await
         .unwrap();
 
     let supervisor = harness.supervisor.clone();
-    let replacement = replacement_voice.voice_context("1", "9", "rotated-session", "rotated-token");
+    let replacement =
+        replacement_voice.voice_context("1", "9", "user-1", "rotated-session", "rotated-token");
     let rollover = tokio::spawn(async move {
         supervisor
             .send(Command::UpdateVoiceContext { voice: replacement })

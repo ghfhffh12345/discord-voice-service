@@ -28,7 +28,7 @@ async fn join_voice_then_play_reaches_connected_runtime_playback_path() {
 
     supervisor
         .send(Command::JoinVoice {
-            voice: fake_voice.voice_context("1", "2", "session-1", "token-1"),
+            voice: fake_voice.voice_context("1", "2", "user-1", "session-1", "token-1"),
         })
         .await
         .unwrap();

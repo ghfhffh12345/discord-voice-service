@@ -63,7 +63,10 @@ pub fn parse_gateway_message(text: &str) -> Result<VoiceGatewayPayload, AppError
         .get("op")
         .and_then(Value::as_u64)
         .ok_or(AppError::InvalidState("voice gateway op missing"))?;
-    let seq = payload.get("s").and_then(Value::as_u64);
+    let seq = payload
+        .get("seq")
+        .or_else(|| payload.get("s"))
+        .and_then(Value::as_u64);
     let data = payload.get("d").cloned().unwrap_or(Value::Null);
 
     let event = match op {
@@ -142,6 +145,7 @@ pub fn identify_payload(voice: &VoiceContext) -> Value {
         "op": 0,
         "d": {
             "server_id": voice.guild_id,
+            "user_id": voice.user_id,
             "session_id": voice.session_id,
             "token": voice.token,
         }
@@ -163,6 +167,7 @@ pub fn select_protocol_payload(address: &DiscoveredUdpAddress, mode: &str) -> Va
 }
 
 pub fn heartbeat_payload(timestamp_millis: u64, seq_ack: Option<u64>) -> Value {
+    let seq_ack = seq_ack_i64(seq_ack);
     json!({
         "op": 3,
         "d": {
@@ -178,6 +183,7 @@ pub fn resume_payload(
     token: &str,
     seq_ack: Option<u64>,
 ) -> Value {
+    let seq_ack = seq_ack_i64(seq_ack);
     json!({
         "op": 7,
         "d": {
@@ -191,4 +197,53 @@ pub fn resume_payload(
 
 pub fn choose_encryption_mode(ready: &Ready) -> Result<&'static str, AppError> {
     crypto::pick_mode(&ready.modes).ok_or(AppError::UnsupportedEncryptionMode)
+}
+
+fn seq_ack_i64(seq_ack: Option<u64>) -> i64 {
+    seq_ack
+        .and_then(|seq| i64::try_from(seq).ok())
+        .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{VoiceGatewayEvent, identify_payload, parse_gateway_message};
+    use crate::session::supervisor::VoiceContext;
+
+    #[test]
+    fn parse_gateway_message_uses_real_seq_field_name() {
+        let payload = parse_gateway_message(
+            r#"{
+                "op": 2,
+                "seq": 42,
+                "d": {
+                    "ssrc": 7,
+                    "ip": "127.0.0.1",
+                    "port": 5000,
+                    "modes": ["aead_xchacha20_poly1305_rtpsize"]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(payload.seq(), Some(42));
+        assert!(matches!(payload.event(), VoiceGatewayEvent::Ready(_)));
+    }
+
+    #[test]
+    fn identify_payload_includes_required_user_id() {
+        let payload = identify_payload(&VoiceContext {
+            guild_id: "guild-1".into(),
+            channel_id: "channel-1".into(),
+            user_id: "user-1".into(),
+            session_id: "session-1".into(),
+            endpoint: "voice.example.discord.gg".into(),
+            token: "token-1".into(),
+        });
+
+        assert_eq!(payload["d"]["server_id"], "guild-1");
+        assert_eq!(payload["d"]["user_id"], "user-1");
+        assert_eq!(payload["d"]["session_id"], "session-1");
+        assert_eq!(payload["d"]["token"], "token-1");
+    }
 }

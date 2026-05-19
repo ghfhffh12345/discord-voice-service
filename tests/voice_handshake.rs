@@ -8,7 +8,7 @@ use self::fake_discord::FakeDiscordPeer;
 #[tokio::test]
 async fn connected_voice_session_does_not_require_synthetic_endpoint_query_params() {
     let fake = FakeDiscordPeer::spawn_real_shape().await;
-    let voice = fake.voice_context("1", "2", "session-1", "token-1");
+    let voice = fake.voice_context("1", "2", "user-1", "session-1", "token-1");
 
     let session = ConnectedVoiceSession::connect(voice).await.unwrap();
 
@@ -18,7 +18,7 @@ async fn connected_voice_session_does_not_require_synthetic_endpoint_query_param
 #[tokio::test]
 async fn voice_handshake_performs_identify_discovery_select_protocol_and_session_description() {
     let fake = FakeDiscordPeer::spawn_real_shape().await;
-    let voice = fake.voice_context("1", "2", "session-1", "token-1");
+    let voice = fake.voice_context("1", "2", "user-1", "session-1", "token-1");
 
     let _session = ConnectedVoiceSession::connect(voice).await.unwrap();
 
@@ -30,12 +30,12 @@ async fn voice_handshake_performs_identify_discovery_select_protocol_and_session
 #[tokio::test]
 async fn voice_handshake_can_resume_instead_of_identify() {
     let fake = FakeDiscordPeer::spawn_real_shape().await;
-    let voice = fake.voice_context("1", "2", "session-1", "token-1");
+    let voice = fake.voice_context("1", "2", "user-1", "session-1", "token-1");
 
-    let _session = handshake::resume(&voice, Some(42)).await.unwrap().unwrap();
+    handshake::resume(&voice, Some(42)).await.unwrap();
 
     assert!(fake.saw_resume().await);
     assert!(!fake.saw_identify().await);
-    assert!(fake.saw_select_protocol().await);
-    assert!(fake.session_description_sent().await);
+    assert!(!fake.saw_select_protocol().await);
+    assert!(!fake.session_description_sent().await);
 }

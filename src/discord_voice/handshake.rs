@@ -11,12 +11,6 @@ use crate::session::supervisor::VoiceContext;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HandshakeStart {
-    Identify,
-    Resume { seq_ack: Option<u64> },
-}
-
 pub struct VoiceHandshakeResult {
     pub gateway: VoiceGatewayClient,
     pub transport: VoiceUdpTransport,
@@ -25,20 +19,6 @@ pub struct VoiceHandshakeResult {
 }
 
 pub async fn connect(voice: &VoiceContext) -> Result<Option<VoiceHandshakeResult>, AppError> {
-    connect_with_start(voice, HandshakeStart::Identify).await
-}
-
-pub async fn resume(
-    voice: &VoiceContext,
-    seq_ack: Option<u64>,
-) -> Result<Option<VoiceHandshakeResult>, AppError> {
-    connect_with_start(voice, HandshakeStart::Resume { seq_ack }).await
-}
-
-async fn connect_with_start(
-    voice: &VoiceContext,
-    start: HandshakeStart,
-) -> Result<Option<VoiceHandshakeResult>, AppError> {
     let Some(gateway_url) = gateway_url(&voice.endpoint)? else {
         return Ok(None);
     };
@@ -47,8 +27,9 @@ async fn connect_with_start(
         .await
         .map_err(|_| AppError::InvalidState("voice gateway connect timed out"))??;
     expect_hello(&mut gateway).await?;
+    gateway.send_identify(voice).await?;
 
-    let ready = start_gateway_handshake(&mut gateway, voice, start).await?;
+    let ready = expect_ready(&mut gateway).await?;
     let mode = protocol::choose_encryption_mode(&ready)?.to_owned();
     let udp_target = resolve_udp_target(&ready).await?;
     let transport = VoiceUdpTransport::connect(udp_target, ready.ssrc).await?;
@@ -66,6 +47,29 @@ async fn connect_with_start(
         ssrc: ready.ssrc,
         session_description,
     }))
+}
+
+pub async fn resume(voice: &VoiceContext, seq_ack: Option<u64>) -> Result<(), AppError> {
+    let Some(gateway_url) = gateway_url(&voice.endpoint)? else {
+        return Err(AppError::InvalidState("voice endpoint invalid for resume"));
+    };
+
+    let mut gateway = timeout(HANDSHAKE_TIMEOUT, VoiceGatewayClient::connect(&gateway_url))
+        .await
+        .map_err(|_| AppError::InvalidState("voice gateway connect timed out"))??;
+    expect_hello(&mut gateway).await?;
+
+    if let Some(seq_ack) = seq_ack {
+        gateway.record_seq_ack(seq_ack);
+    }
+    gateway
+        .send_resume(&voice.guild_id, &voice.session_id, &voice.token)
+        .await?;
+
+    match next_event(&mut gateway).await?.into_event() {
+        VoiceGatewayEvent::Resumed => Ok(()),
+        _ => Err(AppError::InvalidState("voice handshake resume rejected")),
+    }
 }
 
 fn gateway_url(endpoint: &str) -> Result<Option<String>, AppError> {
@@ -146,33 +150,6 @@ fn is_local_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(addr) => addr.is_loopback() || addr.is_private(),
         IpAddr::V6(addr) => addr.is_loopback() || addr.is_unique_local(),
-    }
-}
-
-async fn start_gateway_handshake(
-    gateway: &mut VoiceGatewayClient,
-    voice: &VoiceContext,
-    start: HandshakeStart,
-) -> Result<Ready, AppError> {
-    match start {
-        HandshakeStart::Identify => {
-            gateway.send_identify(voice).await?;
-            expect_ready(gateway).await
-        }
-        HandshakeStart::Resume { seq_ack } => {
-            if let Some(seq_ack) = seq_ack {
-                gateway.record_seq_ack(seq_ack);
-            }
-            gateway
-                .send_resume(&voice.guild_id, &voice.session_id, &voice.token)
-                .await?;
-
-            match next_event(gateway).await?.into_event() {
-                VoiceGatewayEvent::Resumed => expect_ready(gateway).await,
-                VoiceGatewayEvent::Ready(ready) => Ok(ready),
-                _ => Err(AppError::InvalidState("voice handshake resume rejected")),
-            }
-        }
     }
 }
 

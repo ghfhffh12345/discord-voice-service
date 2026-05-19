@@ -15,8 +15,6 @@ use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 
 pub struct FakeDiscordPeer {
     endpoint_host: String,
-    gateway_url: String,
-    udp_addr: std::net::SocketAddr,
     gateway_path: Arc<StdMutex<Option<String>>>,
     discovery_count: Arc<Mutex<usize>>,
     speaking_observed: Arc<Notify>,
@@ -112,7 +110,27 @@ impl FakeDiscordPeer {
                     let payload: Value = serde_json::from_str(text.as_ref()).unwrap();
                     match payload.get("op").and_then(Value::as_u64) {
                         Some(0) => {
-                            *saw_identify_state.lock().await = true;
+                            let identify = payload.get("d").cloned().unwrap_or(Value::Null);
+                            let required_fields_present = identify
+                                .get("server_id")
+                                .and_then(Value::as_str)
+                                .is_some_and(|value| !value.is_empty())
+                                && identify
+                                    .get("user_id")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|value| !value.is_empty())
+                                && identify
+                                    .get("session_id")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|value| !value.is_empty())
+                                && identify
+                                    .get("token")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|value| !value.is_empty());
+                            *saw_identify_state.lock().await = required_fields_present;
+                            if !required_fields_present {
+                                continue;
+                            }
                             ws.send(Message::Text(
                                 json!({
                                     "op": 2,
@@ -135,21 +153,6 @@ impl FakeDiscordPeer {
                                 json!({
                                     "op": 9,
                                     "d": {}
-                                })
-                                .to_string()
-                                .into(),
-                            ))
-                            .await
-                            .unwrap();
-                            ws.send(Message::Text(
-                                json!({
-                                    "op": 2,
-                                    "d": {
-                                        "ssrc": 7,
-                                        "ip": udp_addr.ip().to_string(),
-                                        "port": udp_addr.port(),
-                                        "modes": [PREFERRED_MODE, REQUIRED_MODE],
-                                    }
                                 })
                                 .to_string()
                                 .into(),
@@ -187,8 +190,6 @@ impl FakeDiscordPeer {
 
         Self {
             endpoint_host: ws_addr.to_string(),
-            gateway_url: format!("ws://{ws_addr}"),
-            udp_addr,
             gateway_path,
             discovery_count,
             speaking_observed,
@@ -208,12 +209,14 @@ impl FakeDiscordPeer {
         &self,
         guild_id: &str,
         channel_id: &str,
+        user_id: &str,
         session_id: &str,
         token: &str,
     ) -> VoiceContext {
         VoiceContext {
             guild_id: guild_id.into(),
             channel_id: channel_id.into(),
+            user_id: user_id.into(),
             session_id: session_id.into(),
             endpoint: self.endpoint(),
             token: token.into(),

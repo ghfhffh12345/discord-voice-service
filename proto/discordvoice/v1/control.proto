@@ -18,9 +18,10 @@ message JoinVoiceRequest {
   message VoiceContext {
     string guild_id = 1;
     string channel_id = 2;
-    string session_id = 3;
-    string endpoint = 4;
-    string token = 5;
+    string user_id = 3;
+    string session_id = 4;
+    string endpoint = 5;
+    string token = 6;
   }
 
   VoiceContext voice = 1;

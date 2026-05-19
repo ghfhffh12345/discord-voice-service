@@ -13,6 +13,7 @@ use crate::ytmusic::client::YtMusicClient;
 pub struct VoiceContext {
     pub guild_id: String,
     pub channel_id: String,
+    pub user_id: String,
     pub session_id: String,
     pub endpoint: String,
     pub token: String,

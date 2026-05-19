@@ -51,7 +51,7 @@ async fn update_voice_context_replaces_full_runtime_voice_context() {
     let supervisor = Supervisor::new();
     let fake = FakeVoiceEndpoint::spawn().await;
     let joined = test_voice_context();
-    let updated = fake.voice_context("1", "9", "updated-session", "updated-token");
+    let updated = fake.voice_context("1", "9", "user-1", "updated-session", "updated-token");
 
     supervisor
         .send(Command::JoinVoice {
@@ -78,10 +78,11 @@ async fn update_voice_context_replaces_full_runtime_voice_context() {
 async fn update_voice_context_failure_keeps_snapshot_and_runtime_on_previous_voice() {
     let supervisor = Supervisor::new();
     let fake = FakeVoiceEndpoint::spawn().await;
-    let joined = fake.voice_context("1", "2", "3", "token");
+    let joined = fake.voice_context("1", "2", "user-1", "3", "token");
     let invalid = VoiceContext {
         guild_id: "1".into(),
         channel_id: "9".into(),
+        user_id: "user-1".into(),
         session_id: "broken-session".into(),
         endpoint: "ws://127.0.0.1:1".into(),
         token: "broken-token".into(),
@@ -117,6 +118,7 @@ fn test_voice_context() -> VoiceContext {
     VoiceContext {
         guild_id: "1".into(),
         channel_id: "2".into(),
+        user_id: "user-1".into(),
         session_id: "3".into(),
         endpoint: "voice-placeholder".into(),
         token: "token".into(),
