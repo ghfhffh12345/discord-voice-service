@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 use crate::media::http_stream::HttpOpusStream;
-use crate::media::position::PlaybackPosition;
+use crate::media::position::{PlaybackPosition, SharedPlaybackPosition};
 use crate::media::webm_demux::{DemuxedPacket, WebmOpusDemux};
 use crate::ytmusic::client::ResolvedPlaybackSource;
 
@@ -10,7 +10,7 @@ pub struct PlaybackSource {
     stream: HttpOpusStream,
     demux: WebmOpusDemux,
     pending_packets: VecDeque<DemuxedPacket>,
-    position: PlaybackPosition,
+    position: SharedPlaybackPosition,
 }
 
 impl PlaybackSource {
@@ -19,7 +19,7 @@ impl PlaybackSource {
         stream: HttpOpusStream,
         demux: WebmOpusDemux,
         pending_packets: VecDeque<DemuxedPacket>,
-        position: PlaybackPosition,
+        position: SharedPlaybackPosition,
     ) -> Self {
         Self {
             resolved,
@@ -46,14 +46,16 @@ impl PlaybackSource {
         self.live_position()
     }
 
-    pub fn position_mut(&mut self) -> &mut PlaybackPosition {
-        self.sync_position();
-        &mut self.position
+    pub fn shared_position(&self) -> SharedPlaybackPosition {
+        self.position.clone()
     }
 
     pub fn record_sent_packet(&mut self, duration_ms: u64) {
         self.sync_position();
-        self.position.record_sent_packet(duration_ms);
+        self.position
+            .lock()
+            .unwrap()
+            .record_sent_packet(duration_ms);
     }
 
     pub fn stream_mut(&mut self) -> &mut HttpOpusStream {
@@ -69,13 +71,15 @@ impl PlaybackSource {
     }
 
     fn live_position(&self) -> PlaybackPosition {
-        let mut position = self.position;
+        let mut position = self.position.lock().unwrap().snapshot();
         position.set_byte_offset(self.stream.position().byte_offset());
         position
     }
 
     fn sync_position(&mut self) {
         self.position
+            .lock()
+            .unwrap()
             .set_byte_offset(self.stream.position().byte_offset());
     }
 }

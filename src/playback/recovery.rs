@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 
 use crate::error::AppError;
 use crate::media::http_stream::HttpOpusStream;
-use crate::media::position::PlaybackPosition;
+use crate::media::position::{PlaybackPosition, shared_playback_position};
 use crate::media::webm_demux::{DemuxedPacket, WebmOpusDemux};
 use crate::playback::source::PlaybackSource;
 use crate::ytmusic::client::{ResolvedPlaybackSource, YtMusicClient};
@@ -100,7 +100,7 @@ impl PlaybackRecovery {
             stream,
             demux,
             pending_packets,
-            position,
+            shared_playback_position(position),
         ))
     }
 }

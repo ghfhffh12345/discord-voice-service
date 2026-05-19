@@ -1,4 +1,8 @@
+use std::sync::{Arc, Mutex};
+
 use super::webm_demux::DemuxedPacket;
+
+pub type SharedPlaybackPosition = Arc<Mutex<PlaybackPosition>>;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PlaybackPosition {
@@ -48,4 +52,8 @@ impl PlaybackPosition {
     pub fn record_sent_packet(&mut self, duration_ms: u64) {
         self.sent_duration_ms = self.sent_duration_ms.saturating_add(duration_ms);
     }
+}
+
+pub fn shared_playback_position(position: PlaybackPosition) -> SharedPlaybackPosition {
+    Arc::new(Mutex::new(position))
 }

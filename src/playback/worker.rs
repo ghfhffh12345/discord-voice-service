@@ -1,6 +1,6 @@
 use crate::error::AppError;
 use crate::media::opus_queue::{OpusFrame, OpusFrameQueue};
-use crate::media::position::PlaybackPosition;
+use crate::media::position::{PlaybackPosition, SharedPlaybackPosition, shared_playback_position};
 use crate::media::webm_demux::DemuxedPacket;
 use crate::playback::recovery::PlaybackRecovery;
 use crate::playback::source::PlaybackSource;
@@ -29,7 +29,7 @@ impl PlaybackPlan {
 pub struct PlaybackWorker {
     current_video_id: Option<String>,
     recovery: PlaybackRecovery,
-    position: PlaybackPosition,
+    position: SharedPlaybackPosition,
     prebuffer_target: usize,
 }
 
@@ -38,13 +38,9 @@ impl PlaybackWorker {
         Self {
             current_video_id: None,
             recovery: PlaybackRecovery::new(client),
-            position: PlaybackPosition::default(),
+            position: shared_playback_position(PlaybackPosition::default()),
             prebuffer_target: DEFAULT_PREBUFFER_TARGET,
         }
-    }
-
-    pub fn sync_position_from_source(&mut self, source: &PlaybackSource) {
-        self.position = source.position();
     }
 
     pub async fn prepare(
@@ -53,13 +49,14 @@ impl PlaybackWorker {
         queue: &mut OpusFrameQueue,
     ) -> Result<PlaybackSource, AppError> {
         let resume_position_ms = if self.current_video_id.as_deref() == Some(video_id) {
-            self.position.sent_duration_ms()
+            self.position.lock().unwrap().sent_duration_ms()
         } else {
-            self.position = PlaybackPosition::default();
+            self.position = shared_playback_position(PlaybackPosition::default());
             0
         };
 
         let mut source = self.recovery.recover(video_id, resume_position_ms).await?;
+        self.position = source.shared_position();
 
         while queue.len() < self.prebuffer_target {
             if let Some(packet) = source.pending_packets_mut().pop_front() {
@@ -87,7 +84,6 @@ impl PlaybackWorker {
         }
 
         self.current_video_id = Some(video_id.to_owned());
-        self.position = source.position();
         Ok(source)
     }
 
@@ -96,7 +92,7 @@ impl PlaybackWorker {
         queue: &mut OpusFrameQueue,
         packet: DemuxedPacket,
     ) -> Result<(), AppError> {
-        self.position.record_buffered(&packet);
+        self.position.lock().unwrap().record_buffered(&packet);
         queue
             .push(OpusFrame::new(packet.data.clone(), packet.duration_ms))
             .map_err(|_| AppError::BufferFull)

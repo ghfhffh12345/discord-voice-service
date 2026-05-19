@@ -134,7 +134,6 @@ async fn prepare_preserves_current_track_position_when_recovering_same_video() {
     let mut first_source = worker.prepare("video-1", &mut first_queue).await.unwrap();
     let first_packet = first_queue.pop().expect("queue should contain a packet");
     first_source.record_sent_packet(first_packet.duration_ms);
-    worker.sync_position_from_source(&first_source);
 
     fake.fail_first_url_once().await;
 
