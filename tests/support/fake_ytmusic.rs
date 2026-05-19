@@ -72,9 +72,8 @@ impl FakeYtMusic {
         *self.playable_url.lock().unwrap() = playable_url.into();
     }
 
-    pub async fn fail_first_url_once(&self) {
-        *self.stale_playable_url_once.lock().unwrap() =
-            Some("http://127.0.0.1:9/stale-audio.webm".to_owned());
+    pub async fn set_first_playable_url_once(&self, playable_url: impl Into<String>) {
+        *self.stale_playable_url_once.lock().unwrap() = Some(playable_url.into());
     }
 }
 

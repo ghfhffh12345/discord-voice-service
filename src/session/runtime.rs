@@ -147,8 +147,6 @@ impl VoiceSessionRuntime {
             ensure_active_voice_session(&state, "update_voice_context")?;
         }
 
-        let replacement = ConnectedVoiceSession::connect(new_voice.clone()).await?;
-
         let reconnecting_event = {
             let mut state = self.state.write().await;
             let mut current_voice = self.voice.lock().await;
@@ -163,6 +161,19 @@ impl VoiceSessionRuntime {
             SessionEventRecord::from_snapshot(SessionEventKind::VoiceReconnecting, &state)
         };
         self.events.emit(reconnecting_event);
+
+        let replacement = match ConnectedVoiceSession::connect(new_voice.clone()).await {
+            Ok(replacement) => replacement,
+            Err(err) => {
+                let mut state = self.state.write().await;
+                let mut current_voice = self.voice.lock().await;
+                if let Some(session) = current_voice.as_mut() {
+                    session.rollover_mut().set_voice_reconnecting(false);
+                    apply_rollover_state(&mut state, session);
+                }
+                return Err(err);
+            }
+        };
 
         let reconnected_event = {
             let mut state = self.state.write().await;

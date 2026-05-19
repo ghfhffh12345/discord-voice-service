@@ -27,6 +27,10 @@ pub async fn spawn_non_range_server() -> RangeServer {
     spawn_test_server(ServerBehavior::IgnoreRange, payload.into()).await
 }
 
+pub async fn spawn_status_server(status: &'static str) -> RangeServer {
+    spawn_test_server(ServerBehavior::StaticStatus(status), Bytes::new()).await
+}
+
 async fn spawn_test_server(behavior: ServerBehavior, payload: Bytes) -> RangeServer {
     let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
     let address = listener
@@ -73,6 +77,7 @@ async fn spawn_test_server(behavior: ServerBehavior, payload: Bytes) -> RangeSer
                         payload.len().saturating_sub(1)
                     )),
                 ),
+                ServerBehavior::StaticStatus(status) => (&[][..], status, None),
                 _ => (payload.as_ref(), "HTTP/1.1 200 OK", None),
             };
             let headers = if let Some(content_range) = content_range {
@@ -123,6 +128,7 @@ impl RangeServer {
 enum ServerBehavior {
     HonorRange,
     IgnoreRange,
+    StaticStatus(&'static str),
 }
 
 fn parse_range_start(header: &str) -> Option<u64> {

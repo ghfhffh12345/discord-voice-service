@@ -4,10 +4,10 @@ use discord_voice_service::session::supervisor::VoiceContext;
 use futures::StreamExt;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::Mutex;
-use tokio::time::{Duration, Instant, sleep};
+use tokio::time::{sleep, Duration, Instant};
 use tokio_tungstenite::accept_hdr_async;
-use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+use tokio_tungstenite::tungstenite::Message;
 
 pub struct FakeVoiceEndpoint {
     endpoint: String,
@@ -17,6 +17,10 @@ pub struct FakeVoiceEndpoint {
 
 impl FakeVoiceEndpoint {
     pub async fn spawn() -> Self {
+        Self::spawn_with_gateway_delay(Duration::ZERO).await
+    }
+
+    pub async fn spawn_with_gateway_delay(delay: Duration) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let udp_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let ws_addr = listener.local_addr().unwrap();
@@ -51,6 +55,7 @@ impl FakeVoiceEndpoint {
             let Ok((stream, _)) = listener.accept().await else {
                 return;
             };
+            sleep(delay).await;
             let mut ws = accept_hdr_async(stream, move |request: &Request, response: Response| {
                 *gateway_path_state.lock().unwrap() = Some(request.uri().to_string());
                 Ok(response)

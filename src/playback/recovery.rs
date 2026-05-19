@@ -7,6 +7,7 @@ use crate::media::position::{PlaybackPosition, shared_playback_position};
 use crate::media::webm_demux::{DemuxedPacket, WebmOpusDemux};
 use crate::playback::source::PlaybackSource;
 use crate::ytmusic::client::{ResolvedPlaybackSource, YtMusicClient};
+use reqwest::StatusCode;
 use tokio::time::timeout;
 
 const OPEN_CHUNK_TIMEOUT: Duration = Duration::from_millis(500);
@@ -130,6 +131,16 @@ fn packet_end_ms(packet: &DemuxedPacket) -> u64 {
 }
 
 fn should_reresolve_after_open_failure(err: &AppError) -> bool {
-    matches!(err, AppError::Http(_))
+    matches!(err, AppError::Http(err) if err.status().is_some_and(is_stale_source_status))
         || matches!(err, AppError::MediaParseDetail(message) if message.contains("timed out opening playback source"))
+}
+
+fn is_stale_source_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::UNAUTHORIZED
+            | StatusCode::FORBIDDEN
+            | StatusCode::NOT_FOUND
+            | StatusCode::GONE
+    )
 }
