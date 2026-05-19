@@ -2,6 +2,7 @@
 mod fake_discord;
 
 use discord_voice_service::discord_voice::{handshake, session::ConnectedVoiceSession};
+use tokio::time::Duration;
 
 use self::fake_discord::FakeDiscordPeer;
 
@@ -72,7 +73,7 @@ async fn voice_session_can_join_an_established_dave_group_without_prepare_epoch(
     let session = ConnectedVoiceSession::connect(voice).await.unwrap();
 
     assert!(session.dave_enabled());
-    assert!(!fake.saw_dave_prepare_epoch().await);
+    assert!(!fake.saw_dave_prepare_epoch_within(Duration::from_millis(100)).await);
     assert!(fake.saw_dave_key_package_before_prepare_epoch().await);
     assert!(fake.saw_dave_transition().await);
 }
@@ -87,19 +88,14 @@ async fn voice_session_rejects_unmatched_dave_welcome_transition() {
 }
 
 #[tokio::test]
-async fn voice_session_does_not_acknowledge_a_stray_dave_welcome_after_a_prepare_backed_welcome() {
+async fn voice_session_ignores_a_stray_dave_welcome_after_a_prepare_backed_welcome() {
     let fake = FakeDiscordPeer::spawn_with_prepare_backed_stray_dave_welcome().await;
     let voice = fake.voice_context("1", "2", "1111111111111111", "session-1", "token-1");
 
-    let error = match ConnectedVoiceSession::connect(voice).await {
-        Ok(_) => panic!("stray welcome should not be accepted"),
-        Err(error) => error,
-    };
+    let session = ConnectedVoiceSession::connect(voice).await.unwrap();
 
+    assert!(session.dave_enabled());
     assert!(fake.saw_dave_prepare_epoch().await);
     assert!(!fake.saw_unmatched_dave_transition().await);
-    assert_eq!(
-        error.to_string(),
-        "invalid state: voice dave welcome transition missing pending join"
-    );
+    assert!(fake.saw_dave_transition().await);
 }

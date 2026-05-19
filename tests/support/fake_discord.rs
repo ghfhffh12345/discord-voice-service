@@ -564,6 +564,10 @@ impl FakeDiscordPeer {
         wait_for_value(&self.saw_dave_prepare_epoch, |ready| *ready).await
     }
 
+    pub async fn saw_dave_prepare_epoch_within(&self, timeout: Duration) -> bool {
+        wait_for_value_with_timeout(&self.saw_dave_prepare_epoch, timeout, |ready| *ready).await
+    }
+
     pub async fn saw_dave_key_package_before_prepare_epoch(&self) -> bool {
         wait_for_value(&self.saw_dave_key_package_before_prepare_epoch, |ready| {
             *ready
@@ -651,7 +655,19 @@ where
     T: Clone,
     F: Fn(&T) -> bool,
 {
-    let deadline = Instant::now() + Duration::from_secs(2);
+    wait_for_value_with_timeout(slot, Duration::from_secs(2), ready).await
+}
+
+async fn wait_for_value_with_timeout<T, F>(
+    slot: &Arc<Mutex<T>>,
+    timeout: Duration,
+    ready: F,
+) -> T
+where
+    T: Clone,
+    F: Fn(&T) -> bool,
+{
+    let deadline = Instant::now() + timeout;
     loop {
         let value = slot.lock().await.clone();
         if ready(&value) || Instant::now() >= deadline {

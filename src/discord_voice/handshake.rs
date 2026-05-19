@@ -247,6 +247,9 @@ async fn complete_initial_dave_transition(
                 transition_id,
                 welcome,
             }) => {
+                if pending_transition.is_some() {
+                    continue;
+                }
                 let runtime_protocol_version = if let Some(runtime_protocol_version) =
                     pending_prepared_transitions.remove(&transition_id)
                 {
