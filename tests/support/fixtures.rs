@@ -12,17 +12,22 @@ pub fn load_fixture_bytes(path: &str) -> Bytes {
     Bytes::from(fs::read(path).expect("fixture should be readable"))
 }
 
+pub async fn spawn_stream_server(path: &str) -> RangeServer {
+    let payload = load_fixture_bytes(path);
+    spawn_test_server(ServerBehavior::HonorRange, payload).await
+}
+
 pub async fn spawn_range_server() -> RangeServer {
-    spawn_test_server(ServerBehavior::HonorRange).await
+    let payload = load_fixture_bytes("tests/fixtures/audio-itag250.webm").repeat(4);
+    spawn_test_server(ServerBehavior::HonorRange, payload.into()).await
 }
 
 pub async fn spawn_non_range_server() -> RangeServer {
-    spawn_test_server(ServerBehavior::IgnoreRange).await
+    let payload = load_fixture_bytes("tests/fixtures/audio-itag250.webm").repeat(4);
+    spawn_test_server(ServerBehavior::IgnoreRange, payload.into()).await
 }
 
-async fn spawn_test_server(behavior: ServerBehavior) -> RangeServer {
-    let payload = load_fixture_bytes("tests/fixtures/audio-itag250.webm");
-    let payload = payload.repeat(4);
+async fn spawn_test_server(behavior: ServerBehavior, payload: Bytes) -> RangeServer {
     let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
     let address = listener
         .local_addr()
@@ -68,7 +73,7 @@ async fn spawn_test_server(behavior: ServerBehavior) -> RangeServer {
                         payload.len().saturating_sub(1)
                     )),
                 ),
-                _ => (payload.as_slice(), "HTTP/1.1 200 OK", None),
+                _ => (payload.as_ref(), "HTTP/1.1 200 OK", None),
             };
             let headers = if let Some(content_range) = content_range {
                 format!(

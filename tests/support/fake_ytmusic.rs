@@ -8,14 +8,13 @@ use discord_voice_service::ytmusic::v1::{
     GetLibraryAlbumsContinuationRequest, GetLibraryArtistsContinuationRequest,
     GetLibraryChannelsContinuationRequest, GetLibraryPlaylistsContinuationRequest,
     GetLibraryPodcastsContinuationRequest, GetLibrarySongsContinuationRequest,
-    GetLibrarySubscriptionsContinuationRequest, GetSongRequest, GetSongResponse,
-    GetLikedSongsContinuationRequest, GetSavedEpisodesContinuationRequest,
-    GetWatchPlaylistContinuationRequest, GetWatchPlaylistRequest,
-    LibraryAlbumsResponse, LibraryArtistsResponse, LibraryChannelsResponse,
-    LibraryPlaylistsResponse, LibraryPodcastsResponse, LibrarySongsResponse,
-    LibrarySubscriptionsResponse, LikedSongsResponse, SavedEpisodesResponse,
-    SearchContinuationRequest,
-    SearchRequest, SearchResponse, SongStreamingData, SongStreamFormat, WatchPlaylistResponse,
+    GetLibrarySubscriptionsContinuationRequest, GetLikedSongsContinuationRequest,
+    GetSavedEpisodesContinuationRequest, GetSongRequest, GetSongResponse,
+    GetWatchPlaylistContinuationRequest, GetWatchPlaylistRequest, LibraryAlbumsResponse,
+    LibraryArtistsResponse, LibraryChannelsResponse, LibraryPlaylistsResponse,
+    LibraryPodcastsResponse, LibrarySongsResponse, LibrarySubscriptionsResponse,
+    LikedSongsResponse, SavedEpisodesResponse, SearchContinuationRequest, SearchRequest,
+    SearchResponse, SongStreamFormat, SongStreamingData, WatchPlaylistResponse,
 };
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -26,6 +25,7 @@ use tonic::{Request, Response, Status};
 pub struct FakeYtMusic {
     endpoint: String,
     calls: Arc<Mutex<Vec<String>>>,
+    playable_url: Arc<Mutex<String>>,
     _server: JoinHandle<()>,
 }
 
@@ -34,8 +34,10 @@ impl FakeYtMusic {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let calls = Arc::new(Mutex::new(Vec::new()));
+        let playable_url = Arc::new(Mutex::new("https://cdn.example/audio.webm".to_owned()));
         let service = FakeYtMusicService {
             calls: Arc::clone(&calls),
+            playable_url: Arc::clone(&playable_url),
         };
 
         let server = tokio::spawn(async move {
@@ -49,6 +51,7 @@ impl FakeYtMusic {
         Self {
             endpoint,
             calls,
+            playable_url,
             _server: server,
         }
     }
@@ -60,10 +63,15 @@ impl FakeYtMusic {
     pub fn calls(&self) -> Vec<String> {
         self.calls.lock().unwrap().clone()
     }
+
+    pub async fn set_playable_url(&self, playable_url: impl Into<String>) {
+        *self.playable_url.lock().unwrap() = playable_url.into();
+    }
 }
 
 struct FakeYtMusicService {
     calls: Arc<Mutex<Vec<String>>>,
+    playable_url: Arc<Mutex<String>>,
 }
 
 impl FakeYtMusicService {
@@ -300,7 +308,7 @@ impl YtMusicPublic for FakeYtMusicService {
             return Err(Status::invalid_argument("unexpected cipher"));
         }
         Ok(Response::new(DecipherResponse {
-            playable_url: "https://cdn.example/audio.webm".to_owned(),
+            playable_url: self.playable_url.lock().unwrap().clone(),
         }))
     }
 }
