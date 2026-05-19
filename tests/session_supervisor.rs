@@ -83,7 +83,7 @@ async fn update_voice_context_failure_keeps_snapshot_and_runtime_on_previous_voi
         guild_id: "1".into(),
         channel_id: "9".into(),
         session_id: "broken-session".into(),
-        endpoint: "ws://127.0.0.1/?udp=127.0.0.1:0&ssrc=broken".into(),
+        endpoint: "ws://127.0.0.1:1".into(),
         token: "broken-token".into(),
     };
 

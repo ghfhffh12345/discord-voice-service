@@ -3,8 +3,8 @@
 use std::sync::{Arc, Mutex as StdMutex};
 
 use discord_voice_service::session::supervisor::VoiceContext;
-use futures::StreamExt;
-use serde_json::Value;
+use futures::{SinkExt, StreamExt};
+use serde_json::{Value, json};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{Mutex, Notify};
 use tokio::time::{Duration, Instant, sleep};
@@ -13,16 +13,26 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 
 pub struct FakeDiscordPeer {
-    endpoint: String,
+    endpoint_host: String,
+    gateway_url: String,
+    udp_addr: std::net::SocketAddr,
     gateway_path: Arc<StdMutex<Option<String>>>,
     discovery_count: Arc<Mutex<usize>>,
     speaking_observed: Arc<Notify>,
     audio_frame_count: Arc<Mutex<usize>>,
+    saw_identify: Arc<Mutex<bool>>,
+    saw_select_protocol: Arc<Mutex<bool>>,
+    session_description_sent: Arc<Mutex<bool>>,
 }
 
 impl FakeDiscordPeer {
     #[allow(clippy::result_large_err)]
     pub async fn spawn() -> Self {
+        Self::spawn_real_shape().await
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn spawn_real_shape() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let udp_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let ws_addr = listener.local_addr().unwrap();
@@ -31,6 +41,9 @@ impl FakeDiscordPeer {
         let discovery_count = Arc::new(Mutex::new(0usize));
         let speaking_observed = Arc::new(Notify::new());
         let audio_frame_count = Arc::new(Mutex::new(0usize));
+        let saw_identify = Arc::new(Mutex::new(false));
+        let saw_select_protocol = Arc::new(Mutex::new(false));
+        let session_description_sent = Arc::new(Mutex::new(false));
 
         let discovery_count_state = Arc::clone(&discovery_count);
         let audio_frame_count_state = Arc::clone(&audio_frame_count);
@@ -62,6 +75,9 @@ impl FakeDiscordPeer {
 
         let gateway_path_state = Arc::clone(&gateway_path);
         let speaking_observed_state = Arc::clone(&speaking_observed);
+        let saw_identify_state = Arc::clone(&saw_identify);
+        let saw_select_protocol_state = Arc::clone(&saw_select_protocol);
+        let session_description_state = Arc::clone(&session_description_sent);
         tokio::spawn(async move {
             let Ok((stream, _)) = listener.accept().await else {
                 return;
@@ -73,30 +89,86 @@ impl FakeDiscordPeer {
             .await
             .unwrap();
 
+            ws.send(Message::Text(
+                json!({
+                    "op": 8,
+                    "d": { "heartbeat_interval": 1_000 }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
             while let Some(message) = ws.next().await {
                 let Ok(message) = message else {
                     break;
                 };
                 if let Message::Text(text) = message {
                     let payload: Value = serde_json::from_str(text.as_ref()).unwrap();
-                    if payload.get("op").and_then(Value::as_u64) == Some(5) {
-                        speaking_observed_state.notify_one();
+                    match payload.get("op").and_then(Value::as_u64) {
+                        Some(0) => {
+                            *saw_identify_state.lock().await = true;
+                            ws.send(Message::Text(
+                                json!({
+                                    "op": 2,
+                                    "d": {
+                                        "ssrc": 7,
+                                        "ip": udp_addr.ip().to_string(),
+                                        "port": udp_addr.port(),
+                                        "modes": ["xsalsa20_poly1305"],
+                                    }
+                                })
+                                .to_string()
+                                .into(),
+                            ))
+                            .await
+                            .unwrap();
+                        }
+                        Some(1) => {
+                            *saw_select_protocol_state.lock().await = true;
+                            *session_description_state.lock().await = true;
+                            let mode = payload
+                                .pointer("/d/data/mode")
+                                .and_then(Value::as_str)
+                                .unwrap_or("xsalsa20_poly1305");
+                            ws.send(Message::Text(
+                                json!({
+                                    "op": 4,
+                                    "d": {
+                                        "mode": mode,
+                                        "secret_key": vec![0u8; 32],
+                                    }
+                                })
+                                .to_string()
+                                .into(),
+                            ))
+                            .await
+                            .unwrap();
+                        }
+                        Some(5) => speaking_observed_state.notify_one(),
+                        _ => {}
                     }
                 }
             }
         });
 
         Self {
-            endpoint: format!("ws://{ws_addr}/?udp={udp_addr}&ssrc=7"),
+            endpoint_host: ws_addr.to_string(),
+            gateway_url: format!("ws://{ws_addr}"),
+            udp_addr,
             gateway_path,
             discovery_count,
             speaking_observed,
             audio_frame_count,
+            saw_identify,
+            saw_select_protocol,
+            session_description_sent,
         }
     }
 
     pub fn endpoint(&self) -> String {
-        self.endpoint.clone()
+        self.endpoint_host.clone()
     }
 
     pub fn voice_context(
@@ -129,6 +201,18 @@ impl FakeDiscordPeer {
 
     pub async fn audio_frame_count_at_least(&self, minimum: usize) -> usize {
         wait_for_value(&self.audio_frame_count, |count| *count >= minimum).await
+    }
+
+    pub async fn saw_identify(&self) -> bool {
+        wait_for_value(&self.saw_identify, |ready| *ready).await
+    }
+
+    pub async fn saw_select_protocol(&self) -> bool {
+        wait_for_value(&self.saw_select_protocol, |ready| *ready).await
+    }
+
+    pub async fn session_description_sent(&self) -> bool {
+        wait_for_value(&self.session_description_sent, |ready| *ready).await
     }
 }
 

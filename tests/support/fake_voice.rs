@@ -1,7 +1,8 @@
 use std::sync::{Arc, Mutex as StdMutex};
 
 use discord_voice_service::session::supervisor::VoiceContext;
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
+use serde_json::{Value, json};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant, sleep};
@@ -10,7 +11,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 
 pub struct FakeVoiceEndpoint {
-    endpoint: String,
+    endpoint_host: String,
     gateway_path: Arc<StdMutex<Option<String>>>,
     discovery_count: Arc<Mutex<usize>>,
 }
@@ -64,9 +65,61 @@ impl FakeVoiceEndpoint {
             .await
             .unwrap();
 
+            ws.send(Message::Text(
+                json!({
+                    "op": 8,
+                    "d": { "heartbeat_interval": 1_000 }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
             while let Some(message) = ws.next().await {
                 match message {
-                    Ok(Message::Text(_)) => {}
+                    Ok(Message::Text(text)) => {
+                        let payload: Value = serde_json::from_str(text.as_ref()).unwrap();
+                        match payload.get("op").and_then(Value::as_u64) {
+                            Some(0) => {
+                                ws.send(Message::Text(
+                                    json!({
+                                        "op": 2,
+                                        "d": {
+                                            "ssrc": 7,
+                                            "ip": udp_addr.ip().to_string(),
+                                            "port": udp_addr.port(),
+                                            "modes": ["xsalsa20_poly1305"],
+                                        }
+                                    })
+                                    .to_string()
+                                    .into(),
+                                ))
+                                .await
+                                .unwrap();
+                            }
+                            Some(1) => {
+                                let mode = payload
+                                    .pointer("/d/data/mode")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("xsalsa20_poly1305");
+                                ws.send(Message::Text(
+                                    json!({
+                                        "op": 4,
+                                        "d": {
+                                            "mode": mode,
+                                            "secret_key": vec![0u8; 32],
+                                        }
+                                    })
+                                    .to_string()
+                                    .into(),
+                                ))
+                                .await
+                                .unwrap();
+                            }
+                            _ => {}
+                        }
+                    }
                     Ok(_) => {}
                     Err(_) => break,
                 }
@@ -74,14 +127,14 @@ impl FakeVoiceEndpoint {
         });
 
         Self {
-            endpoint: format!("ws://{ws_addr}/?udp={udp_addr}&ssrc=7"),
+            endpoint_host: ws_addr.to_string(),
             gateway_path,
             discovery_count,
         }
     }
 
     pub fn endpoint(&self) -> String {
-        self.endpoint.clone()
+        self.endpoint_host.clone()
     }
 
     pub fn voice_context(

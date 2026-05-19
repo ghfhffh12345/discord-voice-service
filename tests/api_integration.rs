@@ -309,8 +309,7 @@ async fn join_voice_then_play_streams_end_to_end_playback_events_and_audio() {
     assert!(state.message.is_empty());
 
     let gateway_path = fake_discord.gateway_path().await.unwrap();
-    assert!(gateway_path.starts_with("/?udp="));
-    assert!(gateway_path.contains("ssrc=7"));
+    assert_eq!(gateway_path, "/?v=8&encoding=json");
     assert_eq!(fake_discord.discovery_count().await, 1);
     tokio::time::timeout(Duration::from_secs(2), speaking_observed.notified())
         .await

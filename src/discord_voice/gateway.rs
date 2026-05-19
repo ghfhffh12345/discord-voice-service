@@ -1,24 +1,14 @@
-use serde_json::{Value, json};
+use futures::StreamExt;
+use serde_json::Value;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio_tungstenite::tungstenite::Message;
 
+use crate::discord_voice::protocol::{self, VoiceGatewayPayload};
 use crate::discord_voice::resume::GatewayEvent;
+use crate::discord_voice::udp::DiscoveredUdpAddress;
 use crate::discord_voice::ws::{self, VoiceWebSocket};
 use crate::error::AppError;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VoiceContext {
-    pub guild_id: String,
-    pub channel_id: String,
-    pub session_id: String,
-    pub endpoint: String,
-    pub token: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionDescription {
-    pub mode: String,
-    pub secret_key: Vec<u8>,
-}
+use crate::session::supervisor::VoiceContext;
 
 pub struct VoiceGatewayClient {
     ws: VoiceWebSocket,
@@ -43,14 +33,24 @@ impl VoiceGatewayClient {
         }
     }
 
+    pub async fn send_identify(&mut self, voice: &VoiceContext) -> Result<(), AppError> {
+        self.send_json(protocol::identify_payload(voice)).await
+    }
+
+    pub async fn send_select_protocol(
+        &mut self,
+        address: &DiscoveredUdpAddress,
+        mode: &str,
+    ) -> Result<(), AppError> {
+        self.send_json(protocol::select_protocol_payload(address, mode))
+            .await
+    }
+
     pub async fn send_heartbeat(&mut self) -> Result<(), AppError> {
-        self.send_json(json!({
-            "op": 3,
-            "d": {
-                "t": heartbeat_timestamp_millis()?,
-                "seq_ack": self.seq_ack,
-            }
-        }))
+        self.send_json(protocol::heartbeat_payload(
+            heartbeat_timestamp_millis()?,
+            self.seq_ack,
+        ))
         .await
     }
 
@@ -60,16 +60,37 @@ impl VoiceGatewayClient {
         session_id: &str,
         token: &str,
     ) -> Result<(), AppError> {
-        self.send_json(json!({
-            "op": 7,
-            "d": {
-                "server_id": server_id,
-                "session_id": session_id,
-                "token": token,
-                "seq_ack": self.seq_ack,
-            }
-        }))
+        self.send_json(protocol::resume_payload(
+            server_id,
+            session_id,
+            token,
+            self.seq_ack,
+        ))
         .await
+    }
+
+    pub async fn receive_event(&mut self) -> Result<VoiceGatewayPayload, AppError> {
+        while let Some(message) = self.ws.next().await {
+            match message? {
+                Message::Text(text) => {
+                    let payload = protocol::parse_gateway_message(text.as_ref())?;
+                    if let Some(seq) = payload.seq() {
+                        self.seq_ack = Some(seq);
+                    }
+                    return Ok(payload);
+                }
+                Message::Close(_) => {
+                    return Err(AppError::InvalidState(
+                        "voice gateway closed during receive",
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        Err(AppError::InvalidState(
+            "voice gateway closed during receive",
+        ))
     }
 
     pub(crate) async fn send_json(&mut self, payload: Value) -> Result<(), AppError> {
