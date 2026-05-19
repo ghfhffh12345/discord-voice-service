@@ -246,6 +246,13 @@ async fn complete_initial_dave_transition(
                 transition_id,
                 welcome,
             }) => {
+                let Some(&runtime_protocol_version) =
+                    pending_prepared_transitions.get(&transition_id)
+                else {
+                    return Err(AppError::InvalidState(
+                        "voice dave welcome transition missing prepare",
+                    ));
+                };
                 let recognized = recognized_user_ids
                     .iter()
                     .map(String::as_str)
@@ -253,9 +260,7 @@ async fn complete_initial_dave_transition(
                 session
                     .process_welcome(&welcome, &recognized)
                     .map_err(|_| AppError::InvalidState("voice dave welcome invalid"))?;
-                let runtime_protocol_version = pending_prepared_transitions
-                    .remove(&transition_id)
-                    .unwrap_or(protocol_version);
+                pending_prepared_transitions.remove(&transition_id);
                 let runtime = DaveRuntimeContext::from_session(
                     &session,
                     runtime_protocol_version,

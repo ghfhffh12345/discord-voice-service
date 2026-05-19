@@ -76,3 +76,12 @@ async fn voice_session_can_join_an_established_dave_group() {
     assert!(fake.saw_dave_key_package_after_prepare_epoch().await);
     assert!(fake.saw_dave_transition().await);
 }
+
+#[tokio::test]
+async fn voice_session_rejects_unmatched_dave_welcome_transition() {
+    let fake = FakeDiscordPeer::spawn_with_unmatched_dave_welcome().await;
+    let voice = fake.voice_context("1", "2", "1111111111111111", "session-1", "token-1");
+
+    assert!(ConnectedVoiceSession::connect(voice).await.is_err());
+    assert!(!fake.saw_unmatched_dave_transition().await);
+}

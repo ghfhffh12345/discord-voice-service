@@ -19,12 +19,14 @@ const DAVE_CREATOR_USER_ID: &str = "9999999999999999";
 const DAVE_EXISTING_MEMBER_USER_ID: &str = "8888888888888888";
 const DAVE_PROTOCOL_VERSION: u16 = 1;
 const DAVE_TRANSITION_ID: u16 = 1;
+const DAVE_UNMATCHED_TRANSITION_ID: u16 = 9;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DaveScenario {
     Disabled,
     NewGroup,
     EstablishedGroupJoin,
+    UnmatchedWelcome,
 }
 
 pub struct FakeDiscordPeer {
@@ -40,6 +42,7 @@ pub struct FakeDiscordPeer {
     saw_select_protocol: Arc<Mutex<bool>>,
     session_description_sent: Arc<Mutex<bool>>,
     saw_dave_transition: Arc<Mutex<bool>>,
+    saw_unmatched_dave_transition: Arc<Mutex<bool>>,
     saw_dave_prepare_epoch: Arc<Mutex<bool>>,
     saw_dave_key_package_before_prepare_epoch: Arc<Mutex<bool>>,
     saw_dave_key_package_after_prepare_epoch: Arc<Mutex<bool>>,
@@ -71,6 +74,11 @@ impl FakeDiscordPeer {
         Self::spawn_with_options(1_000, DaveScenario::EstablishedGroupJoin).await
     }
 
+    #[allow(clippy::result_large_err)]
+    pub async fn spawn_with_unmatched_dave_welcome() -> Self {
+        Self::spawn_with_options(1_000, DaveScenario::UnmatchedWelcome).await
+    }
+
     async fn spawn_with_options(heartbeat_interval_ms: u64, dave_scenario: DaveScenario) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let udp_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -87,6 +95,7 @@ impl FakeDiscordPeer {
         let saw_select_protocol = Arc::new(Mutex::new(false));
         let session_description_sent = Arc::new(Mutex::new(false));
         let saw_dave_transition = Arc::new(Mutex::new(false));
+        let saw_unmatched_dave_transition = Arc::new(Mutex::new(false));
         let saw_dave_prepare_epoch = Arc::new(Mutex::new(false));
         let saw_dave_key_package_before_prepare_epoch = Arc::new(Mutex::new(false));
         let saw_dave_key_package_after_prepare_epoch = Arc::new(Mutex::new(false));
@@ -128,6 +137,7 @@ impl FakeDiscordPeer {
         let saw_select_protocol_state = Arc::clone(&saw_select_protocol);
         let session_description_state = Arc::clone(&session_description_sent);
         let saw_dave_transition_state = Arc::clone(&saw_dave_transition);
+        let saw_unmatched_dave_transition_state = Arc::clone(&saw_unmatched_dave_transition);
         let saw_dave_prepare_epoch_state = Arc::clone(&saw_dave_prepare_epoch);
         let saw_dave_key_package_before_prepare_epoch_state =
             Arc::clone(&saw_dave_key_package_before_prepare_epoch);
@@ -247,7 +257,9 @@ impl FakeDiscordPeer {
                             if dave_scenario != DaveScenario::Disabled {
                                 let announced_user_ids = match dave_scenario {
                                     DaveScenario::Disabled => Vec::new(),
-                                    DaveScenario::NewGroup => vec![DAVE_CREATOR_USER_ID],
+                                    DaveScenario::NewGroup | DaveScenario::UnmatchedWelcome => {
+                                        vec![DAVE_CREATOR_USER_ID]
+                                    }
                                     DaveScenario::EstablishedGroupJoin => {
                                         vec![DAVE_CREATOR_USER_ID, DAVE_EXISTING_MEMBER_USER_ID]
                                     }
@@ -343,25 +355,46 @@ impl FakeDiscordPeer {
                         }
                         Some(23) => {
                             if dave_scenario != DaveScenario::Disabled
-                                && payload
+                            {
+                                let Some(transition_id) = payload
                                     .pointer("/d/transition_id")
                                     .and_then(Value::as_u64)
-                                    .is_some_and(|value| value == u64::from(DAVE_TRANSITION_ID))
-                            {
-                                *saw_dave_transition_state.lock().await = true;
-                                ws.send(Message::Text(
-                                    json!({
-                                        "op": 22,
-                                        "seq": 3,
-                                        "d": {
-                                            "transition_id": DAVE_TRANSITION_ID,
-                                        }
-                                    })
-                                    .to_string()
-                                    .into(),
-                                ))
-                                .await
-                                .unwrap();
+                                    .and_then(|value| u16::try_from(value).ok())
+                                else {
+                                    continue;
+                                };
+
+                                if transition_id == DAVE_TRANSITION_ID {
+                                    *saw_dave_transition_state.lock().await = true;
+                                    ws.send(Message::Text(
+                                        json!({
+                                            "op": 22,
+                                            "seq": 3,
+                                            "d": {
+                                                "transition_id": DAVE_TRANSITION_ID,
+                                            }
+                                        })
+                                        .to_string()
+                                        .into(),
+                                    ))
+                                    .await
+                                    .unwrap();
+                                } else if transition_id == DAVE_UNMATCHED_TRANSITION_ID {
+                                    *saw_unmatched_dave_transition_state.lock().await = true;
+                                    ws.send(Message::Text(
+                                        json!({
+                                            "op": 22,
+                                            "seq": 3,
+                                            "d": {
+                                                "transition_id": DAVE_UNMATCHED_TRANSITION_ID,
+                                            }
+                                        })
+                                        .to_string()
+                                        .into(),
+                                    ))
+                                    .await
+                                    .unwrap();
+                                }
                             }
                         }
                         Some(5) => speaking_observed_state.notify_one(),
@@ -390,6 +423,10 @@ impl FakeDiscordPeer {
                             external_sender,
                             dave_scenario,
                             &user_id,
+                            match dave_scenario {
+                                DaveScenario::UnmatchedWelcome => DAVE_UNMATCHED_TRANSITION_ID,
+                                _ => DAVE_TRANSITION_ID,
+                            },
                             &bytes[1..],
                         ))))
                         .await
@@ -412,6 +449,7 @@ impl FakeDiscordPeer {
             saw_select_protocol,
             session_description_sent,
             saw_dave_transition,
+            saw_unmatched_dave_transition,
             saw_dave_prepare_epoch,
             saw_dave_key_package_before_prepare_epoch,
             saw_dave_key_package_after_prepare_epoch,
@@ -481,6 +519,10 @@ impl FakeDiscordPeer {
         wait_for_value(&self.saw_dave_transition, |ready| *ready).await
     }
 
+    pub async fn saw_unmatched_dave_transition(&self) -> bool {
+        *self.saw_unmatched_dave_transition.lock().await
+    }
+
     pub async fn saw_dave_prepare_epoch(&self) -> bool {
         wait_for_value(&self.saw_dave_prepare_epoch, |ready| *ready).await
     }
@@ -514,11 +556,12 @@ fn dave_welcome_message(
     external_sender: &DaveExternalSender,
     dave_scenario: DaveScenario,
     runtime_user_id: &str,
+    transition_id: u16,
     key_package: &[u8],
 ) -> Vec<u8> {
     let proposal_epoch = match dave_scenario {
         DaveScenario::Disabled => unreachable!("disabled DAVE scenario cannot emit welcome"),
-        DaveScenario::NewGroup => 0,
+        DaveScenario::NewGroup | DaveScenario::UnmatchedWelcome => 0,
         DaveScenario::EstablishedGroupJoin => 1,
     };
     let proposal = external_sender
@@ -526,7 +569,9 @@ fn dave_welcome_message(
         .expect("runtime proposal");
     let recognized_user_ids = match dave_scenario {
         DaveScenario::Disabled => unreachable!("disabled DAVE scenario cannot emit welcome"),
-        DaveScenario::NewGroup => vec![DAVE_CREATOR_USER_ID, runtime_user_id],
+        DaveScenario::NewGroup | DaveScenario::UnmatchedWelcome => {
+            vec![DAVE_CREATOR_USER_ID, runtime_user_id]
+        }
         DaveScenario::EstablishedGroupJoin => {
             vec![
                 DAVE_CREATOR_USER_ID,
@@ -548,7 +593,7 @@ fn dave_welcome_message(
     let mut message = Vec::with_capacity(5 + welcome.len());
     message.extend_from_slice(&sequence.to_be_bytes());
     message.push(30);
-    message.extend_from_slice(&DAVE_TRANSITION_ID.to_be_bytes());
+    message.extend_from_slice(&transition_id.to_be_bytes());
     message.extend_from_slice(&welcome);
     message
 }
