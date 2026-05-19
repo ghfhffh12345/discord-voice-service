@@ -136,33 +136,58 @@ impl VoiceSessionRuntime {
         }
 
         let mut queue = OpusFrameQueue::new(PLAYBACK_QUEUE_CAPACITY);
-        let selected_itag = {
+        let (selected_itag, mut source) = {
             let mut worker = playback.lock().await;
             let source = worker.prepare(&video_id, &mut queue).await?;
-            source.selected_itag()
+            let selected_itag = source.selected_itag();
+            (selected_itag, source)
         };
-
-        let mut position_ms = 0;
-        {
-            let mut voice = self.voice.lock().await;
-            let session = voice
-                .as_mut()
-                .ok_or(AppError::InvalidState("play requires active voice session"))?;
-            while let Some(frame) = queue.pop() {
-                position_ms += frame.duration_ms;
-                session.send_audio_frame(frame.data).await?;
-            }
-        }
 
         let playing_event = {
             let mut state = self.state.write().await;
             state.selected_itag = Some(selected_itag);
             state.queue_depth = queue.len();
-            state.position_ms = position_ms;
+            state.position_ms = 0;
             state.state = SessionState::Playing;
             SessionEventRecord::from_snapshot(SessionEventKind::Playing, &state)
         };
         self.events.emit(playing_event);
+
+        let mut position_ms = 0;
+        loop {
+            {
+                let mut voice = self.voice.lock().await;
+                let session = voice
+                    .as_mut()
+                    .ok_or(AppError::InvalidState("play requires active voice session"))?;
+                while let Some(frame) = queue.pop() {
+                    position_ms += frame.duration_ms;
+                    session.send_audio_frame(frame.data).await?;
+                }
+            }
+
+            {
+                let mut worker = playback.lock().await;
+                worker.fill_queue(&mut source, &mut queue).await?;
+            }
+
+            if queue.is_empty() {
+                break;
+            }
+        }
+
+        let track_ended_event = {
+            let mut state = self.state.write().await;
+            state.position_ms = position_ms;
+            let event = SessionEventRecord::from_snapshot(SessionEventKind::TrackEnded, &state);
+            state.current_video_id = None;
+            state.selected_itag = None;
+            state.queue_depth = 0;
+            state.position_ms = 0;
+            state.state = SessionState::VoiceReady;
+            event
+        };
+        self.events.emit(track_ended_event);
         Ok(())
     }
 

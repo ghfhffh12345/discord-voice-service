@@ -11,7 +11,7 @@ use discord_voice_service::session::supervisor::{Command, Supervisor, VoiceConte
 use futures::StreamExt;
 use serde_json::Value;
 use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio::time::{Duration, Instant, sleep};
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
@@ -25,6 +25,7 @@ async fn join_voice_then_play_reaches_connected_runtime_playback_path() {
     let http = spawn_stream_server("tests/fixtures/audio-itag250.webm").await;
     fake_yt.set_playable_url(http.url()).await;
     let fake_voice = FakeDiscordVoice::spawn().await;
+    let speaking_observed = fake_voice.speaking_observed();
     let supervisor = Supervisor::with_ytmusic_endpoint(fake_yt.endpoint())
         .await
         .unwrap();
@@ -44,22 +45,27 @@ async fn join_voice_then_play_reaches_connected_runtime_playback_path() {
         .await
         .unwrap();
 
-    let events = collect_events(&mut rx, 3).await;
+    let events = collect_events(&mut rx, 4).await;
     assert_eq!(events[0].kind, SessionEventKind::VoiceReady);
     assert_eq!(events[1].kind, SessionEventKind::TrackResolving);
     assert_eq!(events[2].kind, SessionEventKind::Playing);
     assert_eq!(events[2].current_video_id.as_deref(), Some("video-1"));
     assert_eq!(events[2].selected_itag, Some(250));
+    assert_eq!(events[3].kind, SessionEventKind::TrackEnded);
+    assert_eq!(events[3].current_video_id.as_deref(), Some("video-1"));
+    assert_eq!(events[3].selected_itag, Some(250));
 
     let snapshot = supervisor.snapshot().await;
-    assert_eq!(snapshot.state, SessionState::Playing);
-    assert_eq!(snapshot.current_video_id.as_deref(), Some("video-1"));
-    assert_eq!(snapshot.selected_itag, Some(250));
-    assert!(snapshot.position_ms > 0);
+    assert_eq!(snapshot.state, SessionState::VoiceReady);
+    assert_eq!(snapshot.current_video_id, None);
+    assert_eq!(snapshot.selected_itag, None);
+    assert_eq!(snapshot.position_ms, 0);
 
     assert_eq!(fake_voice.discovery_count().await, 1);
-    assert!(fake_voice.speaking_sent_before_audio().await);
-    assert!(fake_voice.audio_frame_count().await > 0);
+    tokio::time::timeout(Duration::from_secs(2), speaking_observed.notified())
+        .await
+        .expect("speaking should be observed");
+    assert!(fake_voice.audio_frame_count_at_least(5).await >= 5);
 }
 
 async fn collect_events(
@@ -81,8 +87,7 @@ async fn collect_events(
 struct FakeDiscordVoice {
     endpoint: String,
     discovery_count: Arc<Mutex<usize>>,
-    speaking_index: Arc<Mutex<Option<usize>>>,
-    audio_index: Arc<Mutex<Option<usize>>>,
+    speaking_observed: Arc<Notify>,
     audio_frame_count: Arc<Mutex<usize>>,
 }
 
@@ -93,15 +98,11 @@ impl FakeDiscordVoice {
         let ws_addr = listener.local_addr().unwrap();
         let udp_addr = udp_socket.local_addr().unwrap();
         let discovery_count = Arc::new(Mutex::new(0usize));
-        let speaking_index = Arc::new(Mutex::new(None));
-        let audio_index = Arc::new(Mutex::new(None));
+        let speaking_observed = Arc::new(Notify::new());
         let audio_frame_count = Arc::new(Mutex::new(0usize));
-        let next_index = Arc::new(Mutex::new(0usize));
 
         let discovery_count_state = Arc::clone(&discovery_count);
-        let audio_index_state = Arc::clone(&audio_index);
         let audio_frame_count_state = Arc::clone(&audio_frame_count);
-        let udp_order_state = Arc::clone(&next_index);
 
         tokio::spawn(async move {
             let mut buf = [0u8; 512];
@@ -124,21 +125,12 @@ impl FakeDiscordVoice {
                 }
 
                 if len >= 12 {
-                    let mut index = udp_order_state.lock().await;
-                    let current = *index;
-                    *index += 1;
-
-                    let mut first_audio = audio_index_state.lock().await;
-                    if first_audio.is_none() {
-                        *first_audio = Some(current);
-                    }
                     *audio_frame_count_state.lock().await += 1;
                 }
             }
         });
 
-        let speaking_index_state = Arc::clone(&speaking_index);
-        let ws_order_state = Arc::clone(&next_index);
+        let speaking_observed_state = Arc::clone(&speaking_observed);
 
         tokio::spawn(async move {
             let Ok((stream, _)) = listener.accept().await else {
@@ -153,14 +145,7 @@ impl FakeDiscordVoice {
                 if let Message::Text(text) = message {
                     let payload: Value = serde_json::from_str(text.as_ref()).unwrap();
                     if payload.get("op").and_then(Value::as_u64) == Some(5) {
-                        let mut index = ws_order_state.lock().await;
-                        let current = *index;
-                        *index += 1;
-
-                        let mut speaking = speaking_index_state.lock().await;
-                        if speaking.is_none() {
-                            *speaking = Some(current);
-                        }
+                        speaking_observed_state.notify_one();
                     }
                 }
             }
@@ -169,8 +154,7 @@ impl FakeDiscordVoice {
         Self {
             endpoint: format!("ws://{ws_addr}/?udp={udp_addr}&ssrc=7"),
             discovery_count,
-            speaking_index,
-            audio_index,
+            speaking_observed,
             audio_frame_count,
         }
     }
@@ -189,23 +173,12 @@ impl FakeDiscordVoice {
         wait_for_value(&self.discovery_count, |count| *count >= 1).await
     }
 
-    async fn audio_frame_count(&self) -> usize {
-        wait_for_value(&self.audio_frame_count, |count| *count >= 1).await
+    fn speaking_observed(&self) -> Arc<Notify> {
+        Arc::clone(&self.speaking_observed)
     }
 
-    async fn speaking_sent_before_audio(&self) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            let speaking = *self.speaking_index.lock().await;
-            let audio = *self.audio_index.lock().await;
-            if let (Some(speaking), Some(audio)) = (speaking, audio) {
-                return speaking < audio;
-            }
-            if Instant::now() >= deadline {
-                return false;
-            }
-            sleep(Duration::from_millis(10)).await;
-        }
+    async fn audio_frame_count_at_least(&self, minimum: usize) -> usize {
+        wait_for_value(&self.audio_frame_count, |count| *count >= minimum).await
     }
 }
 

@@ -58,6 +58,20 @@ impl PlaybackWorker {
         let mut source = self.recovery.recover(video_id, resume_position_ms).await?;
         self.position = source.shared_position();
 
+        self.fill_queue(&mut source, queue).await?;
+        if queue.is_empty() {
+            return Err(AppError::MediaParse("unexpected end of stream"));
+        }
+
+        self.current_video_id = Some(video_id.to_owned());
+        Ok(source)
+    }
+
+    pub async fn fill_queue(
+        &mut self,
+        source: &mut PlaybackSource,
+        queue: &mut OpusFrameQueue,
+    ) -> Result<(), AppError> {
         while queue.len() < self.prebuffer_target {
             if let Some(packet) = source.pending_packets_mut().pop_front() {
                 self.buffer_packet(queue, packet)?;
@@ -65,7 +79,7 @@ impl PlaybackWorker {
             }
 
             let Some(chunk) = source.stream_mut().read_chunk().await? else {
-                return Err(AppError::MediaParse("unexpected end of stream"));
+                break;
             };
 
             let packets = {
@@ -83,8 +97,7 @@ impl PlaybackWorker {
             }
         }
 
-        self.current_video_id = Some(video_id.to_owned());
-        Ok(source)
+        Ok(())
     }
 
     fn buffer_packet(
