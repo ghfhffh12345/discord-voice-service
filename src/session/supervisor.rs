@@ -3,9 +3,11 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 
 use crate::error::AppError;
+use crate::playback::worker::PlaybackWorker;
 use crate::session::events::SessionEventRecord;
 use crate::session::runtime::VoiceSessionRuntime;
 use crate::session::state::Snapshot;
+use crate::ytmusic::client::YtMusicClient;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VoiceContext {
@@ -37,6 +39,15 @@ impl Supervisor {
         Self {
             runtime: Arc::new(VoiceSessionRuntime::new()),
         }
+    }
+
+    pub async fn with_ytmusic_endpoint(endpoint: String) -> Result<Self, AppError> {
+        let client = YtMusicClient::connect(endpoint).await?;
+        Ok(Self {
+            runtime: Arc::new(VoiceSessionRuntime::with_playback_worker(
+                PlaybackWorker::new(client),
+            )),
+        })
     }
 
     pub async fn send(&self, command: Command) -> Result<(), AppError> {

@@ -1,7 +1,9 @@
+use bytes::Bytes;
 use tokio::net::lookup_host;
 
 use crate::discord_voice::gateway::VoiceGatewayClient;
 use crate::discord_voice::rollover::VoiceSessionRollover;
+use crate::discord_voice::speaking::send_speaking;
 use crate::discord_voice::udp::VoiceUdpTransport;
 use crate::error::AppError;
 use crate::session::supervisor::VoiceContext;
@@ -9,8 +11,10 @@ use crate::session::supervisor::VoiceContext;
 pub(crate) struct ConnectedVoiceSession {
     voice: VoiceContext,
     rollover: VoiceSessionRollover,
-    _gateway: Option<VoiceGatewayClient>,
-    _transport: Option<VoiceUdpTransport>,
+    gateway: Option<VoiceGatewayClient>,
+    transport: Option<VoiceUdpTransport>,
+    ssrc: Option<u32>,
+    speaking_started: bool,
 }
 
 impl ConnectedVoiceSession {
@@ -18,8 +22,10 @@ impl ConnectedVoiceSession {
         Self {
             voice,
             rollover: VoiceSessionRollover::default(),
-            _gateway: None,
-            _transport: None,
+            gateway: None,
+            transport: None,
+            ssrc: None,
+            speaking_started: false,
         }
     }
 
@@ -29,10 +35,12 @@ impl ConnectedVoiceSession {
         };
 
         Ok(Self {
-            _gateway: Some(VoiceGatewayClient::connect(&voice.endpoint).await?),
-            _transport: Some(VoiceUdpTransport::connect(udp_target, ssrc).await?),
+            gateway: Some(VoiceGatewayClient::connect(&voice.endpoint).await?),
+            transport: Some(VoiceUdpTransport::connect(udp_target, ssrc).await?),
             voice,
             rollover: VoiceSessionRollover::default(),
+            ssrc: Some(ssrc),
+            speaking_started: false,
         })
     }
 
@@ -46,6 +54,30 @@ impl ConnectedVoiceSession {
 
     pub(crate) fn rollover_mut(&mut self) -> &mut VoiceSessionRollover {
         &mut self.rollover
+    }
+
+    pub(crate) fn is_connected(&self) -> bool {
+        self.gateway.is_some() && self.transport.is_some() && self.ssrc.is_some()
+    }
+
+    pub(crate) async fn send_audio_frame(&mut self, frame: Bytes) -> Result<(), AppError> {
+        if !self.speaking_started {
+            let gateway = self
+                .gateway
+                .as_mut()
+                .ok_or(AppError::InvalidState("voice gateway unavailable"))?;
+            let ssrc = self
+                .ssrc
+                .ok_or(AppError::InvalidState("voice ssrc unavailable"))?;
+            send_speaking(gateway, ssrc).await?;
+            self.speaking_started = true;
+        }
+
+        let transport = self
+            .transport
+            .as_mut()
+            .ok_or(AppError::InvalidState("voice transport unavailable"))?;
+        transport.send_audio_frame(frame).await
     }
 }
 

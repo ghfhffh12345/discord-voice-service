@@ -22,7 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let readiness = Readiness::global();
     readiness.mark_runtime_booted().await;
 
-    let supervisor = Supervisor::new();
+    let supervisor = Supervisor::with_ytmusic_endpoint(settings.ytmusic_addr.clone()).await?;
     let control_service = ControlService {
         supervisor,
         readiness: readiness.clone(),

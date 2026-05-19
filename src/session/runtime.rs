@@ -2,6 +2,8 @@ use tokio::sync::{Mutex, RwLock, broadcast};
 
 use crate::discord_voice::session::ConnectedVoiceSession;
 use crate::error::AppError;
+use crate::media::opus_queue::OpusFrameQueue;
+use crate::playback::worker::PlaybackWorker;
 use crate::session::events::{EventBus, SessionEventKind, SessionEventRecord};
 use crate::session::readiness::{
     ensure_active_voice_session, ensure_joinable_session, ensure_pauseable_track,
@@ -10,10 +12,13 @@ use crate::session::readiness::{
 use crate::session::state::{SessionState, Snapshot};
 use crate::session::supervisor::{Command, VoiceContext};
 
+const PLAYBACK_QUEUE_CAPACITY: usize = 32;
+
 pub struct VoiceSessionRuntime {
     state: RwLock<Snapshot>,
     events: EventBus,
     voice: Mutex<Option<ConnectedVoiceSession>>,
+    playback: Option<Mutex<PlaybackWorker>>,
 }
 
 impl VoiceSessionRuntime {
@@ -22,6 +27,16 @@ impl VoiceSessionRuntime {
             state: RwLock::new(Snapshot::default()),
             events: EventBus::new(64),
             voice: Mutex::new(None),
+            playback: None,
+        }
+    }
+
+    pub fn with_playback_worker(worker: PlaybackWorker) -> Self {
+        Self {
+            state: RwLock::new(Snapshot::default()),
+            events: EventBus::new(64),
+            voice: Mutex::new(None),
+            playback: Some(Mutex::new(worker)),
         }
     }
 
@@ -54,11 +69,14 @@ impl VoiceSessionRuntime {
     }
 
     async fn join_voice(&self, voice: VoiceContext) -> Result<(), AppError> {
+        {
+            let state = self.state.read().await;
+            ensure_joinable_session(&state)?;
+        }
+
+        let session = ConnectedVoiceSession::connect(voice).await?;
         let event = {
             let mut state = self.state.write().await;
-            ensure_joinable_session(&state)?;
-
-            let session = ConnectedVoiceSession::new(voice);
             apply_voice_context(&mut state, session.voice_context());
             apply_rollover_state(&mut state, &session);
             state.current_video_id = None;
@@ -66,10 +84,19 @@ impl VoiceSessionRuntime {
             state.queue_depth = 0;
             state.position_ms = 0;
             state.last_reason = None;
-            state.state = SessionState::ConnectingVoice;
+            state.state = if session.is_connected() {
+                SessionState::VoiceReady
+            } else {
+                SessionState::ConnectingVoice
+            };
 
             *self.voice.lock().await = Some(session);
-            SessionEventRecord::from_snapshot(SessionEventKind::VoiceConnecting, &state)
+            let kind = if matches!(state.state, SessionState::VoiceReady) {
+                SessionEventKind::VoiceReady
+            } else {
+                SessionEventKind::VoiceConnecting
+            };
+            SessionEventRecord::from_snapshot(kind, &state)
         };
 
         self.events.emit(event);
@@ -81,17 +108,61 @@ impl VoiceSessionRuntime {
     }
 
     async fn play(&self, video_id: String) -> Result<(), AppError> {
-        let event = {
+        let resolving_event = {
             let mut state = self.state.write().await;
             ensure_active_voice_session(&state, "play")?;
-            state.current_video_id = Some(video_id);
+            state.current_video_id = Some(video_id.clone());
             state.selected_itag = None;
+            state.queue_depth = 0;
             state.position_ms = 0;
             state.state = SessionState::ResolvingTrack;
             SessionEventRecord::from_snapshot(SessionEventKind::TrackResolving, &state)
         };
+        self.events.emit(resolving_event);
 
-        self.events.emit(event);
+        let Some(playback) = &self.playback else {
+            return Ok(());
+        };
+
+        let voice_connected = self
+            .voice
+            .lock()
+            .await
+            .as_ref()
+            .map(ConnectedVoiceSession::is_connected)
+            .unwrap_or(false);
+        if !voice_connected {
+            return Ok(());
+        }
+
+        let mut queue = OpusFrameQueue::new(PLAYBACK_QUEUE_CAPACITY);
+        let selected_itag = {
+            let mut worker = playback.lock().await;
+            let source = worker.prepare(&video_id, &mut queue).await?;
+            source.selected_itag()
+        };
+
+        let mut position_ms = 0;
+        {
+            let mut voice = self.voice.lock().await;
+            let session = voice
+                .as_mut()
+                .ok_or(AppError::InvalidState("play requires active voice session"))?;
+            while let Some(frame) = queue.pop() {
+                position_ms += frame.duration_ms;
+                session.send_audio_frame(frame.data).await?;
+            }
+        }
+
+        let playing_event = {
+            let mut state = self.state.write().await;
+            state.selected_itag = Some(selected_itag);
+            state.queue_depth = queue.len();
+            state.position_ms = position_ms;
+            state.state = SessionState::Playing;
+            SessionEventRecord::from_snapshot(SessionEventKind::Playing, &state)
+        };
+        self.events.emit(playing_event);
         Ok(())
     }
 
