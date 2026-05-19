@@ -6,3 +6,4 @@ AGENTS.md
 /target
 /tmp
 browser.json
+.env
