@@ -107,9 +107,11 @@ async fn wait_for_sync_value<T: Clone>(slot: &Arc<StdMutex<Option<T>>>) -> Optio
 #[tokio::test]
 async fn voice_gateway_v8_heartbeat_and_resume_include_seq_ack() {
     let fake = FakeVoiceGateway::spawn().await;
-    let mut client = VoiceGatewayClient::connect(fake.url()).await.unwrap();
+    let client = VoiceGatewayClient::connect(fake.url()).await.unwrap();
 
-    client.apply_gateway_event(&GatewayEvent::new(Some(42)));
+    client
+        .apply_gateway_event(&GatewayEvent::new(Some(42)))
+        .await;
     client.send_heartbeat().await.unwrap();
     client
         .send_resume("server-id", "session-id", "token")
@@ -127,7 +129,7 @@ async fn voice_gateway_v8_heartbeat_and_resume_include_seq_ack() {
 #[tokio::test]
 async fn voice_gateway_v8_encodes_missing_seq_ack_as_minus_one() {
     let fake = FakeVoiceGateway::spawn().await;
-    let mut client = VoiceGatewayClient::connect(fake.url()).await.unwrap();
+    let client = VoiceGatewayClient::connect(fake.url()).await.unwrap();
 
     client.send_heartbeat().await.unwrap();
     client

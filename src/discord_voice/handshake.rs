@@ -4,7 +4,7 @@ use tokio::net::lookup_host;
 use tokio::time::{Duration, timeout};
 
 use crate::discord_voice::gateway::VoiceGatewayClient;
-use crate::discord_voice::protocol::{self, Ready, SessionDescription, VoiceGatewayEvent};
+use crate::discord_voice::protocol::{self, Hello, Ready, SessionDescription, VoiceGatewayEvent};
 use crate::discord_voice::udp::{DiscoveredUdpAddress, VoiceUdpTransport};
 use crate::error::AppError;
 use crate::session::supervisor::VoiceContext;
@@ -15,6 +15,7 @@ pub struct VoiceHandshakeResult {
     pub gateway: VoiceGatewayClient,
     pub transport: VoiceUdpTransport,
     pub ssrc: u32,
+    pub heartbeat_interval_ms: u64,
     pub session_description: SessionDescription,
 }
 
@@ -23,13 +24,13 @@ pub async fn connect(voice: &VoiceContext) -> Result<Option<VoiceHandshakeResult
         return Ok(None);
     };
 
-    let mut gateway = timeout(HANDSHAKE_TIMEOUT, VoiceGatewayClient::connect(&gateway_url))
+    let gateway = timeout(HANDSHAKE_TIMEOUT, VoiceGatewayClient::connect(&gateway_url))
         .await
         .map_err(|_| AppError::InvalidState("voice gateway connect timed out"))??;
-    expect_hello(&mut gateway).await?;
+    let hello = expect_hello(&gateway).await?;
     gateway.send_identify(voice).await?;
 
-    let ready = expect_ready(&mut gateway).await?;
+    let ready = expect_ready(&gateway).await?;
     let mode = protocol::choose_encryption_mode(&ready)?.to_owned();
     let udp_target = resolve_udp_target(&ready).await?;
     let transport = VoiceUdpTransport::connect(udp_target, ready.ssrc).await?;
@@ -39,12 +40,13 @@ pub async fn connect(voice: &VoiceContext) -> Result<Option<VoiceHandshakeResult
     };
 
     gateway.send_select_protocol(&discovered, &mode).await?;
-    let session_description = expect_session_description(&mut gateway).await?;
+    let session_description = expect_session_description(&gateway).await?;
 
     Ok(Some(VoiceHandshakeResult {
         gateway,
         transport,
         ssrc: ready.ssrc,
+        heartbeat_interval_ms: hello.heartbeat_interval_ms,
         session_description,
     }))
 }
@@ -54,19 +56,19 @@ pub async fn resume(voice: &VoiceContext, seq_ack: Option<u64>) -> Result<(), Ap
         return Err(AppError::InvalidState("voice endpoint invalid for resume"));
     };
 
-    let mut gateway = timeout(HANDSHAKE_TIMEOUT, VoiceGatewayClient::connect(&gateway_url))
+    let gateway = timeout(HANDSHAKE_TIMEOUT, VoiceGatewayClient::connect(&gateway_url))
         .await
         .map_err(|_| AppError::InvalidState("voice gateway connect timed out"))??;
-    expect_hello(&mut gateway).await?;
+    expect_hello(&gateway).await?;
 
     if let Some(seq_ack) = seq_ack {
-        gateway.record_seq_ack(seq_ack);
+        gateway.record_seq_ack(seq_ack).await;
     }
     gateway
         .send_resume(&voice.guild_id, &voice.session_id, &voice.token)
         .await?;
 
-    match next_event(&mut gateway).await?.into_event() {
+    match next_event(&gateway).await?.into_event() {
         VoiceGatewayEvent::Resumed => Ok(()),
         _ => Err(AppError::InvalidState("voice handshake resume rejected")),
     }
@@ -153,14 +155,14 @@ fn is_local_ip(ip: IpAddr) -> bool {
     }
 }
 
-async fn expect_hello(gateway: &mut VoiceGatewayClient) -> Result<(), AppError> {
+async fn expect_hello(gateway: &VoiceGatewayClient) -> Result<Hello, AppError> {
     match next_event(gateway).await?.into_event() {
-        VoiceGatewayEvent::Hello(_) => Ok(()),
+        VoiceGatewayEvent::Hello(hello) => Ok(hello),
         _ => Err(AppError::InvalidState("voice handshake hello missing")),
     }
 }
 
-async fn expect_ready(gateway: &mut VoiceGatewayClient) -> Result<Ready, AppError> {
+async fn expect_ready(gateway: &VoiceGatewayClient) -> Result<Ready, AppError> {
     match next_event(gateway).await?.into_event() {
         VoiceGatewayEvent::Ready(ready) => Ok(ready),
         _ => Err(AppError::InvalidState("voice handshake ready missing")),
@@ -168,7 +170,7 @@ async fn expect_ready(gateway: &mut VoiceGatewayClient) -> Result<Ready, AppErro
 }
 
 async fn expect_session_description(
-    gateway: &mut VoiceGatewayClient,
+    gateway: &VoiceGatewayClient,
 ) -> Result<SessionDescription, AppError> {
     match next_event(gateway).await?.into_event() {
         VoiceGatewayEvent::SessionDescription(description) => Ok(description),
@@ -179,7 +181,7 @@ async fn expect_session_description(
 }
 
 async fn next_event(
-    gateway: &mut VoiceGatewayClient,
+    gateway: &VoiceGatewayClient,
 ) -> Result<protocol::VoiceGatewayPayload, AppError> {
     timeout(HANDSHAKE_TIMEOUT, gateway.receive_event())
         .await

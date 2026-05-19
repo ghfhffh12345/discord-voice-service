@@ -19,6 +19,7 @@ pub struct FakeDiscordPeer {
     discovery_count: Arc<Mutex<usize>>,
     speaking_observed: Arc<Notify>,
     audio_frame_count: Arc<Mutex<usize>>,
+    heartbeat_count: Arc<Mutex<usize>>,
     saw_identify: Arc<Mutex<bool>>,
     saw_resume: Arc<Mutex<bool>>,
     saw_select_protocol: Arc<Mutex<bool>>,
@@ -33,6 +34,11 @@ impl FakeDiscordPeer {
 
     #[allow(clippy::result_large_err)]
     pub async fn spawn_real_shape() -> Self {
+        Self::spawn_real_shape_with_heartbeat_interval(1_000).await
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn spawn_real_shape_with_heartbeat_interval(heartbeat_interval_ms: u64) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let udp_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let ws_addr = listener.local_addr().unwrap();
@@ -41,6 +47,7 @@ impl FakeDiscordPeer {
         let discovery_count = Arc::new(Mutex::new(0usize));
         let speaking_observed = Arc::new(Notify::new());
         let audio_frame_count = Arc::new(Mutex::new(0usize));
+        let heartbeat_count = Arc::new(Mutex::new(0usize));
         let saw_identify = Arc::new(Mutex::new(false));
         let saw_resume = Arc::new(Mutex::new(false));
         let saw_select_protocol = Arc::new(Mutex::new(false));
@@ -76,6 +83,7 @@ impl FakeDiscordPeer {
 
         let gateway_path_state = Arc::clone(&gateway_path);
         let speaking_observed_state = Arc::clone(&speaking_observed);
+        let heartbeat_count_state = Arc::clone(&heartbeat_count);
         let saw_identify_state = Arc::clone(&saw_identify);
         let saw_resume_state = Arc::clone(&saw_resume);
         let saw_select_protocol_state = Arc::clone(&saw_select_protocol);
@@ -94,7 +102,7 @@ impl FakeDiscordPeer {
             ws.send(Message::Text(
                 json!({
                     "op": 8,
-                    "d": { "heartbeat_interval": 1_000 }
+                    "d": { "heartbeat_interval": heartbeat_interval_ms }
                 })
                 .to_string()
                 .into(),
@@ -182,6 +190,7 @@ impl FakeDiscordPeer {
                             .unwrap();
                         }
                         Some(5) => speaking_observed_state.notify_one(),
+                        Some(3) => *heartbeat_count_state.lock().await += 1,
                         _ => {}
                     }
                 }
@@ -194,6 +203,7 @@ impl FakeDiscordPeer {
             discovery_count,
             speaking_observed,
             audio_frame_count,
+            heartbeat_count,
             saw_identify,
             saw_resume,
             saw_select_protocol,
@@ -237,6 +247,10 @@ impl FakeDiscordPeer {
 
     pub async fn audio_frame_count_at_least(&self, minimum: usize) -> usize {
         wait_for_value(&self.audio_frame_count, |count| *count >= minimum).await
+    }
+
+    pub async fn heartbeat_count_at_least(&self, minimum: usize) -> usize {
+        wait_for_value(&self.heartbeat_count, |count| *count >= minimum).await
     }
 
     pub async fn saw_identify(&self) -> bool {

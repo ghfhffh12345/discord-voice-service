@@ -1,4 +1,6 @@
 use bytes::Bytes;
+use tokio::sync::oneshot;
+use tokio::time::{Duration, sleep};
 
 use crate::discord_voice::gateway::VoiceGatewayClient;
 use crate::discord_voice::handshake;
@@ -16,6 +18,7 @@ pub struct ConnectedVoiceSession {
     transport: Option<VoiceUdpTransport>,
     ssrc: Option<u32>,
     session_description: Option<SessionDescription>,
+    heartbeat_shutdown: Option<oneshot::Sender<()>>,
     speaking_started: bool,
 }
 
@@ -28,6 +31,7 @@ impl ConnectedVoiceSession {
             transport: None,
             ssrc: None,
             session_description: None,
+            heartbeat_shutdown: None,
             speaking_started: false,
         }
     }
@@ -37,6 +41,9 @@ impl ConnectedVoiceSession {
             return Ok(Self::new(voice));
         };
 
+        let heartbeat_shutdown =
+            spawn_heartbeat_task(result.gateway.clone(), result.heartbeat_interval_ms);
+
         Ok(Self {
             gateway: Some(result.gateway),
             transport: Some(result.transport),
@@ -44,6 +51,7 @@ impl ConnectedVoiceSession {
             rollover: VoiceSessionRollover::default(),
             ssrc: Some(result.ssrc),
             session_description: Some(result.session_description),
+            heartbeat_shutdown: Some(heartbeat_shutdown),
             speaking_started: false,
         })
     }
@@ -71,7 +79,7 @@ impl ConnectedVoiceSession {
         if !self.speaking_started {
             let gateway = self
                 .gateway
-                .as_mut()
+                .as_ref()
                 .ok_or(AppError::InvalidState("voice gateway unavailable"))?;
             let ssrc = self
                 .ssrc
@@ -86,4 +94,34 @@ impl ConnectedVoiceSession {
             .ok_or(AppError::InvalidState("voice transport unavailable"))?;
         transport.send_audio_frame(frame).await
     }
+}
+
+impl Drop for ConnectedVoiceSession {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.heartbeat_shutdown.take() {
+            let _ = shutdown.send(());
+        }
+    }
+}
+
+fn spawn_heartbeat_task(
+    gateway: VoiceGatewayClient,
+    heartbeat_interval_ms: u64,
+) -> oneshot::Sender<()> {
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+    let interval = Duration::from_millis(heartbeat_interval_ms.max(1));
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                _ = sleep(interval) => {
+                    if gateway.send_heartbeat().await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    shutdown_tx
 }

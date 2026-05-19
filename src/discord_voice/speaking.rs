@@ -7,7 +7,7 @@ use crate::error::AppError;
 
 pub const OPUS_SILENCE_FRAME: [u8; 3] = [0xF8, 0xFF, 0xFE];
 
-pub async fn send_speaking(gateway: &mut VoiceGatewayClient, ssrc: u32) -> Result<(), AppError> {
+pub async fn send_speaking(gateway: &VoiceGatewayClient, ssrc: u32) -> Result<(), AppError> {
     gateway
         .send_json(json!({
             "op": 5,

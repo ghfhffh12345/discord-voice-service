@@ -40,6 +40,10 @@ fn generated_control_messages_expose_expected_fields() {
 fn control_proto_exposes_update_voice_context_and_reason_codes() {
     let proto = std::fs::read_to_string("proto/discordvoice/v1/control.proto").unwrap();
     assert!(proto.contains("rpc UpdateVoiceContext"));
+    assert!(proto.contains("string session_id = 3;"));
+    assert!(proto.contains("string endpoint = 4;"));
+    assert!(proto.contains("string token = 5;"));
+    assert!(proto.contains("string user_id = 6;"));
     assert!(proto.contains("enum SessionEventReason"));
     assert!(proto.contains("SessionEventReason reason = 8;"));
     assert!(proto.contains("VOICE_RECONNECTING"));
