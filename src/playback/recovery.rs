@@ -95,7 +95,7 @@ impl PlaybackRecovery {
             demux.push_bytes(chunk);
             for packet in demux.drain_packets()? {
                 position.record_buffered(&packet);
-                if packet_end_ms(&packet) >= position_ms {
+                if packet_end_ms(&packet) > position_ms {
                     pending_packets.push_back(packet);
                 }
             }

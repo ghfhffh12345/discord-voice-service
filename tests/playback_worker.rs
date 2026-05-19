@@ -12,7 +12,7 @@ use discord_voice_service::ytmusic::client::YtMusicClient;
 use discord_voice_service::ytmusic::v1::SongStreamFormat;
 
 use self::fake_ytmusic::FakeYtMusic;
-use self::fixtures::spawn_stream_server;
+use self::fixtures::{spawn_status_server, spawn_stream_server};
 
 fn stream_format(
     itag: u32,
@@ -87,8 +87,9 @@ async fn prepare_buffers_real_packets_and_returns_selected_itag() {
 async fn prepare_reruns_resolution_when_initial_playable_url_is_stale() {
     let fake = FakeYtMusic::spawn().await;
     let http = spawn_stream_server("tests/fixtures/audio-itag250.webm").await;
+    let expired = spawn_status_server("HTTP/1.1 403 Forbidden").await;
     fake.set_playable_url(http.url()).await;
-    fake.fail_first_url_once().await;
+    fake.set_first_playable_url_once(expired.url()).await;
 
     let mut worker = PlaybackWorker::new(
         YtMusicClient::connect(fake.endpoint())
@@ -137,8 +138,6 @@ async fn prepare_preserves_current_track_position_when_recovering_same_video() {
         first_packet.duration_ms
     );
 
-    fake.fail_first_url_once().await;
-
     let mut recovery_queue = OpusFrameQueue::new(32);
     let recovered = worker
         .prepare("video-1", &mut recovery_queue)
@@ -151,6 +150,16 @@ async fn prepare_preserves_current_track_position_when_recovering_same_video() {
     );
     assert!(recovery_queue.len() > 0);
     assert!(recovered.position().timestamp_ms() >= first_packet.duration_ms);
+
+    let expected_next_packet = first_queue
+        .pop()
+        .expect("first queue should still contain the next packet");
+    let recovered_first_packet = recovery_queue
+        .pop()
+        .expect("recovery queue should contain the next packet");
+
+    assert_eq!(recovered_first_packet, expected_next_packet);
+    assert_ne!(recovered_first_packet, first_packet);
 }
 
 #[tokio::test]
