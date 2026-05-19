@@ -4,6 +4,7 @@ use bytes::Bytes;
 use tokio::net::UdpSocket;
 
 use crate::discord_voice::discovery::discover_ip;
+use crate::discord_voice::protection::ProtectionContext;
 use crate::discord_voice::rtp::{RtpPacketBuilder, RtpSequenceState};
 use crate::error::AppError;
 
@@ -19,6 +20,7 @@ pub struct VoiceUdpTransport {
     packet_builder: RtpPacketBuilder,
     sequence: RtpSequenceState,
     local_addr: SocketAddr,
+    protection: Option<ProtectionContext>,
 }
 
 impl VoiceUdpTransport {
@@ -45,7 +47,23 @@ impl VoiceUdpTransport {
             packet_builder: RtpPacketBuilder::new(ssrc),
             sequence: RtpSequenceState::new(),
             local_addr,
+            protection: None,
         })
+    }
+
+    pub async fn connect_protected(
+        server: SocketAddr,
+        ssrc: u32,
+        protection: ProtectionContext,
+    ) -> Result<Self, AppError> {
+        Ok(Self::connect(server, ssrc)
+            .await?
+            .with_protection(protection))
+    }
+
+    pub fn with_protection(mut self, protection: ProtectionContext) -> Self {
+        self.protection = Some(protection);
+        self
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -54,9 +72,15 @@ impl VoiceUdpTransport {
 
     pub async fn send_audio_frame(&mut self, frame: Bytes) -> Result<(), AppError> {
         let (sequence, timestamp) = self.sequence.advance();
-        let packet = self
-            .packet_builder
-            .build(sequence, timestamp, frame.as_ref());
+        let rtp_header = self.packet_builder.build_header(sequence, timestamp);
+        let packet = match &self.protection {
+            Some(protection) => protection.protect_packet(&rtp_header, frame.as_ref())?,
+            None => {
+                let mut packet = rtp_header;
+                packet.extend_from_slice(frame.as_ref());
+                packet
+            }
+        };
         self.socket.send_to(&packet, self.server).await?;
         Ok(())
     }

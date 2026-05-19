@@ -16,6 +16,18 @@ impl EncryptionMode {
     }
 }
 
+impl std::str::FromStr for EncryptionMode {
+    type Err = crate::error::AppError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            PREFERRED_MODE => Ok(Self::AeadAes256GcmRtpsize),
+            REQUIRED_MODE => Ok(Self::AeadXChaCha20Poly1305Rtpsize),
+            _ => Err(crate::error::AppError::UnsupportedEncryptionMode),
+        }
+    }
+}
+
 pub fn choose_mode(modes: &[String]) -> Result<EncryptionMode, crate::error::AppError> {
     if modes.iter().any(|mode| mode == PREFERRED_MODE) {
         Ok(EncryptionMode::AeadAes256GcmRtpsize)

@@ -4,6 +4,7 @@ pub(crate) mod dave_ffi;
 pub mod discovery;
 pub mod gateway;
 pub mod handshake;
+pub mod protection;
 pub mod protocol;
 pub mod resume;
 pub(crate) mod rollover;

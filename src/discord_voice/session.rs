@@ -4,6 +4,7 @@ use tokio::time::{Duration, sleep};
 
 use crate::discord_voice::gateway::VoiceGatewayClient;
 use crate::discord_voice::handshake;
+use crate::discord_voice::protection::ProtectionContext;
 use crate::discord_voice::protocol::SessionDescription;
 use crate::discord_voice::rollover::VoiceSessionRollover;
 use crate::discord_voice::speaking::send_speaking;
@@ -40,17 +41,25 @@ impl ConnectedVoiceSession {
         let Some(result) = handshake::connect(&voice).await? else {
             return Ok(Self::new(voice));
         };
+        let handshake::VoiceHandshakeResult {
+            gateway,
+            transport,
+            ssrc,
+            heartbeat_interval_ms,
+            session_description,
+        } = result;
+        let transport =
+            transport.with_protection(ProtectionContext::from_session(&session_description)?);
 
-        let heartbeat_shutdown =
-            spawn_heartbeat_task(result.gateway.clone(), result.heartbeat_interval_ms);
+        let heartbeat_shutdown = spawn_heartbeat_task(gateway.clone(), heartbeat_interval_ms);
 
         Ok(Self {
-            gateway: Some(result.gateway),
-            transport: Some(result.transport),
+            gateway: Some(gateway),
+            transport: Some(transport),
             voice,
             rollover: VoiceSessionRollover::default(),
-            ssrc: Some(result.ssrc),
-            session_description: Some(result.session_description),
+            ssrc: Some(ssrc),
+            session_description: Some(session_description),
             heartbeat_shutdown: Some(heartbeat_shutdown),
             speaking_started: false,
         })
