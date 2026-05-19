@@ -5,7 +5,7 @@ mod fixtures;
 
 use bytes::Bytes;
 use discord_voice_service::error::AppError;
-use discord_voice_service::media::opus_queue::OpusFrameQueue;
+use discord_voice_service::media::opus_queue::{OpusFrame, OpusFrameQueue};
 use discord_voice_service::playback::worker::PlaybackPlan;
 use discord_voice_service::playback::worker::PlaybackWorker;
 use discord_voice_service::ytmusic::client::YtMusicClient;
@@ -66,16 +66,21 @@ async fn prepare_buffers_real_packets_and_returns_selected_itag() {
         .expect("source should be prepared");
 
     assert_eq!(source.selected_itag(), 250);
+    assert!(source.position().byte_offset() > 0);
     assert!(source.position().timestamp_ms() > 0);
     assert_eq!(source.position().sent_duration_ms(), 0);
 
-    source.record_sent_packet(20);
-    assert_eq!(source.position().sent_duration_ms(), 20);
-
     assert!(queue.len() > 0);
+    let first_packet = queue.pop().expect("queue should contain a packet");
     assert_ne!(
-        queue.pop(),
-        Some(Bytes::from_static(b"prefetched-opus-frame"))
+        first_packet.data,
+        Bytes::from_static(b"prefetched-opus-frame")
+    );
+
+    source.record_sent_packet(first_packet.duration_ms);
+    assert_eq!(
+        source.position().sent_duration_ms(),
+        first_packet.duration_ms
     );
 }
 
@@ -107,12 +112,15 @@ async fn prepare_rejects_full_queue() {
     );
     let mut queue = OpusFrameQueue::new(1);
     queue
-        .push(Bytes::from_static(b"existing-frame"))
+        .push(OpusFrame::new(Bytes::from_static(b"existing-frame"), 20))
         .expect("queue should accept the initial frame");
 
     let result = worker.prepare("video-1", &mut queue).await;
 
     assert!(matches!(result, Err(AppError::BufferFull)));
     assert_eq!(queue.len(), 1);
-    assert_eq!(queue.pop(), Some(Bytes::from_static(b"existing-frame")));
+    assert_eq!(
+        queue.pop(),
+        Some(OpusFrame::new(Bytes::from_static(b"existing-frame"), 20))
+    );
 }

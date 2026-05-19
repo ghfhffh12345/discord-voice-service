@@ -2,10 +2,22 @@ use std::collections::VecDeque;
 
 use bytes::Bytes;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpusFrame {
+    pub data: Bytes,
+    pub duration_ms: u64,
+}
+
+impl OpusFrame {
+    pub fn new(data: Bytes, duration_ms: u64) -> Self {
+        Self { data, duration_ms }
+    }
+}
+
 #[derive(Debug)]
 pub struct OpusFrameQueue {
     capacity: usize,
-    inner: VecDeque<Bytes>,
+    inner: VecDeque<OpusFrame>,
 }
 
 impl OpusFrameQueue {
@@ -16,7 +28,7 @@ impl OpusFrameQueue {
         }
     }
 
-    pub fn push(&mut self, frame: Bytes) -> Result<(), Bytes> {
+    pub fn push(&mut self, frame: OpusFrame) -> Result<(), OpusFrame> {
         if self.inner.len() >= self.capacity {
             return Err(frame);
         }
@@ -25,7 +37,7 @@ impl OpusFrameQueue {
         Ok(())
     }
 
-    pub fn pop(&mut self) -> Option<Bytes> {
+    pub fn pop(&mut self) -> Option<OpusFrame> {
         self.inner.pop_front()
     }
 

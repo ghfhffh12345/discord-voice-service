@@ -39,14 +39,16 @@ impl PlaybackSource {
     }
 
     pub fn position(&self) -> PlaybackPosition {
-        self.position
+        self.live_position()
     }
 
     pub fn position_mut(&mut self) -> &mut PlaybackPosition {
+        self.sync_position();
         &mut self.position
     }
 
     pub fn record_sent_packet(&mut self, duration_ms: u64) {
+        self.sync_position();
         self.position.record_sent_packet(duration_ms);
     }
 
@@ -60,5 +62,16 @@ impl PlaybackSource {
 
     pub fn pending_packets_mut(&mut self) -> &mut VecDeque<DemuxedPacket> {
         &mut self.pending_packets
+    }
+
+    fn live_position(&self) -> PlaybackPosition {
+        let mut position = self.position;
+        position.set_byte_offset(self.stream.position().byte_offset());
+        position
+    }
+
+    fn sync_position(&mut self) {
+        self.position
+            .set_byte_offset(self.stream.position().byte_offset());
     }
 }

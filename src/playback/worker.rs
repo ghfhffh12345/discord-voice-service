@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 
 use crate::error::AppError;
 use crate::media::http_stream::HttpOpusStream;
-use crate::media::opus_queue::OpusFrameQueue;
+use crate::media::opus_queue::{OpusFrame, OpusFrameQueue};
 use crate::media::position::PlaybackPosition;
 use crate::media::webm_demux::WebmOpusDemux;
 use crate::playback::source::PlaybackSource;
@@ -63,10 +63,9 @@ impl PlaybackWorker {
             demux.push_bytes(chunk);
             for packet in demux.drain_packets()? {
                 self.position.record_buffered(&packet);
+                let frame = OpusFrame::new(packet.data.clone(), packet.duration_ms);
                 if queue.len() < self.prebuffer_target {
-                    queue
-                        .push(packet.data.clone())
-                        .map_err(|_| AppError::BufferFull)?;
+                    queue.push(frame).map_err(|_| AppError::BufferFull)?;
                 } else {
                     pending_packets.push_back(packet);
                 }
