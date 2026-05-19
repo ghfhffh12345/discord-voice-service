@@ -6,12 +6,14 @@ build = "build.rs"
 
 [dependencies]
 aes-gcm = "0.10.3"
+anyhow = "1"
 bytes = "1"
 chacha20poly1305 = "0.10.1"
 futures = "0.3"
 http = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "stream"] }
 prost = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
@@ -22,6 +24,10 @@ tonic = { version = "0.12", features = ["transport"] }
 tonic-health = "0.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+twilight-gateway = "0.17.1"
+twilight-http = "0.17.1"
+twilight-model = "0.17.1"
+twilight-util = "0.17.0"
 webm-iterable = "0.6.4"
 
 [build-dependencies]
