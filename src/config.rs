@@ -1,4 +1,4 @@
-use std::{collections::HashMap, env::VarError, net::SocketAddr};
+use std::{collections::HashMap, env::VarError, net::SocketAddr, time::Duration};
 
 use crate::error::AppError;
 
@@ -23,6 +23,14 @@ impl Settings {
             .map(|(k, v)| (k.to_owned(), v.to_owned()))
             .collect::<HashMap<_, _>>();
         Self::from_map(&env)
+    }
+
+    pub fn ytmusic_probe_interval(&self) -> Duration {
+        Duration::from_secs(15)
+    }
+
+    pub fn ytmusic_probe_timeout(&self) -> Duration {
+        Duration::from_secs(3)
     }
 
     fn from_values(listen_addr: &str, ytmusic_addr: &str) -> Result<Self, AppError> {

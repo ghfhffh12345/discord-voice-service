@@ -13,6 +13,7 @@ use crate::proto::discordvoice::v1::{
 };
 use crate::session::state::SessionState;
 use crate::session::supervisor::{Command, Supervisor, VoiceContext};
+use crate::{observability, session::readiness::Readiness};
 
 pub fn map_play_request(request: PlayRequest) -> String {
     request.video_id
@@ -31,17 +32,20 @@ impl DiscordVoiceControl for ControlService {
         &self,
         request: Request<JoinVoiceRequest>,
     ) -> Result<Response<JoinVoiceResponse>, Status> {
-        self.supervisor
-            .send(Command::JoinVoice {
-                voice: map_voice_context(
-                    request
-                        .into_inner()
-                        .voice
-                        .ok_or_else(|| Status::invalid_argument("missing voice context"))?,
-                )?,
-            })
+        let voice = request
+            .into_inner()
+            .voice
+            .ok_or_else(|| Status::invalid_argument("missing voice context"))
+            .and_then(map_voice_context);
+        let voice = observe_early_status("join_voice", voice)?;
+
+        let result = self
+            .supervisor
+            .send(Command::JoinVoice { voice })
             .await
-            .map_err(map_app_error)?;
+            .map_err(map_app_error);
+        observability::global().record_rpc_result("join_voice", &result);
+        result?;
 
         Ok(Response::new(JoinVoiceResponse {}))
     }
@@ -53,26 +57,33 @@ impl DiscordVoiceControl for ControlService {
         let voice = request
             .into_inner()
             .voice
-            .ok_or_else(|| Status::invalid_argument("missing voice context"))?;
-        self.supervisor
-            .send(Command::UpdateVoiceContext {
-                voice: map_voice_context(voice)?,
-            })
+            .ok_or_else(|| Status::invalid_argument("missing voice context"))
+            .and_then(map_voice_context);
+        let voice = observe_early_status("update_voice_context", voice)?;
+
+        let result = self
+            .supervisor
+            .send(Command::UpdateVoiceContext { voice })
             .await
-            .map_err(map_app_error)?;
+            .map_err(map_app_error);
+        observability::global().record_rpc_result("update_voice_context", &result);
+        result?;
         Ok(Response::new(UpdateVoiceContextResponse {}))
     }
 
     async fn play(&self, request: Request<PlayRequest>) -> Result<Response<PlayResponse>, Status> {
         let request = request.into_inner();
-        validate_non_empty("video_id", &request.video_id)?;
+        observe_early_status("play", validate_non_empty("video_id", &request.video_id))?;
 
-        self.supervisor
+        let result = self
+            .supervisor
             .send(Command::Play {
                 video_id: request.video_id,
             })
             .await
-            .map_err(map_app_error)?;
+            .map_err(map_app_error);
+        observability::global().record_rpc_result("play", &result);
+        result?;
 
         Ok(Response::new(PlayResponse {}))
     }
@@ -81,10 +92,13 @@ impl DiscordVoiceControl for ControlService {
         &self,
         _request: Request<PauseRequest>,
     ) -> Result<Response<PauseResponse>, Status> {
-        self.supervisor
+        let result = self
+            .supervisor
             .send(Command::Pause)
             .await
-            .map_err(map_app_error)?;
+            .map_err(map_app_error);
+        observability::global().record_rpc_result("pause", &result);
+        result?;
         Ok(Response::new(PauseResponse {}))
     }
 
@@ -92,18 +106,24 @@ impl DiscordVoiceControl for ControlService {
         &self,
         _request: Request<ResumeRequest>,
     ) -> Result<Response<ResumeResponse>, Status> {
-        self.supervisor
+        let result = self
+            .supervisor
             .send(Command::Resume)
             .await
-            .map_err(map_app_error)?;
+            .map_err(map_app_error);
+        observability::global().record_rpc_result("resume", &result);
+        result?;
         Ok(Response::new(ResumeResponse {}))
     }
 
     async fn stop(&self, _request: Request<StopRequest>) -> Result<Response<StopResponse>, Status> {
-        self.supervisor
+        let result = self
+            .supervisor
             .send(Command::Stop)
             .await
-            .map_err(map_app_error)?;
+            .map_err(map_app_error);
+        observability::global().record_rpc_result("stop", &result);
+        result?;
         Ok(Response::new(StopResponse {}))
     }
 
@@ -111,10 +131,13 @@ impl DiscordVoiceControl for ControlService {
         &self,
         _request: Request<LeaveVoiceRequest>,
     ) -> Result<Response<LeaveVoiceResponse>, Status> {
-        self.supervisor
+        let result = self
+            .supervisor
             .send(Command::LeaveVoice)
             .await
-            .map_err(map_app_error)?;
+            .map_err(map_app_error);
+        observability::global().record_rpc_result("leave_voice", &result);
+        result?;
         Ok(Response::new(LeaveVoiceResponse {}))
     }
 
@@ -123,6 +146,10 @@ impl DiscordVoiceControl for ControlService {
         _request: Request<GetStateRequest>,
     ) -> Result<Response<SessionStateSnapshot>, Status> {
         let snapshot = self.supervisor.snapshot().await;
+        let readiness = Readiness::global().snapshot().await;
+        observability::global().record_state_query(&snapshot, readiness);
+        observability::global().record_rpc("get_state", tonic::Code::Ok);
+        let message = observability::render_snapshot_message(&snapshot, readiness);
         Ok(Response::new(SessionStateSnapshot {
             state: map_session_state(snapshot.state) as i32,
             guild_id: snapshot.guild_id.unwrap_or_default(),
@@ -130,7 +157,7 @@ impl DiscordVoiceControl for ControlService {
             current_video_id: snapshot.current_video_id.unwrap_or_default(),
             queue_depth: u32::try_from(snapshot.queue_depth).unwrap_or(u32::MAX),
             selected_itag: snapshot.selected_itag.unwrap_or_default(),
-            message: snapshot.last_reason.unwrap_or_default(),
+            message,
         }))
     }
 
@@ -156,6 +183,16 @@ impl DiscordVoiceControl for ControlService {
 
 fn map_app_error(error: crate::error::AppError) -> Status {
     Status::failed_precondition(error.to_string())
+}
+
+fn observe_early_status<T>(method: &'static str, result: Result<T, Status>) -> Result<T, Status> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(status) => {
+            observability::global().record_rpc(method, status.code());
+            Err(status)
+        }
+    }
 }
 
 fn validate_non_empty(field: &'static str, value: &str) -> Result<(), Status> {
