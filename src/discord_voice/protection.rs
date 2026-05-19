@@ -33,10 +33,6 @@ impl ProtectionContext {
         Self::new(session.mode.parse()?, session.secret_key.clone())
     }
 
-    pub fn test_xchacha() -> Self {
-        Self::new(EncryptionMode::AeadXChaCha20Poly1305Rtpsize, vec![7u8; 32]).unwrap()
-    }
-
     pub fn protect_packet(&self, rtp_header: &[u8], payload: &[u8]) -> Result<Vec<u8>, AppError> {
         let nonce_suffix = self
             .next_nonce
