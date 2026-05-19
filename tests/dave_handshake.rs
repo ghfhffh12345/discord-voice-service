@@ -1,5 +1,6 @@
 use discord_voice_service::discord_voice::dave::{
-    DaveDecryptor, DaveEncryptor, DaveError, DaveExternalSender, DaveMediaType, DaveSession,
+    DaveDecryptor, DaveEncryptor, DaveError, DaveExternalSender, DaveMediaType, DaveRuntimeContext,
+    DaveSession,
 };
 
 #[test]
@@ -117,4 +118,98 @@ fn dave_session_surfaces_mls_failure_callback_diagnostics() {
         }
         other => panic!("expected MLS failure diagnostics, got {other:?}"),
     }
+}
+
+#[test]
+fn dave_runtime_context_builds_ratchet_backed_encrypt_and_decrypt_state() {
+    const GROUP_ID: u64 = 1_234_567_890;
+    const PROTOCOL_VERSION: u16 = 1;
+    const SSRC: u32 = 7;
+    const CREATOR_USER_ID: &str = "1234123412341234";
+    const RUNTIME_USER_ID: &str = "5678567856785678";
+
+    let external_sender = DaveExternalSender::new(GROUP_ID).expect("external sender");
+    let external_sender_bytes = external_sender
+        .marshalled_external_sender()
+        .expect("external sender bytes");
+
+    let mut creator = DaveSession::new(None).expect("creator session");
+    creator
+        .set_external_sender(&external_sender_bytes)
+        .expect("creator external sender");
+    creator
+        .init(PROTOCOL_VERSION, GROUP_ID, CREATOR_USER_ID)
+        .expect("creator init");
+
+    let mut runtime_member = DaveSession::new(None).expect("runtime member session");
+    runtime_member
+        .set_external_sender(&external_sender_bytes)
+        .expect("runtime external sender");
+    runtime_member
+        .init(PROTOCOL_VERSION, GROUP_ID, RUNTIME_USER_ID)
+        .expect("runtime init");
+
+    let key_package = runtime_member.key_package().expect("runtime key package");
+    let proposal = external_sender
+        .propose_add(0, &key_package)
+        .expect("add proposal");
+    let recognized_user_ids = [CREATOR_USER_ID, RUNTIME_USER_ID];
+    let commit_welcome = creator
+        .process_proposals(&proposal, &recognized_user_ids)
+        .expect("creator process proposals");
+    let (commit, welcome) = external_sender
+        .split_commit_welcome(&commit_welcome)
+        .expect("split commit/welcome");
+    creator
+        .process_commit(&commit)
+        .expect("creator process commit");
+    runtime_member
+        .process_welcome(&welcome, &recognized_user_ids)
+        .expect("runtime welcome");
+
+    let mut runtime = DaveRuntimeContext::from_session(
+        &runtime_member,
+        PROTOCOL_VERSION,
+        RUNTIME_USER_ID,
+        CREATOR_USER_ID,
+        SSRC,
+    )
+    .expect("runtime context");
+
+    let creator_encrypt_ratchet = creator
+        .key_ratchet_for(CREATOR_USER_ID)
+        .expect("creator encrypt ratchet");
+    let mut creator_encryptor = DaveEncryptor::new().expect("creator encryptor");
+    creator_encryptor.assign_opus_ssrc(SSRC);
+    creator_encryptor
+        .set_key_ratchet(&creator_encrypt_ratchet)
+        .expect("creator encryptor ratchet");
+
+    let creator_decrypt_ratchet = creator
+        .key_ratchet_for(RUNTIME_USER_ID)
+        .expect("creator decrypt ratchet");
+    let mut creator_decryptor = DaveDecryptor::new().expect("creator decryptor");
+    creator_decryptor
+        .set_key_ratchet(&creator_decrypt_ratchet)
+        .expect("creator decryptor ratchet");
+
+    let local_audio = hex::decode("0dc5aedd5bdc3f20be5697e54dd1f437").expect("local audio");
+    let local_encrypted = runtime
+        .encryptor
+        .encrypt(DaveMediaType::Audio, SSRC, &local_audio)
+        .expect("runtime encrypt");
+    let local_decrypted = creator_decryptor
+        .decrypt(DaveMediaType::Audio, &local_encrypted)
+        .expect("creator decrypt");
+    assert_eq!(local_decrypted, local_audio);
+
+    let remote_audio = hex::decode("112233445566778899aabbccddeeff00").expect("remote audio");
+    let remote_encrypted = creator_encryptor
+        .encrypt(DaveMediaType::Audio, SSRC, &remote_audio)
+        .expect("creator encrypt");
+    let remote_decrypted = runtime
+        .decryptor
+        .decrypt(DaveMediaType::Audio, &remote_encrypted)
+        .expect("runtime decrypt");
+    assert_eq!(remote_decrypted, remote_audio);
 }

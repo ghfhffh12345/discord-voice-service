@@ -49,3 +49,14 @@ async fn connected_voice_session_sends_periodic_heartbeats_after_hello() {
 
     assert!(fake.heartbeat_count_at_least(1).await >= 1);
 }
+
+#[tokio::test]
+async fn voice_session_uses_dave_runtime_state_when_session_description_requires_it() {
+    let fake = FakeDiscordPeer::spawn_with_dave().await;
+    let voice = fake.voice_context("1", "2", "1111111111111111", "session-1", "token-1");
+
+    let session = ConnectedVoiceSession::connect(voice).await.unwrap();
+
+    assert!(session.dave_enabled());
+    assert!(fake.saw_dave_transition().await);
+}

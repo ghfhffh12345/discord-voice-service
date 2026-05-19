@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::discord_voice::dave::DaveSession;
 use crate::discord_voice::protocol::{self, VoiceGatewayPayload};
 use crate::discord_voice::resume::GatewayEvent;
 use crate::discord_voice::udp::DiscoveredUdpAddress;
@@ -44,7 +45,10 @@ impl VoiceGatewayClient {
     }
 
     pub async fn send_identify(&self, voice: &VoiceContext) -> Result<(), AppError> {
-        self.send_json(protocol::identify_payload(voice)).await
+        let max_dave_protocol_version =
+            Some(DaveSession::max_supported_protocol_version()).filter(|version| *version > 0);
+        self.send_json(protocol::identify_payload(voice, max_dave_protocol_version))
+            .await
     }
 
     pub async fn send_select_protocol(
@@ -89,6 +93,13 @@ impl VoiceGatewayClient {
                     }
                     return Ok(payload);
                 }
+                Message::Binary(bytes) => {
+                    let payload = protocol::parse_gateway_binary_message(bytes.as_ref())?;
+                    if let Some(seq) = payload.seq() {
+                        inner.seq_ack = Some(seq);
+                    }
+                    return Ok(payload);
+                }
                 Message::Close(_) => {
                     return Err(AppError::InvalidState(
                         "voice gateway closed during receive",
@@ -106,6 +117,21 @@ impl VoiceGatewayClient {
     pub(crate) async fn send_json(&self, payload: Value) -> Result<(), AppError> {
         let mut inner = self.inner.lock().await;
         ws::send_json(&mut inner.ws, payload).await
+    }
+
+    pub(crate) async fn send_binary(&self, payload: Vec<u8>) -> Result<(), AppError> {
+        let mut inner = self.inner.lock().await;
+        ws::send_binary(&mut inner.ws, payload).await
+    }
+
+    pub async fn send_dave_transition_ready(&self, transition_id: u16) -> Result<(), AppError> {
+        self.send_json(protocol::dave_transition_ready_payload(transition_id))
+            .await
+    }
+
+    pub async fn send_dave_mls_key_package(&self, key_package: &[u8]) -> Result<(), AppError> {
+        self.send_binary(protocol::dave_mls_key_package_payload(key_package))
+            .await
     }
 }
 

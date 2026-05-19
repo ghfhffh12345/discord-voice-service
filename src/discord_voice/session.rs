@@ -2,6 +2,7 @@ use bytes::Bytes;
 use tokio::sync::oneshot;
 use tokio::time::{Duration, sleep};
 
+use crate::discord_voice::dave::{DaveMediaType, DaveRuntimeContext};
 use crate::discord_voice::gateway::VoiceGatewayClient;
 use crate::discord_voice::handshake;
 use crate::discord_voice::protection::ProtectionContext;
@@ -19,6 +20,7 @@ pub struct ConnectedVoiceSession {
     transport: Option<VoiceUdpTransport>,
     ssrc: Option<u32>,
     session_description: Option<SessionDescription>,
+    dave: Option<DaveRuntimeContext>,
     heartbeat_shutdown: Option<oneshot::Sender<()>>,
     speaking_started: bool,
 }
@@ -32,6 +34,7 @@ impl ConnectedVoiceSession {
             transport: None,
             ssrc: None,
             session_description: None,
+            dave: None,
             heartbeat_shutdown: None,
             speaking_started: false,
         }
@@ -47,6 +50,7 @@ impl ConnectedVoiceSession {
             ssrc,
             heartbeat_interval_ms,
             session_description,
+            dave,
         } = result;
         let transport =
             transport.with_protection(ProtectionContext::from_session(&session_description)?);
@@ -60,6 +64,7 @@ impl ConnectedVoiceSession {
             rollover: VoiceSessionRollover::default(),
             ssrc: Some(ssrc),
             session_description: Some(session_description),
+            dave,
             heartbeat_shutdown: Some(heartbeat_shutdown),
             speaking_started: false,
         })
@@ -84,19 +89,32 @@ impl ConnectedVoiceSession {
             && self.session_description.is_some()
     }
 
+    pub fn dave_enabled(&self) -> bool {
+        self.dave.is_some()
+    }
+
     pub(crate) async fn send_audio_frame(&mut self, frame: Bytes) -> Result<(), AppError> {
+        let ssrc = self
+            .ssrc
+            .ok_or(AppError::InvalidState("voice ssrc unavailable"))?;
         if !self.speaking_started {
             let gateway = self
                 .gateway
                 .as_ref()
                 .ok_or(AppError::InvalidState("voice gateway unavailable"))?;
-            let ssrc = self
-                .ssrc
-                .ok_or(AppError::InvalidState("voice ssrc unavailable"))?;
             send_speaking(gateway, ssrc).await?;
             self.speaking_started = true;
         }
 
+        let frame = if let Some(dave) = self.dave.as_mut() {
+            Bytes::from(
+                dave.encryptor
+                    .encrypt(DaveMediaType::Audio, ssrc, frame.as_ref())
+                    .map_err(|_| AppError::InvalidState("voice dave frame encryption failed"))?,
+            )
+        } else {
+            frame
+        };
         let transport = self
             .transport
             .as_mut()

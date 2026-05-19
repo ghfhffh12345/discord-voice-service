@@ -3,6 +3,7 @@
 use std::sync::{Arc, Mutex as StdMutex};
 
 use discord_voice_service::discord_voice::crypto::{PREFERRED_MODE, REQUIRED_MODE};
+use discord_voice_service::discord_voice::dave::{DaveExternalSender, DaveSession};
 use discord_voice_service::session::supervisor::VoiceContext;
 use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
@@ -10,12 +11,18 @@ use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{Mutex, Notify};
 use tokio::time::{Duration, Instant, sleep};
 use tokio_tungstenite::accept_hdr_async;
+use tokio_tungstenite::tungstenite::Bytes;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+
+const DAVE_CREATOR_USER_ID: &str = "9999999999999999";
+const DAVE_PROTOCOL_VERSION: u16 = 1;
+const DAVE_TRANSITION_ID: u16 = 1;
 
 pub struct FakeDiscordPeer {
     endpoint_host: String,
     gateway_path: Arc<StdMutex<Option<String>>>,
+    dave_group_id: Arc<StdMutex<Option<u64>>>,
     discovery_count: Arc<Mutex<usize>>,
     speaking_observed: Arc<Notify>,
     audio_frame_count: Arc<Mutex<usize>>,
@@ -24,6 +31,7 @@ pub struct FakeDiscordPeer {
     saw_resume: Arc<Mutex<bool>>,
     saw_select_protocol: Arc<Mutex<bool>>,
     session_description_sent: Arc<Mutex<bool>>,
+    saw_dave_transition: Arc<Mutex<bool>>,
 }
 
 impl FakeDiscordPeer {
@@ -39,11 +47,21 @@ impl FakeDiscordPeer {
 
     #[allow(clippy::result_large_err)]
     pub async fn spawn_real_shape_with_heartbeat_interval(heartbeat_interval_ms: u64) -> Self {
+        Self::spawn_with_options(heartbeat_interval_ms, false).await
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn spawn_with_dave() -> Self {
+        Self::spawn_with_options(1_000, true).await
+    }
+
+    async fn spawn_with_options(heartbeat_interval_ms: u64, use_dave: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let udp_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let ws_addr = listener.local_addr().unwrap();
         let udp_addr = udp_socket.local_addr().unwrap();
         let gateway_path = Arc::new(StdMutex::new(None));
+        let dave_group_id = Arc::new(StdMutex::new(None));
         let discovery_count = Arc::new(Mutex::new(0usize));
         let speaking_observed = Arc::new(Notify::new());
         let audio_frame_count = Arc::new(Mutex::new(0usize));
@@ -52,6 +70,8 @@ impl FakeDiscordPeer {
         let saw_resume = Arc::new(Mutex::new(false));
         let saw_select_protocol = Arc::new(Mutex::new(false));
         let session_description_sent = Arc::new(Mutex::new(false));
+        let saw_dave_transition = Arc::new(Mutex::new(false));
+        let identified_user_id = Arc::new(Mutex::new(None::<String>));
 
         let discovery_count_state = Arc::clone(&discovery_count);
         let audio_frame_count_state = Arc::clone(&audio_frame_count);
@@ -88,10 +108,15 @@ impl FakeDiscordPeer {
         let saw_resume_state = Arc::clone(&saw_resume);
         let saw_select_protocol_state = Arc::clone(&saw_select_protocol);
         let session_description_state = Arc::clone(&session_description_sent);
+        let saw_dave_transition_state = Arc::clone(&saw_dave_transition);
+        let identified_user_id_state = Arc::clone(&identified_user_id);
+        let dave_group_id_state = Arc::clone(&dave_group_id);
         tokio::spawn(async move {
             let Ok((stream, _)) = listener.accept().await else {
                 return;
             };
+            let mut dave_external_sender = None::<DaveExternalSender>;
+            let mut dave_creator = None::<DaveSession>;
             let mut ws = accept_hdr_async(stream, move |request: &Request, response: Response| {
                 *gateway_path_state.lock().unwrap() = Some(request.uri().to_string());
                 Ok(response)
@@ -119,14 +144,16 @@ impl FakeDiscordPeer {
                     match payload.get("op").and_then(Value::as_u64) {
                         Some(0) => {
                             let identify = payload.get("d").cloned().unwrap_or(Value::Null);
+                            let user_id = identify
+                                .get("user_id")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_owned();
                             let required_fields_present = identify
                                 .get("server_id")
                                 .and_then(Value::as_str)
                                 .is_some_and(|value| !value.is_empty())
-                                && identify
-                                    .get("user_id")
-                                    .and_then(Value::as_str)
-                                    .is_some_and(|value| !value.is_empty())
+                                && !user_id.is_empty()
                                 && identify
                                     .get("session_id")
                                     .and_then(Value::as_str)
@@ -136,6 +163,8 @@ impl FakeDiscordPeer {
                                     .and_then(Value::as_str)
                                     .is_some_and(|value| !value.is_empty());
                             *saw_identify_state.lock().await = required_fields_present;
+                            *identified_user_id_state.lock().await =
+                                required_fields_present.then_some(user_id.clone());
                             if !required_fields_present {
                                 continue;
                             }
@@ -181,6 +210,7 @@ impl FakeDiscordPeer {
                                     "d": {
                                         "mode": mode,
                                         "secret_key": vec![0u8; 32],
+                                        "dave_protocol_version": use_dave.then_some(DAVE_PROTOCOL_VERSION),
                                     }
                                 })
                                 .to_string()
@@ -188,10 +218,89 @@ impl FakeDiscordPeer {
                             ))
                             .await
                             .unwrap();
+                            if use_dave {
+                                ws.send(Message::Text(
+                                    json!({
+                                        "op": 11,
+                                        "seq": 1,
+                                        "d": {
+                                            "user_ids": [DAVE_CREATOR_USER_ID],
+                                        }
+                                    })
+                                    .to_string()
+                                    .into(),
+                                ))
+                                .await
+                                .unwrap();
+                                let group_id = dave_group_id_state.lock().unwrap().unwrap_or(2);
+                                let external_sender =
+                                    DaveExternalSender::new(group_id).expect("external sender");
+                                let external_sender_bytes = external_sender
+                                    .marshalled_external_sender()
+                                    .expect("external sender bytes");
+                                let mut creator = DaveSession::new(None).expect("creator session");
+                                creator
+                                    .set_external_sender(&external_sender_bytes)
+                                    .expect("creator external sender");
+                                creator
+                                    .init(DAVE_PROTOCOL_VERSION, group_id, DAVE_CREATOR_USER_ID)
+                                    .expect("creator init");
+                                ws.send(Message::Binary(Bytes::from(
+                                    dave_external_sender_message(2, &external_sender_bytes),
+                                )))
+                                .await
+                                .unwrap();
+                                dave_external_sender = Some(external_sender);
+                                dave_creator = Some(creator);
+                            }
+                        }
+                        Some(23) => {
+                            if use_dave
+                                && payload
+                                    .pointer("/d/transition_id")
+                                    .and_then(Value::as_u64)
+                                    .is_some_and(|value| value == u64::from(DAVE_TRANSITION_ID))
+                            {
+                                *saw_dave_transition_state.lock().await = true;
+                                ws.send(Message::Text(
+                                    json!({
+                                        "op": 22,
+                                        "seq": 3,
+                                        "d": {
+                                            "transition_id": DAVE_TRANSITION_ID,
+                                        }
+                                    })
+                                    .to_string()
+                                    .into(),
+                                ))
+                                .await
+                                .unwrap();
+                            }
                         }
                         Some(5) => speaking_observed_state.notify_one(),
                         Some(3) => *heartbeat_count_state.lock().await += 1,
                         _ => {}
+                    }
+                } else if let Message::Binary(bytes) = message {
+                    if use_dave && bytes.first() == Some(&26) {
+                        let user_id = identified_user_id_state
+                            .lock()
+                            .await
+                            .clone()
+                            .unwrap_or_else(|| "1111111111111111".to_owned());
+                        let external_sender = dave_external_sender
+                            .as_ref()
+                            .expect("external sender missing");
+                        let creator = dave_creator.as_mut().expect("creator session missing");
+                        ws.send(Message::Binary(Bytes::from(dave_welcome_message(
+                            4,
+                            creator,
+                            external_sender,
+                            &user_id,
+                            &bytes[1..],
+                        ))))
+                        .await
+                        .unwrap();
                     }
                 }
             }
@@ -200,6 +309,7 @@ impl FakeDiscordPeer {
         Self {
             endpoint_host: ws_addr.to_string(),
             gateway_path,
+            dave_group_id,
             discovery_count,
             speaking_observed,
             audio_frame_count,
@@ -208,6 +318,7 @@ impl FakeDiscordPeer {
             saw_resume,
             saw_select_protocol,
             session_description_sent,
+            saw_dave_transition,
         }
     }
 
@@ -223,6 +334,7 @@ impl FakeDiscordPeer {
         session_id: &str,
         token: &str,
     ) -> VoiceContext {
+        *self.dave_group_id.lock().unwrap() = channel_id.parse::<u64>().ok();
         VoiceContext {
             guild_id: guild_id.into(),
             channel_id: channel_id.into(),
@@ -268,6 +380,47 @@ impl FakeDiscordPeer {
     pub async fn session_description_sent(&self) -> bool {
         wait_for_value(&self.session_description_sent, |ready| *ready).await
     }
+
+    pub async fn saw_dave_transition(&self) -> bool {
+        wait_for_value(&self.saw_dave_transition, |ready| *ready).await
+    }
+}
+
+fn dave_external_sender_message(sequence: u16, external_sender_bytes: &[u8]) -> Vec<u8> {
+    let mut message = Vec::with_capacity(3 + external_sender_bytes.len());
+    message.extend_from_slice(&sequence.to_be_bytes());
+    message.push(25);
+    message.extend_from_slice(&external_sender_bytes);
+    message
+}
+
+fn dave_welcome_message(
+    sequence: u16,
+    creator: &mut DaveSession,
+    external_sender: &DaveExternalSender,
+    runtime_user_id: &str,
+    key_package: &[u8],
+) -> Vec<u8> {
+    let proposal = external_sender
+        .propose_add(0, key_package)
+        .expect("runtime proposal");
+    let recognized_user_ids = [DAVE_CREATOR_USER_ID, runtime_user_id];
+    let commit_welcome = creator
+        .process_proposals(&proposal, &recognized_user_ids)
+        .expect("creator process proposals");
+    let (commit, welcome) = external_sender
+        .split_commit_welcome(&commit_welcome)
+        .expect("split commit/welcome");
+    creator
+        .process_commit(&commit)
+        .expect("creator process commit");
+
+    let mut message = Vec::with_capacity(5 + welcome.len());
+    message.extend_from_slice(&sequence.to_be_bytes());
+    message.push(30);
+    message.extend_from_slice(&DAVE_TRANSITION_ID.to_be_bytes());
+    message.extend_from_slice(&welcome);
+    message
 }
 
 async fn wait_for_value<T, F>(slot: &Arc<Mutex<T>>, ready: F) -> T

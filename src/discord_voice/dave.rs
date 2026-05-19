@@ -8,6 +8,7 @@ use std::time::Duration;
 use thiserror::Error;
 
 use super::dave_ffi;
+use crate::error::AppError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaveContext {
@@ -56,6 +57,8 @@ pub struct DaveSession {
     handle: dave_ffi::DaveSessionHandle,
     failure_state: Box<SessionFailureState>,
 }
+
+unsafe impl Send for DaveSession {}
 
 impl DaveSession {
     pub fn new(auth_session_id: Option<&str>) -> Result<Self, DaveError> {
@@ -371,6 +374,8 @@ pub struct DaveEncryptor {
     handle: dave_ffi::DaveEncryptorHandle,
 }
 
+unsafe impl Send for DaveEncryptor {}
+
 impl DaveEncryptor {
     pub fn new() -> Result<Self, DaveError> {
         let handle = unsafe { dave_ffi::daveEncryptorCreate() };
@@ -440,6 +445,8 @@ pub struct DaveDecryptor {
     handle: dave_ffi::DaveDecryptorHandle,
 }
 
+unsafe impl Send for DaveDecryptor {}
+
 impl DaveDecryptor {
     pub fn new() -> Result<Self, DaveError> {
         let handle = unsafe { dave_ffi::daveDecryptorCreate() };
@@ -497,10 +504,54 @@ impl Drop for DaveDecryptor {
     }
 }
 
+pub struct DaveRuntimeContext {
+    pub protocol_version: u16,
+    pub encryptor: DaveEncryptor,
+    pub decryptor: DaveDecryptor,
+}
+
+impl DaveRuntimeContext {
+    pub fn from_session(
+        session: &DaveSession,
+        protocol_version: u16,
+        self_user_id: &str,
+        peer_user_id: &str,
+        ssrc: u32,
+    ) -> Result<Self, AppError> {
+        let encrypt_ratchet = session
+            .key_ratchet_for(self_user_id)
+            .map_err(|_| AppError::InvalidState("voice dave self ratchet missing"))?;
+        let decrypt_ratchet = session
+            .key_ratchet_for(peer_user_id)
+            .map_err(|_| AppError::InvalidState("voice dave peer ratchet missing"))?;
+
+        let mut encryptor = DaveEncryptor::new()
+            .map_err(|_| AppError::InvalidState("voice dave encryptor create failed"))?;
+        encryptor.assign_opus_ssrc(ssrc);
+        encryptor
+            .set_key_ratchet(&encrypt_ratchet)
+            .map_err(|_| AppError::InvalidState("voice dave encryptor setup failed"))?;
+
+        let mut decryptor = DaveDecryptor::new()
+            .map_err(|_| AppError::InvalidState("voice dave decryptor create failed"))?;
+        decryptor
+            .set_key_ratchet(&decrypt_ratchet)
+            .map_err(|_| AppError::InvalidState("voice dave decryptor setup failed"))?;
+
+        Ok(Self {
+            protocol_version,
+            encryptor,
+            decryptor,
+        })
+    }
+}
+
 #[doc(hidden)]
 pub struct DaveExternalSender {
     handle: dave_ffi::DaveExternalSenderHandle,
 }
+
+unsafe impl Send for DaveExternalSender {}
 
 impl DaveExternalSender {
     pub fn new(group_id: u64) -> Result<Self, DaveError> {

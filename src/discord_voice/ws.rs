@@ -2,6 +2,7 @@ use futures::SinkExt;
 use http::Uri;
 use serde_json::Value;
 use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::Bytes;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
@@ -17,6 +18,11 @@ pub async fn connect(url: &str) -> Result<VoiceWebSocket, AppError> {
 
 pub async fn send_json(ws: &mut VoiceWebSocket, payload: Value) -> Result<(), AppError> {
     ws.send(Message::Text(payload.to_string().into())).await?;
+    Ok(())
+}
+
+pub async fn send_binary(ws: &mut VoiceWebSocket, payload: Vec<u8>) -> Result<(), AppError> {
+    ws.send(Message::Binary(Bytes::from(payload))).await?;
     Ok(())
 }
 

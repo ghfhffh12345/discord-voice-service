@@ -22,6 +22,28 @@ pub struct Ready {
 pub struct SessionDescription {
     pub mode: String,
     pub secret_key: Vec<u8>,
+    pub dave_protocol_version: Option<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientsConnect {
+    pub user_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaveExecuteTransition {
+    pub transition_id: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaveMlsExternalSenderPackage {
+    pub external_sender: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaveMlsWelcome {
+    pub transition_id: u16,
+    pub welcome: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +51,10 @@ pub enum VoiceGatewayEvent {
     Hello(Hello),
     Ready(Ready),
     SessionDescription(SessionDescription),
+    ClientsConnect(ClientsConnect),
+    DaveExecuteTransition(DaveExecuteTransition),
+    DaveMlsExternalSenderPackage(DaveMlsExternalSenderPackage),
+    DaveMlsWelcome(DaveMlsWelcome),
     Resumed,
 }
 
@@ -116,22 +142,42 @@ pub fn parse_gateway_message(text: &str) -> Result<VoiceGatewayPayload, AppError
                     "voice session description mode missing",
                 ))?
                 .to_owned(),
-            secret_key: data
-                .get("secret_key")
+            secret_key: parse_byte_array(
+                data.get("secret_key"),
+                "voice session description secret key missing",
+                "voice session description secret key invalid",
+            )?,
+            dave_protocol_version: parse_optional_u16(
+                data.get("dave_protocol_version"),
+                "voice session description dave protocol version invalid",
+            )?,
+        }),
+        11 => VoiceGatewayEvent::ClientsConnect(ClientsConnect {
+            user_ids: data
+                .get("user_ids")
                 .and_then(Value::as_array)
                 .ok_or(AppError::InvalidState(
-                    "voice session description secret key missing",
+                    "voice clients connect user ids missing",
                 ))?
                 .iter()
-                .map(|octet| {
-                    octet
-                        .as_u64()
-                        .and_then(|value| u8::try_from(value).ok())
+                .map(|user_id| {
+                    user_id
+                        .as_str()
+                        .map(str::to_owned)
                         .ok_or(AppError::InvalidState(
-                            "voice session description secret key invalid",
+                            "voice clients connect user id invalid",
                         ))
                 })
                 .collect::<Result<Vec<_>, _>>()?,
+        }),
+        22 => VoiceGatewayEvent::DaveExecuteTransition(DaveExecuteTransition {
+            transition_id: data
+                .get("transition_id")
+                .and_then(Value::as_u64)
+                .and_then(|value| u16::try_from(value).ok())
+                .ok_or(AppError::InvalidState(
+                    "voice dave execute transition id invalid",
+                ))?,
         }),
         9 => VoiceGatewayEvent::Resumed,
         _ => return Err(AppError::InvalidState("voice gateway op unsupported")),
@@ -140,14 +186,27 @@ pub fn parse_gateway_message(text: &str) -> Result<VoiceGatewayPayload, AppError
     Ok(VoiceGatewayPayload::new(event, seq))
 }
 
-pub fn identify_payload(voice: &VoiceContext) -> Value {
-    json!({
+pub fn identify_payload(voice: &VoiceContext, max_dave_protocol_version: Option<u16>) -> Value {
+    let mut payload = json!({
         "op": 0,
         "d": {
             "server_id": voice.guild_id,
             "user_id": voice.user_id,
             "session_id": voice.session_id,
             "token": voice.token,
+        }
+    });
+    if let Some(max_dave_protocol_version) = max_dave_protocol_version {
+        payload["d"]["max_dave_protocol_version"] = json!(max_dave_protocol_version);
+    }
+    payload
+}
+
+pub fn dave_transition_ready_payload(transition_id: u16) -> Value {
+    json!({
+        "op": 23,
+        "d": {
+            "transition_id": transition_id,
         }
     })
 }
@@ -199,15 +258,91 @@ pub fn choose_encryption_mode(ready: &Ready) -> Result<&'static str, AppError> {
     crypto::pick_mode(&ready.modes).ok_or(AppError::UnsupportedEncryptionMode)
 }
 
+pub fn parse_gateway_binary_message(bytes: &[u8]) -> Result<VoiceGatewayPayload, AppError> {
+    if bytes.len() < 3 {
+        return Err(AppError::InvalidState(
+            "voice gateway binary payload too short",
+        ));
+    }
+
+    let seq = u16::from_be_bytes([bytes[0], bytes[1]]) as u64;
+    let event = match bytes[2] {
+        25 => VoiceGatewayEvent::DaveMlsExternalSenderPackage(DaveMlsExternalSenderPackage {
+            external_sender: bytes[3..].to_vec(),
+        }),
+        30 => {
+            if bytes.len() < 5 {
+                return Err(AppError::InvalidState(
+                    "voice dave welcome payload too short",
+                ));
+            }
+            VoiceGatewayEvent::DaveMlsWelcome(DaveMlsWelcome {
+                transition_id: u16::from_be_bytes([bytes[3], bytes[4]]),
+                welcome: bytes[5..].to_vec(),
+            })
+        }
+        _ => {
+            return Err(AppError::InvalidState(
+                "voice gateway binary opcode unsupported",
+            ));
+        }
+    };
+
+    Ok(VoiceGatewayPayload::new(event, Some(seq)))
+}
+
+pub fn dave_mls_key_package_payload(key_package: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(1 + key_package.len());
+    payload.push(26);
+    payload.extend_from_slice(key_package);
+    payload
+}
+
 fn seq_ack_i64(seq_ack: Option<u64>) -> i64 {
     seq_ack
         .and_then(|seq| i64::try_from(seq).ok())
         .unwrap_or(-1)
 }
 
+fn parse_optional_u16(
+    value: Option<&Value>,
+    invalid: &'static str,
+) -> Result<Option<u16>, AppError> {
+    value
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|value| u16::try_from(value).ok())
+                .ok_or(AppError::InvalidState(invalid))
+        })
+        .transpose()
+}
+
+fn parse_byte_array(
+    value: Option<&Value>,
+    missing: &'static str,
+    invalid: &'static str,
+) -> Result<Vec<u8>, AppError> {
+    value
+        .and_then(Value::as_array)
+        .ok_or(AppError::InvalidState(missing))?
+        .iter()
+        .map(|octet| {
+            octet
+                .as_u64()
+                .and_then(|value| u8::try_from(value).ok())
+                .ok_or(AppError::InvalidState(invalid))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{VoiceGatewayEvent, identify_payload, parse_gateway_message};
+    use super::{
+        VoiceGatewayEvent, dave_mls_key_package_payload, dave_transition_ready_payload,
+        identify_payload, parse_gateway_binary_message, parse_gateway_message,
+    };
     use crate::session::supervisor::VoiceContext;
 
     #[test]
@@ -232,18 +367,51 @@ mod tests {
 
     #[test]
     fn identify_payload_includes_required_user_id() {
-        let payload = identify_payload(&VoiceContext {
-            guild_id: "guild-1".into(),
-            channel_id: "channel-1".into(),
-            user_id: "user-1".into(),
-            session_id: "session-1".into(),
-            endpoint: "voice.example.discord.gg".into(),
-            token: "token-1".into(),
-        });
+        let payload = identify_payload(
+            &VoiceContext {
+                guild_id: "guild-1".into(),
+                channel_id: "channel-1".into(),
+                user_id: "user-1".into(),
+                session_id: "session-1".into(),
+                endpoint: "voice.example.discord.gg".into(),
+                token: "token-1".into(),
+            },
+            Some(1),
+        );
 
         assert_eq!(payload["d"]["server_id"], "guild-1");
         assert_eq!(payload["d"]["user_id"], "user-1");
         assert_eq!(payload["d"]["session_id"], "session-1");
         assert_eq!(payload["d"]["token"], "token-1");
+        assert_eq!(payload["d"]["max_dave_protocol_version"], 1);
+    }
+
+    #[test]
+    fn parse_gateway_binary_message_supports_dave_external_sender_and_welcome() {
+        let external_sender = parse_gateway_binary_message(&[0, 7, 25, 1, 2, 3]).unwrap();
+        assert_eq!(external_sender.seq(), Some(7));
+        assert!(matches!(
+            external_sender.event(),
+            VoiceGatewayEvent::DaveMlsExternalSenderPackage(_)
+        ));
+
+        let welcome = parse_gateway_binary_message(&[0, 8, 30, 0, 9, 4, 5, 6]).unwrap();
+        assert_eq!(welcome.seq(), Some(8));
+        match welcome.into_event() {
+            VoiceGatewayEvent::DaveMlsWelcome(welcome) => {
+                assert_eq!(welcome.transition_id, 9);
+                assert_eq!(welcome.welcome, vec![4, 5, 6]);
+            }
+            other => panic!("expected dave welcome event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dave_payload_builders_encode_expected_shapes() {
+        let ready = dave_transition_ready_payload(11);
+        assert_eq!(ready["op"], 23);
+        assert_eq!(ready["d"]["transition_id"], 11);
+
+        assert_eq!(dave_mls_key_package_payload(&[1, 2, 3]), vec![26, 1, 2, 3]);
     }
 }
