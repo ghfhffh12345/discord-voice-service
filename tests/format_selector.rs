@@ -28,9 +28,27 @@ fn stream_format(
 #[test]
 fn prefers_250_then_249_then_lower_only() {
     let formats = vec![
-        stream_format(251, "audio/webm; codecs=\"opus\"", 160_000, Some(48_000), Some(2)),
-        stream_format(250, "audio/webm; codecs=\"opus\"", 70_000, Some(48_000), Some(2)),
-        stream_format(249, "audio/webm; codecs=\"opus\"", 50_000, Some(48_000), Some(2)),
+        stream_format(
+            251,
+            "audio/webm; codecs=\"opus\"",
+            160_000,
+            Some(48_000),
+            Some(2),
+        ),
+        stream_format(
+            250,
+            "audio/webm; codecs=\"opus\"",
+            70_000,
+            Some(48_000),
+            Some(2),
+        ),
+        stream_format(
+            249,
+            "audio/webm; codecs=\"opus\"",
+            50_000,
+            Some(48_000),
+            Some(2),
+        ),
     ];
 
     let selected = select_song_stream_format(&formats).expect("format should be selected");
@@ -40,8 +58,20 @@ fn prefers_250_then_249_then_lower_only() {
 #[test]
 fn falls_back_to_249_when_250_is_absent() {
     let formats = vec![
-        stream_format(251, "audio/webm; codecs=\"opus\"", 160_000, Some(48_000), Some(2)),
-        stream_format(249, "audio/webm; codecs=\"opus\"", 50_000, Some(48_000), Some(2)),
+        stream_format(
+            251,
+            "audio/webm; codecs=\"opus\"",
+            160_000,
+            Some(48_000),
+            Some(2),
+        ),
+        stream_format(
+            249,
+            "audio/webm; codecs=\"opus\"",
+            50_000,
+            Some(48_000),
+            Some(2),
+        ),
     ];
 
     let selected = select_song_stream_format(&formats).expect("format should be selected");
@@ -51,9 +81,27 @@ fn falls_back_to_249_when_250_is_absent() {
 #[test]
 fn falls_back_to_lower_bitrate_webm_opus_when_250_and_249_are_absent() {
     let formats = vec![
-        stream_format(251, "audio/webm; codecs=\"opus\"", 160_000, Some(48_000), Some(2)),
-        stream_format(248, "audio/webm; codecs=\"opus\"", 49_000, Some(48_000), Some(2)),
-        stream_format(247, "audio/webm; codecs=\"opus\"", 40_000, Some(48_000), Some(2)),
+        stream_format(
+            251,
+            "audio/webm; codecs=\"opus\"",
+            160_000,
+            Some(48_000),
+            Some(2),
+        ),
+        stream_format(
+            248,
+            "audio/webm; codecs=\"opus\"",
+            49_000,
+            Some(48_000),
+            Some(2),
+        ),
+        stream_format(
+            247,
+            "audio/webm; codecs=\"opus\"",
+            40_000,
+            Some(48_000),
+            Some(2),
+        ),
     ];
 
     let selected = select_song_stream_format(&formats).expect("format should be selected");

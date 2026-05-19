@@ -29,5 +29,11 @@ pub enum AppError {
     #[error(transparent)]
     Transport(#[from] tonic::transport::Error),
     #[error(transparent)]
-    GrpcStatus(#[from] tonic::Status),
+    GrpcStatus(Box<tonic::Status>),
+}
+
+impl From<tonic::Status> for AppError {
+    fn from(error: tonic::Status) -> Self {
+        Self::GrpcStatus(Box::new(error))
+    }
 }

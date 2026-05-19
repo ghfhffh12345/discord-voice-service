@@ -106,10 +106,10 @@ impl Observability {
 pub fn render_snapshot_message(snapshot: &Snapshot, readiness: ReadinessSnapshot) -> String {
     let mut parts = Vec::with_capacity(2);
 
-    if let Some(reason) = snapshot.last_reason.as_deref() {
-        if !reason.is_empty() {
-            parts.push(reason.to_owned());
-        }
+    if let Some(reason) = snapshot.last_reason.as_deref()
+        && !reason.is_empty()
+    {
+        parts.push(reason.to_owned());
     }
 
     parts.push(format!(

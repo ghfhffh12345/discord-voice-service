@@ -33,10 +33,10 @@ impl PlaybackRecovery {
         video_id: &str,
         position_ms: u64,
     ) -> Result<PlaybackSource, AppError> {
-        if self.last_video_id.as_deref() == Some(video_id) {
-            if let Ok(source) = self.try_reopen_existing(position_ms).await {
-                return Ok(source);
-            }
+        if self.last_video_id.as_deref() == Some(video_id)
+            && let Ok(source) = self.try_reopen_existing(position_ms).await
+        {
+            return Ok(source);
         }
 
         let resolved = self.client.resolve_playback_source(video_id).await?;
@@ -138,9 +138,6 @@ fn should_reresolve_after_open_failure(err: &AppError) -> bool {
 fn is_stale_source_status(status: StatusCode) -> bool {
     matches!(
         status,
-        StatusCode::UNAUTHORIZED
-            | StatusCode::FORBIDDEN
-            | StatusCode::NOT_FOUND
-            | StatusCode::GONE
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND | StatusCode::GONE
     )
 }

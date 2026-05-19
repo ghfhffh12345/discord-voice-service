@@ -77,11 +77,11 @@ impl WebmDemuxState {
             MatroskaSpec::TrackEntry(Master::Start),
             MatroskaSpec::BlockGroup(Master::Start),
         ];
-        let mut iterator = WebmIterator::new(Cursor::new(input), &tags_to_buffer);
+        let iterator = WebmIterator::new(Cursor::new(input), &tags_to_buffer);
         let mut state = Self::default();
         let mut packets = Vec::new();
 
-        while let Some(tag) = iterator.next() {
+        for tag in iterator {
             let tag = match tag {
                 Ok(tag) => tag,
                 Err(TagIteratorError::UnexpectedEOF { .. })

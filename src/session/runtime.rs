@@ -21,6 +21,12 @@ pub struct VoiceSessionRuntime {
     playback: Option<Mutex<PlaybackWorker>>,
 }
 
+impl Default for VoiceSessionRuntime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl VoiceSessionRuntime {
     pub fn new() -> Self {
         Self {

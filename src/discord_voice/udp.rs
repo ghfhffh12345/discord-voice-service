@@ -53,7 +53,7 @@ impl VoiceUdpTransport {
     }
 
     pub async fn send_audio_frame(&mut self, frame: Bytes) -> Result<(), AppError> {
-        let (sequence, timestamp) = self.sequence.next();
+        let (sequence, timestamp) = self.sequence.advance();
         let packet = self
             .packet_builder
             .build(sequence, timestamp, frame.as_ref());

@@ -186,6 +186,7 @@ fn map_app_error(error: crate::error::AppError) -> Status {
     Status::failed_precondition(error.to_string())
 }
 
+#[allow(clippy::result_large_err)]
 fn observe_early_status<T>(method: &'static str, result: Result<T, Status>) -> Result<T, Status> {
     match result {
         Ok(value) => Ok(value),
@@ -196,6 +197,7 @@ fn observe_early_status<T>(method: &'static str, result: Result<T, Status>) -> R
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn validate_non_empty(field: &'static str, value: &str) -> Result<(), Status> {
     if value.trim().is_empty() {
         Err(Status::invalid_argument(format!("{field} is required")))
@@ -204,6 +206,7 @@ fn validate_non_empty(field: &'static str, value: &str) -> Result<(), Status> {
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn map_voice_context(voice: join_voice_request::VoiceContext) -> Result<VoiceContext, Status> {
     validate_non_empty("guild_id", &voice.guild_id)?;
     validate_non_empty("channel_id", &voice.channel_id)?;

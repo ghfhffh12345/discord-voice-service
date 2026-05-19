@@ -4,9 +4,9 @@ mod fake_voice;
 use discord_voice_service::session::events::{SessionEventKind, SessionEventRecord};
 use discord_voice_service::session::state::Snapshot;
 use discord_voice_service::session::supervisor::{Command, Supervisor, VoiceContext};
-use tokio::sync::broadcast;
 use tokio::sync::Mutex;
-use tokio::time::{sleep, Duration, Instant};
+use tokio::sync::broadcast;
+use tokio::time::{Duration, Instant, sleep};
 
 use self::fake_voice::FakeVoiceEndpoint;
 
@@ -38,11 +38,13 @@ async fn rollover_rebuilds_transport_and_preserves_track_identity() {
     assert!(harness.seen_event("voice-reconnected").await);
     assert_eq!(replacement_voice.discovery_count().await, 1);
     assert!(replacement_voice.gateway_connected().await);
-    assert!(replacement_voice
-        .gateway_path()
-        .await
-        .unwrap()
-        .contains("v=8"));
+    assert!(
+        replacement_voice
+            .gateway_path()
+            .await
+            .unwrap()
+            .contains("v=8")
+    );
 }
 
 #[tokio::test]

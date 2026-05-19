@@ -1,15 +1,28 @@
+#[path = "support/fake_discord.rs"]
+mod fake_discord;
+#[path = "support/fake_ytmusic.rs"]
+mod fake_ytmusic;
+#[path = "support/fixtures.rs"]
+mod fixtures;
+
 use std::sync::Arc;
 
 use discord_voice_service::api::service::{ControlService, map_play_request};
 use discord_voice_service::proto::discordvoice::v1::discord_voice_control_server::DiscordVoiceControl;
 use discord_voice_service::proto::discordvoice::v1::{
-    GetStateRequest, JoinVoiceRequest, PauseRequest, PlayRequest, ResumeRequest, SessionEventKind,
-    SessionStateSnapshot, SubscribeEventsRequest, UpdateVoiceContextRequest, join_voice_request,
+    GetStateRequest, JoinVoiceRequest, PauseRequest, PlayRequest, ResumeRequest, SessionEvent,
+    SessionEventKind, SessionStateSnapshot, SubscribeEventsRequest, UpdateVoiceContextRequest,
+    join_voice_request,
 };
 use discord_voice_service::session::readiness::Readiness;
 use discord_voice_service::session::supervisor::{Supervisor, VoiceContext};
 use futures::StreamExt;
+use tokio::time::{Duration, Instant};
 use tonic::{Code, Request};
+
+use self::fake_discord::FakeDiscordPeer;
+use self::fake_ytmusic::FakeYtMusic;
+use self::fixtures::spawn_stream_server;
 
 #[test]
 fn maps_proto_play_request_into_internal_video_id() {
@@ -238,6 +251,74 @@ async fn subscribe_events_streams_runtime_events() {
 }
 
 #[tokio::test]
+async fn join_voice_then_play_streams_end_to_end_playback_events_and_audio() {
+    let fake_yt = FakeYtMusic::spawn().await;
+    let http = spawn_stream_server("tests/fixtures/audio-itag250.webm").await;
+    fake_yt.set_playable_url(http.url()).await;
+    let fake_discord = FakeDiscordPeer::spawn().await;
+    let speaking_observed = fake_discord.speaking_observed();
+    let service = test_service_with_ytmusic_endpoint(fake_yt.endpoint()).await;
+    let response = service
+        .subscribe_events(Request::new(SubscribeEventsRequest {}))
+        .await
+        .unwrap();
+    let mut stream = response.into_inner();
+
+    service
+        .join_voice(Request::new(JoinVoiceRequest {
+            voice: Some(join_voice_request::VoiceContext {
+                guild_id: "1".into(),
+                channel_id: "2".into(),
+                session_id: "session-1".into(),
+                endpoint: fake_discord.endpoint(),
+                token: "token-1".into(),
+            }),
+        }))
+        .await
+        .unwrap();
+
+    service
+        .play(Request::new(PlayRequest {
+            video_id: "video-1".into(),
+        }))
+        .await
+        .unwrap();
+
+    let events = collect_proto_events(&mut stream, 4).await;
+    assert_eq!(events[0].kind, SessionEventKind::VoiceReady as i32);
+    assert_eq!(events[1].kind, SessionEventKind::TrackResolving as i32);
+    assert_eq!(events[2].kind, SessionEventKind::Playing as i32);
+    assert_eq!(events[2].current_video_id, "video-1");
+    assert_eq!(events[2].selected_itag, 250);
+    assert_eq!(events[3].kind, SessionEventKind::TrackEnded as i32);
+    assert_eq!(events[3].current_video_id, "video-1");
+    assert_eq!(events[3].selected_itag, 250);
+
+    let state = service
+        .get_state(Request::new(GetStateRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        state.state,
+        discord_voice_service::proto::discordvoice::v1::SessionState::VoiceReadyState as i32
+    );
+    assert!(state.current_video_id.is_empty());
+    assert_eq!(state.selected_itag, 0);
+    assert_eq!(state.queue_depth, 0);
+    assert!(state.message.is_empty());
+
+    let gateway_path = fake_discord.gateway_path().await.unwrap();
+    assert!(gateway_path.starts_with("/?udp="));
+    assert!(gateway_path.contains("ssrc=7"));
+    assert_eq!(fake_discord.discovery_count().await, 1);
+    tokio::time::timeout(Duration::from_secs(2), speaking_observed.notified())
+        .await
+        .expect("speaking should be observed");
+    assert!(fake_discord.audio_frame_count_at_least(5).await >= 5);
+}
+
+#[tokio::test]
 async fn update_voice_context_is_accepted_during_playback() {
     let harness = ApiHarness::spawn().await;
     harness.join_voice().await.unwrap();
@@ -375,6 +456,29 @@ fn test_service() -> ControlService {
         supervisor: Supervisor::new(),
         readiness: Arc::new(Readiness::default()),
     }
+}
+
+async fn test_service_with_ytmusic_endpoint(endpoint: String) -> ControlService {
+    ControlService {
+        supervisor: Supervisor::with_ytmusic_endpoint(endpoint).await.unwrap(),
+        readiness: Arc::new(Readiness::default()),
+    }
+}
+
+async fn collect_proto_events<S>(stream: &mut S, count: usize) -> Vec<SessionEvent>
+where
+    S: futures::Stream<Item = Result<SessionEvent, tonic::Status>> + Unpin,
+{
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut events = Vec::with_capacity(count);
+    while events.len() < count && Instant::now() < deadline {
+        if let Ok(Some(event)) =
+            tokio::time::timeout(Duration::from_millis(200), stream.next()).await
+        {
+            events.push(event.unwrap());
+        }
+    }
+    events
 }
 
 fn test_voice_context_rotated() -> join_voice_request::VoiceContext {

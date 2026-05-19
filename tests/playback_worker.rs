@@ -70,7 +70,7 @@ async fn prepare_buffers_real_packets_and_returns_selected_itag() {
     assert!(source.position().timestamp_ms() > 0);
     assert_eq!(source.position().sent_duration_ms(), 0);
 
-    assert!(queue.len() > 0);
+    assert!(!queue.is_empty());
     let first_packet = queue.pop().expect("queue should contain a packet");
     assert_ne!(
         first_packet.data,
@@ -101,7 +101,7 @@ async fn prepare_reruns_resolution_when_initial_playable_url_is_stale() {
     let source = worker.prepare("video-1", &mut queue).await.unwrap();
 
     assert_eq!(source.selected_itag(), 250);
-    assert!(queue.len() > 0);
+    assert!(!queue.is_empty());
     assert!(
         fake.calls()
             .iter()
@@ -148,7 +148,7 @@ async fn prepare_preserves_current_track_position_when_recovering_same_video() {
         recovered.position().sent_duration_ms(),
         first_packet.duration_ms
     );
-    assert!(recovery_queue.len() > 0);
+    assert!(!recovery_queue.is_empty());
     assert!(recovered.position().timestamp_ms() >= first_packet.duration_ms);
 
     let expected_next_packet = first_queue

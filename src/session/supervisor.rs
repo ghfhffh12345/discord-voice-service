@@ -34,6 +34,12 @@ pub struct Supervisor {
     runtime: Arc<VoiceSessionRuntime>,
 }
 
+impl Default for Supervisor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Supervisor {
     pub fn new() -> Self {
         Self {

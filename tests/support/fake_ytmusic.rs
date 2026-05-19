@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::sync::{Arc, Mutex};
 
 use discord_voice_service::ytmusic::v1::yt_music_public_server::{

@@ -18,7 +18,10 @@ pub fn select_song_stream_format(
         .collect::<Vec<_>>();
 
     allowed.sort_by_key(|format| (priority_for_itag(format.itag), Reverse(format.bitrate)));
-    allowed.into_iter().next().ok_or(AppError::UnsupportedFormat)
+    allowed
+        .into_iter()
+        .next()
+        .ok_or(AppError::UnsupportedFormat)
 }
 
 fn priority_for_itag(itag: u32) -> u8 {

@@ -54,7 +54,7 @@ impl FakeUdpPeer {
                 let (len, from) = socket.recv_from(&mut buf).await.unwrap();
                 let packet = &buf[..len];
 
-                if packet.len() == 74 && &packet[..2] == &1u16.to_be_bytes() {
+                if packet.len() == 74 && packet[..2] == 1u16.to_be_bytes() {
                     *discovery_count_state.lock().await += 1;
                     let mut response = [0u8; 74];
                     response[..2].copy_from_slice(&2u16.to_be_bytes());
@@ -142,7 +142,7 @@ impl FakeVoiceGateway {
             let mut buf = [0u8; 512];
             loop {
                 let (len, from) = udp_socket.recv_from(&mut buf).await.unwrap();
-                if len == 74 && &buf[..2] == &1u16.to_be_bytes() {
+                if len == 74 && buf[..2] == 1u16.to_be_bytes() {
                     let mut response = [0u8; 74];
                     response[..2].copy_from_slice(&2u16.to_be_bytes());
                     response[2..4].copy_from_slice(&70u16.to_be_bytes());
