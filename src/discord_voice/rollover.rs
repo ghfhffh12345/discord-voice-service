@@ -12,4 +12,8 @@ impl VoiceSessionRollover {
     pub(crate) fn voice_reconnecting(&self) -> bool {
         self.voice_reconnecting
     }
+
+    pub(crate) fn set_voice_reconnecting(&mut self, voice_reconnecting: bool) {
+        self.voice_reconnecting = voice_reconnecting;
+    }
 }

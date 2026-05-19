@@ -15,6 +15,10 @@ impl ConnectedVoiceSession {
         }
     }
 
+    pub(crate) async fn connect(voice: VoiceContext) -> Result<Self, crate::error::AppError> {
+        Ok(Self::new(voice))
+    }
+
     pub(crate) fn voice_context(&self) -> &VoiceContext {
         &self.voice
     }
@@ -25,5 +29,9 @@ impl ConnectedVoiceSession {
 
     pub(crate) fn rollover(&self) -> &VoiceSessionRollover {
         &self.rollover
+    }
+
+    pub(crate) fn rollover_mut(&mut self) -> &mut VoiceSessionRollover {
+        &mut self.rollover
     }
 }

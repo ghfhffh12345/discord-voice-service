@@ -26,6 +26,7 @@ pub struct FakeYtMusic {
     endpoint: String,
     calls: Arc<Mutex<Vec<String>>>,
     playable_url: Arc<Mutex<String>>,
+    stale_playable_url_once: Arc<Mutex<Option<String>>>,
     _server: JoinHandle<()>,
 }
 
@@ -35,9 +36,11 @@ impl FakeYtMusic {
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let calls = Arc::new(Mutex::new(Vec::new()));
         let playable_url = Arc::new(Mutex::new("https://cdn.example/audio.webm".to_owned()));
+        let stale_playable_url_once = Arc::new(Mutex::new(None));
         let service = FakeYtMusicService {
             calls: Arc::clone(&calls),
             playable_url: Arc::clone(&playable_url),
+            stale_playable_url_once: Arc::clone(&stale_playable_url_once),
         };
 
         let server = tokio::spawn(async move {
@@ -52,6 +55,7 @@ impl FakeYtMusic {
             endpoint,
             calls,
             playable_url,
+            stale_playable_url_once,
             _server: server,
         }
     }
@@ -67,11 +71,17 @@ impl FakeYtMusic {
     pub async fn set_playable_url(&self, playable_url: impl Into<String>) {
         *self.playable_url.lock().unwrap() = playable_url.into();
     }
+
+    pub async fn fail_first_url_once(&self) {
+        *self.stale_playable_url_once.lock().unwrap() =
+            Some("http://127.0.0.1:9/stale-audio.webm".to_owned());
+    }
 }
 
 struct FakeYtMusicService {
     calls: Arc<Mutex<Vec<String>>>,
     playable_url: Arc<Mutex<String>>,
+    stale_playable_url_once: Arc<Mutex<Option<String>>>,
 }
 
 impl FakeYtMusicService {
@@ -308,7 +318,12 @@ impl YtMusicPublic for FakeYtMusicService {
             return Err(Status::invalid_argument("unexpected cipher"));
         }
         Ok(Response::new(DecipherResponse {
-            playable_url: self.playable_url.lock().unwrap().clone(),
+            playable_url: self
+                .stale_playable_url_once
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or_else(|| self.playable_url.lock().unwrap().clone()),
         }))
     }
 }

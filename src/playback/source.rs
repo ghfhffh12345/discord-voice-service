@@ -34,6 +34,10 @@ impl PlaybackSource {
         self.resolved.selected_itag
     }
 
+    pub fn resolved(&self) -> &ResolvedPlaybackSource {
+        &self.resolved
+    }
+
     pub fn playable_url(&self) -> &str {
         &self.resolved.playable_url
     }
