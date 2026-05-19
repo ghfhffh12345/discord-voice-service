@@ -10,6 +10,7 @@ use crate::ytmusic::client::{ResolvedPlaybackSource, YtMusicClient};
 #[derive(Debug)]
 pub struct PlaybackRecovery {
     client: YtMusicClient,
+    last_video_id: Option<String>,
     last_resolved: Option<ResolvedPlaybackSource>,
 }
 
@@ -17,6 +18,7 @@ impl PlaybackRecovery {
     pub fn new(client: YtMusicClient) -> Self {
         Self {
             client,
+            last_video_id: None,
             last_resolved: None,
         }
     }
@@ -26,21 +28,29 @@ impl PlaybackRecovery {
         video_id: &str,
         position_ms: u64,
     ) -> Result<PlaybackSource, AppError> {
-        if let Ok(source) = self.try_reopen_existing(position_ms).await {
-            return Ok(source);
+        if self.last_video_id.as_deref() == Some(video_id) {
+            if let Ok(source) = self.try_reopen_existing(position_ms).await {
+                return Ok(source);
+            }
         }
 
         let resolved = self.client.resolve_playback_source(video_id).await?;
         match self.open_from_position(resolved, position_ms).await {
-            Ok(source) => Ok(source),
+            Ok(source) => {
+                self.remember_source(video_id, &source);
+                Ok(source)
+            }
             Err(_) => {
                 let resolved = self.client.resolve_playback_source(video_id).await?;
-                self.open_from_position(resolved, position_ms).await
+                let source = self.open_from_position(resolved, position_ms).await?;
+                self.remember_source(video_id, &source);
+                Ok(source)
             }
         }
     }
 
-    pub fn remember_source(&mut self, source: &PlaybackSource) {
+    fn remember_source(&mut self, video_id: &str, source: &PlaybackSource) {
+        self.last_video_id = Some(video_id.to_owned());
         self.last_resolved = Some(source.resolved().clone());
     }
 
@@ -85,7 +95,6 @@ impl PlaybackRecovery {
             position.record_sent_packet(position_ms);
         }
 
-        self.last_resolved = Some(resolved.clone());
         Ok(PlaybackSource::new(
             resolved,
             stream,

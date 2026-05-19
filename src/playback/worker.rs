@@ -1,10 +1,8 @@
-use std::collections::VecDeque;
-
 use crate::error::AppError;
-use crate::media::http_stream::HttpOpusStream;
 use crate::media::opus_queue::{OpusFrame, OpusFrameQueue};
 use crate::media::position::PlaybackPosition;
-use crate::media::webm_demux::WebmOpusDemux;
+use crate::media::webm_demux::DemuxedPacket;
+use crate::playback::recovery::PlaybackRecovery;
 use crate::playback::source::PlaybackSource;
 use crate::ytmusic::client::YtMusicClient;
 use crate::ytmusic::selector::select_song_stream_format;
@@ -29,7 +27,7 @@ impl PlaybackPlan {
 }
 
 pub struct PlaybackWorker {
-    client: YtMusicClient,
+    recovery: PlaybackRecovery,
     position: PlaybackPosition,
     prebuffer_target: usize,
 }
@@ -37,7 +35,7 @@ pub struct PlaybackWorker {
 impl PlaybackWorker {
     pub fn new(client: YtMusicClient) -> Self {
         Self {
-            client,
+            recovery: PlaybackRecovery::new(client),
             position: PlaybackPosition::default(),
             prebuffer_target: DEFAULT_PREBUFFER_TARGET,
         }
@@ -50,34 +48,45 @@ impl PlaybackWorker {
     ) -> Result<PlaybackSource, AppError> {
         self.position = PlaybackPosition::default();
 
-        let resolved = self.client.resolve_playback_source(video_id).await?;
-        let mut stream = HttpOpusStream::new(resolved.playable_url.clone());
-        let mut demux = WebmOpusDemux::default();
-        let mut pending_packets = VecDeque::new();
+        let mut source = self.recovery.recover(video_id, 0).await?;
 
         while queue.len() < self.prebuffer_target {
-            let Some(chunk) = stream.read_chunk().await? else {
+            if let Some(packet) = source.pending_packets_mut().pop_front() {
+                self.buffer_packet(queue, packet)?;
+                continue;
+            }
+
+            let Some(chunk) = source.stream_mut().read_chunk().await? else {
                 return Err(AppError::MediaParse("unexpected end of stream"));
             };
 
-            demux.push_bytes(chunk);
-            for packet in demux.drain_packets()? {
-                self.position.record_buffered(&packet);
-                let frame = OpusFrame::new(packet.data.clone(), packet.duration_ms);
+            let packets = {
+                let demux = source.demux_mut();
+                demux.push_bytes(chunk);
+                demux.drain_packets()?
+            };
+
+            for packet in packets {
                 if queue.len() < self.prebuffer_target {
-                    queue.push(frame).map_err(|_| AppError::BufferFull)?;
+                    self.buffer_packet(queue, packet)?;
                 } else {
-                    pending_packets.push_back(packet);
+                    source.pending_packets_mut().push_back(packet);
                 }
             }
         }
 
-        Ok(PlaybackSource::new(
-            resolved,
-            stream,
-            demux,
-            pending_packets,
-            self.position.snapshot(),
-        ))
+        self.position = source.position();
+        Ok(source)
+    }
+
+    fn buffer_packet(
+        &mut self,
+        queue: &mut OpusFrameQueue,
+        packet: DemuxedPacket,
+    ) -> Result<(), AppError> {
+        self.position.record_buffered(&packet);
+        queue
+            .push(OpusFrame::new(packet.data.clone(), packet.duration_ms))
+            .map_err(|_| AppError::BufferFull)
     }
 }

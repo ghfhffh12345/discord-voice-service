@@ -1,22 +1,49 @@
+#[path = "support/fake_voice.rs"]
+mod fake_voice;
+
 use discord_voice_service::session::events::{SessionEventKind, SessionEventRecord};
 use discord_voice_service::session::state::Snapshot;
 use discord_voice_service::session::supervisor::{Command, Supervisor, VoiceContext};
 use tokio::sync::Mutex;
 use tokio::sync::broadcast;
 
+use self::fake_voice::FakeVoiceEndpoint;
+
 #[tokio::test]
 async fn rollover_rebuilds_transport_and_preserves_track_identity() {
+    let initial_voice = FakeVoiceEndpoint::spawn().await;
+    let replacement_voice = FakeVoiceEndpoint::spawn().await;
     let harness = VoiceRolloverHarness::spawn().await;
-    harness.start_playing("video-1").await.unwrap();
+    harness
+        .start_playing(
+            initial_voice.voice_context("1", "2", "3", "token"),
+            "video-1",
+        )
+        .await
+        .unwrap();
 
     harness
-        .update_voice_context(test_voice_context_rotated())
+        .update_voice_context(replacement_voice.voice_context(
+            "1",
+            "9",
+            "rotated-session",
+            "rotated-token",
+        ))
         .await
         .unwrap();
 
     let snapshot = harness.snapshot().await;
     assert_eq!(snapshot.current_video_id.as_deref(), Some("video-1"));
     assert!(harness.seen_event("voice-reconnected").await);
+    assert_eq!(replacement_voice.discovery_count().await, 1);
+    assert!(replacement_voice.gateway_connected().await);
+    assert!(
+        replacement_voice
+            .gateway_path()
+            .await
+            .unwrap()
+            .contains("v=8")
+    );
 }
 
 struct VoiceRolloverHarness {
@@ -36,13 +63,10 @@ impl VoiceRolloverHarness {
 
     async fn start_playing(
         &self,
+        voice: VoiceContext,
         video_id: &str,
     ) -> Result<(), discord_voice_service::error::AppError> {
-        self.supervisor
-            .send(Command::JoinVoice {
-                voice: test_voice_context(),
-            })
-            .await?;
+        self.supervisor.send(Command::JoinVoice { voice }).await?;
         self.supervisor
             .send(Command::Play {
                 video_id: video_id.into(),
@@ -91,25 +115,5 @@ fn event_name(event: &SessionEventRecord) -> &'static str {
         SessionEventKind::RecoverableWarning => "recoverable-warning",
         SessionEventKind::FatalError => "fatal-error",
         SessionEventKind::VoiceReconnecting => "voice-reconnecting",
-    }
-}
-
-fn test_voice_context() -> VoiceContext {
-    VoiceContext {
-        guild_id: "1".into(),
-        channel_id: "2".into(),
-        session_id: "3".into(),
-        endpoint: "voice.example".into(),
-        token: "token".into(),
-    }
-}
-
-fn test_voice_context_rotated() -> VoiceContext {
-    VoiceContext {
-        guild_id: "1".into(),
-        channel_id: "9".into(),
-        session_id: "rotated-session".into(),
-        endpoint: "rotated.voice.example".into(),
-        token: "rotated-token".into(),
     }
 }

@@ -85,6 +85,40 @@ async fn prepare_buffers_real_packets_and_returns_selected_itag() {
 }
 
 #[tokio::test]
+async fn prepare_reruns_resolution_when_initial_playable_url_is_stale() {
+    let fake = FakeYtMusic::spawn().await;
+    let http = spawn_stream_server("tests/fixtures/audio-itag250.webm").await;
+    fake.set_playable_url(http.url()).await;
+    fake.fail_first_url_once().await;
+
+    let mut worker = PlaybackWorker::new(
+        YtMusicClient::connect(fake.endpoint())
+            .await
+            .expect("client"),
+    );
+    let mut queue = OpusFrameQueue::new(32);
+
+    let source = worker.prepare("video-1", &mut queue).await.unwrap();
+
+    assert_eq!(source.selected_itag(), 250);
+    assert!(queue.len() > 0);
+    assert!(
+        fake.calls()
+            .iter()
+            .filter(|call| *call == "GetSong")
+            .count()
+            >= 2
+    );
+    assert!(
+        fake.calls()
+            .iter()
+            .filter(|call| *call == "Decipher")
+            .count()
+            >= 2
+    );
+}
+
+#[tokio::test]
 async fn prepare_rejects_unsupported_formats() {
     let fake = FakeYtMusic::spawn().await;
     let mut worker = PlaybackWorker::new(

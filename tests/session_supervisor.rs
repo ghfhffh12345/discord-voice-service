@@ -1,5 +1,10 @@
+#[path = "support/fake_voice.rs"]
+mod fake_voice;
+
 use discord_voice_service::session::state::SessionState;
 use discord_voice_service::session::supervisor::{Command, Supervisor, VoiceContext};
+
+use self::fake_voice::FakeVoiceEndpoint;
 
 #[tokio::test]
 async fn join_then_play_advances_state_machine() {
@@ -44,14 +49,9 @@ async fn snapshot_exposes_runtime_position_queue_depth_and_rollover_flags() {
 #[tokio::test]
 async fn update_voice_context_replaces_full_runtime_voice_context() {
     let supervisor = Supervisor::new();
+    let fake = FakeVoiceEndpoint::spawn().await;
     let joined = test_voice_context();
-    let updated = VoiceContext {
-        guild_id: "1".into(),
-        channel_id: "9".into(),
-        session_id: "updated-session".into(),
-        endpoint: "updated.voice.example".into(),
-        token: "updated-token".into(),
-    };
+    let updated = fake.voice_context("1", "9", "updated-session", "updated-token");
 
     supervisor
         .send(Command::JoinVoice {
@@ -69,6 +69,9 @@ async fn update_voice_context_replaces_full_runtime_voice_context() {
     assert_eq!(supervisor.current_voice_context().await, Some(updated));
     assert_eq!(supervisor.snapshot().await.channel_id, Some("9".into()));
     assert_ne!(supervisor.current_voice_context().await, Some(joined));
+    assert_eq!(fake.discovery_count().await, 1);
+    assert!(fake.gateway_connected().await);
+    assert!(fake.gateway_path().await.unwrap().contains("v=8"));
 }
 
 fn test_voice_context() -> VoiceContext {

@@ -154,14 +154,14 @@ impl VoiceSessionRuntime {
             };
 
             session.rollover_mut().set_voice_reconnecting(true);
-            session.update_voice_context(new_voice.clone());
-            apply_voice_context(&mut state, session.voice_context());
+            apply_voice_context(&mut state, &new_voice);
             apply_rollover_state(&mut state, session);
             SessionEventRecord::from_snapshot(SessionEventKind::VoiceReconnecting, &state)
         };
         self.events.emit(reconnecting_event);
 
         let replacement = ConnectedVoiceSession::connect(new_voice).await?;
+        debug_assert!(replacement.is_connected());
 
         let reconnected_event = {
             let mut state = self.state.write().await;
