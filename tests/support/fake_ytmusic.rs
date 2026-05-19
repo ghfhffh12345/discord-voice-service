@@ -20,6 +20,7 @@ use discord_voice_service::ytmusic::v1::{
 };
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
+use tokio::time::{Duration, sleep};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
@@ -29,6 +30,7 @@ pub struct FakeYtMusic {
     calls: Arc<Mutex<Vec<String>>>,
     playable_url: Arc<Mutex<String>>,
     stale_playable_url_once: Arc<Mutex<Option<String>>>,
+    decipher_delay: Arc<Mutex<Option<Duration>>>,
     _server: JoinHandle<()>,
 }
 
@@ -39,10 +41,12 @@ impl FakeYtMusic {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let playable_url = Arc::new(Mutex::new("https://cdn.example/audio.webm".to_owned()));
         let stale_playable_url_once = Arc::new(Mutex::new(None));
+        let decipher_delay = Arc::new(Mutex::new(None));
         let service = FakeYtMusicService {
             calls: Arc::clone(&calls),
             playable_url: Arc::clone(&playable_url),
             stale_playable_url_once: Arc::clone(&stale_playable_url_once),
+            decipher_delay: Arc::clone(&decipher_delay),
         };
 
         let server = tokio::spawn(async move {
@@ -58,6 +62,7 @@ impl FakeYtMusic {
             calls,
             playable_url,
             stale_playable_url_once,
+            decipher_delay,
             _server: server,
         }
     }
@@ -77,12 +82,17 @@ impl FakeYtMusic {
     pub async fn set_first_playable_url_once(&self, playable_url: impl Into<String>) {
         *self.stale_playable_url_once.lock().unwrap() = Some(playable_url.into());
     }
+
+    pub async fn set_decipher_delay(&self, delay: Duration) {
+        *self.decipher_delay.lock().unwrap() = Some(delay);
+    }
 }
 
 struct FakeYtMusicService {
     calls: Arc<Mutex<Vec<String>>>,
     playable_url: Arc<Mutex<String>>,
     stale_playable_url_once: Arc<Mutex<Option<String>>>,
+    decipher_delay: Arc<Mutex<Option<Duration>>>,
 }
 
 impl FakeYtMusicService {
@@ -314,8 +324,12 @@ impl YtMusicPublic for FakeYtMusicService {
         request: Request<DecipherRequest>,
     ) -> Result<Response<DecipherResponse>, Status> {
         self.record("Decipher");
+        let decipher_delay = *self.decipher_delay.lock().unwrap();
+        if let Some(delay) = decipher_delay {
+            sleep(delay).await;
+        }
         let signature_cipher = request.into_inner().signature_cipher;
-        if signature_cipher != "cipher-video-1-250" {
+        if !signature_cipher.starts_with("cipher-") || !signature_cipher.ends_with("-250") {
             return Err(Status::invalid_argument("unexpected cipher"));
         }
         Ok(Response::new(DecipherResponse {

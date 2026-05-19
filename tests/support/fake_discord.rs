@@ -37,6 +37,7 @@ pub struct FakeDiscordPeer {
     discovery_count: Arc<Mutex<usize>>,
     speaking_observed: Arc<Notify>,
     audio_frame_count: Arc<Mutex<usize>>,
+    audio_frame_times: Arc<Mutex<Vec<Instant>>>,
     heartbeat_count: Arc<Mutex<usize>>,
     saw_identify: Arc<Mutex<bool>>,
     saw_resume: Arc<Mutex<bool>>,
@@ -95,6 +96,7 @@ impl FakeDiscordPeer {
         let discovery_count = Arc::new(Mutex::new(0usize));
         let speaking_observed = Arc::new(Notify::new());
         let audio_frame_count = Arc::new(Mutex::new(0usize));
+        let audio_frame_times = Arc::new(Mutex::new(Vec::new()));
         let heartbeat_count = Arc::new(Mutex::new(0usize));
         let saw_identify = Arc::new(Mutex::new(false));
         let saw_resume = Arc::new(Mutex::new(false));
@@ -109,6 +111,7 @@ impl FakeDiscordPeer {
 
         let discovery_count_state = Arc::clone(&discovery_count);
         let audio_frame_count_state = Arc::clone(&audio_frame_count);
+        let audio_frame_times_state = Arc::clone(&audio_frame_times);
         tokio::spawn(async move {
             let mut buf = [0u8; 512];
             loop {
@@ -131,6 +134,7 @@ impl FakeDiscordPeer {
 
                 if len >= 12 {
                     *audio_frame_count_state.lock().await += 1;
+                    audio_frame_times_state.lock().await.push(Instant::now());
                 }
             }
         });
@@ -480,6 +484,7 @@ impl FakeDiscordPeer {
             discovery_count,
             speaking_observed,
             audio_frame_count,
+            audio_frame_times,
             heartbeat_count,
             saw_identify,
             saw_resume,
@@ -530,6 +535,20 @@ impl FakeDiscordPeer {
 
     pub async fn audio_frame_count_at_least(&self, minimum: usize) -> usize {
         wait_for_value(&self.audio_frame_count, |count| *count >= minimum).await
+    }
+
+    pub async fn audio_frame_span_for_first(&self, frame_count: usize) -> Duration {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let timestamps = self.audio_frame_times.lock().await.clone();
+            if timestamps.len() >= frame_count {
+                return timestamps[frame_count - 1].saturating_duration_since(timestamps[0]);
+            }
+            if Instant::now() >= deadline {
+                return Duration::ZERO;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
     }
 
     pub async fn heartbeat_count_at_least(&self, minimum: usize) -> usize {
@@ -658,11 +677,7 @@ where
     wait_for_value_with_timeout(slot, Duration::from_secs(2), ready).await
 }
 
-async fn wait_for_value_with_timeout<T, F>(
-    slot: &Arc<Mutex<T>>,
-    timeout: Duration,
-    ready: F,
-) -> T
+async fn wait_for_value_with_timeout<T, F>(slot: &Arc<Mutex<T>>, timeout: Duration, ready: F) -> T
 where
     T: Clone,
     F: Fn(&T) -> bool,

@@ -55,6 +55,11 @@ impl PlaybackRecovery {
         }
     }
 
+    pub fn reset(&mut self) {
+        self.last_video_id = None;
+        self.last_resolved = None;
+    }
+
     fn remember_source(&mut self, video_id: &str, source: &PlaybackSource) {
         self.last_video_id = Some(video_id.to_owned());
         self.last_resolved = Some(source.resolved().clone());

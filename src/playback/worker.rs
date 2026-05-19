@@ -67,6 +67,12 @@ impl PlaybackWorker {
         Ok(source)
     }
 
+    pub fn reset(&mut self) {
+        self.current_video_id = None;
+        self.recovery.reset();
+        self.position = shared_playback_position(PlaybackPosition::default());
+    }
+
     pub async fn fill_queue(
         &mut self,
         source: &mut PlaybackSource,
@@ -107,11 +113,7 @@ impl PlaybackWorker {
     ) -> Result<(), AppError> {
         self.position.lock().unwrap().record_buffered(&packet);
         queue
-            .push(OpusFrame::tracked(
-                packet.data.clone(),
-                packet.duration_ms,
-                self.position.clone(),
-            ))
+            .push(OpusFrame::new(packet.data.clone(), packet.duration_ms))
             .map_err(|_| AppError::BufferFull)
     }
 }

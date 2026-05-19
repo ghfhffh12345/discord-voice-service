@@ -302,15 +302,18 @@ async fn join_voice_then_play_streams_end_to_end_playback_events_and_audio() {
         .await
         .unwrap();
 
-    let events = collect_proto_events(&mut stream, 4).await;
+    let events = collect_proto_events(&mut stream, 5).await;
     assert_eq!(events[0].kind, SessionEventKind::VoiceReady as i32);
     assert_eq!(events[1].kind, SessionEventKind::TrackResolving as i32);
-    assert_eq!(events[2].kind, SessionEventKind::Playing as i32);
+    assert_eq!(events[2].kind, SessionEventKind::Buffering as i32);
     assert_eq!(events[2].current_video_id, "video-1");
     assert_eq!(events[2].selected_itag, 250);
-    assert_eq!(events[3].kind, SessionEventKind::TrackEnded as i32);
+    assert_eq!(events[3].kind, SessionEventKind::Playing as i32);
     assert_eq!(events[3].current_video_id, "video-1");
     assert_eq!(events[3].selected_itag, 250);
+    assert_eq!(events[4].kind, SessionEventKind::TrackEnded as i32);
+    assert_eq!(events[4].current_video_id, "video-1");
+    assert_eq!(events[4].selected_itag, 250);
 
     let state = service
         .get_state(Request::new(GetStateRequest {}))
@@ -333,6 +336,10 @@ async fn join_voice_then_play_streams_end_to_end_playback_events_and_audio() {
         .await
         .expect("speaking should be observed");
     assert!(fake_discord.audio_frame_count_at_least(5).await >= 5);
+    assert!(
+        fake_discord.audio_frame_span_for_first(5).await >= Duration::from_millis(70),
+        "the first five audio frames should span at least four 20ms pacing intervals"
+    );
 }
 
 #[tokio::test]

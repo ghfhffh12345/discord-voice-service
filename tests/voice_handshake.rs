@@ -73,7 +73,11 @@ async fn voice_session_can_join_an_established_dave_group_without_prepare_epoch(
     let session = ConnectedVoiceSession::connect(voice).await.unwrap();
 
     assert!(session.dave_enabled());
-    assert!(!fake.saw_dave_prepare_epoch_within(Duration::from_millis(100)).await);
+    assert!(
+        !fake
+            .saw_dave_prepare_epoch_within(Duration::from_millis(100))
+            .await
+    );
     assert!(fake.saw_dave_key_package_before_prepare_epoch().await);
     assert!(fake.saw_dave_transition().await);
 }

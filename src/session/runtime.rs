@@ -1,8 +1,11 @@
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
 use tokio::sync::{Mutex, RwLock, broadcast};
 
 use crate::discord_voice::session::ConnectedVoiceSession;
 use crate::error::AppError;
 use crate::media::opus_queue::OpusFrameQueue;
+use crate::playback::pacer::AudioPacer;
 use crate::playback::worker::PlaybackWorker;
 use crate::session::events::{EventBus, SessionEventKind, SessionEventRecord};
 use crate::session::readiness::{
@@ -19,6 +22,8 @@ pub struct VoiceSessionRuntime {
     events: EventBus,
     voice: Mutex<Option<ConnectedVoiceSession>>,
     playback: Option<Mutex<PlaybackWorker>>,
+    playback_epoch: AtomicU64,
+    playback_reset_pending: AtomicBool,
 }
 
 impl Default for VoiceSessionRuntime {
@@ -34,6 +39,8 @@ impl VoiceSessionRuntime {
             events: EventBus::new(64),
             voice: Mutex::new(None),
             playback: None,
+            playback_epoch: AtomicU64::new(0),
+            playback_reset_pending: AtomicBool::new(false),
         }
     }
 
@@ -43,6 +50,8 @@ impl VoiceSessionRuntime {
             events: EventBus::new(64),
             voice: Mutex::new(None),
             playback: Some(Mutex::new(worker)),
+            playback_epoch: AtomicU64::new(0),
+            playback_reset_pending: AtomicBool::new(false),
         }
     }
 
@@ -114,8 +123,12 @@ impl VoiceSessionRuntime {
     }
 
     async fn play(&self, video_id: String) -> Result<(), AppError> {
+        let playback_epoch = self.begin_playback();
         let resolving_event = {
             let mut state = self.state.write().await;
+            if self.playback_interrupted(playback_epoch) {
+                return Ok(());
+            }
             ensure_active_voice_session(&state, "play")?;
             state.current_video_id = Some(video_id.clone());
             state.selected_itag = None;
@@ -144,13 +157,35 @@ impl VoiceSessionRuntime {
         let mut queue = OpusFrameQueue::new(PLAYBACK_QUEUE_CAPACITY);
         let (selected_itag, mut source) = {
             let mut worker = playback.lock().await;
+            if self.consume_playback_reset() {
+                worker.reset();
+            }
             let source = worker.prepare(&video_id, &mut queue).await?;
             let selected_itag = source.selected_itag();
             (selected_itag, source)
         };
+        if self.playback_interrupted(playback_epoch) {
+            return Ok(());
+        }
+
+        let buffering_event = {
+            let mut state = self.state.write().await;
+            if self.playback_interrupted(playback_epoch) {
+                return Ok(());
+            }
+            state.selected_itag = Some(selected_itag);
+            state.queue_depth = queue.len();
+            state.position_ms = 0;
+            state.state = SessionState::Buffering;
+            SessionEventRecord::from_snapshot(SessionEventKind::Buffering, &state)
+        };
+        self.events.emit(buffering_event);
 
         let playing_event = {
             let mut state = self.state.write().await;
+            if self.playback_interrupted(playback_epoch) {
+                return Ok(());
+            }
             state.selected_itag = Some(selected_itag);
             state.queue_depth = queue.len();
             state.position_ms = 0;
@@ -159,31 +194,89 @@ impl VoiceSessionRuntime {
         };
         self.events.emit(playing_event);
 
+        let mut pacer = AudioPacer::new();
         let mut position_ms = 0;
         loop {
+            if self.playback_interrupted(playback_epoch) {
+                return Ok(());
+            }
+
+            let Some(frame) = queue.pop() else {
+                let mut worker = playback.lock().await;
+                worker.fill_queue(&mut source, &mut queue).await?;
+                if self.playback_interrupted(playback_epoch) {
+                    return Ok(());
+                }
+                {
+                    let mut state = self.state.write().await;
+                    if self.playback_interrupted(playback_epoch) {
+                        return Ok(());
+                    }
+                    state.queue_depth = queue.len();
+                }
+
+                if queue.is_empty() {
+                    break;
+                }
+
+                continue;
+            };
+
+            pacer.wait_next().await;
+            if self.playback_interrupted(playback_epoch) {
+                return Ok(());
+            }
+
             {
                 let mut voice = self.voice.lock().await;
+                if self.playback_interrupted(playback_epoch) {
+                    return Ok(());
+                }
                 let session = voice
                     .as_mut()
                     .ok_or(AppError::InvalidState("play requires active voice session"))?;
-                while let Some(frame) = queue.pop() {
-                    position_ms += frame.duration_ms;
-                    session.send_audio_frame(frame.data).await?;
-                }
+                session.send_audio_frame(frame.data).await?;
             }
+            source.record_sent_packet(frame.duration_ms);
+            position_ms += frame.duration_ms;
 
             {
                 let mut worker = playback.lock().await;
                 worker.fill_queue(&mut source, &mut queue).await?;
             }
-
-            if queue.is_empty() {
-                break;
+            if self.playback_interrupted(playback_epoch) {
+                return Ok(());
             }
+            {
+                let mut state = self.state.write().await;
+                if self.playback_interrupted(playback_epoch) {
+                    return Ok(());
+                }
+                state.queue_depth = queue.len();
+                state.position_ms = position_ms;
+            }
+        }
+
+        if self.playback_interrupted(playback_epoch) {
+            return Ok(());
+        }
+
+        {
+            let mut voice = self.voice.lock().await;
+            let session = voice
+                .as_mut()
+                .ok_or(AppError::InvalidState("play requires active voice session"))?;
+            session.stop_audio().await?;
+        }
+        if self.playback_interrupted(playback_epoch) {
+            return Ok(());
         }
 
         let track_ended_event = {
             let mut state = self.state.write().await;
+            if self.playback_interrupted(playback_epoch) {
+                return Ok(());
+            }
             state.position_ms = position_ms;
             let event = SessionEventRecord::from_snapshot(SessionEventKind::TrackEnded, &state);
             state.current_video_id = None;
@@ -222,9 +315,23 @@ impl VoiceSessionRuntime {
     }
 
     async fn stop(&self) -> Result<(), AppError> {
+        {
+            let state = self.state.read().await;
+            ensure_active_voice_session(&state, "stop")?;
+        }
+        self.invalidate_playback();
+        self.defer_playback_reset();
+        {
+            let mut voice = self.voice.lock().await;
+            if let Some(session) = voice.as_mut() {
+                if session.is_connected() && session.media_started() {
+                    session.stop_audio().await?;
+                }
+            }
+        }
+
         let event = {
             let mut state = self.state.write().await;
-            ensure_active_voice_session(&state, "stop")?;
             state.current_video_id = None;
             state.selected_itag = None;
             state.queue_depth = 0;
@@ -238,6 +345,8 @@ impl VoiceSessionRuntime {
     }
 
     async fn leave_voice(&self) -> Result<(), AppError> {
+        self.invalidate_playback();
+        self.defer_playback_reset();
         *self.state.write().await = Snapshot::default();
         *self.voice.lock().await = None;
         Ok(())
@@ -292,6 +401,26 @@ impl VoiceSessionRuntime {
         self.events.emit(reconnected_event);
 
         Ok(())
+    }
+
+    fn begin_playback(&self) -> u64 {
+        self.playback_epoch.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    fn invalidate_playback(&self) {
+        self.playback_epoch.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn defer_playback_reset(&self) {
+        self.playback_reset_pending.store(true, Ordering::SeqCst);
+    }
+
+    fn consume_playback_reset(&self) -> bool {
+        self.playback_reset_pending.swap(false, Ordering::SeqCst)
+    }
+
+    fn playback_interrupted(&self, playback_epoch: u64) -> bool {
+        self.playback_epoch.load(Ordering::SeqCst) != playback_epoch
     }
 }
 

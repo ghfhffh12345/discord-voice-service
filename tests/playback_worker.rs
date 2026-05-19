@@ -60,7 +60,7 @@ async fn prepare_buffers_real_packets_and_returns_selected_itag() {
     );
     let mut queue = OpusFrameQueue::new(32);
 
-    let source = worker
+    let mut source = worker
         .prepare("video-1", &mut queue)
         .await
         .expect("source should be prepared");
@@ -77,6 +77,9 @@ async fn prepare_buffers_real_packets_and_returns_selected_itag() {
         Bytes::from_static(b"prefetched-opus-frame")
     );
 
+    assert_eq!(source.position().sent_duration_ms(), 0);
+
+    source.record_sent_packet(first_packet.duration_ms);
     assert_eq!(
         source.position().sent_duration_ms(),
         first_packet.duration_ms
@@ -131,8 +134,9 @@ async fn prepare_preserves_current_track_position_when_recovering_same_video() {
     );
     let mut first_queue = OpusFrameQueue::new(32);
 
-    let first_source = worker.prepare("video-1", &mut first_queue).await.unwrap();
+    let mut first_source = worker.prepare("video-1", &mut first_queue).await.unwrap();
     let first_packet = first_queue.pop().expect("queue should contain a packet");
+    first_source.record_sent_packet(first_packet.duration_ms);
     assert_eq!(
         first_source.position().sent_duration_ms(),
         first_packet.duration_ms
@@ -160,6 +164,35 @@ async fn prepare_preserves_current_track_position_when_recovering_same_video() {
 
     assert_eq!(recovered_first_packet, expected_next_packet);
     assert_ne!(recovered_first_packet, first_packet);
+}
+
+#[tokio::test]
+async fn reset_discards_same_video_resume_state() {
+    let fake = FakeYtMusic::spawn().await;
+    let http = spawn_stream_server("tests/fixtures/audio-itag250.webm").await;
+    fake.set_playable_url(http.url()).await;
+
+    let mut worker = PlaybackWorker::new(
+        YtMusicClient::connect(fake.endpoint())
+            .await
+            .expect("client"),
+    );
+    let mut first_queue = OpusFrameQueue::new(32);
+
+    let mut first_source = worker.prepare("video-1", &mut first_queue).await.unwrap();
+    let first_packet = first_queue.pop().expect("queue should contain a packet");
+    first_source.record_sent_packet(first_packet.duration_ms);
+
+    worker.reset();
+
+    let mut replay_queue = OpusFrameQueue::new(32);
+    let replay_source = worker.prepare("video-1", &mut replay_queue).await.unwrap();
+    let replay_first_packet = replay_queue
+        .pop()
+        .expect("replay queue should contain a packet");
+
+    assert_eq!(replay_source.position().sent_duration_ms(), 0);
+    assert_eq!(replay_first_packet, first_packet);
 }
 
 #[tokio::test]
