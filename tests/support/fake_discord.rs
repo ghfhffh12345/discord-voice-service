@@ -16,8 +16,16 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 
 const DAVE_CREATOR_USER_ID: &str = "9999999999999999";
+const DAVE_EXISTING_MEMBER_USER_ID: &str = "8888888888888888";
 const DAVE_PROTOCOL_VERSION: u16 = 1;
 const DAVE_TRANSITION_ID: u16 = 1;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DaveScenario {
+    Disabled,
+    NewGroup,
+    EstablishedGroupJoin,
+}
 
 pub struct FakeDiscordPeer {
     endpoint_host: String,
@@ -50,15 +58,20 @@ impl FakeDiscordPeer {
 
     #[allow(clippy::result_large_err)]
     pub async fn spawn_real_shape_with_heartbeat_interval(heartbeat_interval_ms: u64) -> Self {
-        Self::spawn_with_options(heartbeat_interval_ms, false).await
+        Self::spawn_with_options(heartbeat_interval_ms, DaveScenario::Disabled).await
     }
 
     #[allow(clippy::result_large_err)]
     pub async fn spawn_with_dave() -> Self {
-        Self::spawn_with_options(1_000, true).await
+        Self::spawn_with_options(1_000, DaveScenario::NewGroup).await
     }
 
-    async fn spawn_with_options(heartbeat_interval_ms: u64, use_dave: bool) -> Self {
+    #[allow(clippy::result_large_err)]
+    pub async fn spawn_with_established_dave_group() -> Self {
+        Self::spawn_with_options(1_000, DaveScenario::EstablishedGroupJoin).await
+    }
+
+    async fn spawn_with_options(heartbeat_interval_ms: u64, dave_scenario: DaveScenario) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let udp_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let ws_addr = listener.local_addr().unwrap();
@@ -221,7 +234,9 @@ impl FakeDiscordPeer {
                                     "d": {
                                         "mode": mode,
                                         "secret_key": vec![0u8; 32],
-                                        "dave_protocol_version": use_dave.then_some(DAVE_PROTOCOL_VERSION),
+                                        "dave_protocol_version": (dave_scenario
+                                            != DaveScenario::Disabled)
+                                            .then_some(DAVE_PROTOCOL_VERSION),
                                     }
                                 })
                                 .to_string()
@@ -229,13 +244,20 @@ impl FakeDiscordPeer {
                             ))
                             .await
                             .unwrap();
-                            if use_dave {
+                            if dave_scenario != DaveScenario::Disabled {
+                                let announced_user_ids = match dave_scenario {
+                                    DaveScenario::Disabled => Vec::new(),
+                                    DaveScenario::NewGroup => vec![DAVE_CREATOR_USER_ID],
+                                    DaveScenario::EstablishedGroupJoin => {
+                                        vec![DAVE_CREATOR_USER_ID, DAVE_EXISTING_MEMBER_USER_ID]
+                                    }
+                                };
                                 ws.send(Message::Text(
                                     json!({
                                         "op": 11,
                                         "seq": 1,
                                         "d": {
-                                            "user_ids": [DAVE_CREATOR_USER_ID],
+                                            "user_ids": announced_user_ids,
                                         }
                                     })
                                     .to_string()
@@ -256,6 +278,40 @@ impl FakeDiscordPeer {
                                 creator
                                     .init(DAVE_PROTOCOL_VERSION, group_id, DAVE_CREATOR_USER_ID)
                                     .expect("creator init");
+                                if dave_scenario == DaveScenario::EstablishedGroupJoin {
+                                    let mut existing_member =
+                                        DaveSession::new(None).expect("existing member session");
+                                    existing_member
+                                        .set_external_sender(&external_sender_bytes)
+                                        .expect("existing external sender");
+                                    existing_member
+                                        .init(
+                                            DAVE_PROTOCOL_VERSION,
+                                            group_id,
+                                            DAVE_EXISTING_MEMBER_USER_ID,
+                                        )
+                                        .expect("existing member init");
+                                    let existing_key_package = existing_member
+                                        .key_package()
+                                        .expect("existing member key package");
+                                    let proposal = external_sender
+                                        .propose_add(0, &existing_key_package)
+                                        .expect("existing member add proposal");
+                                    let recognized_user_ids =
+                                        [DAVE_CREATOR_USER_ID, DAVE_EXISTING_MEMBER_USER_ID];
+                                    let commit_welcome = creator
+                                        .process_proposals(&proposal, &recognized_user_ids)
+                                        .expect("creator process proposals");
+                                    let (commit, welcome) = external_sender
+                                        .split_commit_welcome(&commit_welcome)
+                                        .expect("split existing member commit/welcome");
+                                    creator
+                                        .process_commit(&commit)
+                                        .expect("creator process existing member commit");
+                                    existing_member
+                                        .process_welcome(&welcome, &recognized_user_ids)
+                                        .expect("existing member welcome");
+                                }
                                 ws.send(Message::Binary(Bytes::from(
                                     dave_external_sender_message(2, &external_sender_bytes),
                                 )))
@@ -266,7 +322,12 @@ impl FakeDiscordPeer {
                                         "op": 24,
                                         "seq": 3,
                                         "d": {
-                                            "epoch": "1",
+                                            "transition_id": DAVE_TRANSITION_ID,
+                                            "epoch": if dave_scenario == DaveScenario::EstablishedGroupJoin {
+                                                "2"
+                                            } else {
+                                                "1"
+                                            },
                                             "protocol_version": DAVE_PROTOCOL_VERSION,
                                         }
                                     })
@@ -281,7 +342,7 @@ impl FakeDiscordPeer {
                             }
                         }
                         Some(23) => {
-                            if use_dave
+                            if dave_scenario != DaveScenario::Disabled
                                 && payload
                                     .pointer("/d/transition_id")
                                     .and_then(Value::as_u64)
@@ -308,7 +369,7 @@ impl FakeDiscordPeer {
                         _ => {}
                     }
                 } else if let Message::Binary(bytes) = message {
-                    if use_dave && bytes.first() == Some(&26) {
+                    if dave_scenario != DaveScenario::Disabled && bytes.first() == Some(&26) {
                         if *saw_dave_prepare_epoch_state.lock().await {
                             *saw_dave_key_package_after_prepare_epoch_state.lock().await = true;
                         } else {
@@ -327,6 +388,7 @@ impl FakeDiscordPeer {
                             4,
                             creator,
                             external_sender,
+                            dave_scenario,
                             &user_id,
                             &bytes[1..],
                         ))))
@@ -450,13 +512,29 @@ fn dave_welcome_message(
     sequence: u16,
     creator: &mut DaveSession,
     external_sender: &DaveExternalSender,
+    dave_scenario: DaveScenario,
     runtime_user_id: &str,
     key_package: &[u8],
 ) -> Vec<u8> {
+    let proposal_epoch = match dave_scenario {
+        DaveScenario::Disabled => unreachable!("disabled DAVE scenario cannot emit welcome"),
+        DaveScenario::NewGroup => 0,
+        DaveScenario::EstablishedGroupJoin => 1,
+    };
     let proposal = external_sender
-        .propose_add(0, key_package)
+        .propose_add(proposal_epoch, key_package)
         .expect("runtime proposal");
-    let recognized_user_ids = [DAVE_CREATOR_USER_ID, runtime_user_id];
+    let recognized_user_ids = match dave_scenario {
+        DaveScenario::Disabled => unreachable!("disabled DAVE scenario cannot emit welcome"),
+        DaveScenario::NewGroup => vec![DAVE_CREATOR_USER_ID, runtime_user_id],
+        DaveScenario::EstablishedGroupJoin => {
+            vec![
+                DAVE_CREATOR_USER_ID,
+                DAVE_EXISTING_MEMBER_USER_ID,
+                runtime_user_id,
+            ]
+        }
+    };
     let commit_welcome = creator
         .process_proposals(&proposal, &recognized_user_ids)
         .expect("creator process proposals");

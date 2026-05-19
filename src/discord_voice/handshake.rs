@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, SocketAddr};
 
 use tokio::net::lookup_host;
@@ -205,7 +205,10 @@ async fn complete_initial_dave_transition(
     let mut recognized_user_ids = BTreeSet::from([voice.user_id.clone()]);
     let mut session = DaveSession::new(None)
         .map_err(|_| AppError::InvalidState("voice dave session create failed"))?;
-    let mut prepare_epoch_protocol_version = None;
+    session
+        .init(protocol_version, group_id, &voice.user_id)
+        .map_err(|_| AppError::InvalidState("voice dave session init failed"))?;
+    let mut pending_prepared_transitions = BTreeMap::<u16, u16>::new();
     let mut pending_transition = None::<(u16, DaveRuntimeContext)>;
 
     loop {
@@ -221,6 +224,7 @@ async fn complete_initial_dave_transition(
                     .map_err(|_| AppError::InvalidState("voice dave external sender invalid"))?;
             }
             VoiceGatewayEvent::DavePrepareEpoch(DavePrepareEpoch {
+                transition_id,
                 epoch,
                 protocol_version: prepare_protocol_version,
             }) => {
@@ -229,29 +233,19 @@ async fn complete_initial_dave_transition(
                         "voice dave prepare epoch protocol version mismatch",
                     ));
                 }
-                if epoch != "1" {
-                    return Err(AppError::InvalidState(
-                        "voice dave prepare epoch unsupported",
-                    ));
+                if epoch.is_empty() {
+                    return Err(AppError::InvalidState("voice dave prepare epoch missing"));
                 }
-                session
-                    .init(prepare_protocol_version, group_id, &voice.user_id)
-                    .map_err(|_| AppError::InvalidState("voice dave session init failed"))?;
                 let key_package = session
                     .key_package()
                     .map_err(|_| AppError::InvalidState("voice dave key package failed"))?;
                 gateway.send_dave_mls_key_package(&key_package).await?;
-                prepare_epoch_protocol_version = Some(prepare_protocol_version);
+                pending_prepared_transitions.insert(transition_id, prepare_protocol_version);
             }
             VoiceGatewayEvent::DaveMlsWelcome(DaveMlsWelcome {
                 transition_id,
                 welcome,
             }) => {
-                let Some(prepared_protocol_version) = prepare_epoch_protocol_version else {
-                    return Err(AppError::InvalidState(
-                        "voice dave welcome received before prepare epoch",
-                    ));
-                };
                 let recognized = recognized_user_ids
                     .iter()
                     .map(String::as_str)
@@ -259,9 +253,12 @@ async fn complete_initial_dave_transition(
                 session
                     .process_welcome(&welcome, &recognized)
                     .map_err(|_| AppError::InvalidState("voice dave welcome invalid"))?;
+                let runtime_protocol_version = pending_prepared_transitions
+                    .remove(&transition_id)
+                    .unwrap_or(protocol_version);
                 let runtime = DaveRuntimeContext::from_session(
                     &session,
-                    prepared_protocol_version,
+                    runtime_protocol_version,
                     &voice.user_id,
                     ssrc,
                 )?;

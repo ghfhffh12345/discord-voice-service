@@ -63,3 +63,16 @@ async fn voice_session_uses_dave_runtime_state_when_session_description_requires
     assert!(fake.saw_dave_key_package_after_prepare_epoch().await);
     assert!(fake.saw_dave_transition().await);
 }
+
+#[tokio::test]
+async fn voice_session_can_join_an_established_dave_group() {
+    let fake = FakeDiscordPeer::spawn_with_established_dave_group().await;
+    let voice = fake.voice_context("1", "2", "1111111111111111", "session-1", "token-1");
+
+    let session = ConnectedVoiceSession::connect(voice).await.unwrap();
+
+    assert!(session.dave_enabled());
+    assert!(fake.saw_dave_prepare_epoch().await);
+    assert!(fake.saw_dave_key_package_after_prepare_epoch().await);
+    assert!(fake.saw_dave_transition().await);
+}

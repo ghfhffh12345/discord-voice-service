@@ -37,6 +37,7 @@ pub struct DaveExecuteTransition {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DavePrepareEpoch {
+    pub transition_id: u16,
     pub epoch: String,
     pub protocol_version: u16,
 }
@@ -178,6 +179,13 @@ pub fn parse_gateway_message(text: &str) -> Result<VoiceGatewayPayload, AppError
                 .collect::<Result<Vec<_>, _>>()?,
         }),
         24 => VoiceGatewayEvent::DavePrepareEpoch(DavePrepareEpoch {
+            transition_id: data
+                .get("transition_id")
+                .and_then(Value::as_u64)
+                .and_then(|value| u16::try_from(value).ok())
+                .ok_or(AppError::InvalidState(
+                    "voice dave prepare epoch transition id invalid",
+                ))?,
             epoch: data
                 .get("epoch")
                 .and_then(Value::as_str)
@@ -443,6 +451,7 @@ mod tests {
                 "op": 24,
                 "seq": 9,
                 "d": {
+                    "transition_id": 11,
                     "epoch": "1",
                     "protocol_version": 1
                 }
@@ -453,6 +462,7 @@ mod tests {
         assert_eq!(payload.seq(), Some(9));
         match payload.into_event() {
             VoiceGatewayEvent::DavePrepareEpoch(epoch) => {
+                assert_eq!(epoch.transition_id, 11);
                 assert_eq!(epoch.epoch, "1");
                 assert_eq!(epoch.protocol_version, 1);
             }
