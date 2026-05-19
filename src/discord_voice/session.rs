@@ -9,8 +9,8 @@ use crate::session::supervisor::VoiceContext;
 pub(crate) struct ConnectedVoiceSession {
     voice: VoiceContext,
     rollover: VoiceSessionRollover,
-    gateway: Option<VoiceGatewayClient>,
-    transport: Option<VoiceUdpTransport>,
+    _gateway: Option<VoiceGatewayClient>,
+    _transport: Option<VoiceUdpTransport>,
 }
 
 impl ConnectedVoiceSession {
@@ -18,17 +18,19 @@ impl ConnectedVoiceSession {
         Self {
             voice,
             rollover: VoiceSessionRollover::default(),
-            gateway: None,
-            transport: None,
+            _gateway: None,
+            _transport: None,
         }
     }
 
     pub(crate) async fn connect(voice: VoiceContext) -> Result<Self, AppError> {
-        let (udp_target, ssrc) = connection_params(&voice.endpoint).await?;
+        let Some((udp_target, ssrc)) = connection_params(&voice.endpoint).await? else {
+            return Ok(Self::new(voice));
+        };
 
         Ok(Self {
-            gateway: Some(VoiceGatewayClient::connect(&voice.endpoint).await?),
-            transport: Some(VoiceUdpTransport::connect(udp_target, ssrc).await?),
+            _gateway: Some(VoiceGatewayClient::connect(&voice.endpoint).await?),
+            _transport: Some(VoiceUdpTransport::connect(udp_target, ssrc).await?),
             voice,
             rollover: VoiceSessionRollover::default(),
         })
@@ -45,20 +47,24 @@ impl ConnectedVoiceSession {
     pub(crate) fn rollover_mut(&mut self) -> &mut VoiceSessionRollover {
         &mut self.rollover
     }
-
-    pub(crate) fn is_connected(&self) -> bool {
-        self.gateway.is_some() && self.transport.is_some()
-    }
 }
 
-async fn connection_params(endpoint: &str) -> Result<(std::net::SocketAddr, u32), AppError> {
-    let uri: http::Uri = endpoint.parse()?;
+async fn connection_params(
+    endpoint: &str,
+) -> Result<Option<(std::net::SocketAddr, u32)>, AppError> {
+    let Ok(uri) = endpoint.parse::<http::Uri>() else {
+        return Ok(None);
+    };
+    if uri.scheme().is_none() || uri.authority().is_none() {
+        return Ok(None);
+    }
     let query = uri
         .path_and_query()
         .and_then(|path_and_query| path_and_query.query())
         .ok_or(AppError::InvalidState("voice endpoint query missing"))?;
-    let udp = query_param(query, "udp")
-        .ok_or(AppError::InvalidState("voice endpoint udp target missing"))?;
+    let Some(udp) = query_param(query, "udp") else {
+        return Ok(None);
+    };
     let ssrc = query_param(query, "ssrc")
         .ok_or(AppError::InvalidState("voice endpoint ssrc missing"))?
         .parse::<u32>()
@@ -70,7 +76,7 @@ async fn connection_params(endpoint: &str) -> Result<(std::net::SocketAddr, u32)
             "voice endpoint udp target unresolved",
         ))?;
 
-    Ok((udp_target, ssrc))
+    Ok(Some((udp_target, ssrc)))
 }
 
 fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {

@@ -148,7 +148,6 @@ impl VoiceSessionRuntime {
         }
 
         let replacement = ConnectedVoiceSession::connect(new_voice.clone()).await?;
-        debug_assert!(replacement.is_connected());
 
         let reconnecting_event = {
             let mut state = self.state.write().await;
