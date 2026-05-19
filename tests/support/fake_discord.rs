@@ -26,6 +26,7 @@ enum DaveScenario {
     Disabled,
     NewGroup,
     EstablishedGroupJoin,
+    PrepareBackedWelcomeWithStrayFollowUp,
     UnmatchedWelcome,
 }
 
@@ -77,6 +78,11 @@ impl FakeDiscordPeer {
     #[allow(clippy::result_large_err)]
     pub async fn spawn_with_unmatched_dave_welcome() -> Self {
         Self::spawn_with_options(1_000, DaveScenario::UnmatchedWelcome).await
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn spawn_with_prepare_backed_stray_dave_welcome() -> Self {
+        Self::spawn_with_options(1_000, DaveScenario::PrepareBackedWelcomeWithStrayFollowUp).await
     }
 
     async fn spawn_with_options(heartbeat_interval_ms: u64, dave_scenario: DaveScenario) -> Self {
@@ -151,6 +157,7 @@ impl FakeDiscordPeer {
             };
             let mut dave_external_sender = None::<DaveExternalSender>;
             let mut dave_creator = None::<DaveSession>;
+            let mut queued_stray_welcome = None::<Vec<u8>>;
             let mut ws = accept_hdr_async(stream, move |request: &Request, response: Response| {
                 *gateway_path_state.lock().unwrap() = Some(request.uri().to_string());
                 Ok(response)
@@ -257,7 +264,9 @@ impl FakeDiscordPeer {
                             if dave_scenario != DaveScenario::Disabled {
                                 let announced_user_ids = match dave_scenario {
                                     DaveScenario::Disabled => Vec::new(),
-                                    DaveScenario::NewGroup | DaveScenario::UnmatchedWelcome => {
+                                    DaveScenario::NewGroup
+                                    | DaveScenario::PrepareBackedWelcomeWithStrayFollowUp
+                                    | DaveScenario::UnmatchedWelcome => {
                                         vec![DAVE_CREATOR_USER_ID]
                                     }
                                     DaveScenario::EstablishedGroupJoin => {
@@ -329,33 +338,30 @@ impl FakeDiscordPeer {
                                 )))
                                 .await
                                 .unwrap();
-                                ws.send(Message::Text(
-                                    json!({
-                                        "op": 24,
-                                        "seq": 3,
-                                        "d": {
-                                            "transition_id": DAVE_TRANSITION_ID,
-                                            "epoch": if dave_scenario == DaveScenario::EstablishedGroupJoin {
-                                                "2"
-                                            } else {
-                                                "1"
-                                            },
-                                            "protocol_version": DAVE_PROTOCOL_VERSION,
-                                        }
-                                    })
-                                    .to_string()
-                                    .into(),
-                                ))
-                                .await
-                                .unwrap();
-                                *saw_dave_prepare_epoch_state.lock().await = true;
+                                if dave_scenario != DaveScenario::EstablishedGroupJoin {
+                                    ws.send(Message::Text(
+                                        json!({
+                                            "op": 24,
+                                            "seq": 3,
+                                            "d": {
+                                                "transition_id": DAVE_TRANSITION_ID,
+                                                "epoch": "1",
+                                                "protocol_version": DAVE_PROTOCOL_VERSION,
+                                            }
+                                        })
+                                        .to_string()
+                                        .into(),
+                                    ))
+                                    .await
+                                    .unwrap();
+                                    *saw_dave_prepare_epoch_state.lock().await = true;
+                                }
                                 dave_external_sender = Some(external_sender);
                                 dave_creator = Some(creator);
                             }
                         }
                         Some(23) => {
-                            if dave_scenario != DaveScenario::Disabled
-                            {
+                            if dave_scenario != DaveScenario::Disabled {
                                 let Some(transition_id) = payload
                                     .pointer("/d/transition_id")
                                     .and_then(Value::as_u64)
@@ -366,6 +372,11 @@ impl FakeDiscordPeer {
 
                                 if transition_id == DAVE_TRANSITION_ID {
                                     *saw_dave_transition_state.lock().await = true;
+                                    if let Some(stray_welcome) = queued_stray_welcome.take() {
+                                        ws.send(Message::Binary(Bytes::from(stray_welcome)))
+                                            .await
+                                            .unwrap();
+                                    }
                                     ws.send(Message::Text(
                                         json!({
                                             "op": 22,
@@ -417,6 +428,32 @@ impl FakeDiscordPeer {
                             .as_ref()
                             .expect("external sender missing");
                         let creator = dave_creator.as_mut().expect("creator session missing");
+                        if dave_scenario == DaveScenario::PrepareBackedWelcomeWithStrayFollowUp {
+                            let mut stray_creator =
+                                DaveSession::new(None).expect("stray creator session");
+                            let external_sender_bytes = external_sender
+                                .marshalled_external_sender()
+                                .expect("stray external sender bytes");
+                            stray_creator
+                                .set_external_sender(&external_sender_bytes)
+                                .expect("stray creator external sender");
+                            stray_creator
+                                .init(
+                                    DAVE_PROTOCOL_VERSION,
+                                    group_id_from_user_context(&user_id, &dave_group_id_state),
+                                    DAVE_CREATOR_USER_ID,
+                                )
+                                .expect("stray creator init");
+                            queued_stray_welcome = Some(dave_welcome_message(
+                                5,
+                                &mut stray_creator,
+                                external_sender,
+                                DaveScenario::NewGroup,
+                                &user_id,
+                                DAVE_UNMATCHED_TRANSITION_ID,
+                                &bytes[1..],
+                            ));
+                        }
                         ws.send(Message::Binary(Bytes::from(dave_welcome_message(
                             4,
                             creator,
@@ -542,6 +579,13 @@ impl FakeDiscordPeer {
     }
 }
 
+fn group_id_from_user_context(
+    _runtime_user_id: &str,
+    dave_group_id_state: &Arc<StdMutex<Option<u64>>>,
+) -> u64 {
+    dave_group_id_state.lock().unwrap().unwrap_or(2)
+}
+
 fn dave_external_sender_message(sequence: u16, external_sender_bytes: &[u8]) -> Vec<u8> {
     let mut message = Vec::with_capacity(3 + external_sender_bytes.len());
     message.extend_from_slice(&sequence.to_be_bytes());
@@ -561,7 +605,9 @@ fn dave_welcome_message(
 ) -> Vec<u8> {
     let proposal_epoch = match dave_scenario {
         DaveScenario::Disabled => unreachable!("disabled DAVE scenario cannot emit welcome"),
-        DaveScenario::NewGroup | DaveScenario::UnmatchedWelcome => 0,
+        DaveScenario::NewGroup
+        | DaveScenario::PrepareBackedWelcomeWithStrayFollowUp
+        | DaveScenario::UnmatchedWelcome => 0,
         DaveScenario::EstablishedGroupJoin => 1,
     };
     let proposal = external_sender
@@ -569,7 +615,9 @@ fn dave_welcome_message(
         .expect("runtime proposal");
     let recognized_user_ids = match dave_scenario {
         DaveScenario::Disabled => unreachable!("disabled DAVE scenario cannot emit welcome"),
-        DaveScenario::NewGroup | DaveScenario::UnmatchedWelcome => {
+        DaveScenario::NewGroup
+        | DaveScenario::PrepareBackedWelcomeWithStrayFollowUp
+        | DaveScenario::UnmatchedWelcome => {
             vec![DAVE_CREATOR_USER_ID, runtime_user_id]
         }
         DaveScenario::EstablishedGroupJoin => {

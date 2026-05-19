@@ -51,7 +51,7 @@ async fn connected_voice_session_sends_periodic_heartbeats_after_hello() {
 }
 
 #[tokio::test]
-async fn voice_session_uses_dave_runtime_state_when_session_description_requires_it() {
+async fn voice_session_completes_prepare_backed_dave_join() {
     let fake = FakeDiscordPeer::spawn_with_dave().await;
     let voice = fake.voice_context("1", "2", "1111111111111111", "session-1", "token-1");
 
@@ -65,15 +65,15 @@ async fn voice_session_uses_dave_runtime_state_when_session_description_requires
 }
 
 #[tokio::test]
-async fn voice_session_can_join_an_established_dave_group() {
+async fn voice_session_can_join_an_established_dave_group_without_prepare_epoch() {
     let fake = FakeDiscordPeer::spawn_with_established_dave_group().await;
     let voice = fake.voice_context("1", "2", "1111111111111111", "session-1", "token-1");
 
     let session = ConnectedVoiceSession::connect(voice).await.unwrap();
 
     assert!(session.dave_enabled());
-    assert!(fake.saw_dave_prepare_epoch().await);
-    assert!(fake.saw_dave_key_package_after_prepare_epoch().await);
+    assert!(!fake.saw_dave_prepare_epoch().await);
+    assert!(fake.saw_dave_key_package_before_prepare_epoch().await);
     assert!(fake.saw_dave_transition().await);
 }
 
@@ -84,4 +84,22 @@ async fn voice_session_rejects_unmatched_dave_welcome_transition() {
 
     assert!(ConnectedVoiceSession::connect(voice).await.is_err());
     assert!(!fake.saw_unmatched_dave_transition().await);
+}
+
+#[tokio::test]
+async fn voice_session_does_not_acknowledge_a_stray_dave_welcome_after_a_prepare_backed_welcome() {
+    let fake = FakeDiscordPeer::spawn_with_prepare_backed_stray_dave_welcome().await;
+    let voice = fake.voice_context("1", "2", "1111111111111111", "session-1", "token-1");
+
+    let error = match ConnectedVoiceSession::connect(voice).await {
+        Ok(_) => panic!("stray welcome should not be accepted"),
+        Err(error) => error,
+    };
+
+    assert!(fake.saw_dave_prepare_epoch().await);
+    assert!(!fake.saw_unmatched_dave_transition().await);
+    assert_eq!(
+        error.to_string(),
+        "invalid state: voice dave welcome transition missing pending join"
+    );
 }

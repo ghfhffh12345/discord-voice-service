@@ -210,6 +210,7 @@ async fn complete_initial_dave_transition(
         .map_err(|_| AppError::InvalidState("voice dave session init failed"))?;
     let mut pending_prepared_transitions = BTreeMap::<u16, u16>::new();
     let mut pending_transition = None::<(u16, DaveRuntimeContext)>;
+    let mut pending_key_package = false;
 
     loop {
         match next_event(gateway).await?.into_event() {
@@ -222,6 +223,8 @@ async fn complete_initial_dave_transition(
                 session
                     .set_external_sender(&sender)
                     .map_err(|_| AppError::InvalidState("voice dave external sender invalid"))?;
+                send_pending_join_key_package(gateway, &mut session, &mut pending_key_package)
+                    .await?;
             }
             VoiceGatewayEvent::DavePrepareEpoch(DavePrepareEpoch {
                 transition_id,
@@ -236,21 +239,23 @@ async fn complete_initial_dave_transition(
                 if epoch.is_empty() {
                     return Err(AppError::InvalidState("voice dave prepare epoch missing"));
                 }
-                let key_package = session
-                    .key_package()
-                    .map_err(|_| AppError::InvalidState("voice dave key package failed"))?;
-                gateway.send_dave_mls_key_package(&key_package).await?;
+                send_pending_join_key_package(gateway, &mut session, &mut pending_key_package)
+                    .await?;
                 pending_prepared_transitions.insert(transition_id, prepare_protocol_version);
             }
             VoiceGatewayEvent::DaveMlsWelcome(DaveMlsWelcome {
                 transition_id,
                 welcome,
             }) => {
-                let Some(&runtime_protocol_version) =
-                    pending_prepared_transitions.get(&transition_id)
-                else {
+                let runtime_protocol_version = if let Some(runtime_protocol_version) =
+                    pending_prepared_transitions.remove(&transition_id)
+                {
+                    runtime_protocol_version
+                } else if pending_key_package && pending_prepared_transitions.is_empty() {
+                    protocol_version
+                } else {
                     return Err(AppError::InvalidState(
-                        "voice dave welcome transition missing prepare",
+                        "voice dave welcome transition missing pending join",
                     ));
                 };
                 let recognized = recognized_user_ids
@@ -260,7 +265,8 @@ async fn complete_initial_dave_transition(
                 session
                     .process_welcome(&welcome, &recognized)
                     .map_err(|_| AppError::InvalidState("voice dave welcome invalid"))?;
-                pending_prepared_transitions.remove(&transition_id);
+                pending_key_package = false;
+                pending_prepared_transitions.clear();
                 let runtime = DaveRuntimeContext::from_session(
                     &session,
                     runtime_protocol_version,
@@ -283,6 +289,23 @@ async fn complete_initial_dave_transition(
             _ => {}
         }
     }
+}
+
+async fn send_pending_join_key_package(
+    gateway: &VoiceGatewayClient,
+    session: &mut DaveSession,
+    pending_key_package: &mut bool,
+) -> Result<(), AppError> {
+    if *pending_key_package {
+        return Ok(());
+    }
+
+    let key_package = session
+        .key_package()
+        .map_err(|_| AppError::InvalidState("voice dave key package failed"))?;
+    gateway.send_dave_mls_key_package(&key_package).await?;
+    *pending_key_package = true;
+    Ok(())
 }
 
 async fn next_event(
