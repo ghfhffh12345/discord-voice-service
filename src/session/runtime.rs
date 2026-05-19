@@ -142,10 +142,16 @@ impl VoiceSessionRuntime {
     }
 
     async fn rollover_voice_context(&self, new_voice: VoiceContext) -> Result<(), AppError> {
+        {
+            let state = self.state.read().await;
+            ensure_active_voice_session(&state, "update_voice_context")?;
+        }
+
+        let replacement = ConnectedVoiceSession::connect(new_voice.clone()).await?;
+        debug_assert!(replacement.is_connected());
+
         let reconnecting_event = {
             let mut state = self.state.write().await;
-            ensure_active_voice_session(&state, "update_voice_context")?;
-
             let mut current_voice = self.voice.lock().await;
             let Some(session) = current_voice.as_mut() else {
                 return Err(AppError::InvalidState(
@@ -154,14 +160,10 @@ impl VoiceSessionRuntime {
             };
 
             session.rollover_mut().set_voice_reconnecting(true);
-            apply_voice_context(&mut state, &new_voice);
             apply_rollover_state(&mut state, session);
             SessionEventRecord::from_snapshot(SessionEventKind::VoiceReconnecting, &state)
         };
         self.events.emit(reconnecting_event);
-
-        let replacement = ConnectedVoiceSession::connect(new_voice).await?;
-        debug_assert!(replacement.is_connected());
 
         let reconnected_event = {
             let mut state = self.state.write().await;

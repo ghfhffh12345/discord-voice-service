@@ -74,6 +74,45 @@ async fn update_voice_context_replaces_full_runtime_voice_context() {
     assert!(fake.gateway_path().await.unwrap().contains("v=8"));
 }
 
+#[tokio::test]
+async fn update_voice_context_failure_keeps_snapshot_and_runtime_on_previous_voice() {
+    let supervisor = Supervisor::new();
+    let fake = FakeVoiceEndpoint::spawn().await;
+    let joined = fake.voice_context("1", "2", "3", "token");
+    let invalid = VoiceContext {
+        guild_id: "1".into(),
+        channel_id: "9".into(),
+        session_id: "broken-session".into(),
+        endpoint: "not-a-valid-voice-endpoint".into(),
+        token: "broken-token".into(),
+    };
+
+    supervisor
+        .send(Command::JoinVoice {
+            voice: joined.clone(),
+        })
+        .await
+        .unwrap();
+
+    let err = supervisor
+        .send(Command::UpdateVoiceContext {
+            voice: invalid.clone(),
+        })
+        .await
+        .unwrap_err();
+
+    assert!(err.to_string().contains("voice"));
+    assert_eq!(
+        supervisor.current_voice_context().await,
+        Some(joined.clone())
+    );
+
+    let snapshot = supervisor.snapshot().await;
+    assert_eq!(snapshot.guild_id, Some(joined.guild_id.clone()));
+    assert_eq!(snapshot.channel_id, Some(joined.channel_id.clone()));
+    assert!(!snapshot.voice_reconnecting);
+}
+
 fn test_voice_context() -> VoiceContext {
     VoiceContext {
         guild_id: "1".into(),

@@ -119,6 +119,40 @@ async fn prepare_reruns_resolution_when_initial_playable_url_is_stale() {
 }
 
 #[tokio::test]
+async fn prepare_preserves_current_track_position_when_recovering_same_video() {
+    let fake = FakeYtMusic::spawn().await;
+    let http = spawn_stream_server("tests/fixtures/audio-itag250.webm").await;
+    fake.set_playable_url(http.url()).await;
+
+    let mut worker = PlaybackWorker::new(
+        YtMusicClient::connect(fake.endpoint())
+            .await
+            .expect("client"),
+    );
+    let mut first_queue = OpusFrameQueue::new(32);
+
+    let mut first_source = worker.prepare("video-1", &mut first_queue).await.unwrap();
+    let first_packet = first_queue.pop().expect("queue should contain a packet");
+    first_source.record_sent_packet(first_packet.duration_ms);
+    worker.sync_position_from_source(&first_source);
+
+    fake.fail_first_url_once().await;
+
+    let mut recovery_queue = OpusFrameQueue::new(32);
+    let recovered = worker
+        .prepare("video-1", &mut recovery_queue)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        recovered.position().sent_duration_ms(),
+        first_packet.duration_ms
+    );
+    assert!(recovery_queue.len() > 0);
+    assert!(recovered.position().timestamp_ms() >= first_packet.duration_ms);
+}
+
+#[tokio::test]
 async fn prepare_rejects_unsupported_formats() {
     let fake = FakeYtMusic::spawn().await;
     let mut worker = PlaybackWorker::new(

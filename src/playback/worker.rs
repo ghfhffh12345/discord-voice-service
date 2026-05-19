@@ -27,6 +27,7 @@ impl PlaybackPlan {
 }
 
 pub struct PlaybackWorker {
+    current_video_id: Option<String>,
     recovery: PlaybackRecovery,
     position: PlaybackPosition,
     prebuffer_target: usize,
@@ -35,10 +36,15 @@ pub struct PlaybackWorker {
 impl PlaybackWorker {
     pub fn new(client: YtMusicClient) -> Self {
         Self {
+            current_video_id: None,
             recovery: PlaybackRecovery::new(client),
             position: PlaybackPosition::default(),
             prebuffer_target: DEFAULT_PREBUFFER_TARGET,
         }
+    }
+
+    pub fn sync_position_from_source(&mut self, source: &PlaybackSource) {
+        self.position = source.position();
     }
 
     pub async fn prepare(
@@ -46,9 +52,14 @@ impl PlaybackWorker {
         video_id: &str,
         queue: &mut OpusFrameQueue,
     ) -> Result<PlaybackSource, AppError> {
-        self.position = PlaybackPosition::default();
+        let resume_position_ms = if self.current_video_id.as_deref() == Some(video_id) {
+            self.position.sent_duration_ms()
+        } else {
+            self.position = PlaybackPosition::default();
+            0
+        };
 
-        let mut source = self.recovery.recover(video_id, 0).await?;
+        let mut source = self.recovery.recover(video_id, resume_position_ms).await?;
 
         while queue.len() < self.prebuffer_target {
             if let Some(packet) = source.pending_packets_mut().pop_front() {
@@ -75,6 +86,7 @@ impl PlaybackWorker {
             }
         }
 
+        self.current_video_id = Some(video_id.to_owned());
         self.position = source.position();
         Ok(source)
     }
