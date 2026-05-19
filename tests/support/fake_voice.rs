@@ -1,5 +1,6 @@
 use std::sync::{Arc, Mutex as StdMutex};
 
+use discord_voice_service::discord_voice::crypto::{PREFERRED_MODE, REQUIRED_MODE};
 use discord_voice_service::session::supervisor::VoiceContext;
 use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
@@ -89,7 +90,7 @@ impl FakeVoiceEndpoint {
                                             "ssrc": 7,
                                             "ip": udp_addr.ip().to_string(),
                                             "port": udp_addr.port(),
-                                            "modes": ["xsalsa20_poly1305"],
+                                            "modes": [PREFERRED_MODE, REQUIRED_MODE],
                                         }
                                     })
                                     .to_string()
@@ -102,7 +103,7 @@ impl FakeVoiceEndpoint {
                                 let mode = payload
                                     .pointer("/d/data/mode")
                                     .and_then(Value::as_str)
-                                    .unwrap_or("xsalsa20_poly1305");
+                                    .unwrap_or(PREFERRED_MODE);
                                 ws.send(Message::Text(
                                     json!({
                                         "op": 4,

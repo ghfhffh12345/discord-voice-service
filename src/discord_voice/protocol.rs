@@ -1,10 +1,9 @@
 use serde_json::{Value, json};
 
+use crate::discord_voice::crypto;
 use crate::discord_voice::udp::DiscoveredUdpAddress;
 use crate::error::AppError;
 use crate::session::supervisor::VoiceContext;
-
-pub const SUPPORTED_ENCRYPTION_MODE: &str = "xsalsa20_poly1305";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hello {
@@ -190,11 +189,6 @@ pub fn resume_payload(
     })
 }
 
-pub fn choose_encryption_mode(ready: &Ready) -> Result<&str, AppError> {
-    ready
-        .modes
-        .iter()
-        .find(|mode| mode.as_str() == SUPPORTED_ENCRYPTION_MODE)
-        .map(|mode| mode.as_str())
-        .ok_or(AppError::UnsupportedEncryptionMode)
+pub fn choose_encryption_mode(ready: &Ready) -> Result<&'static str, AppError> {
+    crypto::pick_mode(&ready.modes).ok_or(AppError::UnsupportedEncryptionMode)
 }

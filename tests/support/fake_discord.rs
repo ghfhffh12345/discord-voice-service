@@ -2,6 +2,7 @@
 
 use std::sync::{Arc, Mutex as StdMutex};
 
+use discord_voice_service::discord_voice::crypto::{PREFERRED_MODE, REQUIRED_MODE};
 use discord_voice_service::session::supervisor::VoiceContext;
 use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
@@ -21,6 +22,7 @@ pub struct FakeDiscordPeer {
     speaking_observed: Arc<Notify>,
     audio_frame_count: Arc<Mutex<usize>>,
     saw_identify: Arc<Mutex<bool>>,
+    saw_resume: Arc<Mutex<bool>>,
     saw_select_protocol: Arc<Mutex<bool>>,
     session_description_sent: Arc<Mutex<bool>>,
 }
@@ -42,6 +44,7 @@ impl FakeDiscordPeer {
         let speaking_observed = Arc::new(Notify::new());
         let audio_frame_count = Arc::new(Mutex::new(0usize));
         let saw_identify = Arc::new(Mutex::new(false));
+        let saw_resume = Arc::new(Mutex::new(false));
         let saw_select_protocol = Arc::new(Mutex::new(false));
         let session_description_sent = Arc::new(Mutex::new(false));
 
@@ -76,6 +79,7 @@ impl FakeDiscordPeer {
         let gateway_path_state = Arc::clone(&gateway_path);
         let speaking_observed_state = Arc::clone(&speaking_observed);
         let saw_identify_state = Arc::clone(&saw_identify);
+        let saw_resume_state = Arc::clone(&saw_resume);
         let saw_select_protocol_state = Arc::clone(&saw_select_protocol);
         let session_description_state = Arc::clone(&session_description_sent);
         tokio::spawn(async move {
@@ -116,7 +120,35 @@ impl FakeDiscordPeer {
                                         "ssrc": 7,
                                         "ip": udp_addr.ip().to_string(),
                                         "port": udp_addr.port(),
-                                        "modes": ["xsalsa20_poly1305"],
+                                        "modes": [PREFERRED_MODE, REQUIRED_MODE],
+                                    }
+                                })
+                                .to_string()
+                                .into(),
+                            ))
+                            .await
+                            .unwrap();
+                        }
+                        Some(7) => {
+                            *saw_resume_state.lock().await = true;
+                            ws.send(Message::Text(
+                                json!({
+                                    "op": 9,
+                                    "d": {}
+                                })
+                                .to_string()
+                                .into(),
+                            ))
+                            .await
+                            .unwrap();
+                            ws.send(Message::Text(
+                                json!({
+                                    "op": 2,
+                                    "d": {
+                                        "ssrc": 7,
+                                        "ip": udp_addr.ip().to_string(),
+                                        "port": udp_addr.port(),
+                                        "modes": [PREFERRED_MODE, REQUIRED_MODE],
                                     }
                                 })
                                 .to_string()
@@ -131,7 +163,7 @@ impl FakeDiscordPeer {
                             let mode = payload
                                 .pointer("/d/data/mode")
                                 .and_then(Value::as_str)
-                                .unwrap_or("xsalsa20_poly1305");
+                                .unwrap_or(PREFERRED_MODE);
                             ws.send(Message::Text(
                                 json!({
                                     "op": 4,
@@ -162,6 +194,7 @@ impl FakeDiscordPeer {
             speaking_observed,
             audio_frame_count,
             saw_identify,
+            saw_resume,
             saw_select_protocol,
             session_description_sent,
         }
@@ -205,6 +238,10 @@ impl FakeDiscordPeer {
 
     pub async fn saw_identify(&self) -> bool {
         wait_for_value(&self.saw_identify, |ready| *ready).await
+    }
+
+    pub async fn saw_resume(&self) -> bool {
+        wait_for_value(&self.saw_resume, |ready| *ready).await
     }
 
     pub async fn saw_select_protocol(&self) -> bool {

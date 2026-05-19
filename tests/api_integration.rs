@@ -69,7 +69,7 @@ async fn pause_while_resolving_track_returns_failed_precondition() {
                 guild_id: "1".into(),
                 channel_id: "2".into(),
                 session_id: "3".into(),
-                endpoint: "voice.example".into(),
+                endpoint: "voice-placeholder".into(),
                 token: "token".into(),
             }),
         }))
@@ -100,21 +100,21 @@ async fn join_voice_rejects_empty_required_fields() {
             guild_id: String::new(),
             channel_id: "2".into(),
             session_id: "3".into(),
-            endpoint: "voice.example".into(),
+            endpoint: "voice-placeholder".into(),
             token: "token".into(),
         },
         join_voice_request::VoiceContext {
             guild_id: "1".into(),
             channel_id: String::new(),
             session_id: "3".into(),
-            endpoint: "voice.example".into(),
+            endpoint: "voice-placeholder".into(),
             token: "token".into(),
         },
         join_voice_request::VoiceContext {
             guild_id: "1".into(),
             channel_id: "2".into(),
             session_id: String::new(),
-            endpoint: "voice.example".into(),
+            endpoint: "voice-placeholder".into(),
             token: "token".into(),
         },
         join_voice_request::VoiceContext {
@@ -128,7 +128,7 @@ async fn join_voice_rejects_empty_required_fields() {
             guild_id: "1".into(),
             channel_id: "2".into(),
             session_id: "3".into(),
-            endpoint: "voice.example".into(),
+            endpoint: "voice-placeholder".into(),
             token: String::new(),
         },
     ];
@@ -167,7 +167,7 @@ async fn resume_after_join_voice_before_play_returns_failed_precondition() {
                 guild_id: "1".into(),
                 channel_id: "2".into(),
                 session_id: "3".into(),
-                endpoint: "voice.example".into(),
+                endpoint: "voice-placeholder".into(),
                 token: "token".into(),
             }),
         }))
@@ -192,7 +192,7 @@ async fn duplicate_join_voice_returns_failed_precondition_without_clobbering_ses
                 guild_id: "1".into(),
                 channel_id: "2".into(),
                 session_id: "3".into(),
-                endpoint: "voice.example".into(),
+                endpoint: "voice-placeholder".into(),
                 token: "token".into(),
             }),
         }))
@@ -361,7 +361,7 @@ async fn join_voice_then_play_updates_supervisor_snapshot_through_service() {
                 guild_id: "1".into(),
                 channel_id: "2".into(),
                 session_id: "3".into(),
-                endpoint: "voice.example".into(),
+                endpoint: "voice-placeholder".into(),
                 token: "token".into(),
             }),
         }))
@@ -445,7 +445,7 @@ fn test_voice_context() -> join_voice_request::VoiceContext {
         guild_id: "1".into(),
         channel_id: "2".into(),
         session_id: "3".into(),
-        endpoint: "voice.example".into(),
+        endpoint: "voice-placeholder".into(),
         token: "token".into(),
     }
 }
@@ -485,7 +485,7 @@ fn test_voice_context_rotated() -> join_voice_request::VoiceContext {
         guild_id: "1".into(),
         channel_id: "9".into(),
         session_id: "rotated-session".into(),
-        endpoint: "rotated.voice.example".into(),
+        endpoint: "rotated-voice-placeholder".into(),
         token: "rotated-token".into(),
     }
 }
