@@ -121,7 +121,7 @@ fn dave_session_surfaces_mls_failure_callback_diagnostics() {
 }
 
 #[test]
-fn dave_runtime_context_builds_ratchet_backed_encrypt_and_decrypt_state() {
+fn dave_runtime_context_builds_send_side_encrypt_state_from_welcomed_session() {
     const GROUP_ID: u64 = 1_234_567_890;
     const PROTOCOL_VERSION: u16 = 1;
     const SSRC: u32 = 7;
@@ -167,23 +167,9 @@ fn dave_runtime_context_builds_ratchet_backed_encrypt_and_decrypt_state() {
         .process_welcome(&welcome, &recognized_user_ids)
         .expect("runtime welcome");
 
-    let mut runtime = DaveRuntimeContext::from_session(
-        &runtime_member,
-        PROTOCOL_VERSION,
-        RUNTIME_USER_ID,
-        CREATOR_USER_ID,
-        SSRC,
-    )
-    .expect("runtime context");
-
-    let creator_encrypt_ratchet = creator
-        .key_ratchet_for(CREATOR_USER_ID)
-        .expect("creator encrypt ratchet");
-    let mut creator_encryptor = DaveEncryptor::new().expect("creator encryptor");
-    creator_encryptor.assign_opus_ssrc(SSRC);
-    creator_encryptor
-        .set_key_ratchet(&creator_encrypt_ratchet)
-        .expect("creator encryptor ratchet");
+    let mut runtime =
+        DaveRuntimeContext::from_session(&runtime_member, PROTOCOL_VERSION, RUNTIME_USER_ID, SSRC)
+            .expect("runtime context");
 
     let creator_decrypt_ratchet = creator
         .key_ratchet_for(RUNTIME_USER_ID)
@@ -202,14 +188,4 @@ fn dave_runtime_context_builds_ratchet_backed_encrypt_and_decrypt_state() {
         .decrypt(DaveMediaType::Audio, &local_encrypted)
         .expect("creator decrypt");
     assert_eq!(local_decrypted, local_audio);
-
-    let remote_audio = hex::decode("112233445566778899aabbccddeeff00").expect("remote audio");
-    let remote_encrypted = creator_encryptor
-        .encrypt(DaveMediaType::Audio, SSRC, &remote_audio)
-        .expect("creator encrypt");
-    let remote_decrypted = runtime
-        .decryptor
-        .decrypt(DaveMediaType::Audio, &remote_encrypted)
-        .expect("runtime decrypt");
-    assert_eq!(remote_decrypted, remote_audio);
 }

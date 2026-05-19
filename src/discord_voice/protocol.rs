@@ -36,6 +36,12 @@ pub struct DaveExecuteTransition {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DavePrepareEpoch {
+    pub epoch: String,
+    pub protocol_version: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaveMlsExternalSenderPackage {
     pub external_sender: Vec<u8>,
 }
@@ -53,6 +59,7 @@ pub enum VoiceGatewayEvent {
     SessionDescription(SessionDescription),
     ClientsConnect(ClientsConnect),
     DaveExecuteTransition(DaveExecuteTransition),
+    DavePrepareEpoch(DavePrepareEpoch),
     DaveMlsExternalSenderPackage(DaveMlsExternalSenderPackage),
     DaveMlsWelcome(DaveMlsWelcome),
     Resumed,
@@ -169,6 +176,20 @@ pub fn parse_gateway_message(text: &str) -> Result<VoiceGatewayPayload, AppError
                         ))
                 })
                 .collect::<Result<Vec<_>, _>>()?,
+        }),
+        24 => VoiceGatewayEvent::DavePrepareEpoch(DavePrepareEpoch {
+            epoch: data
+                .get("epoch")
+                .and_then(Value::as_str)
+                .ok_or(AppError::InvalidState("voice dave prepare epoch missing"))?
+                .to_owned(),
+            protocol_version: data
+                .get("protocol_version")
+                .and_then(Value::as_u64)
+                .and_then(|value| u16::try_from(value).ok())
+                .ok_or(AppError::InvalidState(
+                    "voice dave prepare epoch protocol version invalid",
+                ))?,
         }),
         22 => VoiceGatewayEvent::DaveExecuteTransition(DaveExecuteTransition {
             transition_id: data
@@ -413,5 +434,29 @@ mod tests {
         assert_eq!(ready["d"]["transition_id"], 11);
 
         assert_eq!(dave_mls_key_package_payload(&[1, 2, 3]), vec![26, 1, 2, 3]);
+    }
+
+    #[test]
+    fn parse_gateway_message_supports_dave_prepare_epoch() {
+        let payload = parse_gateway_message(
+            r#"{
+                "op": 24,
+                "seq": 9,
+                "d": {
+                    "epoch": "1",
+                    "protocol_version": 1
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(payload.seq(), Some(9));
+        match payload.into_event() {
+            VoiceGatewayEvent::DavePrepareEpoch(epoch) => {
+                assert_eq!(epoch.epoch, "1");
+                assert_eq!(epoch.protocol_version, 1);
+            }
+            other => panic!("expected dave prepare epoch, got {other:?}"),
+        }
     }
 }

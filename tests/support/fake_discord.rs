@@ -32,6 +32,9 @@ pub struct FakeDiscordPeer {
     saw_select_protocol: Arc<Mutex<bool>>,
     session_description_sent: Arc<Mutex<bool>>,
     saw_dave_transition: Arc<Mutex<bool>>,
+    saw_dave_prepare_epoch: Arc<Mutex<bool>>,
+    saw_dave_key_package_before_prepare_epoch: Arc<Mutex<bool>>,
+    saw_dave_key_package_after_prepare_epoch: Arc<Mutex<bool>>,
 }
 
 impl FakeDiscordPeer {
@@ -71,6 +74,9 @@ impl FakeDiscordPeer {
         let saw_select_protocol = Arc::new(Mutex::new(false));
         let session_description_sent = Arc::new(Mutex::new(false));
         let saw_dave_transition = Arc::new(Mutex::new(false));
+        let saw_dave_prepare_epoch = Arc::new(Mutex::new(false));
+        let saw_dave_key_package_before_prepare_epoch = Arc::new(Mutex::new(false));
+        let saw_dave_key_package_after_prepare_epoch = Arc::new(Mutex::new(false));
         let identified_user_id = Arc::new(Mutex::new(None::<String>));
 
         let discovery_count_state = Arc::clone(&discovery_count);
@@ -109,6 +115,11 @@ impl FakeDiscordPeer {
         let saw_select_protocol_state = Arc::clone(&saw_select_protocol);
         let session_description_state = Arc::clone(&session_description_sent);
         let saw_dave_transition_state = Arc::clone(&saw_dave_transition);
+        let saw_dave_prepare_epoch_state = Arc::clone(&saw_dave_prepare_epoch);
+        let saw_dave_key_package_before_prepare_epoch_state =
+            Arc::clone(&saw_dave_key_package_before_prepare_epoch);
+        let saw_dave_key_package_after_prepare_epoch_state =
+            Arc::clone(&saw_dave_key_package_after_prepare_epoch);
         let identified_user_id_state = Arc::clone(&identified_user_id);
         let dave_group_id_state = Arc::clone(&dave_group_id);
         tokio::spawn(async move {
@@ -250,6 +261,21 @@ impl FakeDiscordPeer {
                                 )))
                                 .await
                                 .unwrap();
+                                ws.send(Message::Text(
+                                    json!({
+                                        "op": 24,
+                                        "seq": 3,
+                                        "d": {
+                                            "epoch": "1",
+                                            "protocol_version": DAVE_PROTOCOL_VERSION,
+                                        }
+                                    })
+                                    .to_string()
+                                    .into(),
+                                ))
+                                .await
+                                .unwrap();
+                                *saw_dave_prepare_epoch_state.lock().await = true;
                                 dave_external_sender = Some(external_sender);
                                 dave_creator = Some(creator);
                             }
@@ -283,6 +309,11 @@ impl FakeDiscordPeer {
                     }
                 } else if let Message::Binary(bytes) = message {
                     if use_dave && bytes.first() == Some(&26) {
+                        if *saw_dave_prepare_epoch_state.lock().await {
+                            *saw_dave_key_package_after_prepare_epoch_state.lock().await = true;
+                        } else {
+                            *saw_dave_key_package_before_prepare_epoch_state.lock().await = true;
+                        }
                         let user_id = identified_user_id_state
                             .lock()
                             .await
@@ -319,6 +350,9 @@ impl FakeDiscordPeer {
             saw_select_protocol,
             session_description_sent,
             saw_dave_transition,
+            saw_dave_prepare_epoch,
+            saw_dave_key_package_before_prepare_epoch,
+            saw_dave_key_package_after_prepare_epoch,
         }
     }
 
@@ -383,6 +417,24 @@ impl FakeDiscordPeer {
 
     pub async fn saw_dave_transition(&self) -> bool {
         wait_for_value(&self.saw_dave_transition, |ready| *ready).await
+    }
+
+    pub async fn saw_dave_prepare_epoch(&self) -> bool {
+        wait_for_value(&self.saw_dave_prepare_epoch, |ready| *ready).await
+    }
+
+    pub async fn saw_dave_key_package_before_prepare_epoch(&self) -> bool {
+        wait_for_value(&self.saw_dave_key_package_before_prepare_epoch, |ready| {
+            *ready
+        })
+        .await
+    }
+
+    pub async fn saw_dave_key_package_after_prepare_epoch(&self) -> bool {
+        wait_for_value(&self.saw_dave_key_package_after_prepare_epoch, |ready| {
+            *ready
+        })
+        .await
     }
 }
 

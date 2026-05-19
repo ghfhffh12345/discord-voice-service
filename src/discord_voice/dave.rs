@@ -58,6 +58,10 @@ pub struct DaveSession {
     failure_state: Box<SessionFailureState>,
 }
 
+// SAFETY: This wrapper has unique ownership of a single libdave session handle and we do not
+// implement `Sync`, so the handle is never accessed concurrently from Rust. The `Send` bound is
+// needed only because async tasks may move ownership between executor threads at await points
+// while still preserving single-threaded access to the handle.
 unsafe impl Send for DaveSession {}
 
 impl DaveSession {
@@ -374,6 +378,10 @@ pub struct DaveEncryptor {
     handle: dave_ffi::DaveEncryptorHandle,
 }
 
+// SAFETY: Vendored libdave uses internal mutexes in the encryptor implementation
+// (`vendor/libdave/cpp/src/encryptor.h`) to protect its mutable frame-processor and key-generation
+// state. We still do not expose `Sync`; `Send` only permits moving the owned handle between
+// executor threads while preserving exclusive Rust access.
 unsafe impl Send for DaveEncryptor {}
 
 impl DaveEncryptor {
@@ -445,6 +453,9 @@ pub struct DaveDecryptor {
     handle: dave_ffi::DaveDecryptorHandle,
 }
 
+// SAFETY: Vendored libdave uses an internal mutex in the decryptor implementation
+// (`vendor/libdave/cpp/src/decryptor.h`) to protect mutable frame-processor state. We do not
+// expose `Sync`; `Send` only allows moving this uniquely owned handle between executor threads.
 unsafe impl Send for DaveDecryptor {}
 
 impl DaveDecryptor {
@@ -507,7 +518,6 @@ impl Drop for DaveDecryptor {
 pub struct DaveRuntimeContext {
     pub protocol_version: u16,
     pub encryptor: DaveEncryptor,
-    pub decryptor: DaveDecryptor,
 }
 
 impl DaveRuntimeContext {
@@ -515,15 +525,11 @@ impl DaveRuntimeContext {
         session: &DaveSession,
         protocol_version: u16,
         self_user_id: &str,
-        peer_user_id: &str,
         ssrc: u32,
     ) -> Result<Self, AppError> {
         let encrypt_ratchet = session
             .key_ratchet_for(self_user_id)
             .map_err(|_| AppError::InvalidState("voice dave self ratchet missing"))?;
-        let decrypt_ratchet = session
-            .key_ratchet_for(peer_user_id)
-            .map_err(|_| AppError::InvalidState("voice dave peer ratchet missing"))?;
 
         let mut encryptor = DaveEncryptor::new()
             .map_err(|_| AppError::InvalidState("voice dave encryptor create failed"))?;
@@ -532,16 +538,9 @@ impl DaveRuntimeContext {
             .set_key_ratchet(&encrypt_ratchet)
             .map_err(|_| AppError::InvalidState("voice dave encryptor setup failed"))?;
 
-        let mut decryptor = DaveDecryptor::new()
-            .map_err(|_| AppError::InvalidState("voice dave decryptor create failed"))?;
-        decryptor
-            .set_key_ratchet(&decrypt_ratchet)
-            .map_err(|_| AppError::InvalidState("voice dave decryptor setup failed"))?;
-
         Ok(Self {
             protocol_version,
             encryptor,
-            decryptor,
         })
     }
 }
@@ -551,6 +550,9 @@ pub struct DaveExternalSender {
     handle: dave_ffi::DaveExternalSenderHandle,
 }
 
+// SAFETY: This wrapper uniquely owns one libdave external-sender handle and Rust never shares it
+// concurrently because the type is not `Sync`. `Send` is only used to move ownership across async
+// executor threads while keeping access serialized by Rust borrows.
 unsafe impl Send for DaveExternalSender {}
 
 impl DaveExternalSender {

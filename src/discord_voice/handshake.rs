@@ -8,7 +8,7 @@ use crate::discord_voice::dave::{DaveRuntimeContext, DaveSession};
 use crate::discord_voice::gateway::VoiceGatewayClient;
 use crate::discord_voice::protocol::{
     self, ClientsConnect, DaveExecuteTransition, DaveMlsExternalSenderPackage, DaveMlsWelcome,
-    Hello, Ready, SessionDescription, VoiceGatewayEvent,
+    DavePrepareEpoch, Hello, Ready, SessionDescription, VoiceGatewayEvent,
 };
 use crate::discord_voice::udp::{DiscoveredUdpAddress, VoiceUdpTransport};
 use crate::error::AppError;
@@ -203,8 +203,10 @@ async fn complete_initial_dave_transition(
         .parse::<u64>()
         .map_err(|_| AppError::InvalidState("voice dave group id invalid"))?;
     let mut recognized_user_ids = BTreeSet::from([voice.user_id.clone()]);
-    let mut session = None;
-    let mut pending_transition = None;
+    let mut session = DaveSession::new(None)
+        .map_err(|_| AppError::InvalidState("voice dave session create failed"))?;
+    let mut prepare_epoch_protocol_version = None;
+    let mut pending_transition = None::<(u16, DaveRuntimeContext)>;
 
     loop {
         match next_event(gateway).await?.into_event() {
@@ -214,26 +216,42 @@ async fn complete_initial_dave_transition(
             VoiceGatewayEvent::DaveMlsExternalSenderPackage(DaveMlsExternalSenderPackage {
                 external_sender: sender,
             }) => {
-                if session.is_none() {
-                    session = Some(
-                        initialize_dave_session(
-                            gateway,
-                            protocol_version,
-                            group_id,
-                            &voice.user_id,
-                            &sender,
-                        )
-                        .await?,
-                    );
+                session
+                    .set_external_sender(&sender)
+                    .map_err(|_| AppError::InvalidState("voice dave external sender invalid"))?;
+            }
+            VoiceGatewayEvent::DavePrepareEpoch(DavePrepareEpoch {
+                epoch,
+                protocol_version: prepare_protocol_version,
+            }) => {
+                if prepare_protocol_version != protocol_version {
+                    return Err(AppError::InvalidState(
+                        "voice dave prepare epoch protocol version mismatch",
+                    ));
                 }
+                if epoch != "1" {
+                    return Err(AppError::InvalidState(
+                        "voice dave prepare epoch unsupported",
+                    ));
+                }
+                session
+                    .init(prepare_protocol_version, group_id, &voice.user_id)
+                    .map_err(|_| AppError::InvalidState("voice dave session init failed"))?;
+                let key_package = session
+                    .key_package()
+                    .map_err(|_| AppError::InvalidState("voice dave key package failed"))?;
+                gateway.send_dave_mls_key_package(&key_package).await?;
+                prepare_epoch_protocol_version = Some(prepare_protocol_version);
             }
             VoiceGatewayEvent::DaveMlsWelcome(DaveMlsWelcome {
                 transition_id,
                 welcome,
             }) => {
-                let session = session
-                    .as_mut()
-                    .ok_or(AppError::InvalidState("voice dave session unavailable"))?;
+                let Some(prepared_protocol_version) = prepare_epoch_protocol_version else {
+                    return Err(AppError::InvalidState(
+                        "voice dave welcome received before prepare epoch",
+                    ));
+                };
                 let recognized = recognized_user_ids
                     .iter()
                     .map(String::as_str)
@@ -241,53 +259,28 @@ async fn complete_initial_dave_transition(
                 session
                     .process_welcome(&welcome, &recognized)
                     .map_err(|_| AppError::InvalidState("voice dave welcome invalid"))?;
-                let peer_user_id = recognized_user_ids
-                    .iter()
-                    .find(|user_id| user_id.as_str() != voice.user_id)
-                    .cloned()
-                    .ok_or(AppError::InvalidState("voice dave peer user missing"))?;
                 let runtime = DaveRuntimeContext::from_session(
-                    session,
-                    protocol_version,
+                    &session,
+                    prepared_protocol_version,
                     &voice.user_id,
-                    &peer_user_id,
                     ssrc,
                 )?;
                 gateway.send_dave_transition_ready(transition_id).await?;
                 pending_transition = Some((transition_id, runtime));
             }
             VoiceGatewayEvent::DaveExecuteTransition(DaveExecuteTransition { transition_id }) => {
-                if let Some((expected_transition_id, runtime)) = pending_transition.take() {
-                    if transition_id == expected_transition_id {
-                        return Ok(runtime);
-                    }
+                if pending_transition
+                    .as_ref()
+                    .is_some_and(|(expected_transition_id, _)| {
+                        transition_id == *expected_transition_id
+                    })
+                {
+                    return Ok(pending_transition.take().expect("pending transition").1);
                 }
             }
             _ => {}
         }
     }
-}
-
-async fn initialize_dave_session(
-    gateway: &VoiceGatewayClient,
-    protocol_version: u16,
-    group_id: u64,
-    self_user_id: &str,
-    external_sender: &[u8],
-) -> Result<DaveSession, AppError> {
-    let mut session = DaveSession::new(None)
-        .map_err(|_| AppError::InvalidState("voice dave session create failed"))?;
-    session
-        .set_external_sender(external_sender)
-        .map_err(|_| AppError::InvalidState("voice dave external sender invalid"))?;
-    session
-        .init(protocol_version, group_id, self_user_id)
-        .map_err(|_| AppError::InvalidState("voice dave session init failed"))?;
-    let key_package = session
-        .key_package()
-        .map_err(|_| AppError::InvalidState("voice dave key package failed"))?;
-    gateway.send_dave_mls_key_package(&key_package).await?;
-    Ok(session)
 }
 
 async fn next_event(

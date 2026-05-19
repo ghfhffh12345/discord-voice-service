@@ -58,5 +58,8 @@ async fn voice_session_uses_dave_runtime_state_when_session_description_requires
     let session = ConnectedVoiceSession::connect(voice).await.unwrap();
 
     assert!(session.dave_enabled());
+    assert!(fake.saw_dave_prepare_epoch().await);
+    assert!(!fake.saw_dave_key_package_before_prepare_epoch().await);
+    assert!(fake.saw_dave_key_package_after_prepare_epoch().await);
     assert!(fake.saw_dave_transition().await);
 }
