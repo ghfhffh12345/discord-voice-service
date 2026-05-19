@@ -2,17 +2,40 @@ use std::collections::VecDeque;
 
 use bytes::Bytes;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+use crate::media::position::SharedPlaybackPosition;
+
+#[derive(Clone, Debug)]
 pub struct OpusFrame {
     pub data: Bytes,
     pub duration_ms: u64,
+    tracker: Option<SharedPlaybackPosition>,
 }
 
 impl OpusFrame {
     pub fn new(data: Bytes, duration_ms: u64) -> Self {
-        Self { data, duration_ms }
+        Self {
+            data,
+            duration_ms,
+            tracker: None,
+        }
+    }
+
+    pub(crate) fn tracked(data: Bytes, duration_ms: u64, tracker: SharedPlaybackPosition) -> Self {
+        Self {
+            data,
+            duration_ms,
+            tracker: Some(tracker),
+        }
     }
 }
+
+impl PartialEq for OpusFrame {
+    fn eq(&self, other: &Self) -> bool {
+        self.data == other.data && self.duration_ms == other.duration_ms
+    }
+}
+
+impl Eq for OpusFrame {}
 
 #[derive(Debug)]
 pub struct OpusFrameQueue {
@@ -38,7 +61,14 @@ impl OpusFrameQueue {
     }
 
     pub fn pop(&mut self) -> Option<OpusFrame> {
-        self.inner.pop_front()
+        let frame = self.inner.pop_front()?;
+        if let Some(tracker) = &frame.tracker {
+            tracker
+                .lock()
+                .unwrap()
+                .record_sent_packet(frame.duration_ms);
+        }
+        Some(frame)
     }
 
     pub fn len(&self) -> usize {

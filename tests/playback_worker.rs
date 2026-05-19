@@ -60,7 +60,7 @@ async fn prepare_buffers_real_packets_and_returns_selected_itag() {
     );
     let mut queue = OpusFrameQueue::new(32);
 
-    let mut source = worker
+    let source = worker
         .prepare("video-1", &mut queue)
         .await
         .expect("source should be prepared");
@@ -77,7 +77,6 @@ async fn prepare_buffers_real_packets_and_returns_selected_itag() {
         Bytes::from_static(b"prefetched-opus-frame")
     );
 
-    source.record_sent_packet(first_packet.duration_ms);
     assert_eq!(
         source.position().sent_duration_ms(),
         first_packet.duration_ms
@@ -131,9 +130,12 @@ async fn prepare_preserves_current_track_position_when_recovering_same_video() {
     );
     let mut first_queue = OpusFrameQueue::new(32);
 
-    let mut first_source = worker.prepare("video-1", &mut first_queue).await.unwrap();
+    let first_source = worker.prepare("video-1", &mut first_queue).await.unwrap();
     let first_packet = first_queue.pop().expect("queue should contain a packet");
-    first_source.record_sent_packet(first_packet.duration_ms);
+    assert_eq!(
+        first_source.position().sent_duration_ms(),
+        first_packet.duration_ms
+    );
 
     fake.fail_first_url_once().await;
 

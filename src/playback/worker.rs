@@ -94,7 +94,11 @@ impl PlaybackWorker {
     ) -> Result<(), AppError> {
         self.position.lock().unwrap().record_buffered(&packet);
         queue
-            .push(OpusFrame::new(packet.data.clone(), packet.duration_ms))
+            .push(OpusFrame::tracked(
+                packet.data.clone(),
+                packet.duration_ms,
+                self.position.clone(),
+            ))
             .map_err(|_| AppError::BufferFull)
     }
 }
