@@ -10,6 +10,12 @@ pub struct AudioPacer {
     emitted_frames: usize,
 }
 
+impl Default for AudioPacer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AudioPacer {
     pub fn new() -> Self {
         let mut ticker = time::interval(FRAME_DURATION);

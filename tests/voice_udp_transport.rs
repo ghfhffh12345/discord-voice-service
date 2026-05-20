@@ -257,7 +257,7 @@ impl TestConnectedVoiceSession {
     async fn send_audio_frame(&mut self, frame: Bytes) -> Result<(), AppError> {
         if !self.speaking_started {
             let observed = self.speaking_observed.notified();
-            send_speaking(&mut self.gateway, self.ssrc).await?;
+            send_speaking(&self.gateway, self.ssrc).await?;
             observed.await;
             self.speaking_started = true;
         }

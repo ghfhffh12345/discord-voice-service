@@ -27,8 +27,38 @@ pub async fn spawn_non_range_server() -> RangeServer {
     spawn_test_server(ServerBehavior::IgnoreRange, payload.into()).await
 }
 
+pub async fn spawn_range_server_with_416_at_eof() -> RangeServer {
+    let payload = load_fixture_bytes("tests/fixtures/audio-itag250.webm").repeat(4);
+    spawn_test_server(ServerBehavior::HonorRangeWith416AtEof, payload.into()).await
+}
+
+pub async fn spawn_range_server_with_partial_body_then_close(bytes_before_close: usize) -> RangeServer {
+    let payload = load_fixture_bytes("tests/fixtures/audio-itag250.webm").repeat(4);
+    spawn_test_server(
+        ServerBehavior::PartialBodyThenCloseOnce { bytes_before_close },
+        payload.into(),
+    )
+    .await
+}
+
 pub async fn spawn_status_server(status: &'static str) -> RangeServer {
     spawn_test_server(ServerBehavior::StaticStatus(status), Bytes::new()).await
+}
+
+pub async fn spawn_stream_server_with_status_after_requests(
+    path: &str,
+    ok_requests: usize,
+    status: &'static str,
+) -> RangeServer {
+    let payload = load_fixture_bytes(path);
+    spawn_test_server(
+        ServerBehavior::StaticStatusAfterRequests {
+            ok_requests,
+            status,
+        },
+        payload,
+    )
+    .await
 }
 
 async fn spawn_test_server(behavior: ServerBehavior, payload: Bytes) -> RangeServer {
@@ -38,6 +68,8 @@ async fn spawn_test_server(behavior: ServerBehavior, payload: Bytes) -> RangeSer
         .expect("listener should have a local addr");
     let last_range_header = Arc::new(Mutex::new(None));
     let recorded_header = Arc::clone(&last_range_header);
+    let request_count = Arc::new(Mutex::new(0usize));
+    let request_count_state = Arc::clone(&request_count);
 
     thread::spawn(move || {
         for stream in listener.incoming() {
@@ -68,7 +100,20 @@ async fn spawn_test_server(behavior: ServerBehavior, payload: Bytes) -> RangeSer
                 .as_deref()
                 .and_then(parse_range_start)
                 .unwrap_or(0);
-            let (body, status, content_range) = match behavior {
+            let request_number = {
+                let mut request_count = request_count_state
+                    .lock()
+                    .expect("request count mutex should lock");
+                *request_count += 1;
+                *request_count
+            };
+            let (body, status, content_range, content_length) = match behavior {
+                ServerBehavior::HonorRangeWith416AtEof if start >= payload.len() as u64 => (
+                    &[][..],
+                    "HTTP/1.1 416 Range Not Satisfiable",
+                    None,
+                    0,
+                ),
                 ServerBehavior::HonorRange if start > 0 => (
                     payload.get(start as usize..).unwrap_or(&[]),
                     "HTTP/1.1 206 Partial Content",
@@ -76,19 +121,53 @@ async fn spawn_test_server(behavior: ServerBehavior, payload: Bytes) -> RangeSer
                         "bytes {start}-{}/*",
                         payload.len().saturating_sub(1)
                     )),
+                    payload.len().saturating_sub(start as usize),
                 ),
-                ServerBehavior::StaticStatus(status) => (&[][..], status, None),
-                _ => (payload.as_ref(), "HTTP/1.1 200 OK", None),
+                ServerBehavior::PartialBodyThenCloseOnce { bytes_before_close }
+                    if request_number == 1 =>
+                {
+                    let content_length = payload.len().saturating_sub(start as usize);
+                    let end = (start as usize)
+                        .saturating_add(bytes_before_close)
+                        .min(payload.len());
+                    (
+                        payload.get(start as usize..end).unwrap_or(&[]),
+                        if start > 0 {
+                            "HTTP/1.1 206 Partial Content"
+                        } else {
+                            "HTTP/1.1 200 OK"
+                        },
+                        (start > 0).then(|| {
+                            format!("bytes {start}-{}/*", payload.len().saturating_sub(1))
+                        }),
+                        content_length,
+                    )
+                }
+                ServerBehavior::PartialBodyThenCloseOnce { .. } if start > 0 => (
+                    payload.get(start as usize..).unwrap_or(&[]),
+                    "HTTP/1.1 206 Partial Content",
+                    Some(format!(
+                        "bytes {start}-{}/*",
+                        payload.len().saturating_sub(1)
+                    )),
+                    payload.len().saturating_sub(start as usize),
+                ),
+                ServerBehavior::StaticStatus(status) => (&[][..], status, None, 0),
+                ServerBehavior::StaticStatusAfterRequests {
+                    ok_requests,
+                    status,
+                } if request_number > ok_requests => (&[][..], status, None, 0),
+                _ => (payload.as_ref(), "HTTP/1.1 200 OK", None, payload.len()),
             };
             let headers = if let Some(content_range) = content_range {
                 format!(
                     "Content-Length: {}\r\nAccept-Ranges: bytes\r\nContent-Range: {content_range}\r\nConnection: close\r\n\r\n",
-                    body.len()
+                    content_length
                 )
             } else {
                 format!(
                     "Content-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
-                    body.len()
+                    content_length
                 )
             };
             let response = format!("{status}\r\n{headers}",);
@@ -127,8 +206,14 @@ impl RangeServer {
 #[derive(Clone, Copy)]
 enum ServerBehavior {
     HonorRange,
+    HonorRangeWith416AtEof,
+    PartialBodyThenCloseOnce { bytes_before_close: usize },
     IgnoreRange,
     StaticStatus(&'static str),
+    StaticStatusAfterRequests {
+        ok_requests: usize,
+        status: &'static str,
+    },
 }
 
 fn parse_range_start(header: &str) -> Option<u64> {

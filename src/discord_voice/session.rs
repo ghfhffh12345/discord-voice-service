@@ -1,6 +1,5 @@
 use bytes::Bytes;
 use tokio::sync::oneshot;
-use tokio::time::{Duration, sleep};
 
 use crate::discord_voice::dave::{DaveMediaType, DaveRuntimeContext};
 use crate::discord_voice::gateway::VoiceGatewayClient;
@@ -48,14 +47,12 @@ impl ConnectedVoiceSession {
             gateway,
             transport,
             ssrc,
-            heartbeat_interval_ms,
+            heartbeat_shutdown,
             session_description,
             dave,
         } = result;
         let transport =
             transport.with_protection(ProtectionContext::from_session(&session_description)?);
-
-        let heartbeat_shutdown = spawn_heartbeat_task(gateway.clone(), heartbeat_interval_ms);
 
         Ok(Self {
             gateway: Some(gateway),
@@ -76,10 +73,6 @@ impl ConnectedVoiceSession {
 
     pub(crate) fn rollover(&self) -> &VoiceSessionRollover {
         &self.rollover
-    }
-
-    pub(crate) fn rollover_mut(&mut self) -> &mut VoiceSessionRollover {
-        &mut self.rollover
     }
 
     pub fn is_connected(&self) -> bool {
@@ -129,9 +122,18 @@ impl ConnectedVoiceSession {
     }
 
     pub(crate) async fn stop_audio(&mut self) -> Result<(), AppError> {
-        for _ in 0..5 {
-            self.send_audio_frame(Bytes::copy_from_slice(&OPUS_SILENCE_FRAME))
-                .await?;
+        for silence_frame_index in 0..5 {
+            if let Err(err) = self
+                .send_audio_frame(Bytes::copy_from_slice(&OPUS_SILENCE_FRAME))
+                .await
+            {
+                tracing::debug!(
+                    silence_frame_index,
+                    error = ?err,
+                    "voice stop_audio silence send failed"
+                );
+                return Err(err);
+            }
         }
         self.speaking_started = false;
         Ok(())
@@ -144,28 +146,6 @@ impl Drop for ConnectedVoiceSession {
             let _ = shutdown.send(());
         }
     }
-}
-
-fn spawn_heartbeat_task(
-    gateway: VoiceGatewayClient,
-    heartbeat_interval_ms: u64,
-) -> oneshot::Sender<()> {
-    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
-    let interval = Duration::from_millis(heartbeat_interval_ms.max(1));
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = &mut shutdown_rx => break,
-                _ = sleep(interval) => {
-                    if gateway.send_heartbeat().await.is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-    });
-
-    shutdown_tx
 }
 
 #[cfg(test)]
@@ -220,7 +200,10 @@ mod tests {
                 }
             });
 
-            Self { addr, silence_frame_count }
+            Self {
+                addr,
+                silence_frame_count,
+            }
         }
 
         fn addr(&self) -> SocketAddr {

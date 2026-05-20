@@ -16,6 +16,7 @@ struct FakeVoiceGateway {
     request_path: Arc<StdMutex<Option<String>>>,
     heartbeat_seq_ack: Arc<Mutex<Option<i64>>>,
     resume_seq_ack: Arc<Mutex<Option<i64>>>,
+    heartbeat_count: Arc<Mutex<usize>>,
 }
 
 impl FakeVoiceGateway {
@@ -26,9 +27,11 @@ impl FakeVoiceGateway {
         let request_path = Arc::new(StdMutex::new(None));
         let heartbeat_seq_ack = Arc::new(Mutex::new(None));
         let resume_seq_ack = Arc::new(Mutex::new(None));
+        let heartbeat_count = Arc::new(Mutex::new(0usize));
         let request_path_state = Arc::clone(&request_path);
         let heartbeat_state = Arc::clone(&heartbeat_seq_ack);
         let resume_state = Arc::clone(&resume_seq_ack);
+        let heartbeat_count_state = Arc::clone(&heartbeat_count);
 
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
@@ -49,7 +52,10 @@ impl FakeVoiceGateway {
                         .and_then(Value::as_i64);
 
                     match payload.get("op").and_then(Value::as_u64) {
-                        Some(3) => *heartbeat_state.lock().await = seq_ack,
+                        Some(3) => {
+                            *heartbeat_state.lock().await = seq_ack;
+                            *heartbeat_count_state.lock().await += 1;
+                        }
                         Some(7) => *resume_state.lock().await = seq_ack,
                         _ => {}
                     }
@@ -62,6 +68,7 @@ impl FakeVoiceGateway {
             request_path,
             heartbeat_seq_ack,
             resume_seq_ack,
+            heartbeat_count,
         }
     }
 
@@ -79,6 +86,17 @@ impl FakeVoiceGateway {
 
     async fn last_resume_seq_ack(&self) -> Option<i64> {
         wait_for_value(&self.resume_seq_ack).await
+    }
+
+    async fn heartbeat_count_at_least(&self, minimum: usize) -> usize {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let count = *self.heartbeat_count.lock().await;
+            if count >= minimum || Instant::now() >= deadline {
+                return count;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
     }
 }
 
@@ -139,4 +157,19 @@ async fn voice_gateway_v8_encodes_missing_seq_ack_as_minus_one() {
 
     assert_eq!(fake.last_heartbeat_seq_ack().await, Some(-1));
     assert_eq!(fake.last_resume_seq_ack().await, Some(-1));
+}
+
+#[tokio::test]
+async fn voice_gateway_can_send_heartbeat_while_receive_is_pending() {
+    let fake = FakeVoiceGateway::spawn().await;
+    let client = VoiceGatewayClient::connect(fake.url()).await.unwrap();
+    let reader = client.clone();
+
+    tokio::spawn(async move {
+        let _ = reader.receive_event().await;
+    });
+
+    client.send_heartbeat().await.unwrap();
+
+    assert_eq!(fake.heartbeat_count_at_least(1).await, 1);
 }

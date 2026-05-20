@@ -39,20 +39,7 @@ impl PlaybackRecovery {
             return Ok(source);
         }
 
-        let resolved = self.client.resolve_playback_source(video_id).await?;
-        match self.open_from_position(resolved, position_ms).await {
-            Ok(source) => {
-                self.remember_source(video_id, &source);
-                Ok(source)
-            }
-            Err(err) if should_reresolve_after_open_failure(&err) => {
-                let resolved = self.client.resolve_playback_source(video_id).await?;
-                let source = self.open_from_position(resolved, position_ms).await?;
-                self.remember_source(video_id, &source);
-                Ok(source)
-            }
-            Err(err) => Err(err),
-        }
+        self.resolve_and_open(video_id, position_ms).await
     }
 
     pub fn reset(&mut self) {
@@ -70,6 +57,27 @@ impl PlaybackRecovery {
             "no playback source available to reopen",
         ))?;
         self.open_from_position(resolved, position_ms).await
+    }
+
+    async fn resolve_and_open(
+        &mut self,
+        video_id: &str,
+        position_ms: u64,
+    ) -> Result<PlaybackSource, AppError> {
+        let resolved = self.client.resolve_playback_source(video_id).await?;
+        match self.open_from_position(resolved, position_ms).await {
+            Ok(source) => {
+                self.remember_source(video_id, &source);
+                Ok(source)
+            }
+            Err(err) if should_reresolve_after_open_failure(&err) => {
+                let resolved = self.client.resolve_playback_source(video_id).await?;
+                let source = self.open_from_position(resolved, position_ms).await?;
+                self.remember_source(video_id, &source);
+                Ok(source)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     async fn open_from_position(

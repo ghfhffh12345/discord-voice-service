@@ -1,4 +1,4 @@
-use std::{collections::HashMap, env, str::FromStr, time::Duration};
+use std::{collections::HashMap, env, future::Future, str::FromStr, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail};
 use discord_voice_service::proto::discordvoice::v1::discord_voice_control_client::DiscordVoiceControlClient;
@@ -13,15 +13,17 @@ use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 use twilight_gateway::error::ReceiveMessageErrorType;
 use twilight_gateway::{Event, EventTypeFlags, Intents, Shard, ShardId, StreamExt as _};
-use twilight_http::Client as HttpClient;
+use twilight_http::{Client as HttpClient, error::ErrorType as HttpErrorType};
 use twilight_model::gateway::payload::outgoing::UpdateVoiceState;
 use twilight_model::id::{
     Id,
     marker::{ChannelMarker, GuildMarker, UserMarker},
 };
+use twilight_model::voice::VoiceState;
 
 const AUTHENTIC_VOICE_EVENT_TIMEOUT: Duration = Duration::from_secs(45);
 const GATEWAY_LEAVE_TIMEOUT: Duration = Duration::from_secs(30);
+const GATEWAY_LEAVE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const LIVE_CONTRACT_TIMEOUT: Duration = Duration::from_secs(240);
 const MIN_LIVE_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -74,21 +76,6 @@ struct ForwardedVoiceContext {
     endpoint: String,
     token: String,
 }
-
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ServiceFlowStep {
-    SubscribeEvents,
-    JoinVoice,
-    Play,
-}
-
-#[cfg(test)]
-pub(crate) const SERVICE_FLOW_ORDER: [ServiceFlowStep; 3] = [
-    ServiceFlowStep::SubscribeEvents,
-    ServiceFlowStep::JoinVoice,
-    ServiceFlowStep::Play,
-];
 
 #[derive(Debug)]
 struct ServiceFlowOutcome {
@@ -157,7 +144,7 @@ pub(crate) async fn run(config: StagingConfig) -> Result<()> {
     {
         Ok(context) => context,
         Err(error) => {
-            let cleanup = cleanup_gateway_voice(&sender, &mut shard, guild_id, user_id).await;
+            let cleanup = cleanup_gateway_voice(&http, &sender, &mut shard, guild_id, user_id).await;
             return combine_results(Err(error), cleanup);
         }
     };
@@ -166,6 +153,7 @@ pub(crate) async fn run(config: StagingConfig) -> Result<()> {
     let cleanup = cleanup_after_flow(
         &config.discord_voice_service_addr,
         flow.service_joined,
+        &http,
         &sender,
         &mut shard,
         guild_id,
@@ -180,13 +168,17 @@ async fn run_service_flow(
     config: &StagingConfig,
     forwarded_voice: ForwardedVoiceContext,
 ) -> ServiceFlowOutcome {
-    let join_client =
-        DiscordVoiceControlClient::connect(config.discord_voice_service_addr.clone())
-            .await
-            .context("connect JoinVoice gRPC client");
+    let join_client = DiscordVoiceControlClient::connect(config.discord_voice_service_addr.clone())
+        .await
+        .context("connect JoinVoice gRPC client");
     let mut join_client = match join_client {
         Ok(client) => client,
-        Err(error) => return ServiceFlowOutcome { result: Err(error), service_joined: false },
+        Err(error) => {
+            return ServiceFlowOutcome {
+                result: Err(error),
+                service_joined: false,
+            };
+        }
     };
     let event_client =
         DiscordVoiceControlClient::connect(config.discord_voice_service_addr.clone())
@@ -194,7 +186,12 @@ async fn run_service_flow(
             .context("connect SubscribeEvents gRPC client");
     let mut event_client = match event_client {
         Ok(client) => client,
-        Err(error) => return ServiceFlowOutcome { result: Err(error), service_joined: false },
+        Err(error) => {
+            return ServiceFlowOutcome {
+                result: Err(error),
+                service_joined: false,
+            };
+        }
     };
 
     let response = event_client
@@ -203,7 +200,12 @@ async fn run_service_flow(
         .context("subscribe to service events");
     let response = match response {
         Ok(response) => response,
-        Err(error) => return ServiceFlowOutcome { result: Err(error), service_joined: false },
+        Err(error) => {
+            return ServiceFlowOutcome {
+                result: Err(error),
+                service_joined: false,
+            };
+        }
     };
     let mut events = response.into_inner();
 
@@ -221,33 +223,73 @@ async fn run_service_flow(
         .await
         .context("forward authentic voice context to JoinVoice");
     if let Err(error) = join_result {
-        return ServiceFlowOutcome { result: Err(error), service_joined: false };
+        return ServiceFlowOutcome {
+            result: Err(error),
+            service_joined: false,
+        };
     }
 
-    let play_result = join_client
-        .play(PlayRequest {
-            video_id: config.test_video_id.clone(),
-        })
-        .await
-        .context("call Play");
-    if let Err(error) = play_result {
-        return ServiceFlowOutcome { result: Err(error), service_joined: true };
-    }
-
-    let contract_result =
-        timeout(LIVE_CONTRACT_TIMEOUT, assert_live_success_contract(&mut events)).await;
-
-    let result = match contract_result {
-        Ok(result) => result,
-        Err(_) => Err(anyhow!(
-            "live contract timed out after {} seconds",
-            LIVE_CONTRACT_TIMEOUT.as_secs()
-        )),
+    let play_rpc = async {
+        join_client
+            .play(PlayRequest {
+                video_id: config.test_video_id.clone(),
+            })
+            .await
+            .context("call Play")
+            .map(|_| ())
     };
+    let live_contract = async {
+        match timeout(
+            LIVE_CONTRACT_TIMEOUT,
+            assert_live_success_contract(&mut events),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(anyhow!(
+                "live contract timed out after {} seconds",
+                LIVE_CONTRACT_TIMEOUT.as_secs()
+            )),
+        }
+    };
+
+    let result = wait_for_play_and_live_contract(live_contract, play_rpc).await;
 
     ServiceFlowOutcome {
         result,
         service_joined: true,
+    }
+}
+
+pub(crate) async fn wait_for_play_and_live_contract<ContractFuture, PlayFuture>(
+    contract_future: ContractFuture,
+    play_future: PlayFuture,
+) -> Result<()>
+where
+    ContractFuture: Future<Output = Result<()>>,
+    PlayFuture: Future<Output = Result<()>>,
+{
+    let mut contract_finished = false;
+    let mut play_finished = false;
+
+    tokio::pin!(contract_future);
+    tokio::pin!(play_future);
+
+    loop {
+        if contract_finished && play_finished {
+            return Ok(());
+        }
+
+        tokio::select! {
+            contract_result = &mut contract_future, if !contract_finished => {
+                contract_finished = true;
+                contract_result?;
+            }
+            play_result = &mut play_future, if !play_finished => {
+                play_finished = true;
+                play_result?;
+            }
+        }
     }
 }
 
@@ -293,7 +335,9 @@ async fn wait_for_authentic_voice_context(
             Ok(event) => event,
             Err(source) => {
                 if is_fatal_gateway_receive_error(&source) {
-                    return Err(anyhow!("fatal gateway receive error while waiting for voice events: {source}"));
+                    return Err(anyhow!(
+                        "fatal gateway receive error while waiting for voice events: {source}"
+                    ));
                 }
 
                 warn!(error = %source, "transient gateway receive error");
@@ -310,7 +354,8 @@ async fn wait_for_authentic_voice_context(
                 session_id = Some(update.session_id.clone());
             }
             Event::VoiceServerUpdate(update) if update.guild_id == guild_id => {
-                if let Some(found_endpoint) = update.endpoint.as_ref().filter(|value| !value.is_empty())
+                if let Some(found_endpoint) =
+                    update.endpoint.as_ref().filter(|value| !value.is_empty())
                 {
                     endpoint = Some(found_endpoint.clone());
                 }
@@ -324,16 +369,14 @@ async fn wait_for_authentic_voice_context(
     }
 }
 
-async fn assert_live_success_contract(
-    events: &mut tonic::Streaming<SessionEvent>,
-) -> Result<()> {
+async fn assert_live_success_contract(events: &mut tonic::Streaming<SessionEvent>) -> Result<()> {
     let mut state = LiveContractState::default();
 
     loop {
         if state.waiting_for_live_interval() {
             match state.min_interval_deadline {
                 Some(deadline) if Instant::now() >= deadline => {
-                    state.satisfied_min_interval = true;
+                    state.update_min_interval(Instant::now());
                     continue;
                 }
                 Some(deadline) => {
@@ -345,7 +388,7 @@ async fn assert_live_success_contract(
                             }
                         }
                         _ = sleep_until(deadline) => {
-                            state.satisfied_min_interval = true;
+                            state.update_min_interval(deadline);
                         }
                     }
                 }
@@ -366,9 +409,12 @@ impl LiveContractState {
         self.saw_playing && !self.satisfied_min_interval
     }
 
-    #[cfg(test)]
-    pub(crate) fn mark_min_interval_elapsed(&mut self) {
-        self.satisfied_min_interval = true;
+    pub(crate) fn update_min_interval(&mut self, now: Instant) {
+        if let Some(deadline) = self.min_interval_deadline
+            && now >= deadline
+        {
+            self.satisfied_min_interval = true;
+        }
     }
 
     pub(crate) fn observe_event(&mut self, event: SessionEvent, now: Instant) -> Result<bool> {
@@ -407,7 +453,10 @@ impl LiveContractState {
                 );
             }
             SessionEventKind::VoiceReconnecting => {
-                bail!("VoiceReconnecting observed: {}", display_event_message(&event));
+                bail!(
+                    "VoiceReconnecting observed: {}",
+                    display_event_message(&event)
+                );
             }
             SessionEventKind::VoiceConnecting
             | SessionEventKind::TrackResolving
@@ -449,6 +498,7 @@ fn display_event_message(event: &SessionEvent) -> String {
 async fn cleanup_after_flow(
     service_addr: &str,
     service_joined: bool,
+    http: &HttpClient,
     sender: &twilight_gateway::MessageSender,
     shard: &mut Shard,
     guild_id: Id<GuildMarker>,
@@ -459,7 +509,7 @@ async fn cleanup_after_flow(
     } else {
         Ok(())
     };
-    let gateway_cleanup = cleanup_gateway_voice(sender, shard, guild_id, user_id).await;
+    let gateway_cleanup = cleanup_gateway_voice(http, sender, shard, guild_id, user_id).await;
 
     combine_results(service_cleanup, gateway_cleanup)
 }
@@ -478,6 +528,7 @@ async fn cleanup_service_voice(service_addr: &str) -> Result<()> {
 }
 
 async fn cleanup_gateway_voice(
+    http: &HttpClient,
     sender: &twilight_gateway::MessageSender,
     shard: &mut Shard,
     guild_id: Id<GuildMarker>,
@@ -492,34 +543,64 @@ async fn cleanup_gateway_voice(
         ))
         .context("failed to send gateway leave command")?;
 
-    wait_for_gateway_leave(shard, guild_id, user_id).await
+    wait_for_gateway_leave(http, shard, guild_id, user_id).await
 }
 
 async fn wait_for_gateway_leave(
+    http: &HttpClient,
     shard: &mut Shard,
     guild_id: Id<GuildMarker>,
     user_id: Id<UserMarker>,
 ) -> Result<()> {
     let deadline = Instant::now() + GATEWAY_LEAVE_TIMEOUT;
+    let mut next_voice_state_poll = Instant::now();
 
     loop {
+        let now = Instant::now();
+        if now >= deadline {
+            if current_user_absent_from_guild_voice(http, guild_id).await? {
+                return Ok(());
+            }
+
+            bail!("timed out waiting for leave confirmation");
+        }
+
+        if now >= next_voice_state_poll {
+            if current_user_absent_from_guild_voice(http, guild_id).await? {
+                return Ok(());
+            }
+
+            next_voice_state_poll = now + GATEWAY_LEAVE_POLL_INTERVAL;
+        }
+
         let remaining = deadline
             .checked_duration_since(Instant::now())
-            .ok_or_else(|| anyhow!("timed out waiting for gateway leave acknowledgement"))?;
-
-        let next = timeout(remaining, shard.next_event(EventTypeFlags::all()))
-            .await
-            .map_err(|_| anyhow!("timed out waiting for gateway leave acknowledgement"))?;
+            .ok_or_else(|| anyhow!("timed out waiting for leave confirmation"))?;
+        let poll_remaining = next_voice_state_poll.saturating_duration_since(Instant::now());
+        let next = match timeout(remaining.min(poll_remaining), shard.next_event(EventTypeFlags::all())).await {
+            Ok(next) => next,
+            Err(_) => continue,
+        };
 
         let Some(item) = next else {
-            bail!("gateway shard ended before leave acknowledgement");
+            if current_user_absent_from_guild_voice(http, guild_id).await? {
+                return Ok(());
+            }
+
+            bail!("gateway shard ended before leave confirmation");
         };
 
         let event = match item {
             Ok(event) => event,
             Err(source) => {
                 if is_fatal_gateway_receive_error(&source) {
-                    return Err(anyhow!("fatal gateway receive error during cleanup: {source}"));
+                    if current_user_absent_from_guild_voice(http, guild_id).await? {
+                        return Ok(());
+                    }
+
+                    return Err(anyhow!(
+                        "fatal gateway receive error during cleanup: {source}"
+                    ));
                 }
 
                 warn!(error = %source, "transient gateway receive error during cleanup");
@@ -537,14 +618,63 @@ async fn wait_for_gateway_leave(
     }
 }
 
+pub(crate) async fn current_user_absent_from_guild_voice(
+    http: &HttpClient,
+    guild_id: Id<GuildMarker>,
+) -> Result<bool> {
+    let response = match http.current_user_voice_state(guild_id).await {
+        Ok(response) => response,
+        Err(source) => {
+            if let HttpErrorType::Response { status, .. } = source.kind()
+                && status.get() == 404
+            {
+                return Ok(true);
+            }
+
+            return Err(source).context("query current user voice state during cleanup");
+        }
+    };
+    let status = response.status();
+
+    if status == 404 {
+        return leave_confirmed_by_rest_voice_state(status.get(), None);
+    }
+
+    if !status.is_success() {
+        bail!("current user voice state lookup during cleanup failed with status {status}");
+    }
+
+    let voice_state = response
+        .model()
+        .await
+        .context("decode current user voice state during cleanup")?;
+
+    leave_confirmed_by_rest_voice_state(status.get(), Some(&voice_state))
+}
+
+pub(crate) fn leave_confirmed_by_rest_voice_state(
+    status: u16,
+    voice_state: Option<&VoiceState>,
+) -> Result<bool> {
+    if status == 404 {
+        return Ok(true);
+    }
+
+    if !(200..300).contains(&status) {
+        bail!("voice state lookup failed with status {status}");
+    }
+
+    let voice_state = voice_state.context("voice state lookup succeeded without a voice state body")?;
+
+    Ok(voice_state.channel_id.is_none())
+}
+
 pub(crate) fn combine_results(primary: Result<()>, cleanup: Result<()>) -> Result<()> {
     match (primary, cleanup) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(primary), Ok(())) => Err(primary),
         (Ok(()), Err(cleanup)) => Err(cleanup),
-        (Err(primary), Err(cleanup)) => Err(anyhow!(
-            "{primary}; cleanup also failed: {cleanup}"
-        )),
+        (Err(primary), Err(cleanup)) => Err(anyhow!("{primary}; cleanup also failed: {cleanup}")),
     }
 }
 

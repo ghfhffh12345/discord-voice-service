@@ -52,6 +52,18 @@ async fn connected_voice_session_sends_periodic_heartbeats_after_hello() {
 }
 
 #[tokio::test]
+async fn voice_handshake_starts_heartbeats_before_handshake_completes() {
+    let fake =
+        FakeDiscordPeer::spawn_real_shape_with_ready_delay(25, Duration::from_millis(100)).await;
+    let voice = fake.voice_context("1", "2", "user-1", "session-1", "token-1");
+
+    let session = ConnectedVoiceSession::connect(voice).await.unwrap();
+
+    assert!(session.is_connected());
+    assert!(fake.heartbeat_count_at_least(1).await >= 1);
+}
+
+#[tokio::test]
 async fn voice_session_completes_prepare_backed_dave_join() {
     let fake = FakeDiscordPeer::spawn_with_dave().await;
     let voice = fake.voice_context("1", "2", "1111111111111111", "session-1", "token-1");
@@ -60,9 +72,101 @@ async fn voice_session_completes_prepare_backed_dave_join() {
 
     assert!(session.dave_enabled());
     assert!(fake.saw_dave_prepare_epoch().await);
-    assert!(!fake.saw_dave_key_package_before_prepare_epoch().await);
-    assert!(fake.saw_dave_key_package_after_prepare_epoch().await);
-    assert!(fake.saw_dave_transition().await);
+    assert!(fake.saw_dave_key_package_before_prepare_epoch().await);
+    assert!(fake.saw_dave_commit_welcome().await);
+    assert!(fake.sent_dave_prepare_commit_transition().await);
+    assert!(
+        !fake
+            .saw_dave_transition_within(Duration::from_millis(100))
+            .await
+    );
+    assert!(fake.saw_dave_init_transition_ready().await);
+}
+
+#[tokio::test]
+async fn voice_session_sends_init_transition_ready_before_prepare_commit_transition_for_new_group_creator_path(
+) {
+    let fake =
+        FakeDiscordPeer::spawn_with_dave_requiring_init_transition_ready_before_prepare_commit_transition()
+            .await;
+    let voice = fake.voice_context("1", "2", "1111111111111111", "session-1", "token-1");
+
+    let session = ConnectedVoiceSession::connect(voice).await.unwrap();
+
+    assert!(session.dave_enabled());
+    assert!(fake.saw_dave_commit_welcome().await);
+    assert!(fake.saw_dave_init_transition_ready().await);
+    assert!(
+        fake.saw_dave_init_transition_ready_before_prepare_commit_transition()
+            .await
+    );
+    assert!(fake.sent_dave_prepare_commit_transition().await);
+}
+
+#[tokio::test]
+async fn voice_session_sends_initial_key_package_before_external_sender_when_required() {
+    let fake = FakeDiscordPeer::spawn_with_dave_requiring_init_key_package().await;
+    let voice = fake.voice_context("1", "2", "1111111111111111", "session-1", "token-1");
+
+    let session = ConnectedVoiceSession::connect(voice).await.unwrap();
+
+    assert!(session.dave_enabled());
+    assert!(fake.saw_dave_key_package_before_external_sender().await);
+    assert!(fake.saw_dave_prepare_epoch().await);
+    assert!(fake.saw_dave_commit_welcome().await);
+    assert!(fake.saw_dave_init_transition_ready().await);
+}
+
+#[tokio::test]
+async fn voice_session_can_create_a_self_only_dave_group_without_proposals() {
+    let fake = FakeDiscordPeer::spawn_with_dave_self_only_no_proposals().await;
+    let voice = fake.voice_context("1", "2", "1111111111111111", "session-1", "token-1");
+
+    let session = ConnectedVoiceSession::connect(voice).await.unwrap();
+
+    assert!(session.dave_enabled());
+    assert!(fake.saw_dave_key_package_after_external_sender().await);
+    assert!(fake.saw_dave_commit_welcome().await);
+    assert!(fake.saw_dave_init_transition_ready().await);
+    assert!(
+        !fake
+            .sent_dave_prepare_commit_transition_within(Duration::from_millis(100))
+            .await
+    );
+    assert!(
+        !fake
+            .saw_dave_transition_within(Duration::from_millis(100))
+            .await
+    );
+}
+
+#[tokio::test]
+async fn voice_session_refreshes_key_package_after_external_sender_when_required() {
+    let fake = FakeDiscordPeer::spawn_with_dave_requiring_refreshed_key_package().await;
+    let voice = fake.voice_context("1", "2", "1111111111111111", "session-1", "token-1");
+
+    let session = ConnectedVoiceSession::connect(voice).await.unwrap();
+
+    assert!(session.dave_enabled());
+    assert!(fake.saw_dave_key_package_before_external_sender().await);
+    assert!(fake.saw_dave_key_package_after_external_sender().await);
+    assert!(fake.saw_dave_prepare_epoch().await);
+    assert!(fake.saw_dave_commit_welcome().await);
+    assert!(fake.saw_dave_init_transition_ready().await);
+}
+
+#[tokio::test]
+async fn voice_session_accepts_commit_transition_before_prepare_epoch_map_entry() {
+    let fake = FakeDiscordPeer::spawn_with_dave_commit_before_prepare_epoch().await;
+    let voice = fake.voice_context("1", "2", "1111111111111111", "session-1", "token-1");
+
+    let session = ConnectedVoiceSession::connect(voice).await.unwrap();
+
+    assert!(session.dave_enabled());
+    assert!(fake.saw_dave_commit_welcome().await);
+    assert!(fake.sent_dave_prepare_commit_transition().await);
+    assert!(fake.saw_dave_prepare_epoch().await);
+    assert!(fake.saw_dave_init_transition_ready().await);
 }
 
 #[tokio::test]

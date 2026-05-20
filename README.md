@@ -35,8 +35,9 @@ The main bot should continue to own commands and high-level playback decisions. 
 - Runtime event emission for voice/session state transitions such as `VoiceConnecting`, `VoiceReady`, `TrackResolving`, `Playing`, and `TrackEnded`
 - A real runtime playback path that connects to a Discord voice endpoint, performs UDP discovery, sends speaking updates, and emits Opus RTP frames for supported sources
 - Distroless container packaging in [`Containerfile`](Containerfile)
-- A release-triggered GHCR image workflow in [`.github/workflows/release-image.yml`](.github/workflows/release-image.yml)
-- A self-hosted live validation workflow in [`.github/workflows/live-staging.yml`](.github/workflows/live-staging.yml) that exercises the real staging controller against Discord
+- A branch and PR gate in [`.github/workflows/fake-peer-ci.yml`](.github/workflows/fake-peer-ci.yml) that runs the fake-peer verification suite on pushes, pull requests, and merge-queue checks
+- A protected self-hosted live validation workflow in [`.github/workflows/live-staging.yml`](.github/workflows/live-staging.yml) that exercises the real staging controller against Discord
+- A release workflow in [`.github/workflows/release-image.yml`](.github/workflows/release-image.yml) that only publishes the GHCR image after both fake-peer CI and live staging gates are satisfied
 
 ## Playback selection policy
 
@@ -106,9 +107,15 @@ cargo run
 
 ## Live staging validation
 
-Real Discord validation is self-hosted first. [`.github/workflows/live-staging.yml`](.github/workflows/live-staging.yml) is the operator workflow for that gate, and it supports both manual `workflow_dispatch` runs and automatic runs after `Release Image` succeeds.
+Real Discord validation is self-hosted first. [`.github/workflows/live-staging.yml`](.github/workflows/live-staging.yml) is the protected operator workflow for that gate. It supports manual `workflow_dispatch` runs and is also called as a reusable workflow from [`.github/workflows/release-image.yml`](.github/workflows/release-image.yml) when a GitHub release is published.
 
-The current workflow is intentionally honest about scope: both trigger paths validate the checked-out `discord-voice-service` source build on the self-hosted runner, not the published GHCR image for this repository. The automatic `workflow_run` path checks out the triggering commit from `Release Image` and rebuilds it locally before running the live Discord validation.
+The current workflow is intentionally honest about scope: both trigger paths validate the checked-out `discord-voice-service` source build on the self-hosted runner, not the published GHCR image for this repository. The release path checks out the published release tag, resolves the tagged commit, and rebuilds it locally before running the live Discord validation.
+
+GitHub Actions cannot express `needs` edges across separate top-level workflows. The release-ready gate is therefore enforced in a pragmatic but technically correct way:
+
+1. [`.github/workflows/fake-peer-ci.yml`](.github/workflows/fake-peer-ci.yml) is the normal branch, PR, and merge-queue gate and should be configured as the required status check in branch protection or repository rulesets.
+2. [`.github/workflows/live-staging.yml`](.github/workflows/live-staging.yml) runs on a protected self-hosted runner and uses the `live-staging` environment so real secrets and required reviewers can guard the live Discord check.
+3. [`.github/workflows/release-image.yml`](.github/workflows/release-image.yml) treats release publication as not ready until it verifies a successful `Fake Peer CI` run for the tagged commit, then calls the reusable live-staging workflow, and only then builds and pushes the GHCR image.
 
 The self-hosted runner must already have:
 
@@ -124,6 +131,8 @@ The staging environment must use dedicated Discord resources:
 - a dedicated test guild
 - a dedicated non-stage voice channel
 
+The `live-staging` environment should hold the real Discord secrets and use required reviewers if release publication must wait for an explicit operator approval before the live gate starts.
+
 The live validation controller contract is:
 
 | Variable | Purpose | Example |
@@ -135,6 +144,12 @@ The live validation controller contract is:
 | `TEST_VIDEO_ID` | YouTube video ID used for the live playback assertion | `dQw4w9WgXcQ` |
 | `DISCORD_VOICE_SERVICE_ADDR` | gRPC URI used by `staging_live_check` to reach this service | `http://127.0.0.1:55051` |
 | `DISCORD_VOICE_SERVICE_YTMUSIC_ADDR` | gRPC URI used by both the service and controller to reach `ytmusic-service` | `http://127.0.0.1:50051` |
+
+For a manual or local staging run, the operator command is:
+
+```bash
+cargo run --bin staging_live_check
+```
 
 The workflow also accepts a configurable `ytmusic-service` image ref. It resolves in this order:
 
@@ -156,6 +171,16 @@ The workflow intentionally starts the live dependencies itself instead of assumi
 8. tear down the container, remove `${GITHUB_WORKSPACE}/browser.json`, and stop the service process
 
 The workflow also handles one current contract wrinkle explicitly: `staging_live_check` expects `DISCORD_VOICE_SERVICE_ADDR` as a URI, while the service process still binds from the same variable name as a bare socket address. The workflow keeps the controller contract at `http://127.0.0.1:55051` and overrides the service-start step to bind on `127.0.0.1:55051`.
+
+Every successful live staging validation should record this evidence in the implementation or release notes:
+
+- commit SHA tested
+- runner type used
+- whether `ytmusic-service` was started with `./browser.json`
+- whether authentic voice context was acquired
+- whether `VoiceReady`, `Playing`, and `TrackEnded` were observed
+- whether the 5-second live interval passed
+- whether cleanup succeeded
 
 ## Verify and use the service
 

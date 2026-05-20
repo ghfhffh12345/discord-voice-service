@@ -18,6 +18,7 @@ use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 const DAVE_CREATOR_USER_ID: &str = "9999999999999999";
 const DAVE_EXISTING_MEMBER_USER_ID: &str = "8888888888888888";
 const DAVE_PROTOCOL_VERSION: u16 = 1;
+const DAVE_INIT_TRANSITION_ID: u16 = 0;
 const DAVE_TRANSITION_ID: u16 = 1;
 const DAVE_UNMATCHED_TRANSITION_ID: u16 = 9;
 
@@ -25,6 +26,11 @@ const DAVE_UNMATCHED_TRANSITION_ID: u16 = 9;
 enum DaveScenario {
     Disabled,
     NewGroup,
+    NewGroupSelfOnlyNoProposals,
+    NewGroupRequiresInitTransitionReadyBeforePrepareCommitTransition,
+    NewGroupCommitBeforePrepareEpoch,
+    NewGroupRequiresInitKeyPackage,
+    NewGroupRequiresRefreshedKeyPackage,
     EstablishedGroupJoin,
     PrepareBackedWelcomeWithStrayFollowUp,
     UnmatchedWelcome,
@@ -48,6 +54,12 @@ pub struct FakeDiscordPeer {
     saw_dave_prepare_epoch: Arc<Mutex<bool>>,
     saw_dave_key_package_before_prepare_epoch: Arc<Mutex<bool>>,
     saw_dave_key_package_after_prepare_epoch: Arc<Mutex<bool>>,
+    saw_dave_key_package_before_external_sender: Arc<Mutex<bool>>,
+    saw_dave_key_package_after_external_sender: Arc<Mutex<bool>>,
+    saw_dave_commit_welcome: Arc<Mutex<bool>>,
+    saw_dave_init_transition_ready: Arc<Mutex<bool>>,
+    saw_dave_init_transition_ready_before_prepare_commit_transition: Arc<Mutex<bool>>,
+    sent_dave_prepare_commit_transition: Arc<Mutex<bool>>,
 }
 
 impl FakeDiscordPeer {
@@ -58,35 +70,161 @@ impl FakeDiscordPeer {
 
     #[allow(clippy::result_large_err)]
     pub async fn spawn_real_shape() -> Self {
-        Self::spawn_real_shape_with_heartbeat_interval(1_000).await
+        Self::spawn_with_options(1_000, DaveScenario::Disabled, Duration::ZERO).await
     }
 
     #[allow(clippy::result_large_err)]
     pub async fn spawn_real_shape_with_heartbeat_interval(heartbeat_interval_ms: u64) -> Self {
-        Self::spawn_with_options(heartbeat_interval_ms, DaveScenario::Disabled).await
+        Self::spawn_with_options_and_ready_delay(
+            heartbeat_interval_ms,
+            DaveScenario::Disabled,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .await
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn spawn_with_gateway_delay(delay: Duration) -> Self {
+        Self::spawn_with_options_and_ready_delay(1_000, DaveScenario::Disabled, delay, Duration::ZERO).await
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn spawn_real_shape_with_ready_delay(
+        heartbeat_interval_ms: u64,
+        ready_delay: Duration,
+    ) -> Self {
+        Self::spawn_with_options_and_ready_delay(
+            heartbeat_interval_ms,
+            DaveScenario::Disabled,
+            Duration::ZERO,
+            ready_delay,
+        )
+        .await
     }
 
     #[allow(clippy::result_large_err)]
     pub async fn spawn_with_dave() -> Self {
-        Self::spawn_with_options(1_000, DaveScenario::NewGroup).await
+        Self::spawn_with_options_and_ready_delay(
+            1_000,
+            DaveScenario::NewGroup,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .await
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn spawn_with_dave_self_only_no_proposals() -> Self {
+        Self::spawn_with_options_and_ready_delay(
+            1_000,
+            DaveScenario::NewGroupSelfOnlyNoProposals,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .await
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn spawn_with_dave_requiring_init_transition_ready_before_prepare_commit_transition(
+    ) -> Self {
+        Self::spawn_with_options_and_ready_delay(
+            1_000,
+            DaveScenario::NewGroupRequiresInitTransitionReadyBeforePrepareCommitTransition,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .await
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn spawn_with_dave_commit_before_prepare_epoch() -> Self {
+        Self::spawn_with_options_and_ready_delay(
+            1_000,
+            DaveScenario::NewGroupCommitBeforePrepareEpoch,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .await
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn spawn_with_dave_requiring_init_key_package() -> Self {
+        Self::spawn_with_options_and_ready_delay(
+            1_000,
+            DaveScenario::NewGroupRequiresInitKeyPackage,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .await
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn spawn_with_dave_requiring_refreshed_key_package() -> Self {
+        Self::spawn_with_options_and_ready_delay(
+            1_000,
+            DaveScenario::NewGroupRequiresRefreshedKeyPackage,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .await
     }
 
     #[allow(clippy::result_large_err)]
     pub async fn spawn_with_established_dave_group() -> Self {
-        Self::spawn_with_options(1_000, DaveScenario::EstablishedGroupJoin).await
+        Self::spawn_with_options_and_ready_delay(
+            1_000,
+            DaveScenario::EstablishedGroupJoin,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .await
     }
 
     #[allow(clippy::result_large_err)]
     pub async fn spawn_with_unmatched_dave_welcome() -> Self {
-        Self::spawn_with_options(1_000, DaveScenario::UnmatchedWelcome).await
+        Self::spawn_with_options_and_ready_delay(
+            1_000,
+            DaveScenario::UnmatchedWelcome,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .await
     }
 
     #[allow(clippy::result_large_err)]
     pub async fn spawn_with_prepare_backed_stray_dave_welcome() -> Self {
-        Self::spawn_with_options(1_000, DaveScenario::PrepareBackedWelcomeWithStrayFollowUp).await
+        Self::spawn_with_options_and_ready_delay(
+            1_000,
+            DaveScenario::PrepareBackedWelcomeWithStrayFollowUp,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .await
     }
 
-    async fn spawn_with_options(heartbeat_interval_ms: u64, dave_scenario: DaveScenario) -> Self {
+    #[allow(clippy::result_large_err)]
+    async fn spawn_with_options(
+        heartbeat_interval_ms: u64,
+        dave_scenario: DaveScenario,
+        gateway_delay: Duration,
+    ) -> Self {
+        Self::spawn_with_options_and_ready_delay(
+            heartbeat_interval_ms,
+            dave_scenario,
+            gateway_delay,
+            Duration::ZERO,
+        )
+        .await
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn spawn_with_options_and_ready_delay(
+        heartbeat_interval_ms: u64,
+        dave_scenario: DaveScenario,
+        gateway_delay: Duration,
+        ready_delay: Duration,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let udp_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let ws_addr = listener.local_addr().unwrap();
@@ -107,6 +245,13 @@ impl FakeDiscordPeer {
         let saw_dave_prepare_epoch = Arc::new(Mutex::new(false));
         let saw_dave_key_package_before_prepare_epoch = Arc::new(Mutex::new(false));
         let saw_dave_key_package_after_prepare_epoch = Arc::new(Mutex::new(false));
+        let saw_dave_key_package_before_external_sender = Arc::new(Mutex::new(false));
+        let saw_dave_key_package_after_external_sender = Arc::new(Mutex::new(false));
+        let saw_dave_commit_welcome = Arc::new(Mutex::new(false));
+        let saw_dave_init_transition_ready = Arc::new(Mutex::new(false));
+        let saw_dave_init_transition_ready_before_prepare_commit_transition =
+            Arc::new(Mutex::new(false));
+        let sent_dave_prepare_commit_transition = Arc::new(Mutex::new(false));
         let identified_user_id = Arc::new(Mutex::new(None::<String>));
 
         let discovery_count_state = Arc::clone(&discovery_count);
@@ -153,15 +298,38 @@ impl FakeDiscordPeer {
             Arc::clone(&saw_dave_key_package_before_prepare_epoch);
         let saw_dave_key_package_after_prepare_epoch_state =
             Arc::clone(&saw_dave_key_package_after_prepare_epoch);
+        let saw_dave_key_package_before_external_sender_state =
+            Arc::clone(&saw_dave_key_package_before_external_sender);
+        let saw_dave_key_package_after_external_sender_state =
+            Arc::clone(&saw_dave_key_package_after_external_sender);
+        let saw_dave_commit_welcome_state = Arc::clone(&saw_dave_commit_welcome);
+        let saw_dave_init_transition_ready_state = Arc::clone(&saw_dave_init_transition_ready);
+        let saw_dave_init_transition_ready_before_prepare_commit_transition_state = Arc::clone(
+            &saw_dave_init_transition_ready_before_prepare_commit_transition,
+        );
+        let sent_dave_prepare_commit_transition_state =
+            Arc::clone(&sent_dave_prepare_commit_transition);
         let identified_user_id_state = Arc::clone(&identified_user_id);
         let dave_group_id_state = Arc::clone(&dave_group_id);
         tokio::spawn(async move {
             let Ok((stream, _)) = listener.accept().await else {
                 return;
             };
+            sleep(gateway_delay).await;
             let mut dave_external_sender = None::<DaveExternalSender>;
             let mut dave_creator = None::<DaveSession>;
             let mut queued_stray_welcome = None::<Vec<u8>>;
+            let mut queued_init_prepare_commit_transition = None::<Vec<u8>>;
+            let mut sent_initial_external_sender = false;
+            let mut dave_key_package_count = 0usize;
+            let mut delayed_prepare_epoch_after_proposals =
+                matches!(
+                    dave_scenario,
+                    DaveScenario::NewGroup
+                        | DaveScenario::NewGroupRequiresInitTransitionReadyBeforePrepareCommitTransition
+                );
+            let mut delayed_prepare_epoch_after_commit =
+                dave_scenario == DaveScenario::NewGroupCommitBeforePrepareEpoch;
             let mut ws = accept_hdr_async(stream, move |request: &Request, response: Response| {
                 *gateway_path_state.lock().unwrap() = Some(request.uri().to_string());
                 Ok(response)
@@ -213,6 +381,7 @@ impl FakeDiscordPeer {
                             if !required_fields_present {
                                 continue;
                             }
+                            sleep(ready_delay).await;
                             ws.send(Message::Text(
                                 json!({
                                     "op": 2,
@@ -269,9 +438,18 @@ impl FakeDiscordPeer {
                                 let announced_user_ids = match dave_scenario {
                                     DaveScenario::Disabled => Vec::new(),
                                     DaveScenario::NewGroup
+                                    | DaveScenario::NewGroupSelfOnlyNoProposals
+                                    | DaveScenario::NewGroupRequiresInitTransitionReadyBeforePrepareCommitTransition
+                                    | DaveScenario::NewGroupCommitBeforePrepareEpoch
+                                    | DaveScenario::NewGroupRequiresInitKeyPackage
+                                    | DaveScenario::NewGroupRequiresRefreshedKeyPackage
                                     | DaveScenario::PrepareBackedWelcomeWithStrayFollowUp
                                     | DaveScenario::UnmatchedWelcome => {
-                                        vec![DAVE_CREATOR_USER_ID]
+                                        if dave_scenario == DaveScenario::NewGroupSelfOnlyNoProposals {
+                                            Vec::new()
+                                        } else {
+                                            vec![DAVE_CREATOR_USER_ID]
+                                        }
                                     }
                                     DaveScenario::EstablishedGroupJoin => {
                                         vec![DAVE_CREATOR_USER_ID, DAVE_EXISTING_MEMBER_USER_ID]
@@ -337,18 +515,48 @@ impl FakeDiscordPeer {
                                         .process_welcome(&welcome, &recognized_user_ids)
                                         .expect("existing member welcome");
                                 }
-                                ws.send(Message::Binary(Bytes::from(
-                                    dave_external_sender_message(2, &external_sender_bytes),
-                                )))
-                                .await
-                                .unwrap();
-                                if dave_scenario != DaveScenario::EstablishedGroupJoin {
+                                if !matches!(
+                                    dave_scenario,
+                                    DaveScenario::NewGroupCommitBeforePrepareEpoch
+                                        | DaveScenario::NewGroupRequiresInitKeyPackage
+                                        | DaveScenario::NewGroupRequiresRefreshedKeyPackage
+                                ) {
+                                    ws.send(Message::Binary(Bytes::from(
+                                        dave_external_sender_message(2, &external_sender_bytes),
+                                    )))
+                                    .await
+                                    .unwrap();
+                                    sent_initial_external_sender = true;
+                                }
+                                if dave_scenario != DaveScenario::EstablishedGroupJoin
+                                    && !matches!(
+                                        dave_scenario,
+                                        DaveScenario::NewGroupCommitBeforePrepareEpoch
+                                            | DaveScenario::NewGroupRequiresInitKeyPackage
+                                            | DaveScenario::NewGroupRequiresRefreshedKeyPackage
+                                    )
+                                    && !matches!(
+                                        dave_scenario,
+                                        DaveScenario::NewGroup
+                                            | DaveScenario::NewGroupSelfOnlyNoProposals
+                                            | DaveScenario::NewGroupRequiresInitTransitionReadyBeforePrepareCommitTransition
+                                    )
+                                {
+                                    let transition_id = if matches!(
+                                        dave_scenario,
+                                        DaveScenario::NewGroup
+                                            | DaveScenario::NewGroupRequiresInitTransitionReadyBeforePrepareCommitTransition
+                                    ) {
+                                        DAVE_INIT_TRANSITION_ID
+                                    } else {
+                                        DAVE_TRANSITION_ID
+                                    };
                                     ws.send(Message::Text(
                                         json!({
                                             "op": 24,
                                             "seq": 3,
                                             "d": {
-                                                "transition_id": DAVE_TRANSITION_ID,
+                                                "transition_id": transition_id,
                                                 "epoch": "1",
                                                 "protocol_version": DAVE_PROTOCOL_VERSION,
                                             }
@@ -394,6 +602,26 @@ impl FakeDiscordPeer {
                                     ))
                                     .await
                                     .unwrap();
+                                } else if transition_id == DAVE_INIT_TRANSITION_ID {
+                                    *saw_dave_init_transition_ready_state.lock().await = true;
+                                    if queued_init_prepare_commit_transition.is_some()
+                                        && !*sent_dave_prepare_commit_transition_state.lock().await
+                                    {
+                                        *saw_dave_init_transition_ready_before_prepare_commit_transition_state
+                                            .lock()
+                                            .await = true;
+                                    }
+                                    if let Some(prepare_commit_message) =
+                                        queued_init_prepare_commit_transition.take()
+                                    {
+                                        *sent_dave_prepare_commit_transition_state.lock().await =
+                                            true;
+                                        ws.send(Message::Binary(Bytes::from(
+                                            prepare_commit_message,
+                                        )))
+                                        .await
+                                        .unwrap();
+                                    }
                                 } else if transition_id == DAVE_UNMATCHED_TRANSITION_ID {
                                     *saw_unmatched_dave_transition_state.lock().await = true;
                                     ws.send(Message::Text(
@@ -416,62 +644,269 @@ impl FakeDiscordPeer {
                         Some(3) => *heartbeat_count_state.lock().await += 1,
                         _ => {}
                     }
-                } else if let Message::Binary(bytes) = message {
-                    if dave_scenario != DaveScenario::Disabled && bytes.first() == Some(&26) {
-                        if *saw_dave_prepare_epoch_state.lock().await {
-                            *saw_dave_key_package_after_prepare_epoch_state.lock().await = true;
-                        } else {
-                            *saw_dave_key_package_before_prepare_epoch_state.lock().await = true;
-                        }
-                        let user_id = identified_user_id_state
-                            .lock()
-                            .await
-                            .clone()
-                            .unwrap_or_else(|| "1111111111111111".to_owned());
-                        let external_sender = dave_external_sender
-                            .as_ref()
-                            .expect("external sender missing");
-                        let creator = dave_creator.as_mut().expect("creator session missing");
-                        if dave_scenario == DaveScenario::PrepareBackedWelcomeWithStrayFollowUp {
-                            let mut stray_creator =
-                                DaveSession::new(None).expect("stray creator session");
-                            let external_sender_bytes = external_sender
-                                .marshalled_external_sender()
-                                .expect("stray external sender bytes");
-                            stray_creator
-                                .set_external_sender(&external_sender_bytes)
-                                .expect("stray creator external sender");
-                            stray_creator
-                                .init(
-                                    DAVE_PROTOCOL_VERSION,
-                                    group_id_from_user_context(&user_id, &dave_group_id_state),
-                                    DAVE_CREATOR_USER_ID,
+                } else if let Message::Binary(bytes) = message
+                    && dave_scenario != DaveScenario::Disabled
+                {
+                    match bytes.first().copied() {
+                        Some(26) => {
+                            dave_key_package_count += 1;
+                            if !sent_initial_external_sender
+                                && matches!(
+                                    dave_scenario,
+                                    DaveScenario::NewGroupCommitBeforePrepareEpoch
+                                        | DaveScenario::NewGroupRequiresInitTransitionReadyBeforePrepareCommitTransition
+                                        | DaveScenario::NewGroupRequiresInitKeyPackage
+                                        | DaveScenario::NewGroupRequiresRefreshedKeyPackage
                                 )
-                                .expect("stray creator init");
-                            queued_stray_welcome = Some(dave_welcome_message(
-                                5,
-                                &mut stray_creator,
-                                external_sender,
-                                DaveScenario::NewGroup,
-                                &user_id,
-                                DAVE_UNMATCHED_TRANSITION_ID,
-                                &bytes[1..],
-                            ));
-                        }
-                        ws.send(Message::Binary(Bytes::from(dave_welcome_message(
-                            4,
-                            creator,
-                            external_sender,
-                            dave_scenario,
-                            &user_id,
-                            match dave_scenario {
+                            {
+                                *saw_dave_key_package_before_external_sender_state
+                                    .lock()
+                                    .await = true;
+                                let external_sender = dave_external_sender
+                                    .as_ref()
+                                    .expect("external sender missing");
+                                let external_sender_bytes = external_sender
+                                    .marshalled_external_sender()
+                                    .expect("external sender bytes");
+                                ws.send(Message::Binary(Bytes::from(
+                                    dave_external_sender_message(2, &external_sender_bytes),
+                                )))
+                                .await
+                                .unwrap();
+                                sent_initial_external_sender = true;
+                            }
+                            if dave_key_package_count == 1 {
+                                continue;
+                            }
+                            if sent_initial_external_sender
+                                && matches!(
+                                    dave_scenario,
+                                    DaveScenario::NewGroupCommitBeforePrepareEpoch
+                                        | DaveScenario::NewGroupRequiresInitTransitionReadyBeforePrepareCommitTransition
+                                        | DaveScenario::NewGroupRequiresInitKeyPackage
+                                        | DaveScenario::NewGroupRequiresRefreshedKeyPackage
+                                )
+                                && !*saw_dave_prepare_epoch_state.lock().await
+                            {
+                                *saw_dave_key_package_after_external_sender_state
+                                    .lock()
+                                    .await = true;
+                                ws.send(Message::Text(
+                                    json!({
+                                        "op": 24,
+                                        "seq": 3,
+                                        "d": {
+                                            "transition_id": DAVE_INIT_TRANSITION_ID,
+                                            "epoch": "1",
+                                            "protocol_version": DAVE_PROTOCOL_VERSION,
+                                        }
+                                    })
+                                    .to_string()
+                                    .into(),
+                                ))
+                                .await
+                                .unwrap();
+                                *saw_dave_prepare_epoch_state.lock().await = true;
+                            } else if sent_initial_external_sender
+                                && matches!(
+                                    dave_scenario,
+                                    DaveScenario::NewGroup
+                                        | DaveScenario::NewGroupSelfOnlyNoProposals
+                                        | DaveScenario::NewGroupRequiresInitTransitionReadyBeforePrepareCommitTransition
+                                        | DaveScenario::EstablishedGroupJoin
+                                        | DaveScenario::PrepareBackedWelcomeWithStrayFollowUp
+                                        | DaveScenario::UnmatchedWelcome
+                                )
+                            {
+                                *saw_dave_key_package_after_external_sender_state
+                                    .lock()
+                                    .await = true;
+                            }
+                            if *saw_dave_prepare_epoch_state.lock().await {
+                                *saw_dave_key_package_after_prepare_epoch_state.lock().await = true;
+                            } else {
+                                *saw_dave_key_package_before_prepare_epoch_state.lock().await =
+                                    true;
+                            }
+                            let user_id = identified_user_id_state
+                                .lock()
+                                .await
+                                .clone()
+                                .unwrap_or_else(|| "1111111111111111".to_owned());
+                            let external_sender = dave_external_sender
+                                .as_ref()
+                                .expect("external sender missing");
+                            let creator = dave_creator.as_mut().expect("creator session missing");
+                            if dave_scenario == DaveScenario::PrepareBackedWelcomeWithStrayFollowUp {
+                                let mut stray_creator =
+                                    DaveSession::new(None).expect("stray creator session");
+                                let external_sender_bytes = external_sender
+                                    .marshalled_external_sender()
+                                    .expect("stray external sender bytes");
+                                stray_creator
+                                    .set_external_sender(&external_sender_bytes)
+                                    .expect("stray creator external sender");
+                                stray_creator
+                                    .init(
+                                        DAVE_PROTOCOL_VERSION,
+                                        group_id_from_user_context(&user_id, &dave_group_id_state),
+                                        DAVE_CREATOR_USER_ID,
+                                    )
+                                    .expect("stray creator init");
+                                queued_stray_welcome = Some(dave_welcome_message(
+                                    5,
+                                    &mut stray_creator,
+                                    external_sender,
+                                    DaveScenario::NewGroup,
+                                    &user_id,
+                                    DAVE_UNMATCHED_TRANSITION_ID,
+                                    &bytes[1..],
+                                ));
+                            }
+
+                            let transition_id = match dave_scenario {
+                                DaveScenario::NewGroup
+                                | DaveScenario::NewGroupSelfOnlyNoProposals
+                                | DaveScenario::NewGroupRequiresInitTransitionReadyBeforePrepareCommitTransition
+                                | DaveScenario::NewGroupCommitBeforePrepareEpoch
+                                | DaveScenario::NewGroupRequiresInitKeyPackage
+                                | DaveScenario::NewGroupRequiresRefreshedKeyPackage => {
+                                    DAVE_INIT_TRANSITION_ID
+                                }
                                 DaveScenario::UnmatchedWelcome => DAVE_UNMATCHED_TRANSITION_ID,
                                 _ => DAVE_TRANSITION_ID,
-                            },
-                            &bytes[1..],
-                        ))))
-                        .await
-                        .unwrap();
+                            };
+
+                            if dave_scenario == DaveScenario::NewGroupSelfOnlyNoProposals {
+                                continue;
+                            } else if matches!(
+                                dave_scenario,
+                                DaveScenario::NewGroup
+                                    | DaveScenario::NewGroupRequiresInitTransitionReadyBeforePrepareCommitTransition
+                                    | DaveScenario::NewGroupCommitBeforePrepareEpoch
+                                    | DaveScenario::NewGroupRequiresInitKeyPackage
+                                    | DaveScenario::NewGroupRequiresRefreshedKeyPackage
+                            ) {
+                                let proposal_message = {
+                                    let creator_key_package =
+                                        creator.key_package().expect("creator key package");
+                                    let proposal = external_sender
+                                        .propose_add(0, &creator_key_package)
+                                        .expect("runtime proposal");
+                                    dave_proposals_message(4, &proposal)
+                                };
+                                ws.send(Message::Binary(Bytes::from(proposal_message)))
+                                    .await
+                                    .unwrap();
+                                if delayed_prepare_epoch_after_proposals {
+                                    ws.send(Message::Text(
+                                        json!({
+                                            "op": 24,
+                                            "seq": 3,
+                                            "d": {
+                                                "transition_id": DAVE_INIT_TRANSITION_ID,
+                                                "epoch": "1",
+                                                "protocol_version": DAVE_PROTOCOL_VERSION,
+                                            }
+                                        })
+                                        .to_string()
+                                        .into(),
+                                    ))
+                                    .await
+                                    .unwrap();
+                                    *saw_dave_prepare_epoch_state.lock().await = true;
+                                    delayed_prepare_epoch_after_proposals = false;
+                                }
+                            } else {
+                                let welcome_message = dave_welcome_message(
+                                    4,
+                                    creator,
+                                    external_sender,
+                                    dave_scenario,
+                                    &user_id,
+                                    transition_id,
+                                    &bytes[1..],
+                                );
+                                ws.send(Message::Binary(Bytes::from(welcome_message)))
+                                    .await
+                                    .unwrap();
+                            }
+                        }
+                        Some(28)
+                            if matches!(
+                                dave_scenario,
+                                DaveScenario::NewGroupSelfOnlyNoProposals
+                            ) =>
+                        {
+                            *saw_dave_commit_welcome_state.lock().await = true;
+                        }
+                        Some(28)
+                            if matches!(
+                                dave_scenario,
+                                DaveScenario::NewGroup
+                                    | DaveScenario::NewGroupRequiresInitTransitionReadyBeforePrepareCommitTransition
+                                    | DaveScenario::NewGroupCommitBeforePrepareEpoch
+                                    | DaveScenario::NewGroupRequiresInitKeyPackage
+                                    | DaveScenario::NewGroupRequiresRefreshedKeyPackage
+                            ) =>
+                        {
+                            *saw_dave_commit_welcome_state.lock().await = true;
+                            let user_id = identified_user_id_state
+                                .lock()
+                                .await
+                                .clone()
+                                .unwrap_or_else(|| "1111111111111111".to_owned());
+                            let prepare_commit_message = {
+                                let external_sender = dave_external_sender
+                                    .as_ref()
+                                    .expect("external sender missing");
+                                let creator =
+                                    dave_creator.as_mut().expect("creator session missing");
+                                let recognized_user_ids = [DAVE_CREATOR_USER_ID, user_id.as_str()];
+                                let (commit, welcome) = external_sender
+                                    .split_commit_welcome(&bytes[1..])
+                                    .expect("split commit/welcome");
+                                creator
+                                    .process_welcome(&welcome, &recognized_user_ids)
+                                    .expect("creator process welcome");
+                                dave_prepare_commit_transition_message(
+                                    5,
+                                    DAVE_INIT_TRANSITION_ID,
+                                    &commit,
+                                )
+                            };
+                            if dave_scenario
+                                == DaveScenario::NewGroupRequiresInitTransitionReadyBeforePrepareCommitTransition
+                            {
+                                queued_init_prepare_commit_transition =
+                                    Some(prepare_commit_message);
+                            } else {
+                                *sent_dave_prepare_commit_transition_state.lock().await = true;
+                                ws.send(Message::Binary(Bytes::from(prepare_commit_message)))
+                                    .await
+                                    .unwrap();
+                            }
+                            if delayed_prepare_epoch_after_commit {
+                                ws.send(Message::Text(
+                                    json!({
+                                        "op": 24,
+                                        "seq": 3,
+                                        "d": {
+                                            "transition_id": DAVE_INIT_TRANSITION_ID,
+                                            "epoch": "1",
+                                            "protocol_version": DAVE_PROTOCOL_VERSION,
+                                        }
+                                    })
+                                    .to_string()
+                                    .into(),
+                                ))
+                                .await
+                                .unwrap();
+                                *saw_dave_prepare_epoch_state.lock().await = true;
+                                delayed_prepare_epoch_after_commit = false;
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -495,6 +930,12 @@ impl FakeDiscordPeer {
             saw_dave_prepare_epoch,
             saw_dave_key_package_before_prepare_epoch,
             saw_dave_key_package_after_prepare_epoch,
+            saw_dave_key_package_before_external_sender,
+            saw_dave_key_package_after_external_sender,
+            saw_dave_commit_welcome,
+            saw_dave_init_transition_ready,
+            saw_dave_init_transition_ready_before_prepare_commit_transition,
+            sent_dave_prepare_commit_transition,
         }
     }
 
@@ -575,6 +1016,10 @@ impl FakeDiscordPeer {
         wait_for_value(&self.saw_dave_transition, |ready| *ready).await
     }
 
+    pub async fn saw_dave_transition_within(&self, timeout: Duration) -> bool {
+        wait_for_value_with_timeout(&self.saw_dave_transition, timeout, |ready| *ready).await
+    }
+
     pub async fn saw_unmatched_dave_transition(&self) -> bool {
         *self.saw_unmatched_dave_transition.lock().await
     }
@@ -600,6 +1045,46 @@ impl FakeDiscordPeer {
         })
         .await
     }
+
+    pub async fn saw_dave_key_package_before_external_sender(&self) -> bool {
+        wait_for_value(&self.saw_dave_key_package_before_external_sender, |ready| {
+            *ready
+        })
+        .await
+    }
+
+    pub async fn saw_dave_key_package_after_external_sender(&self) -> bool {
+        wait_for_value(&self.saw_dave_key_package_after_external_sender, |ready| *ready).await
+    }
+
+    pub async fn saw_dave_commit_welcome(&self) -> bool {
+        wait_for_value(&self.saw_dave_commit_welcome, |ready| *ready).await
+    }
+
+    pub async fn saw_dave_init_transition_ready(&self) -> bool {
+        wait_for_value(&self.saw_dave_init_transition_ready, |ready| *ready).await
+    }
+
+    pub async fn saw_dave_init_transition_ready_before_prepare_commit_transition(
+        &self,
+    ) -> bool {
+        wait_for_value(
+            &self.saw_dave_init_transition_ready_before_prepare_commit_transition,
+            |ready| *ready,
+        )
+        .await
+    }
+
+    pub async fn sent_dave_prepare_commit_transition(&self) -> bool {
+        wait_for_value(&self.sent_dave_prepare_commit_transition, |ready| *ready).await
+    }
+
+    pub async fn sent_dave_prepare_commit_transition_within(&self, timeout: Duration) -> bool {
+        wait_for_value_with_timeout(&self.sent_dave_prepare_commit_transition, timeout, |ready| {
+            *ready
+        })
+        .await
+    }
 }
 
 fn group_id_from_user_context(
@@ -613,7 +1098,28 @@ fn dave_external_sender_message(sequence: u16, external_sender_bytes: &[u8]) -> 
     let mut message = Vec::with_capacity(3 + external_sender_bytes.len());
     message.extend_from_slice(&sequence.to_be_bytes());
     message.push(25);
-    message.extend_from_slice(&external_sender_bytes);
+    message.extend_from_slice(external_sender_bytes);
+    message
+}
+
+fn dave_proposals_message(sequence: u16, proposals: &[u8]) -> Vec<u8> {
+    let mut message = Vec::with_capacity(3 + proposals.len());
+    message.extend_from_slice(&sequence.to_be_bytes());
+    message.push(27);
+    message.extend_from_slice(proposals);
+    message
+}
+
+fn dave_prepare_commit_transition_message(
+    sequence: u16,
+    transition_id: u16,
+    commit: &[u8],
+) -> Vec<u8> {
+    let mut message = Vec::with_capacity(5 + commit.len());
+    message.extend_from_slice(&sequence.to_be_bytes());
+    message.push(29);
+    message.extend_from_slice(&transition_id.to_be_bytes());
+    message.extend_from_slice(commit);
     message
 }
 
@@ -629,6 +1135,11 @@ fn dave_welcome_message(
     let proposal_epoch = match dave_scenario {
         DaveScenario::Disabled => unreachable!("disabled DAVE scenario cannot emit welcome"),
         DaveScenario::NewGroup
+        | DaveScenario::NewGroupSelfOnlyNoProposals
+        | DaveScenario::NewGroupRequiresInitTransitionReadyBeforePrepareCommitTransition
+        | DaveScenario::NewGroupCommitBeforePrepareEpoch
+        | DaveScenario::NewGroupRequiresInitKeyPackage
+        | DaveScenario::NewGroupRequiresRefreshedKeyPackage
         | DaveScenario::PrepareBackedWelcomeWithStrayFollowUp
         | DaveScenario::UnmatchedWelcome => 0,
         DaveScenario::EstablishedGroupJoin => 1,
@@ -639,6 +1150,11 @@ fn dave_welcome_message(
     let recognized_user_ids = match dave_scenario {
         DaveScenario::Disabled => unreachable!("disabled DAVE scenario cannot emit welcome"),
         DaveScenario::NewGroup
+        | DaveScenario::NewGroupSelfOnlyNoProposals
+        | DaveScenario::NewGroupRequiresInitTransitionReadyBeforePrepareCommitTransition
+        | DaveScenario::NewGroupCommitBeforePrepareEpoch
+        | DaveScenario::NewGroupRequiresInitKeyPackage
+        | DaveScenario::NewGroupRequiresRefreshedKeyPackage
         | DaveScenario::PrepareBackedWelcomeWithStrayFollowUp
         | DaveScenario::UnmatchedWelcome => {
             vec![DAVE_CREATOR_USER_ID, runtime_user_id]

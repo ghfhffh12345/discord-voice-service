@@ -1,0 +1,62 @@
+name: Fake Peer CI
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+  merge_group:
+    types:
+      - checks_requested
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+concurrency:
+  group: fake-peer-ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fake-peer-ci:
+    name: Fake Peer CI
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Verify formatting
+        shell: bash
+        run: cargo fmt --check
+
+      - name: Verify lint cleanliness
+        shell: bash
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run full cargo test suite
+        shell: bash
+        run: cargo test -v
+
+      - name: Run fake-peer critical subset
+        shell: bash
+        run: >
+          cargo test
+          --test voice_handshake
+          --test voice_gateway_v8
+          --test voice_udp_transport
+          --test pacer_runtime
+          --test runtime_end_to_end_playback
+          --test recovery_reresolve
+          --test recovery_reopen
+          --test voice_context_rollover
+          -v

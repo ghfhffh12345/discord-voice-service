@@ -17,13 +17,106 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  verify-fake-peer-ci:
+    name: Verify Fake Peer CI Gate
+    runs-on: ubuntu-22.04
+    outputs:
+      release_ref: ${{ steps.release-target.outputs.release_ref }}
+      release_sha: ${{ steps.release-target.outputs.release_sha }}
+
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Resolve release target
+        id: release-target
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          release_ref="refs/tags/${{ github.event.release.tag_name }}"
+          release_sha="$(git rev-list -n 1 "${{ github.event.release.tag_name }}")"
+
+          {
+            echo "release_ref=${release_ref}"
+            echo "release_sha=${release_sha}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Require successful Fake Peer CI run for release commit
+        uses: actions/github-script@v8
+        env:
+          RELEASE_SHA: ${{ steps.release-target.outputs.release_sha }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const releaseSha = process.env.RELEASE_SHA;
+            const allowedEvents = new Set(["push", "pull_request", "merge_group"]);
+
+            const runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
+              owner,
+              repo,
+              workflow_id: "fake-peer-ci.yml",
+              head_sha: releaseSha,
+              status: "completed",
+              per_page: 100,
+            });
+
+            const success = runs.find((run) =>
+              run.conclusion === "success" && allowedEvents.has(run.event)
+            );
+
+            if (!success) {
+              core.setFailed(
+                `No successful Fake Peer CI run from push/pull_request/merge_group was found for release commit ${releaseSha}. ` +
+                  "Release publishing stays blocked until the normal fake-peer gate succeeds for that commit."
+              );
+              return;
+            }
+
+            core.notice(
+              `Fake Peer CI gate satisfied by run ${success.id} (${success.html_url}) for ${releaseSha}.`
+            );
+
+  live-staging:
+    name: Live Staging Release Gate
+    needs: verify-fake-peer-ci
+    uses: ./.github/workflows/live-staging.yml
+    with:
+      source_ref: ${{ needs.verify-fake-peer-ci.outputs.release_ref }}
+      source_sha: ${{ needs.verify-fake-peer-ci.outputs.release_sha }}
+    secrets: inherit
+
+  release-ready:
+    name: Release Ready Gate
+    runs-on: ubuntu-22.04
+    needs:
+      - verify-fake-peer-ci
+      - live-staging
+
+    steps:
+      - name: Summarize enforced release gates
+        shell: bash
+        run: |
+          {
+            echo "## Release-ready gate"
+            echo
+            echo "- Release commit: \`${{ needs.verify-fake-peer-ci.outputs.release_sha }}\`"
+            echo "- Fake Peer CI: passed before release publication continued"
+            echo "- Live staging: passed through the protected self-hosted \`live-staging\` gate"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
   build-and-push:
     name: Build and Push GHCR Image
+    needs: release-ready
     runs-on: ubuntu-22.04
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.release.tag_name }}
 
       - name: Install QEMU for cross-architecture RUN support
         run: |

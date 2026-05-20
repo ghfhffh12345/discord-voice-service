@@ -1,4 +1,4 @@
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use reqwest::StatusCode;
 use reqwest::header::{CONTENT_RANGE, RANGE};
 
@@ -33,15 +33,28 @@ impl HttpOpusStream {
     pub async fn read_chunk(&mut self) -> Result<Option<Bytes>, AppError> {
         let expected_start = self.position.byte_offset();
         let range = format!("bytes={expected_start}-");
-        let response = self
+        let mut response = self
             .client
             .get(&self.url)
             .header(RANGE, range)
             .send()
             .await?;
-        let response = response.error_for_status()?;
+        if expected_start > 0 && response.status() == StatusCode::RANGE_NOT_SATISFIABLE {
+            return Ok(None);
+        }
+        response = response.error_for_status()?;
         validate_resume_response(&response, expected_start)?;
-        let bytes = response.bytes().await?;
+        let mut body = BytesMut::new();
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+                Ok(None) => break,
+                Err(_err) if !body.is_empty() => break,
+                Err(err) => return Err(err.into()),
+            }
+        }
+
+        let bytes = body.freeze();
         if bytes.is_empty() {
             return Ok(None);
         }

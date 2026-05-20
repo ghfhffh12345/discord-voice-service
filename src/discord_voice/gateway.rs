@@ -10,32 +10,29 @@ use crate::discord_voice::dave::DaveSession;
 use crate::discord_voice::protocol::{self, VoiceGatewayPayload};
 use crate::discord_voice::resume::GatewayEvent;
 use crate::discord_voice::udp::DiscoveredUdpAddress;
-use crate::discord_voice::ws::{self, VoiceWebSocket};
+use crate::discord_voice::ws::{self, VoiceWebSocketReader, VoiceWebSocketWriter};
 use crate::error::AppError;
 use crate::session::supervisor::VoiceContext;
 
-struct VoiceGatewayInner {
-    ws: VoiceWebSocket,
-    seq_ack: Option<u64>,
-}
-
 #[derive(Clone)]
 pub struct VoiceGatewayClient {
-    inner: Arc<Mutex<VoiceGatewayInner>>,
+    read: Arc<Mutex<VoiceWebSocketReader>>,
+    write: Arc<Mutex<VoiceWebSocketWriter>>,
+    seq_ack: Arc<Mutex<Option<u64>>>,
 }
 
 impl VoiceGatewayClient {
     pub async fn connect(url: &str) -> Result<Self, AppError> {
+        let (write, read) = ws::connect(url).await?;
         Ok(Self {
-            inner: Arc::new(Mutex::new(VoiceGatewayInner {
-                ws: ws::connect(url).await?,
-                seq_ack: None,
-            })),
+            read: Arc::new(Mutex::new(read)),
+            write: Arc::new(Mutex::new(write)),
+            seq_ack: Arc::new(Mutex::new(None)),
         })
     }
 
     pub async fn record_seq_ack(&self, seq: u64) {
-        self.inner.lock().await.seq_ack = Some(seq);
+        *self.seq_ack.lock().await = Some(seq);
     }
 
     pub async fn apply_gateway_event(&self, event: &GatewayEvent) {
@@ -61,7 +58,8 @@ impl VoiceGatewayClient {
     }
 
     pub async fn send_heartbeat(&self) -> Result<(), AppError> {
-        let seq_ack = self.inner.lock().await.seq_ack;
+        let seq_ack = *self.seq_ack.lock().await;
+        tracing::debug!(seq_ack, "voice gateway sending heartbeat");
         self.send_json(protocol::heartbeat_payload(
             heartbeat_timestamp_millis()?,
             seq_ack,
@@ -75,7 +73,7 @@ impl VoiceGatewayClient {
         session_id: &str,
         token: &str,
     ) -> Result<(), AppError> {
-        let seq_ack = self.inner.lock().await.seq_ack;
+        let seq_ack = *self.seq_ack.lock().await;
         self.send_json(protocol::resume_payload(
             server_id, session_id, token, seq_ack,
         ))
@@ -83,20 +81,27 @@ impl VoiceGatewayClient {
     }
 
     pub async fn receive_event(&self) -> Result<VoiceGatewayPayload, AppError> {
-        let mut inner = self.inner.lock().await;
-        while let Some(message) = inner.ws.next().await {
+        let mut reader = self.read.lock().await;
+        while let Some(message) = reader.next().await {
             match message? {
                 Message::Text(text) => {
                     let payload = protocol::parse_gateway_message(text.as_ref())?;
                     if let Some(seq) = payload.seq() {
-                        inner.seq_ack = Some(seq);
+                        *self.seq_ack.lock().await = Some(seq);
+                    }
+                    if let protocol::VoiceGatewayEvent::HeartbeatAck(ack) = payload.event() {
+                        tracing::debug!(
+                            seq = payload.seq(),
+                            nonce = ack.nonce,
+                            "voice gateway received heartbeat ack"
+                        );
                     }
                     return Ok(payload);
                 }
                 Message::Binary(bytes) => {
                     let payload = protocol::parse_gateway_binary_message(bytes.as_ref())?;
                     if let Some(seq) = payload.seq() {
-                        inner.seq_ack = Some(seq);
+                        *self.seq_ack.lock().await = Some(seq);
                     }
                     return Ok(payload);
                 }
@@ -115,13 +120,13 @@ impl VoiceGatewayClient {
     }
 
     pub(crate) async fn send_json(&self, payload: Value) -> Result<(), AppError> {
-        let mut inner = self.inner.lock().await;
-        ws::send_json(&mut inner.ws, payload).await
+        let mut writer = self.write.lock().await;
+        ws::send_json(&mut writer, payload).await
     }
 
     pub(crate) async fn send_binary(&self, payload: Vec<u8>) -> Result<(), AppError> {
-        let mut inner = self.inner.lock().await;
-        ws::send_binary(&mut inner.ws, payload).await
+        let mut writer = self.write.lock().await;
+        ws::send_binary(&mut writer, payload).await
     }
 
     pub async fn send_dave_transition_ready(&self, transition_id: u16) -> Result<(), AppError> {

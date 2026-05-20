@@ -1,4 +1,4 @@
-use futures::SinkExt;
+use futures::{SinkExt, StreamExt};
 use http::Uri;
 use serde_json::Value;
 use tokio::net::TcpStream;
@@ -9,19 +9,21 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use crate::error::AppError;
 
 pub type VoiceWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+pub type VoiceWebSocketWriter = futures::stream::SplitSink<VoiceWebSocket, Message>;
+pub type VoiceWebSocketReader = futures::stream::SplitStream<VoiceWebSocket>;
 
-pub async fn connect(url: &str) -> Result<VoiceWebSocket, AppError> {
+pub async fn connect(url: &str) -> Result<(VoiceWebSocketWriter, VoiceWebSocketReader), AppError> {
     let normalized_url = normalize_gateway_url(url)?;
     let (ws, _) = connect_async(normalized_url).await?;
-    Ok(ws)
+    Ok(ws.split())
 }
 
-pub async fn send_json(ws: &mut VoiceWebSocket, payload: Value) -> Result<(), AppError> {
+pub async fn send_json(ws: &mut VoiceWebSocketWriter, payload: Value) -> Result<(), AppError> {
     ws.send(Message::Text(payload.to_string().into())).await?;
     Ok(())
 }
 
-pub async fn send_binary(ws: &mut VoiceWebSocket, payload: Vec<u8>) -> Result<(), AppError> {
+pub async fn send_binary(ws: &mut VoiceWebSocketWriter, payload: Vec<u8>) -> Result<(), AppError> {
     ws.send(Message::Binary(Bytes::from(payload))).await?;
     Ok(())
 }
