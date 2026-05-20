@@ -9,6 +9,9 @@ fn live_staging_workflow_targets_container_artifacts() {
     assert!(workflow.contains("DISCORD_VOICE_SERVICE_URI"));
     assert!(workflow.contains("scripts/ci/live_staging_preflight.sh"));
     assert!(workflow.contains("scripts/ci/run_live_staging.sh"));
+    assert!(workflow.contains("DISCORD_VOICE_SERVICE_RESOLVED_IMAGE_REF"));
+    assert!(workflow.contains("${DISCORD_VOICE_SERVICE_IMAGE_REF:-not resolved}"));
+    assert!(workflow.contains("${YTMUSIC_SERVICE_IMAGE_REF:-not resolved}"));
     assert!(
         !workflow.contains("Build local binaries"),
         "live staging should no longer build local binaries",

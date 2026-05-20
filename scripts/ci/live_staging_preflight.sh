@@ -45,14 +45,24 @@ if [[ ! -f "${browser_json_source_path}" ]]; then
   exit 1
 fi
 
+resolved_digest="$(
+  skopeo inspect --format '{{.Digest}}' "docker://${DISCORD_VOICE_SERVICE_IMAGE_REF}"
+)"
+resolved_image_ref="${DISCORD_VOICE_SERVICE_IMAGE_REF%@*}@${resolved_digest}"
+
 if [[ -n "${DISCORD_VOICE_SERVICE_IMAGE_DIGEST:-}" ]]; then
-  resolved_digest="$(
-    skopeo inspect --format '{{.Digest}}' "docker://${DISCORD_VOICE_SERVICE_IMAGE_REF}"
-  )"
   if [[ "${resolved_digest}" != "${DISCORD_VOICE_SERVICE_IMAGE_DIGEST}" ]]; then
     echo "::error::discord-voice-service image digest mismatch for ${DISCORD_VOICE_SERVICE_IMAGE_REF}: expected ${DISCORD_VOICE_SERVICE_IMAGE_DIGEST}, got ${resolved_digest}"
     exit 1
   fi
+fi
+
+export DISCORD_VOICE_SERVICE_RESOLVED_IMAGE_REF="${resolved_image_ref}"
+if [[ -n "${GITHUB_ENV:-}" ]]; then
+  {
+    echo "DISCORD_VOICE_SERVICE_RESOLVED_IMAGE_REF=${resolved_image_ref}"
+    echo "DISCORD_VOICE_SERVICE_RESOLVED_IMAGE_DIGEST=${resolved_digest}"
+  } >> "${GITHUB_ENV}"
 fi
 
 podman --version

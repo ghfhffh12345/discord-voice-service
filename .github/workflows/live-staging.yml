@@ -158,10 +158,11 @@ jobs:
             echo
             echo "- Trigger: \`${{ steps.source.outputs.trigger_mode }}\`"
             echo "- Protected environment: \`live-staging\`"
-            echo "- Validation target for \`discord-voice-service\`: requested candidate image ref \`${DISCORD_VOICE_SERVICE_IMAGE_REF}\`"
+            echo "- Validation target for \`discord-voice-service\`: requested candidate image ref \`${DISCORD_VOICE_SERVICE_IMAGE_REF:-not resolved}\`"
+            echo "- Resolved artifact ref: \`${DISCORD_VOICE_SERVICE_RESOLVED_IMAGE_REF:-not resolved}\`"
             echo "- Candidate digest check: \`${DISCORD_VOICE_SERVICE_IMAGE_DIGEST:-not requested}\`"
             echo "- Source ref: \`${{ steps.source.outputs.checkout_ref }}\`"
             echo "- Source commit: \`${{ steps.source.outputs.source_sha }}\`"
-            echo "- ytmusic-service image ref: \`${YTMUSIC_SERVICE_IMAGE_REF}\`"
+            echo "- ytmusic-service image ref: \`${YTMUSIC_SERVICE_IMAGE_REF:-not resolved}\`"
             echo "- browser.json source path provider: \`BROWSER_JSON_SOURCE_PATH\` or \`STAGING_BROWSER_JSON_SOURCE_PATH\`"
           } >> "${GITHUB_STEP_SUMMARY}"

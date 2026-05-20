@@ -7,6 +7,7 @@ service_container_name="discord-voice-service-live-staging"
 controller_log="${RUNNER_TEMP}/staging-live-check.log"
 controller_binary="${GITHUB_WORKSPACE}/target/debug/staging_live_check"
 staged_browser_json="${GITHUB_WORKSPACE}/browser.json"
+service_image_ref="${DISCORD_VOICE_SERVICE_RESOLVED_IMAGE_REF:-${DISCORD_VOICE_SERVICE_IMAGE_REF}}"
 
 wait_for_port() {
   local port="$1"
@@ -56,6 +57,8 @@ trap cleanup EXIT
 browser_json_source_path="${BROWSER_JSON_SOURCE_PATH:-${STAGING_BROWSER_JSON_SOURCE_PATH:-}}"
 install -m 600 "${browser_json_source_path}" "${staged_browser_json}"
 
+cargo build --locked --bin staging_live_check
+
 if ! podman network inspect "${network_name}" >/dev/null 2>&1; then
   podman network create "${network_name}" >/dev/null
 fi
@@ -63,7 +66,7 @@ fi
 podman rm -f "${service_container_name}" >/dev/null 2>&1 || true
 podman rm -f "${ytmusic_container_name}" >/dev/null 2>&1 || true
 
-podman pull "${DISCORD_VOICE_SERVICE_IMAGE_REF}"
+podman pull "${service_image_ref}"
 
 podman run -d \
   --name "${ytmusic_container_name}" \
@@ -85,10 +88,9 @@ podman run -d \
   -p 55051:55051 \
   -e DISCORD_VOICE_SERVICE_BIND_ADDR="0.0.0.0:55051" \
   -e DISCORD_VOICE_SERVICE_YTMUSIC_ADDR="http://ytmusic-service-live-staging:50051" \
-  "${DISCORD_VOICE_SERVICE_IMAGE_REF}"
+  "${service_image_ref}"
 
 wait_for_port 55051 "discord-voice-service gRPC listener"
 sleep 5
 
-cargo build --locked --bin staging_live_check
 "${controller_binary}" >"${controller_log}" 2>&1
