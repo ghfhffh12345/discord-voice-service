@@ -36,6 +36,7 @@ The main bot should continue to own commands and high-level playback decisions. 
 - A real runtime playback path that connects to a Discord voice endpoint, performs UDP discovery, sends speaking updates, and emits Opus RTP frames for supported sources
 - Distroless container packaging in [`Containerfile`](Containerfile)
 - A release-triggered GHCR image workflow in [`.github/workflows/release-image.yml`](.github/workflows/release-image.yml)
+- A self-hosted live validation workflow in [`.github/workflows/live-staging.yml`](.github/workflows/live-staging.yml) that exercises the real staging controller against Discord
 
 ## Playback selection policy
 
@@ -102,6 +103,45 @@ export DISCORD_VOICE_SERVICE_YTMUSIC_ADDR=http://127.0.0.1:50051
 
 cargo run
 ```
+
+## Live staging validation
+
+Real Discord validation is self-hosted first. [`.github/workflows/live-staging.yml`](.github/workflows/live-staging.yml) is the operator workflow for that gate, and it supports both manual `workflow_dispatch` runs and automatic runs after `Release Image` succeeds.
+
+The self-hosted runner must already have:
+
+- a runner-local `./browser.json` in the checked-out workspace; the workflow uses `actions/checkout` with `clean: false` so this gitignored file survives checkout
+- the Rust toolchain with `cargo` and `rustc`
+- Podman
+- outbound internet access plus inbound UDP replies suitable for real Discord voice validation
+
+The staging environment must use dedicated Discord resources:
+
+- a dedicated bot token
+- a dedicated test guild
+- a dedicated non-stage voice channel
+
+The live validation controller contract is:
+
+| Variable | Purpose | Example |
+| --- | --- | --- |
+| `APPLICATION_ID` | Discord application ID for the dedicated staging bot | `123456789012345678` |
+| `BOT_TOKEN` | Bot token for the dedicated staging bot | `discord-bot-token` |
+| `TEST_GUILD_ID` | Dedicated staging guild ID | `234567890123456789` |
+| `TEST_VOICE_CHANNEL_ID` | Dedicated non-stage voice channel ID inside that guild | `345678901234567890` |
+| `TEST_VIDEO_ID` | YouTube video ID used for the live playback assertion | `dQw4w9WgXcQ` |
+| `DISCORD_VOICE_SERVICE_ADDR` | gRPC URI used by `staging_live_check` to reach this service | `http://127.0.0.1:55051` |
+| `DISCORD_VOICE_SERVICE_YTMUSIC_ADDR` | gRPC URI used by both the service and controller to reach `ytmusic-service` | `http://127.0.0.1:50051` |
+
+The workflow intentionally starts the live dependencies itself instead of assuming external staging processes:
+
+1. validate that the self-hosted runner already has `./browser.json`, Podman, and the Rust toolchain
+2. start `ytmusic-service` in Podman with `./browser.json`
+3. start `discord-voice-service` from the checked-out repository
+4. run `cargo run --bin staging_live_check`
+5. tear down the container and the local service process
+
+The workflow also handles one current contract wrinkle explicitly: `staging_live_check` expects `DISCORD_VOICE_SERVICE_ADDR` as a URI, while the service process still binds from the same variable name as a bare socket address. The workflow keeps the controller contract at `http://127.0.0.1:55051` and overrides the service-start step to bind on `127.0.0.1:55051`.
 
 ## Verify and use the service
 
