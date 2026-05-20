@@ -8,6 +8,7 @@ use discord_voice_service::proto::discordvoice::v1::{
     SubscribeEventsRequest,
 };
 use futures::StreamExt;
+use serde::Serialize;
 use tokio::time::{Instant, sleep_until, timeout};
 use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
@@ -34,7 +35,7 @@ pub(crate) struct StagingConfig {
     pub(crate) test_guild_id: String,
     pub(crate) test_voice_channel_id: String,
     pub(crate) test_video_id: String,
-    pub(crate) discord_voice_service_addr: String,
+    pub(crate) discord_voice_service_uri: String,
     pub(crate) discord_voice_service_ytmusic_addr: String,
 }
 
@@ -50,7 +51,7 @@ impl StagingConfig {
             test_guild_id: required_env(&env, "TEST_GUILD_ID")?,
             test_voice_channel_id: required_env(&env, "TEST_VOICE_CHANNEL_ID")?,
             test_video_id: required_env(&env, "TEST_VIDEO_ID")?,
-            discord_voice_service_addr: required_env(&env, "DISCORD_VOICE_SERVICE_ADDR")?,
+            discord_voice_service_uri: required_env(&env, "DISCORD_VOICE_SERVICE_URI")?,
             discord_voice_service_ytmusic_addr: required_env(
                 &env,
                 "DISCORD_VOICE_SERVICE_YTMUSIC_ADDR",
@@ -79,7 +80,7 @@ struct ForwardedVoiceContext {
 
 #[derive(Debug)]
 struct ServiceFlowOutcome {
-    result: Result<()>,
+    result: Result<LiveContractState>,
     service_joined: bool,
 }
 
@@ -89,6 +90,18 @@ pub(crate) struct LiveContractState {
     saw_playing: bool,
     satisfied_min_interval: bool,
     min_interval_deadline: Option<Instant>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct LiveValidationEvidence {
+    pub(crate) outcome: String,
+    pub(crate) service_uri: String,
+    pub(crate) ytmusic_addr: String,
+    pub(crate) saw_voice_ready: bool,
+    pub(crate) saw_playing: bool,
+    pub(crate) saw_track_ended: bool,
+    pub(crate) satisfied_min_interval: bool,
+    pub(crate) failure_reason: Option<String>,
 }
 
 #[tokio::main]
@@ -108,7 +121,7 @@ pub(crate) async fn run(config: StagingConfig) -> Result<()> {
         application_id = %config.application_id,
         guild_id = %config.test_guild_id,
         channel_id = %config.test_voice_channel_id,
-        service_addr = %config.discord_voice_service_addr,
+        service_uri = %config.discord_voice_service_uri,
         ytmusic_addr = %config.discord_voice_service_ytmusic_addr,
         "starting staging live controller",
     );
@@ -144,14 +157,15 @@ pub(crate) async fn run(config: StagingConfig) -> Result<()> {
     {
         Ok(context) => context,
         Err(error) => {
-            let cleanup = cleanup_gateway_voice(&http, &sender, &mut shard, guild_id, user_id).await;
+            let cleanup =
+                cleanup_gateway_voice(&http, &sender, &mut shard, guild_id, user_id).await;
             return combine_results(Err(error), cleanup);
         }
     };
 
     let flow = run_service_flow(&config, forwarded_voice).await;
     let cleanup = cleanup_after_flow(
-        &config.discord_voice_service_addr,
+        &config.discord_voice_service_uri,
         flow.service_joined,
         &http,
         &sender,
@@ -161,14 +175,36 @@ pub(crate) async fn run(config: StagingConfig) -> Result<()> {
     )
     .await;
 
-    combine_results(flow.result, cleanup)
+    let flow_result = flow.result.and_then(|state| {
+        emit_validation_evidence(&LiveValidationEvidence {
+            outcome: "success".to_owned(),
+            service_uri: config.discord_voice_service_uri.clone(),
+            ytmusic_addr: config.discord_voice_service_ytmusic_addr.clone(),
+            saw_voice_ready: state.saw_voice_ready,
+            saw_playing: state.saw_playing,
+            saw_track_ended: true,
+            satisfied_min_interval: state.satisfied_min_interval,
+            failure_reason: None,
+        })?;
+
+        Ok(state)
+    });
+
+    match (flow_result, cleanup) {
+        (Ok(_), Ok(())) => Ok(()),
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
+        (Err(primary), Err(cleanup_error)) => {
+            Err(primary.context(format!("cleanup also failed: {cleanup_error}")))
+        }
+    }
 }
 
 async fn run_service_flow(
     config: &StagingConfig,
     forwarded_voice: ForwardedVoiceContext,
 ) -> ServiceFlowOutcome {
-    let join_client = DiscordVoiceControlClient::connect(config.discord_voice_service_addr.clone())
+    let join_client = DiscordVoiceControlClient::connect(config.discord_voice_service_uri.clone())
         .await
         .context("connect JoinVoice gRPC client");
     let mut join_client = match join_client {
@@ -180,10 +216,9 @@ async fn run_service_flow(
             };
         }
     };
-    let event_client =
-        DiscordVoiceControlClient::connect(config.discord_voice_service_addr.clone())
-            .await
-            .context("connect SubscribeEvents gRPC client");
+    let event_client = DiscordVoiceControlClient::connect(config.discord_voice_service_uri.clone())
+        .await
+        .context("connect SubscribeEvents gRPC client");
     let mut event_client = match event_client {
         Ok(client) => client,
         Err(error) => {
@@ -264,26 +299,29 @@ async fn run_service_flow(
 pub(crate) async fn wait_for_play_and_live_contract<ContractFuture, PlayFuture>(
     contract_future: ContractFuture,
     play_future: PlayFuture,
-) -> Result<()>
+) -> Result<LiveContractState>
 where
-    ContractFuture: Future<Output = Result<()>>,
+    ContractFuture: Future<Output = Result<LiveContractState>>,
     PlayFuture: Future<Output = Result<()>>,
 {
     let mut contract_finished = false;
     let mut play_finished = false;
+    let mut contract_state = None;
 
     tokio::pin!(contract_future);
     tokio::pin!(play_future);
 
     loop {
         if contract_finished && play_finished {
-            return Ok(());
+            return contract_state.ok_or_else(|| {
+                anyhow!("internal controller error: live contract completed without state")
+            });
         }
 
         tokio::select! {
             contract_result = &mut contract_future, if !contract_finished => {
                 contract_finished = true;
-                contract_result?;
+                contract_state = Some(contract_result?);
             }
             play_result = &mut play_future, if !play_finished => {
                 play_finished = true;
@@ -369,7 +407,9 @@ async fn wait_for_authentic_voice_context(
     }
 }
 
-async fn assert_live_success_contract(events: &mut tonic::Streaming<SessionEvent>) -> Result<()> {
+async fn assert_live_success_contract(
+    events: &mut tonic::Streaming<SessionEvent>,
+) -> Result<LiveContractState> {
     let mut state = LiveContractState::default();
 
     loop {
@@ -384,7 +424,7 @@ async fn assert_live_success_contract(events: &mut tonic::Streaming<SessionEvent
                         maybe_event = events.next() => {
                             let event = next_session_event(maybe_event)?;
                             if state.observe_event(event, Instant::now())? {
-                                return Ok(());
+                                return Ok(state);
                             }
                         }
                         _ = sleep_until(deadline) => {
@@ -398,10 +438,18 @@ async fn assert_live_success_contract(events: &mut tonic::Streaming<SessionEvent
             let maybe_event = events.next().await;
             let event = next_session_event(maybe_event)?;
             if state.observe_event(event, Instant::now())? {
-                return Ok(());
+                return Ok(state);
             }
         }
     }
+}
+
+pub(crate) fn emit_validation_evidence(evidence: &LiveValidationEvidence) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string(evidence).context("serialize live validation evidence")?
+    );
+    Ok(())
 }
 
 impl LiveContractState {
@@ -577,7 +625,12 @@ async fn wait_for_gateway_leave(
             .checked_duration_since(Instant::now())
             .ok_or_else(|| anyhow!("timed out waiting for leave confirmation"))?;
         let poll_remaining = next_voice_state_poll.saturating_duration_since(Instant::now());
-        let next = match timeout(remaining.min(poll_remaining), shard.next_event(EventTypeFlags::all())).await {
+        let next = match timeout(
+            remaining.min(poll_remaining),
+            shard.next_event(EventTypeFlags::all()),
+        )
+        .await
+        {
             Ok(next) => next,
             Err(_) => continue,
         };
@@ -664,7 +717,8 @@ pub(crate) fn leave_confirmed_by_rest_voice_state(
         bail!("voice state lookup failed with status {status}");
     }
 
-    let voice_state = voice_state.context("voice state lookup succeeded without a voice state body")?;
+    let voice_state =
+        voice_state.context("voice state lookup succeeded without a voice state body")?;
 
     Ok(voice_state.channel_id.is_none())
 }

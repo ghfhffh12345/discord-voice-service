@@ -13,12 +13,15 @@ use tokio::time::{Duration as TokioDuration, Instant, timeout};
 
 use discord_voice_service::proto::discordvoice::v1::{SessionEvent, SessionEventKind};
 use staging_live_check::{
-    LiveContractState, StagingConfig, combine_results, current_user_absent_from_guild_voice,
-    leave_confirmed_by_rest_voice_state,
+    LiveContractState, LiveValidationEvidence, StagingConfig, combine_results,
+    current_user_absent_from_guild_voice, leave_confirmed_by_rest_voice_state,
     wait_for_play_and_live_contract,
 };
 use twilight_http::Client as HttpClient;
-use twilight_model::id::{Id, marker::{ChannelMarker, UserMarker}};
+use twilight_model::id::{
+    Id,
+    marker::{ChannelMarker, UserMarker},
+};
 use twilight_model::voice::VoiceState;
 
 #[test]
@@ -40,7 +43,7 @@ fn staging_controller_rejects_empty_required_values() {
         ("TEST_VOICE_CHANNEL_ID".to_owned(), "3".to_owned()),
         ("TEST_VIDEO_ID".to_owned(), "video".to_owned()),
         (
-            "DISCORD_VOICE_SERVICE_ADDR".to_owned(),
+            "DISCORD_VOICE_SERVICE_URI".to_owned(),
             "http://127.0.0.1:55051".to_owned(),
         ),
         (
@@ -51,6 +54,19 @@ fn staging_controller_rejects_empty_required_values() {
     .expect_err("config should fail");
 
     assert!(error.to_string().contains("BOT_TOKEN"));
+}
+
+#[test]
+fn staging_controller_requires_service_uri() {
+    let mut env = valid_env();
+    env.remove("DISCORD_VOICE_SERVICE_URI");
+
+    let error = StagingConfig::from_env_map(env).expect_err("config should fail");
+
+    assert!(
+        error.to_string().contains("DISCORD_VOICE_SERVICE_URI"),
+        "expected DISCORD_VOICE_SERVICE_URI in error, got: {error}",
+    );
 }
 
 #[test]
@@ -70,6 +86,26 @@ fn staging_controller_rejects_invalid_discord_ids() {
     let error = config.guild_id().expect_err("guild id should fail");
 
     assert!(error.to_string().contains("TEST_GUILD_ID"));
+}
+
+#[test]
+fn evidence_json_captures_success_contract() {
+    let evidence = LiveValidationEvidence {
+        outcome: "success".to_owned(),
+        service_uri: "http://127.0.0.1:55051".to_owned(),
+        ytmusic_addr: "http://127.0.0.1:50051".to_owned(),
+        saw_voice_ready: true,
+        saw_playing: true,
+        saw_track_ended: true,
+        satisfied_min_interval: true,
+        failure_reason: None,
+    };
+
+    let json = serde_json::to_string(&evidence).expect("evidence should serialize");
+
+    assert!(json.contains("\"outcome\":\"success\""));
+    assert!(json.contains("\"service_uri\":\"http://127.0.0.1:55051\""));
+    assert!(json.contains("\"saw_track_ended\":true"));
 }
 
 #[test]
@@ -175,7 +211,7 @@ fn combine_results_preserves_both_primary_and_cleanup_failures() {
 #[tokio::test]
 async fn orchestration_waits_for_long_running_play_after_contract_success() {
     let (play_tx, play_rx) = oneshot::channel::<Result<()>>();
-    let (contract_tx, contract_rx) = oneshot::channel::<Result<()>>();
+    let (contract_tx, contract_rx) = oneshot::channel::<Result<LiveContractState>>();
 
     let mut orchestration = tokio::spawn(wait_for_play_and_live_contract(
         async move { contract_rx.await.expect("contract sender should complete") },
@@ -183,7 +219,7 @@ async fn orchestration_waits_for_long_running_play_after_contract_success() {
     ));
 
     contract_tx
-        .send(Ok(()))
+        .send(Ok(LiveContractState::default()))
         .expect("contract result should be sent");
 
     assert!(
@@ -201,10 +237,14 @@ async fn orchestration_waits_for_long_running_play_after_contract_success() {
 #[tokio::test]
 async fn orchestration_fails_immediately_when_play_errors_first() {
     let (play_tx, play_rx) = oneshot::channel::<Result<()>>();
-    let (_contract_tx, contract_rx) = oneshot::channel::<Result<()>>();
+    let (_contract_tx, contract_rx) = oneshot::channel::<Result<LiveContractState>>();
 
     let orchestration = tokio::spawn(wait_for_play_and_live_contract(
-        async move { contract_rx.await.expect("contract sender should stay pending") },
+        async move {
+            contract_rx
+                .await
+                .expect("contract sender should stay pending")
+        },
         async move { play_rx.await.expect("play sender should complete") },
     ));
 
@@ -212,14 +252,17 @@ async fn orchestration_fails_immediately_when_play_errors_first() {
         .send(fail("call Play failed early"))
         .expect("play error should be sent");
 
-    let error = orchestration.await.unwrap().expect_err("play error should fail");
+    let error = orchestration
+        .await
+        .unwrap()
+        .expect_err("play error should fail");
     assert!(error.to_string().contains("call Play failed early"));
 }
 
 #[tokio::test]
 async fn orchestration_waits_for_contract_after_play_succeeds() {
     let (play_tx, play_rx) = oneshot::channel::<Result<()>>();
-    let (contract_tx, contract_rx) = oneshot::channel::<Result<()>>();
+    let (contract_tx, contract_rx) = oneshot::channel::<Result<LiveContractState>>();
 
     let mut orchestration = tokio::spawn(wait_for_play_and_live_contract(
         async move { contract_rx.await.expect("contract sender should complete") },
@@ -236,7 +279,7 @@ async fn orchestration_waits_for_contract_after_play_succeeds() {
     );
 
     contract_tx
-        .send(Ok(()))
+        .send(Ok(LiveContractState::default()))
         .expect("contract result should be sent");
 
     orchestration.await.unwrap().unwrap();
@@ -268,11 +311,7 @@ fn cleanup_does_not_confirm_absence_when_voice_state_still_has_channel() {
 
 #[tokio::test]
 async fn cleanup_treats_http_404_voice_state_error_as_absence() {
-    let client = mock_http_client(
-        404,
-        r#"{"message":"Unknown Voice State","code":10065}"#,
-    )
-    .await;
+    let client = mock_http_client(404, r#"{"message":"Unknown Voice State","code":10065}"#).await;
 
     assert!(
         current_user_absent_from_guild_voice(&client, Id::new(2))
@@ -284,11 +323,7 @@ async fn cleanup_treats_http_404_voice_state_error_as_absence() {
 
 #[tokio::test]
 async fn cleanup_keeps_non_404_voice_state_errors_strict() {
-    let client = mock_http_client(
-        500,
-        r#"{"message":"Internal Server Error","code":0}"#,
-    )
-    .await;
+    let client = mock_http_client(500, r#"{"message":"Internal Server Error","code":0}"#).await;
 
     let error = current_user_absent_from_guild_voice(&client, Id::new(2))
         .await
@@ -312,7 +347,7 @@ fn valid_env() -> HashMap<String, String> {
         ("TEST_VOICE_CHANNEL_ID".to_owned(), "3".to_owned()),
         ("TEST_VIDEO_ID".to_owned(), "video".to_owned()),
         (
-            "DISCORD_VOICE_SERVICE_ADDR".to_owned(),
+            "DISCORD_VOICE_SERVICE_URI".to_owned(),
             "http://127.0.0.1:55051".to_owned(),
         ),
         (
