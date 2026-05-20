@@ -2,6 +2,11 @@ name: Live Staging
 
 on:
   workflow_dispatch:
+    inputs:
+      ytmusic_service_image_ref:
+        description: Optional override for the ytmusic-service image ref used during this run
+        required: false
+        type: string
   workflow_run:
     workflows:
       - Release Image
@@ -21,6 +26,10 @@ env:
   DISCORD_VOICE_SERVICE_ADDR: http://127.0.0.1:55051
   DISCORD_VOICE_SERVICE_YTMUSIC_ADDR: http://127.0.0.1:50051
   DISCORD_VOICE_SERVICE_BIND_ADDR: 127.0.0.1:55051
+  BROWSER_JSON_SOURCE_PATH: ${{ vars.STAGING_BROWSER_JSON_SOURCE_PATH }}
+  CONFIGURED_YTMUSIC_SERVICE_IMAGE_REF: ${{ vars.YTMUSIC_SERVICE_IMAGE_REF }}
+  WORKFLOW_DISPATCH_YTMUSIC_SERVICE_IMAGE_REF: ${{ github.event.inputs.ytmusic_service_image_ref }}
+  DEFAULT_YTMUSIC_SERVICE_IMAGE_REF: ghcr.io/ghfhffh12345/ytmusic-service:latest
   YTMUSIC_SERVICE_PUBLIC_ADDR: 0.0.0.0:50051
   YTMUSIC_SERVICE_ADMIN_ADDR: 0.0.0.0:50052
   YTMUSIC_SERVICE_BROWSER_JSON: /run/secrets/browser.json
@@ -36,18 +45,19 @@ jobs:
     timeout-minutes: 45
 
     steps:
+      # actions/checkout@v5 is a JavaScript action that runs on Node 24 before any shell
+      # prerequisite checks. The self-hosted runner must already support Node 24-backed
+      # GitHub Actions execution for this workflow to start at all.
       - name: Check out triggering workflow commit
         if: ${{ github.event_name == 'workflow_run' }}
         uses: actions/checkout@v5
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
-          clean: false
 
+      # Manual runs still validate the checked-out source build on the staging runner.
       - name: Check out requested ref
         if: ${{ github.event_name != 'workflow_run' }}
         uses: actions/checkout@v5
-        with:
-          clean: false
 
       - name: Validate runner prerequisites and required inputs
         shell: bash
@@ -67,8 +77,14 @@ jobs:
             exit 1
           }
 
-          test -f "${GITHUB_WORKSPACE}/browser.json" || {
-            echo "::error::browser.json must already exist at ${GITHUB_WORKSPACE}/browser.json on the self-hosted staging runner"
+          browser_json_source_path="${BROWSER_JSON_SOURCE_PATH:-${STAGING_BROWSER_JSON_SOURCE_PATH:-}}"
+          if [[ -z "${browser_json_source_path}" ]]; then
+            echo "::error::Set STAGING_BROWSER_JSON_SOURCE_PATH as a repository variable or runner environment variable to a browser.json path outside the workspace"
+            exit 1
+          fi
+
+          test -f "${browser_json_source_path}" || {
+            echo "::error::browser.json source path does not exist: ${browser_json_source_path}"
             exit 1
           }
 
@@ -91,6 +107,29 @@ jobs:
           cargo --version
           rustc --version
 
+      - name: Stage browser.json into workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          browser_json_source_path="${BROWSER_JSON_SOURCE_PATH:-${STAGING_BROWSER_JSON_SOURCE_PATH:-}}"
+          install -m 600 "${browser_json_source_path}" "${GITHUB_WORKSPACE}/browser.json"
+
+      - name: Resolve ytmusic image ref
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ytmusic_image_ref="${WORKFLOW_DISPATCH_YTMUSIC_SERVICE_IMAGE_REF:-}"
+          if [[ -z "${ytmusic_image_ref}" ]]; then
+            ytmusic_image_ref="${CONFIGURED_YTMUSIC_SERVICE_IMAGE_REF:-${YTMUSIC_SERVICE_IMAGE_REF:-}}"
+          fi
+          if [[ -z "${ytmusic_image_ref}" ]]; then
+            ytmusic_image_ref="${DEFAULT_YTMUSIC_SERVICE_IMAGE_REF}"
+          fi
+
+          echo "YTMUSIC_SERVICE_IMAGE_REF=${ytmusic_image_ref}" >> "${GITHUB_ENV}"
+
       - name: Build local binaries
         shell: bash
         run: |
@@ -103,6 +142,9 @@ jobs:
           set -euo pipefail
 
           service_log="${RUNNER_TEMP}/discord-voice-service-live-staging.log"
+          controller_log="${RUNNER_TEMP}/staging-live-check.log"
+          service_binary="${GITHUB_WORKSPACE}/target/debug/discord-voice-service"
+          controller_binary="${GITHUB_WORKSPACE}/target/debug/staging_live_check"
 
           wait_for_port() {
             local port="$1"
@@ -129,6 +171,11 @@ jobs:
                 tail -n 200 "${service_log}" || true
                 echo "::endgroup::"
               fi
+              if [[ -f "${controller_log}" ]]; then
+                echo "::group::staging_live_check log"
+                tail -n 200 "${controller_log}" || true
+                echo "::endgroup::"
+              fi
 
               echo "::group::ytmusic-service log"
               podman logs ytmusic-service-live-staging || true
@@ -141,6 +188,7 @@ jobs:
             fi
 
             podman rm -f ytmusic-service-live-staging >/dev/null 2>&1 || true
+            rm -f "${GITHUB_WORKSPACE}/browser.json"
           }
 
           trap cleanup EXIT
@@ -154,15 +202,36 @@ jobs:
             -e YTMUSIC_SERVICE_ADMIN_ADDR="${YTMUSIC_SERVICE_ADMIN_ADDR}" \
             -e YTMUSIC_SERVICE_BROWSER_JSON="${YTMUSIC_SERVICE_BROWSER_JSON}" \
             -v "${GITHUB_WORKSPACE}/browser.json:${YTMUSIC_SERVICE_BROWSER_JSON}:ro,Z" \
-            ghcr.io/ghfhffh12345/ytmusic-service:latest
+            "${YTMUSIC_SERVICE_IMAGE_REF}"
 
           wait_for_port 50051 "ytmusic-service public gRPC listener"
 
           DISCORD_VOICE_SERVICE_ADDR="${DISCORD_VOICE_SERVICE_BIND_ADDR}" \
-            cargo run --locked --bin discord-voice-service >"${service_log}" 2>&1 &
+            "${service_binary}" >"${service_log}" 2>&1 &
           service_pid=$!
 
           wait_for_port 55051 "discord-voice-service gRPC listener"
           sleep 5
 
-          cargo run --locked --bin staging_live_check
+          "${controller_binary}" >"${controller_log}" 2>&1
+
+      - name: Summarize staging validation mode
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          {
+            echo "## Live staging validation"
+            echo
+            echo "- Trigger: \`${GITHUB_EVENT_NAME}\`"
+            echo "- Validation target for \`discord-voice-service\`: checked-out source build on the self-hosted runner, not the published GHCR image"
+            echo "- Triggering ref:"
+            if [[ "${GITHUB_EVENT_NAME}" == "workflow_run" ]]; then
+              echo "  - source commit: \`${{ github.event.workflow_run.head_sha }}\`"
+            else
+              echo "  - source ref: \`${GITHUB_REF}\`"
+            fi
+            echo "- ytmusic-service image ref: \`${YTMUSIC_SERVICE_IMAGE_REF}\`"
+            echo "- browser.json source path provider: repository variable or runner environment variable \`STAGING_BROWSER_JSON_SOURCE_PATH\`"
+          } >> "${GITHUB_STEP_SUMMARY}"

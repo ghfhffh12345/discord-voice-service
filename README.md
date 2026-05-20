@@ -108,9 +108,12 @@ cargo run
 
 Real Discord validation is self-hosted first. [`.github/workflows/live-staging.yml`](.github/workflows/live-staging.yml) is the operator workflow for that gate, and it supports both manual `workflow_dispatch` runs and automatic runs after `Release Image` succeeds.
 
+The current workflow is intentionally honest about scope: both trigger paths validate the checked-out `discord-voice-service` source build on the self-hosted runner, not the published GHCR image for this repository. The automatic `workflow_run` path checks out the triggering commit from `Release Image` and rebuilds it locally before running the live Discord validation.
+
 The self-hosted runner must already have:
 
-- a runner-local `./browser.json` in the checked-out workspace; the workflow uses `actions/checkout` with `clean: false` so this gitignored file survives checkout
+- support for Node 24-backed GitHub JavaScript actions before the workflow reaches any shell step; `actions/checkout@v5` depends on that runner capability
+- a runner-local `browser.json` outside the workspace, exposed through a repository variable or runner environment variable named `STAGING_BROWSER_JSON_SOURCE_PATH`; the workflow copies that file into `${GITHUB_WORKSPACE}/browser.json` after checkout
 - the Rust toolchain with `cargo` and `rustc`
 - Podman
 - outbound internet access plus inbound UDP replies suitable for real Discord voice validation
@@ -133,13 +136,24 @@ The live validation controller contract is:
 | `DISCORD_VOICE_SERVICE_ADDR` | gRPC URI used by `staging_live_check` to reach this service | `http://127.0.0.1:55051` |
 | `DISCORD_VOICE_SERVICE_YTMUSIC_ADDR` | gRPC URI used by both the service and controller to reach `ytmusic-service` | `http://127.0.0.1:50051` |
 
+The workflow also accepts a configurable `ytmusic-service` image ref. It resolves in this order:
+
+1. `workflow_dispatch` input `ytmusic_service_image_ref`
+2. repository or environment variable `YTMUSIC_SERVICE_IMAGE_REF`
+3. default `ghcr.io/ghfhffh12345/ytmusic-service:latest`
+
+For reproducible staging, pin `YTMUSIC_SERVICE_IMAGE_REF` to an immutable tag or digest instead of relying on `:latest`.
+
 The workflow intentionally starts the live dependencies itself instead of assuming external staging processes:
 
-1. validate that the self-hosted runner already has `./browser.json`, Podman, and the Rust toolchain
-2. start `ytmusic-service` in Podman with `./browser.json`
-3. start `discord-voice-service` from the checked-out repository
-4. run `cargo run --bin staging_live_check`
-5. tear down the container and the local service process
+1. check out the requested commit cleanly
+2. rely on the runner's pre-existing Node 24 action support for checkout, then validate the browser-config source path, Podman, and the Rust toolchain
+3. copy the runner-local browser config into `${GITHUB_WORKSPACE}/browser.json`
+4. build the service and staging controller binaries from the checked-out source
+5. start `ytmusic-service` in Podman with `./browser.json`
+6. start the built `discord-voice-service` binary from the checked-out repository
+7. run the built `staging_live_check` binary
+8. tear down the container, remove `${GITHUB_WORKSPACE}/browser.json`, and stop the service process
 
 The workflow also handles one current contract wrinkle explicitly: `staging_live_check` expects `DISCORD_VOICE_SERVICE_ADDR` as a URI, while the service process still binds from the same variable name as a bare socket address. The workflow keeps the controller contract at `http://127.0.0.1:55051` and overrides the service-start step to bind on `127.0.0.1:55051`.
 
