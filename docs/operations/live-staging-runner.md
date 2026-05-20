@@ -7,6 +7,7 @@
 - Podman, `cargo`, `rustc`, and `skopeo` installed
 - Outbound internet access and inbound UDP replies for Discord voice
 - Runner-local `browser.json` available through `STAGING_BROWSER_JSON_SOURCE_PATH`
+- Protected `live-staging` GitHub environment configured to supply the required Discord secrets and enforce any required reviewer approvals before the live gate starts
 
 ## Preflight expectations
 
