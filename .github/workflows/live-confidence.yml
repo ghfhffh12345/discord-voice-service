@@ -1,0 +1,23 @@
+name: Live Confidence
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+    inputs:
+      discord_voice_service_image_ref:
+        description: Optional override for the discord-voice-service image ref to validate
+        required: false
+        type: string
+      ytmusic_service_image_ref:
+        description: Optional override for the ytmusic-service image ref to validate
+        required: false
+        type: string
+
+jobs:
+  live-confidence:
+    uses: ./.github/workflows/live-staging.yml
+    with:
+      discord_voice_service_image_ref: ${{ inputs.discord_voice_service_image_ref || format('ghcr.io/{0}/discord-voice-service:latest', github.repository_owner) }}
+      ytmusic_service_image_ref: ${{ inputs.ytmusic_service_image_ref }}
+    secrets: inherit
