@@ -6,13 +6,13 @@ The main bot is expected to keep user-facing music features such as search, radi
 
 ## Current status
 
-This repository now has a real single-session join/play path wired through the runtime.
+This service is production-ready for controlled single-guild, single-session use within the supported operating envelope published below.
 
 - The gRPC control surface is implemented, including `SubscribeEvents` and `UpdateVoiceContext`.
 - Startup config, health checks, container packaging, and the single-session supervisor/runtime are in place.
 - Playback resolves Discord-compatible WebM/Opus sources through `ytmusic-service`, performs the runtime join path, and emits session events as state changes occur.
 - Integration coverage includes a fake Discord gateway/UDP peer that verifies voice join, speaking notification, RTP/UDP audio emission, and gRPC event streaming end to end.
-- Recovery and broader production hardening are still in progress, so treat this as an actively maturing service rather than a finished drop-in replacement for a general-purpose music bot.
+- Live release publication is gated by fake-peer CI plus protected staging validation of the exact container artifact that will be promoted.
 
 ## Intended responsibility
 
@@ -29,7 +29,7 @@ The main bot should continue to own commands and high-level playback decisions. 
 
 ## What is available today
 
-- One gRPC listener on `DISCORD_VOICE_SERVICE_ADDR`
+- One gRPC listener on `DISCORD_VOICE_SERVICE_BIND_ADDR`
 - Standard gRPC health checks on the same listener
 - `discordvoice.v1.DiscordVoiceControl` with these RPCs: `JoinVoice`, `UpdateVoiceContext`, `Play`, `Pause`, `Resume`, `Stop`, `LeaveVoice`, `GetState`, `SubscribeEvents`
 - Runtime event emission for voice/session state transitions such as `VoiceConnecting`, `VoiceReady`, `TrackResolving`, `Playing`, and `TrackEnded`
@@ -38,6 +38,15 @@ The main bot should continue to own commands and high-level playback decisions. 
 - A branch and PR gate in [`.github/workflows/fake-peer-ci.yml`](.github/workflows/fake-peer-ci.yml) that runs the fake-peer verification suite on pushes, pull requests, and merge-queue checks
 - A protected self-hosted live validation workflow in [`.github/workflows/live-staging.yml`](.github/workflows/live-staging.yml) that exercises the real staging controller against Discord
 - A release workflow in [`.github/workflows/release-image.yml`](.github/workflows/release-image.yml) that only publishes the GHCR image after both fake-peer CI and live staging gates are satisfied
+
+## Supported envelope
+
+- one process, one active voice session
+- one deployment, one guild
+- Opus-in-WebM passthrough only
+- self-hosted live validation as a supported release constraint
+
+This README intentionally does not broaden support claims into multi-guild scheduling, high-availability failover, or general-purpose Discord media handling.
 
 ## Playback selection policy
 
@@ -67,10 +76,12 @@ For `ytmusic-service` setup, use its own README:
 
 | Variable | Purpose | Example |
 | --- | --- | --- |
-| `DISCORD_VOICE_SERVICE_ADDR` | Bind address for the gRPC control listener and health checks | `127.0.0.1:55051` |
+| `DISCORD_VOICE_SERVICE_BIND_ADDR` | Bind address for the gRPC control listener and health checks used by the service runtime | `127.0.0.1:55051` |
 | `DISCORD_VOICE_SERVICE_YTMUSIC_ADDR` | Base gRPC endpoint for `ytmusic-service` | `http://127.0.0.1:50051` |
 
 Startup fails if either variable is missing or if `DISCORD_VOICE_SERVICE_YTMUSIC_ADDR` is not a valid `http://` or `https://` URI with an authority.
+
+The staging controller is a separate contract. It reaches this service through `DISCORD_VOICE_SERVICE_URI`, while the service process itself binds from `DISCORD_VOICE_SERVICE_BIND_ADDR`.
 
 The current scaffold also hard-codes queue targets in code:
 
@@ -86,7 +97,7 @@ podman run --rm \
   --name discord-voice-service \
   --network music-stack \
   -p 55051:55051 \
-  -e DISCORD_VOICE_SERVICE_ADDR=0.0.0.0:55051 \
+  -e DISCORD_VOICE_SERVICE_BIND_ADDR=0.0.0.0:55051 \
   -e DISCORD_VOICE_SERVICE_YTMUSIC_ADDR=http://ytmusic-service:50051 \
   ghcr.io/ghfhffh12345/discord-voice-service:latest
 ```
@@ -99,7 +110,7 @@ Use the source-based path below if you want to run the service from this reposit
 git clone https://github.com/ghfhffh12345/discord-voice-service.git
 cd discord-voice-service
 
-export DISCORD_VOICE_SERVICE_ADDR=127.0.0.1:55051
+export DISCORD_VOICE_SERVICE_BIND_ADDR=127.0.0.1:55051
 export DISCORD_VOICE_SERVICE_YTMUSIC_ADDR=http://127.0.0.1:50051
 
 cargo run
@@ -107,23 +118,17 @@ cargo run
 
 ## Live staging validation
 
-Real Discord validation is self-hosted first. [`.github/workflows/live-staging.yml`](.github/workflows/live-staging.yml) is the protected operator workflow for that gate. It supports manual `workflow_dispatch` runs and is also called as a reusable workflow from [`.github/workflows/release-image.yml`](.github/workflows/release-image.yml) when a GitHub release is published.
+Real Discord validation is self-hosted first. [`.github/workflows/live-staging.yml`](.github/workflows/live-staging.yml) is the protected operator workflow for that gate, and [`.github/workflows/release-image.yml`](.github/workflows/release-image.yml) does not continue release publication until the candidate image digest has passed fake-peer CI and protected live staging on the supported self-hosted runner profile.
 
-The current workflow is intentionally honest about scope: both trigger paths validate the checked-out `discord-voice-service` source build on the self-hosted runner, not the published GHCR image for this repository. The release path checks out the published release tag, resolves the tagged commit, and rebuilds it locally before running the live Discord validation.
+The live gate validates the exact container artifact that will be promoted. Release publication builds a candidate GHCR manifest, resolves its digest, passes that digest into the protected live workflow, and promotes the public tags only after the same digest succeeds in staging.
 
-GitHub Actions cannot express `needs` edges across separate top-level workflows. The release-ready gate is therefore enforced in a pragmatic but technically correct way:
+The release-ready contract is:
 
-1. [`.github/workflows/fake-peer-ci.yml`](.github/workflows/fake-peer-ci.yml) is the normal branch, PR, and merge-queue gate and should be configured as the required status check in branch protection or repository rulesets.
-2. [`.github/workflows/live-staging.yml`](.github/workflows/live-staging.yml) runs on a protected self-hosted runner and uses the `live-staging` environment so real secrets and required reviewers can guard the live Discord check.
-3. [`.github/workflows/release-image.yml`](.github/workflows/release-image.yml) treats release publication as not ready until it verifies a successful `Fake Peer CI` run for the tagged commit, then calls the reusable live-staging workflow, and only then builds and pushes the GHCR image.
+1. [`.github/workflows/fake-peer-ci.yml`](.github/workflows/fake-peer-ci.yml) must pass for the release commit.
+2. [`.github/workflows/live-staging.yml`](.github/workflows/live-staging.yml) must validate the exact container artifact on the protected `live-staging` environment.
+3. [`.github/workflows/release-image.yml`](.github/workflows/release-image.yml) promotes the already-validated candidate digest to the public GHCR tags.
 
-The self-hosted runner must already have:
-
-- support for Node 24-backed GitHub JavaScript actions before the workflow reaches any shell step; `actions/checkout@v5` depends on that runner capability
-- a runner-local `browser.json` outside the workspace, exposed through a repository variable or runner environment variable named `STAGING_BROWSER_JSON_SOURCE_PATH`; the workflow copies that file into `${GITHUB_WORKSPACE}/browser.json` after checkout
-- the Rust toolchain with `cargo` and `rustc`
-- Podman
-- outbound internet access plus inbound UDP replies suitable for real Discord voice validation
+The supported self-hosted runner profile is documented in [`docs/operations/live-staging-runner.md`](docs/operations/live-staging-runner.md). At a minimum it must provide Node 24-compatible GitHub Actions support, Podman, `cargo`, `rustc`, `skopeo`, outbound internet access, inbound UDP replies for Discord voice, and a runner-local `browser.json` exposed through `STAGING_BROWSER_JSON_SOURCE_PATH`.
 
 The staging environment must use dedicated Discord resources:
 
@@ -142,8 +147,10 @@ The live validation controller contract is:
 | `TEST_GUILD_ID` | Dedicated staging guild ID | `234567890123456789` |
 | `TEST_VOICE_CHANNEL_ID` | Dedicated non-stage voice channel ID inside that guild | `345678901234567890` |
 | `TEST_VIDEO_ID` | YouTube video ID used for the live playback assertion | `dQw4w9WgXcQ` |
-| `DISCORD_VOICE_SERVICE_ADDR` | gRPC URI used by `staging_live_check` to reach this service | `http://127.0.0.1:55051` |
-| `DISCORD_VOICE_SERVICE_YTMUSIC_ADDR` | gRPC URI used by both the service and controller to reach `ytmusic-service` | `http://127.0.0.1:50051` |
+| `DISCORD_VOICE_SERVICE_URI` | gRPC URI used by `staging_live_check` to reach this service | `http://127.0.0.1:55051` |
+| `DISCORD_VOICE_SERVICE_YTMUSIC_ADDR` | Base gRPC endpoint used by the service and controller to reach `ytmusic-service` | `http://127.0.0.1:50051` |
+
+Inside the live workflow, the service container still binds with `DISCORD_VOICE_SERVICE_BIND_ADDR`, while the staging controller talks to that listener through `DISCORD_VOICE_SERVICE_URI`.
 
 For a manual or local staging run, the operator command is:
 
@@ -162,15 +169,13 @@ For reproducible staging, pin `YTMUSIC_SERVICE_IMAGE_REF` to an immutable tag or
 The workflow intentionally starts the live dependencies itself instead of assuming external staging processes:
 
 1. check out the requested commit cleanly
-2. rely on the runner's pre-existing Node 24 action support for checkout, then validate the browser-config source path, Podman, and the Rust toolchain
+2. rely on the runner's pre-existing Node 24 action support for checkout, then validate tools, secrets, browser config, and candidate artifact identity before the live run
 3. copy the runner-local browser config into `${GITHUB_WORKSPACE}/browser.json`
-4. build the service and staging controller binaries from the checked-out source
+4. build the staging controller binary from the checked-out source
 5. start `ytmusic-service` in Podman with `./browser.json`
-6. start the built `discord-voice-service` binary from the checked-out repository
+6. start the exact candidate `discord-voice-service` container artifact from GHCR
 7. run the built `staging_live_check` binary
 8. tear down the container, remove `${GITHUB_WORKSPACE}/browser.json`, and stop the service process
-
-The workflow also handles one current contract wrinkle explicitly: `staging_live_check` expects `DISCORD_VOICE_SERVICE_ADDR` as a URI, while the service process still binds from the same variable name as a bare socket address. The workflow keeps the controller contract at `http://127.0.0.1:55051` and overrides the service-start step to bind on `127.0.0.1:55051`.
 
 Every successful live staging validation should record this evidence in the implementation or release notes:
 
@@ -181,6 +186,10 @@ Every successful live staging validation should record this evidence in the impl
 - whether `VoiceReady`, `Playing`, and `TrackEnded` were observed
 - whether the 5-second live interval passed
 - whether cleanup succeeded
+
+## Rollback
+
+Rollback means promoting a previously validated GHCR digest back to the public tags. If the self-hosted runner profile or the staging environment changed materially since that digest was last exercised, rerun [`Live Confidence`](.github/workflows/live-confidence.yml) before treating the rollback as release-ready.
 
 ## Verify and use the service
 
@@ -262,15 +271,16 @@ grpcurl -plaintext \
 
 ## Troubleshooting
 
-- Missing environment variables: startup fails if either `DISCORD_VOICE_SERVICE_ADDR` or `DISCORD_VOICE_SERVICE_YTMUSIC_ADDR` is not set.
+- Missing environment variables: startup fails if either `DISCORD_VOICE_SERVICE_BIND_ADDR` or `DISCORD_VOICE_SERVICE_YTMUSIC_ADDR` is not set.
 - Invalid `ytmusic-service` endpoint: startup fails unless `DISCORD_VOICE_SERVICE_YTMUSIC_ADDR` is a valid `http://` or `https://` URI.
-- Port already in use: choose a different value for `DISCORD_VOICE_SERVICE_ADDR` or free the port.
+- Port already in use: choose a different value for `DISCORD_VOICE_SERVICE_BIND_ADDR` or free the port.
 - `grpcurl list` fails: reflection is not registered, so use `-import-path` and `-proto` instead.
 - Voice playback only accepts Discord-friendly WebM/Opus formats that satisfy the selector policy; unsupported formats fail instead of transcoding.
-- The join/play path is real, but recovery and resilience work is still evolving, so expect behavior to keep tightening as the service matures.
+- Live staging failures should be diagnosed against the runner contract in [`docs/operations/live-staging-runner.md`](docs/operations/live-staging-runner.md) before rerunning the protected gate.
 
 ## Further reference
 
 - [`proto/discordvoice/v1/control.proto`](proto/discordvoice/v1/control.proto)
+- [`docs/operations/live-staging-runner.md`](docs/operations/live-staging-runner.md)
 - [`docs/superpowers/specs/2026-05-18-discord-voice-service-design.md`](docs/superpowers/specs/2026-05-18-discord-voice-service-design.md)
 - [ghfhffh12345/ytmusic-service](https://github.com/ghfhffh12345/ytmusic-service)
