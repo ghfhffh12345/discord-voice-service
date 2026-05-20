@@ -175,8 +175,10 @@ pub(crate) async fn run(config: StagingConfig) -> Result<()> {
     )
     .await;
 
-    let flow_result = flow.result.and_then(|state| {
-        emit_validation_evidence(&LiveValidationEvidence {
+    finalize_success_evidence(
+        flow.result,
+        cleanup,
+        |state| LiveValidationEvidence {
             outcome: "success".to_owned(),
             service_uri: config.discord_voice_service_uri.clone(),
             ytmusic_addr: config.discord_voice_service_ytmusic_addr.clone(),
@@ -185,19 +187,9 @@ pub(crate) async fn run(config: StagingConfig) -> Result<()> {
             saw_track_ended: true,
             satisfied_min_interval: state.satisfied_min_interval,
             failure_reason: None,
-        })?;
-
-        Ok(state)
-    });
-
-    match (flow_result, cleanup) {
-        (Ok(_), Ok(())) => Ok(()),
-        (Err(primary), Ok(())) => Err(primary),
-        (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
-        (Err(primary), Err(cleanup_error)) => {
-            Err(primary.context(format!("cleanup also failed: {cleanup_error}")))
-        }
-    }
+        },
+        emit_validation_evidence,
+    )
 }
 
 async fn run_service_flow(
@@ -450,6 +442,29 @@ pub(crate) fn emit_validation_evidence(evidence: &LiveValidationEvidence) -> Res
         serde_json::to_string(evidence).context("serialize live validation evidence")?
     );
     Ok(())
+}
+
+pub(crate) fn finalize_success_evidence<BuildEvidence, EmitEvidence>(
+    flow_result: Result<LiveContractState>,
+    cleanup: Result<()>,
+    build_evidence: BuildEvidence,
+    emit_evidence: EmitEvidence,
+) -> Result<()>
+where
+    BuildEvidence: FnOnce(LiveContractState) -> LiveValidationEvidence,
+    EmitEvidence: FnOnce(&LiveValidationEvidence) -> Result<()>,
+{
+    match (flow_result, cleanup) {
+        (Ok(state), Ok(())) => {
+            let evidence = build_evidence(state);
+            emit_evidence(&evidence)
+        }
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
+        (Err(primary), Err(cleanup_error)) => {
+            Err(primary.context(format!("cleanup also failed: {cleanup_error}")))
+        }
+    }
 }
 
 impl LiveContractState {

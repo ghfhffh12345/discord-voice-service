@@ -1,4 +1,8 @@
 use std::collections::HashMap;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 #[allow(dead_code)]
@@ -14,8 +18,8 @@ use tokio::time::{Duration as TokioDuration, Instant, timeout};
 use discord_voice_service::proto::discordvoice::v1::{SessionEvent, SessionEventKind};
 use staging_live_check::{
     LiveContractState, LiveValidationEvidence, StagingConfig, combine_results,
-    current_user_absent_from_guild_voice, leave_confirmed_by_rest_voice_state,
-    wait_for_play_and_live_contract,
+    current_user_absent_from_guild_voice, finalize_success_evidence,
+    leave_confirmed_by_rest_voice_state, wait_for_play_and_live_contract,
 };
 use twilight_http::Client as HttpClient;
 use twilight_model::id::{
@@ -206,6 +210,41 @@ fn combine_results_preserves_both_primary_and_cleanup_failures() {
     assert!(message.contains("primary failed"));
     assert!(message.contains("cleanup also failed"));
     assert!(message.contains("cleanup failed"));
+}
+
+#[test]
+fn success_evidence_waits_for_cleanup_success() {
+    let built = Arc::new(AtomicBool::new(false));
+    let emitted = Arc::new(AtomicBool::new(false));
+    let built_for_closure = Arc::clone(&built);
+    let emitted_for_closure = Arc::clone(&emitted);
+
+    let error = finalize_success_evidence(
+        Ok(LiveContractState::default()),
+        fail("cleanup failed"),
+        move |_| {
+            built_for_closure.store(true, Ordering::SeqCst);
+            LiveValidationEvidence {
+                outcome: "success".to_owned(),
+                service_uri: "http://127.0.0.1:55051".to_owned(),
+                ytmusic_addr: "http://127.0.0.1:50051".to_owned(),
+                saw_voice_ready: false,
+                saw_playing: false,
+                saw_track_ended: true,
+                satisfied_min_interval: false,
+                failure_reason: None,
+            }
+        },
+        move |_| {
+            emitted_for_closure.store(true, Ordering::SeqCst);
+            Ok(())
+        },
+    )
+    .expect_err("cleanup failure should win");
+
+    assert_eq!(error.to_string(), "cleanup failed");
+    assert!(!built.load(Ordering::SeqCst));
+    assert!(!emitted.load(Ordering::SeqCst));
 }
 
 #[tokio::test]
