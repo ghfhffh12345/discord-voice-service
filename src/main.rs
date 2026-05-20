@@ -39,7 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Server::builder()
         .add_service(health_service)
         .add_service(DiscordVoiceControlServer::new(control_service))
-        .serve(settings.listen_addr)
+        .serve(settings.bind_addr)
         .await?;
 
     Ok(())

@@ -4,7 +4,7 @@ use crate::error::AppError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
-    pub listen_addr: SocketAddr,
+    pub bind_addr: SocketAddr,
     pub ytmusic_addr: String,
     pub prebuffer_frames: usize,
     pub max_buffer_frames: usize,
@@ -12,9 +12,9 @@ pub struct Settings {
 
 impl Settings {
     pub fn from_env() -> Result<Self, AppError> {
-        let listen_addr = read_env("DISCORD_VOICE_SERVICE_ADDR")?;
+        let bind_addr = read_env("DISCORD_VOICE_SERVICE_BIND_ADDR")?;
         let ytmusic_addr = read_env("DISCORD_VOICE_SERVICE_YTMUSIC_ADDR")?;
-        Self::from_values(&listen_addr, &ytmusic_addr)
+        Self::from_values(&bind_addr, &ytmusic_addr)
     }
 
     pub fn from_pairs<const N: usize>(pairs: [(&str, &str); N]) -> Result<Self, AppError> {
@@ -33,14 +33,14 @@ impl Settings {
         Duration::from_secs(3)
     }
 
-    fn from_values(listen_addr: &str, ytmusic_addr: &str) -> Result<Self, AppError> {
-        let listen_addr = listen_addr
+    fn from_values(bind_addr: &str, ytmusic_addr: &str) -> Result<Self, AppError> {
+        let bind_addr = bind_addr
             .parse()
-            .map_err(|_| AppError::InvalidEnv("DISCORD_VOICE_SERVICE_ADDR"))?;
+            .map_err(|_| AppError::InvalidEnv("DISCORD_VOICE_SERVICE_BIND_ADDR"))?;
         validate_ytmusic_addr(ytmusic_addr)?;
 
         Ok(Self {
-            listen_addr,
+            bind_addr,
             ytmusic_addr: ytmusic_addr.to_owned(),
             prebuffer_frames: 150,
             max_buffer_frames: 300,
@@ -48,16 +48,16 @@ impl Settings {
     }
 
     fn from_map(env: &HashMap<String, String>) -> Result<Self, AppError> {
-        let listen_addr = env
-            .get("DISCORD_VOICE_SERVICE_ADDR")
-            .ok_or(AppError::MissingEnv("DISCORD_VOICE_SERVICE_ADDR"))?;
+        let bind_addr = env
+            .get("DISCORD_VOICE_SERVICE_BIND_ADDR")
+            .ok_or(AppError::MissingEnv("DISCORD_VOICE_SERVICE_BIND_ADDR"))?;
 
         let ytmusic_addr = env
             .get("DISCORD_VOICE_SERVICE_YTMUSIC_ADDR")
             .cloned()
             .ok_or(AppError::MissingEnv("DISCORD_VOICE_SERVICE_YTMUSIC_ADDR"))?;
 
-        Self::from_values(listen_addr, &ytmusic_addr)
+        Self::from_values(bind_addr, &ytmusic_addr)
     }
 }
 
