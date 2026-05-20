@@ -3,6 +3,14 @@ name: Live Staging
 on:
   workflow_dispatch:
     inputs:
+      discord_voice_service_image_ref:
+        description: Optional override for the discord-voice-service candidate image ref used during this run
+        required: false
+        type: string
+      discord_voice_service_image_digest:
+        description: Optional expected digest for the discord-voice-service candidate image ref
+        required: false
+        type: string
       ytmusic_service_image_ref:
         description: Optional override for the ytmusic-service image ref used during this run
         required: false
@@ -15,6 +23,14 @@ on:
         type: string
       source_sha:
         description: Commit SHA expected for the validated source ref
+        required: false
+        type: string
+      discord_voice_service_image_ref:
+        description: Candidate discord-voice-service image ref to validate in the protected staging environment
+        required: true
+        type: string
+      discord_voice_service_image_digest:
+        description: Optional expected digest for the candidate discord-voice-service image ref
         required: false
         type: string
       ytmusic_service_image_ref:
@@ -32,10 +48,12 @@ env:
   TEST_GUILD_ID: ${{ secrets.TEST_GUILD_ID }}
   TEST_VOICE_CHANNEL_ID: ${{ secrets.TEST_VOICE_CHANNEL_ID }}
   TEST_VIDEO_ID: ${{ secrets.TEST_VIDEO_ID }}
-  DISCORD_VOICE_SERVICE_ADDR: http://127.0.0.1:55051
-  DISCORD_VOICE_SERVICE_YTMUSIC_ADDR: http://127.0.0.1:50051
+  DISCORD_VOICE_SERVICE_URI: http://127.0.0.1:55051
   DISCORD_VOICE_SERVICE_BIND_ADDR: 127.0.0.1:55051
+  DISCORD_VOICE_SERVICE_YTMUSIC_ADDR: http://127.0.0.1:50051
   BROWSER_JSON_SOURCE_PATH: ${{ vars.STAGING_BROWSER_JSON_SOURCE_PATH }}
+  REQUESTED_DISCORD_VOICE_SERVICE_IMAGE_REF: ${{ inputs.discord_voice_service_image_ref }}
+  REQUESTED_DISCORD_VOICE_SERVICE_IMAGE_DIGEST: ${{ inputs.discord_voice_service_image_digest }}
   CONFIGURED_YTMUSIC_SERVICE_IMAGE_REF: ${{ vars.YTMUSIC_SERVICE_IMAGE_REF }}
   REQUESTED_YTMUSIC_SERVICE_IMAGE_REF: ${{ inputs.ytmusic_service_image_ref }}
   DEFAULT_YTMUSIC_SERVICE_IMAGE_REF: ghcr.io/ghfhffh12345/ytmusic-service:latest
@@ -89,61 +107,26 @@ jobs:
         with:
           ref: ${{ steps.source.outputs.checkout_ref }}
 
-      - name: Validate runner prerequisites and required inputs
+      - name: Resolve discord-voice-service image ref
         shell: bash
         run: |
           set -euo pipefail
 
-          command -v podman >/dev/null 2>&1 || {
-            echo "::error::podman must already be installed on the self-hosted staging runner"
-            exit 1
-          }
-          command -v cargo >/dev/null 2>&1 || {
-            echo "::error::cargo must already be installed on the self-hosted staging runner"
-            exit 1
-          }
-          command -v rustc >/dev/null 2>&1 || {
-            echo "::error::rustc must already be installed on the self-hosted staging runner"
-            exit 1
-          }
-
-          browser_json_source_path="${BROWSER_JSON_SOURCE_PATH:-${STAGING_BROWSER_JSON_SOURCE_PATH:-}}"
-          if [[ -z "${browser_json_source_path}" ]]; then
-            echo "::error::Set STAGING_BROWSER_JSON_SOURCE_PATH as a repository variable or runner environment variable to a browser.json path outside the workspace"
+          service_image_ref="${REQUESTED_DISCORD_VOICE_SERVICE_IMAGE_REF:-${DISCORD_VOICE_SERVICE_IMAGE_REF:-}}"
+          if [[ -z "${service_image_ref}" ]]; then
+            echo "::error::Provide discord_voice_service_image_ref for this validation run or set DISCORD_VOICE_SERVICE_IMAGE_REF on the self-hosted runner"
             exit 1
           fi
 
-          test -f "${browser_json_source_path}" || {
-            echo "::error::browser.json source path does not exist: ${browser_json_source_path}"
-            exit 1
-          }
+          echo "DISCORD_VOICE_SERVICE_IMAGE_REF=${service_image_ref}" >> "${GITHUB_ENV}"
 
-          for required_var in \
-            APPLICATION_ID \
-            BOT_TOKEN \
-            TEST_GUILD_ID \
-            TEST_VOICE_CHANNEL_ID \
-            TEST_VIDEO_ID \
-            DISCORD_VOICE_SERVICE_ADDR \
-            DISCORD_VOICE_SERVICE_YTMUSIC_ADDR
-          do
-            if [[ -z "${!required_var:-}" ]]; then
-              echo "::error::${required_var} is required for live staging validation"
-              exit 1
-            fi
-          done
+          if [[ -n "${REQUESTED_DISCORD_VOICE_SERVICE_IMAGE_DIGEST:-}" ]]; then
+            echo "DISCORD_VOICE_SERVICE_IMAGE_DIGEST=${REQUESTED_DISCORD_VOICE_SERVICE_IMAGE_DIGEST}" >> "${GITHUB_ENV}"
+          fi
 
-          podman --version
-          cargo --version
-          rustc --version
-
-      - name: Stage browser.json into workspace
+      - name: Validate runner prerequisites and required inputs
         shell: bash
-        run: |
-          set -euo pipefail
-
-          browser_json_source_path="${BROWSER_JSON_SOURCE_PATH:-${STAGING_BROWSER_JSON_SOURCE_PATH:-}}"
-          install -m 600 "${browser_json_source_path}" "${GITHUB_WORKSPACE}/browser.json"
+        run: ./scripts/ci/live_staging_preflight.sh
 
       - name: Resolve ytmusic image ref
         shell: bash
@@ -160,90 +143,9 @@ jobs:
 
           echo "YTMUSIC_SERVICE_IMAGE_REF=${ytmusic_image_ref}" >> "${GITHUB_ENV}"
 
-      - name: Build local binaries
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo build --locked --bins
-
       - name: Run live staging validation
         shell: bash
-        run: |
-          set -euo pipefail
-
-          service_log="${RUNNER_TEMP}/discord-voice-service-live-staging.log"
-          controller_log="${RUNNER_TEMP}/staging-live-check.log"
-          service_binary="${GITHUB_WORKSPACE}/target/debug/discord-voice-service"
-          controller_binary="${GITHUB_WORKSPACE}/target/debug/staging_live_check"
-
-          wait_for_port() {
-            local port="$1"
-            local label="$2"
-            local attempts="${3:-60}"
-
-            for _ in $(seq 1 "${attempts}"); do
-              if bash -lc "</dev/tcp/127.0.0.1/${port}" >/dev/null 2>&1; then
-                return 0
-              fi
-              sleep 1
-            done
-
-            echo "::error::Timed out waiting for ${label} on 127.0.0.1:${port}"
-            return 1
-          }
-
-          cleanup() {
-            local status=$?
-
-            if [[ "${status}" -ne 0 ]]; then
-              if [[ -f "${service_log}" ]]; then
-                echo "::group::discord-voice-service log"
-                tail -n 200 "${service_log}" || true
-                echo "::endgroup::"
-              fi
-              if [[ -f "${controller_log}" ]]; then
-                echo "::group::staging_live_check log"
-                tail -n 200 "${controller_log}" || true
-                echo "::endgroup::"
-              fi
-
-              echo "::group::ytmusic-service log"
-              podman logs ytmusic-service-live-staging || true
-              echo "::endgroup::"
-            fi
-
-            if [[ -n "${service_pid:-}" ]] && kill -0 "${service_pid}" >/dev/null 2>&1; then
-              kill "${service_pid}" >/dev/null 2>&1 || true
-              wait "${service_pid}" >/dev/null 2>&1 || true
-            fi
-
-            podman rm -f ytmusic-service-live-staging >/dev/null 2>&1 || true
-            rm -f "${GITHUB_WORKSPACE}/browser.json"
-          }
-
-          trap cleanup EXIT
-
-          podman rm -f ytmusic-service-live-staging >/dev/null 2>&1 || true
-          podman run -d \
-            --name ytmusic-service-live-staging \
-            -p 50051:50051 \
-            -p 50052:50052 \
-            -e YTMUSIC_SERVICE_PUBLIC_ADDR="${YTMUSIC_SERVICE_PUBLIC_ADDR}" \
-            -e YTMUSIC_SERVICE_ADMIN_ADDR="${YTMUSIC_SERVICE_ADMIN_ADDR}" \
-            -e YTMUSIC_SERVICE_BROWSER_JSON="${YTMUSIC_SERVICE_BROWSER_JSON}" \
-            -v "${GITHUB_WORKSPACE}/browser.json:${YTMUSIC_SERVICE_BROWSER_JSON}:ro,Z" \
-            "${YTMUSIC_SERVICE_IMAGE_REF}"
-
-          wait_for_port 50051 "ytmusic-service public gRPC listener"
-
-          DISCORD_VOICE_SERVICE_ADDR="${DISCORD_VOICE_SERVICE_BIND_ADDR}" \
-            "${service_binary}" >"${service_log}" 2>&1 &
-          service_pid=$!
-
-          wait_for_port 55051 "discord-voice-service gRPC listener"
-          sleep 5
-
-          "${controller_binary}" >"${controller_log}" 2>&1
+        run: ./scripts/ci/run_live_staging.sh
 
       - name: Summarize staging validation mode
         if: ${{ always() }}
@@ -256,9 +158,10 @@ jobs:
             echo
             echo "- Trigger: \`${{ steps.source.outputs.trigger_mode }}\`"
             echo "- Protected environment: \`live-staging\`"
-            echo "- Validation target for \`discord-voice-service\`: checked-out source build on the self-hosted runner, not the published GHCR image"
+            echo "- Validation target for \`discord-voice-service\`: requested candidate image ref \`${DISCORD_VOICE_SERVICE_IMAGE_REF}\`"
+            echo "- Candidate digest check: \`${DISCORD_VOICE_SERVICE_IMAGE_DIGEST:-not requested}\`"
             echo "- Source ref: \`${{ steps.source.outputs.checkout_ref }}\`"
             echo "- Source commit: \`${{ steps.source.outputs.source_sha }}\`"
             echo "- ytmusic-service image ref: \`${YTMUSIC_SERVICE_IMAGE_REF}\`"
-            echo "- browser.json source path provider: repository variable or runner environment variable \`STAGING_BROWSER_JSON_SOURCE_PATH\`"
+            echo "- browser.json source path provider: \`BROWSER_JSON_SOURCE_PATH\` or \`STAGING_BROWSER_JSON_SOURCE_PATH\`"
           } >> "${GITHUB_STEP_SUMMARY}"
