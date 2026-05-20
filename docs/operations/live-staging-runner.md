@@ -2,12 +2,12 @@
 
 ## Supported runner profile
 
-- Self-hosted Linux runner labeled for Discord voice staging
+- Self-hosted Linux runner carrying the required `self-hosted`, `linux`, and `discord-voice-staging` labels
 - Node 24-compatible GitHub Actions runtime
 - Podman, `cargo`, `rustc`, and `skopeo` installed
 - Outbound internet access and inbound UDP replies for Discord voice
 - Runner-local `browser.json` available through `STAGING_BROWSER_JSON_SOURCE_PATH`
-- Protected `live-staging` GitHub environment configured to supply the required Discord secrets and enforce any required reviewer approvals before the live gate starts
+- Protected `live-staging` GitHub environment required to supply the Discord secrets and enforce any required reviewer approvals before the live gate starts
 
 ## Preflight expectations
 

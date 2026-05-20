@@ -158,6 +158,8 @@ For a manual or local staging run, the operator command is:
 cargo run --bin staging_live_check
 ```
 
+For manual `workflow_dispatch` live-staging runs, provide `discord_voice_service_image_ref` or configure the runner fallback `DISCORD_VOICE_SERVICE_IMAGE_REF`. Optional digest validation is available through `discord_voice_service_image_digest` or `DISCORD_VOICE_SERVICE_IMAGE_DIGEST`.
+
 The workflow also accepts a configurable `ytmusic-service` image ref. It resolves in this order:
 
 1. `workflow_dispatch` input `ytmusic_service_image_ref`
@@ -175,7 +177,7 @@ The workflow intentionally starts the live dependencies itself instead of assumi
 5. start `ytmusic-service` in Podman with `./browser.json`
 6. start the exact candidate `discord-voice-service` container artifact from GHCR
 7. run the built `staging_live_check` binary
-8. tear down the container, remove `${GITHUB_WORKSPACE}/browser.json`, and stop the service process
+8. remove the service container, tear down the remaining live dependencies, and remove `${GITHUB_WORKSPACE}/browser.json`
 
 Every successful live staging validation should record this evidence in the implementation or release notes:
 

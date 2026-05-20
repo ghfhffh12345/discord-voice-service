@@ -9,5 +9,8 @@ fn readme_publishes_the_new_production_contract() {
     assert!(readme.contains("production-ready for controlled single-guild, single-session use"));
     assert!(readme.contains("exact container artifact"));
     assert!(readme.contains("self-hosted runner profile"));
+    assert!(readme.contains("protected `live-staging` environment"));
+    assert!(readme.contains("candidate digest"));
     assert!(readme.contains("rollback"));
+    assert!(!readme.contains("DISCORD_VOICE_SERVICE_ADDR"));
 }
