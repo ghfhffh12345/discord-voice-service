@@ -5,7 +5,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use config::Settings;
 pub use discord_voice_service_runtime::RuntimeError;
-use discord_voice_service_runtime::{ControlService, Readiness, Supervisor};
+use discord_voice_service_runtime::{ControlService, Readiness, Supervisor, record_ytmusic_probe};
 use tonic::transport::{Endpoint, Server};
 use tonic_health::ServingStatus;
 use tracing::{info, warn};
@@ -49,6 +49,7 @@ async fn run_ytmusic_probe_loop(
 
     loop {
         let healthy = probe_ytmusic(&settings).await;
+        record_ytmusic_probe(healthy);
 
         if healthy {
             readiness.mark_ytmusic_healthy().await;

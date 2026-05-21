@@ -123,3 +123,18 @@ pub fn render_snapshot_message(snapshot: &Snapshot, readiness: ReadinessSnapshot
 
     parts.join(" | ")
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn public_probe_hook_records_metric() {
+        let before = super::global().ytmusic_probe_total.load(Ordering::Relaxed);
+
+        crate::record_ytmusic_probe(true);
+
+        let after = super::global().ytmusic_probe_total.load(Ordering::Relaxed);
+        assert_eq!(after, before + 1);
+    }
+}
