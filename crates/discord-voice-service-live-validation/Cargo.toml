@@ -3,6 +3,10 @@ name = "discord-voice-service-live-validation"
 version.workspace = true
 edition.workspace = true
 
+[[bin]]
+name = "staging_live_check"
+path = "src/main.rs"
+
 [dependencies]
 anyhow.workspace = true
 discord-voice-service-proto = { path = "../discord-voice-service-proto" }

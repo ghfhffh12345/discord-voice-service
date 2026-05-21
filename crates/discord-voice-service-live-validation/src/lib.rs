@@ -1,6 +1,6 @@
-pub mod config;
-pub mod contract;
-pub mod controller;
+mod config;
+mod contract;
+mod controller;
 
 pub use config::StagingConfig;
 pub use contract::{
