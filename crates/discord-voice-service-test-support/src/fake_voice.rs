@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex as StdMutex};
 
-use discord_voice_service::discord_voice::crypto::{PREFERRED_MODE, REQUIRED_MODE};
-use discord_voice_service::session::supervisor::VoiceContext;
+use discord_voice_service_runtime::VoiceContext;
+use discord_voice_service_voice::crypto::{PREFERRED_MODE, REQUIRED_MODE};
 use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::net::{TcpListener, UdpSocket};

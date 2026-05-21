@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
-use discord_voice_service::session::readiness::Readiness;
-use discord_voice_service::session::supervisor::{Command, Supervisor, VoiceContext};
+use discord_voice_service_runtime::{Command, Readiness, Supervisor, VoiceContext};
 
 #[tokio::test]
 async fn readiness_depends_on_runtime_boot_and_ytmusic_reachability_not_playback() {

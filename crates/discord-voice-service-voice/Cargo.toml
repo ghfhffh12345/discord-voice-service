@@ -22,3 +22,10 @@ twilight-model.workspace = true
 
 [build-dependencies]
 cc.workspace = true
+
+[dev-dependencies]
+discord-voice-service-proto = { path = "../discord-voice-service-proto" }
+discord-voice-service-runtime = { path = "../discord-voice-service-runtime" }
+discord-voice-service-test-support = { path = "../discord-voice-service-test-support" }
+hex.workspace = true
+tonic.workspace = true

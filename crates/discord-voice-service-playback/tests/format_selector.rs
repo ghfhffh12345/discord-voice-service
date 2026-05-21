@@ -1,9 +1,6 @@
-#[path = "support/fake_ytmusic.rs"]
-mod fake_ytmusic;
+use discord_voice_service_test_support::fake_ytmusic::FakeYtMusic;
 
 use discord_voice_service_playback::YtMusicClient;
-
-use self::fake_ytmusic::FakeYtMusic;
 
 #[tokio::test]
 async fn resolve_playback_source_calls_get_song_and_decipher() {

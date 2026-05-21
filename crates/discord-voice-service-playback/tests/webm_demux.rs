@@ -1,14 +1,11 @@
-#[path = "support/fixtures.rs"]
-mod fixtures;
+use discord_voice_service_test_support::fixtures::load_fixture_bytes;
 
 use bytes::Bytes;
-use discord_voice_service::media::webm_demux::WebmOpusDemux;
-
-use self::fixtures::load_fixture_bytes;
+use discord_voice_service_playback::media::webm_demux::WebmOpusDemux;
 
 #[test]
 fn demux_extracts_multiple_opus_packets_from_split_fixture() {
-    let fixture = load_fixture_bytes("tests/fixtures/audio-itag250.webm");
+    let fixture = load_fixture_bytes("audio-itag250.webm");
     let split_sizes = [1usize, 2, 3, 4, 64, 128, 254, 255, 256, 257, 512, 678];
 
     for split_size in split_sizes {

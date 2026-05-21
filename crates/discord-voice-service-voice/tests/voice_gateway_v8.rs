@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex as StdMutex};
 
-use discord_voice_service::discord_voice::gateway::VoiceGatewayClient;
-use discord_voice_service::discord_voice::resume::GatewayEvent;
+use discord_voice_service_voice::gateway::VoiceGatewayClient;
+use discord_voice_service_voice::resume::GatewayEvent;
 use futures::StreamExt;
 use serde_json::Value;
 use tokio::net::TcpListener;

@@ -1,10 +1,7 @@
-#[path = "support/fake_discord.rs"]
-mod fake_discord;
+use discord_voice_service_test_support::fake_discord::FakeDiscordPeer;
 
 use discord_voice_service_voice::{ConnectedVoiceSession, handshake};
 use tokio::time::Duration;
-
-use self::fake_discord::FakeDiscordPeer;
 
 #[tokio::test]
 async fn connected_voice_session_does_not_require_synthetic_endpoint_query_params() {

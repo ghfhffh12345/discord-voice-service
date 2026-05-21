@@ -1,4 +1,4 @@
-use discord_voice_service::playback::pacer::AudioPacer;
+use discord_voice_service_playback::pacer::AudioPacer;
 use tokio::task::yield_now;
 use tokio::time::{Duration, Instant, advance};
 

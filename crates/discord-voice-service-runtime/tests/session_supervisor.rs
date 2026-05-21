@@ -1,9 +1,6 @@
-#[path = "support/fake_voice.rs"]
-mod fake_voice;
+use discord_voice_service_test_support::fake_voice::FakeVoiceEndpoint;
 
 use discord_voice_service_runtime::{Command, SessionState, Supervisor, VoiceContext};
-
-use self::fake_voice::FakeVoiceEndpoint;
 
 #[tokio::test]
 async fn join_then_play_advances_state_machine() {

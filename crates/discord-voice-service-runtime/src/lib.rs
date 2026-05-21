@@ -5,6 +5,7 @@ mod session;
 
 pub use api::ControlService;
 pub use error::RuntimeError;
+pub use session::events::{SessionEventKind, SessionEventRecord};
 pub use session::{
     Command, Readiness, ReadinessSnapshot, SessionState, Snapshot, Supervisor, VoiceContext,
 };

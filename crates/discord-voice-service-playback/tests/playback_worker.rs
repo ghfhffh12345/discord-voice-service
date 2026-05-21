@@ -1,20 +1,17 @@
-#[path = "support/fake_ytmusic.rs"]
-mod fake_ytmusic;
-#[path = "support/fixtures.rs"]
-mod fixtures;
+use discord_voice_service_test_support::fake_ytmusic::FakeYtMusic;
+use discord_voice_service_test_support::fixtures::spawn_stream_server;
 
 use bytes::Bytes;
 use discord_voice_service_playback::media::opus_queue::OpusFrame;
 use discord_voice_service_playback::media::opus_queue::OpusFrameQueue;
 use discord_voice_service_playback::{PlaybackError, PlaybackWorker, YtMusicClient};
 
-use self::fake_ytmusic::FakeYtMusic;
-use self::fixtures::{spawn_status_server, spawn_stream_server};
+use discord_voice_service_test_support::fixtures::spawn_status_server;
 
 #[tokio::test]
 async fn prepare_buffers_real_packets_and_returns_selected_itag() {
     let fake_yt = FakeYtMusic::spawn().await;
-    let http = spawn_stream_server("tests/fixtures/audio-itag250.webm").await;
+    let http = spawn_stream_server("audio-itag250.webm").await;
     fake_yt.set_playable_url(http.url()).await;
 
     let mut worker = PlaybackWorker::new(
@@ -46,7 +43,7 @@ async fn prepare_buffers_real_packets_and_returns_selected_itag() {
 #[tokio::test]
 async fn prepare_reruns_resolution_when_initial_playable_url_is_stale() {
     let fake = FakeYtMusic::spawn().await;
-    let http = spawn_stream_server("tests/fixtures/audio-itag250.webm").await;
+    let http = spawn_stream_server("audio-itag250.webm").await;
     let expired = spawn_status_server("HTTP/1.1 403 Forbidden").await;
     fake.set_playable_url(http.url()).await;
     fake.set_first_playable_url_once(expired.url()).await;
@@ -100,7 +97,7 @@ async fn prepare_rejects_unsupported_formats() {
 #[tokio::test]
 async fn prepare_preserves_current_track_position_when_recovering_same_video() {
     let fake = FakeYtMusic::spawn().await;
-    let http = spawn_stream_server("tests/fixtures/audio-itag250.webm").await;
+    let http = spawn_stream_server("audio-itag250.webm").await;
     fake.set_playable_url(http.url()).await;
 
     let mut worker = PlaybackWorker::new(
@@ -145,7 +142,7 @@ async fn prepare_preserves_current_track_position_when_recovering_same_video() {
 #[tokio::test]
 async fn reset_discards_same_video_resume_state() {
     let fake = FakeYtMusic::spawn().await;
-    let http = spawn_stream_server("tests/fixtures/audio-itag250.webm").await;
+    let http = spawn_stream_server("audio-itag250.webm").await;
     fake.set_playable_url(http.url()).await;
 
     let mut worker = PlaybackWorker::new(
@@ -174,7 +171,7 @@ async fn reset_discards_same_video_resume_state() {
 #[tokio::test]
 async fn prepare_rejects_full_queue() {
     let fake = FakeYtMusic::spawn().await;
-    let http = spawn_stream_server("tests/fixtures/audio-itag250.webm").await;
+    let http = spawn_stream_server("audio-itag250.webm").await;
     fake.set_playable_url(http.url()).await;
 
     let mut worker = PlaybackWorker::new(

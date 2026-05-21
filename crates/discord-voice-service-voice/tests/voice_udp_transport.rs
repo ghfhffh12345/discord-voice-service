@@ -2,14 +2,14 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use discord_voice_service::discord_voice::crypto::{EncryptionMode, choose_mode};
-use discord_voice_service::discord_voice::discovery::{
+use discord_voice_service_voice::VoiceError;
+use discord_voice_service_voice::crypto::{EncryptionMode, choose_mode};
+use discord_voice_service_voice::discovery::{
     build_ip_discovery_packet, discover_ip, parse_ip_discovery_response,
 };
-use discord_voice_service::discord_voice::gateway::VoiceGatewayClient;
-use discord_voice_service::discord_voice::speaking::{OPUS_SILENCE_FRAME, send_speaking};
-use discord_voice_service::discord_voice::udp::VoiceUdpTransport;
-use discord_voice_service::error::AppError;
+use discord_voice_service_voice::gateway::VoiceGatewayClient;
+use discord_voice_service_voice::speaking::{OPUS_SILENCE_FRAME, send_speaking};
+use discord_voice_service_voice::udp::VoiceUdpTransport;
 use futures::StreamExt;
 use serde_json::Value;
 use tokio::net::{TcpListener, UdpSocket, lookup_host};

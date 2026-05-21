@@ -1,20 +1,15 @@
-#[path = "support/fake_ytmusic.rs"]
-mod fake_ytmusic;
-#[path = "support/fixtures.rs"]
-mod fixtures;
+use discord_voice_service_test_support::fake_ytmusic::FakeYtMusic;
+use discord_voice_service_test_support::fixtures::{spawn_status_server, spawn_stream_server};
 
 use std::time::{Duration, Instant};
 
-use discord_voice_service::playback::recovery::PlaybackRecovery;
-use discord_voice_service::ytmusic::client::YtMusicClient;
-
-use self::fake_ytmusic::FakeYtMusic;
-use self::fixtures::{spawn_status_server, spawn_stream_server};
+use discord_voice_service_playback::YtMusicClient;
+use discord_voice_service_playback::recovery::PlaybackRecovery;
 
 #[tokio::test]
 async fn recovery_reruns_get_song_and_decipher_when_playable_url_is_stale() {
     let fake = FakeYtMusic::spawn().await;
-    let http = spawn_stream_server("tests/fixtures/audio-itag250.webm").await;
+    let http = spawn_stream_server("audio-itag250.webm").await;
     let expired = spawn_status_server("HTTP/1.1 403 Forbidden").await;
     fake.set_playable_url(http.url()).await;
     fake.set_first_playable_url_once(expired.url()).await;
@@ -45,7 +40,7 @@ async fn recovery_reruns_get_song_and_decipher_when_playable_url_is_stale() {
 #[tokio::test]
 async fn recovery_reopens_same_video_without_rerunning_resolution() {
     let fake = FakeYtMusic::spawn().await;
-    let http = spawn_stream_server("tests/fixtures/audio-itag250.webm").await;
+    let http = spawn_stream_server("audio-itag250.webm").await;
     fake.set_playable_url(http.url()).await;
 
     let mut recovery =
@@ -99,7 +94,7 @@ async fn recovery_does_not_rerun_resolution_when_open_fails_with_non_stale_http_
 #[tokio::test]
 async fn recovery_errors_when_requested_position_cannot_be_reached() {
     let fake = FakeYtMusic::spawn().await;
-    let http = spawn_stream_server("tests/fixtures/audio-itag250.webm").await;
+    let http = spawn_stream_server("audio-itag250.webm").await;
     fake.set_playable_url(http.url()).await;
 
     let mut recovery =

@@ -1,18 +1,18 @@
 pub mod crypto;
 pub mod dave;
 pub(crate) mod dave_ffi;
-mod discovery;
+pub mod discovery;
 mod error;
-mod gateway;
+pub mod gateway;
 pub mod handshake;
-mod protection;
+pub mod protection;
 mod protocol;
-mod resume;
+pub mod resume;
 pub(crate) mod rollover;
-pub(crate) mod rtp;
+pub mod rtp;
 mod session;
-mod speaking;
-mod udp;
+pub mod speaking;
+pub mod udp;
 mod ws;
 
 pub use error::VoiceError;

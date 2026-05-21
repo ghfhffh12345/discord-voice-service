@@ -1,15 +1,9 @@
-#[path = "support/fixtures.rs"]
-mod fixtures;
-
-use discord_voice_service::media::http_stream::HttpOpusStream;
-
-use self::fixtures::{
-    load_fixture_bytes,
-    spawn_non_range_server,
-    spawn_range_server,
-    spawn_range_server_with_416_at_eof,
-    spawn_range_server_with_partial_body_then_close,
+use discord_voice_service_test_support::fixtures::{
+    load_fixture_bytes, spawn_non_range_server, spawn_range_server,
+    spawn_range_server_with_416_at_eof, spawn_range_server_with_partial_body_then_close,
 };
+
+use discord_voice_service_playback::media::http_stream::HttpOpusStream;
 
 #[tokio::test]
 async fn http_stream_reopens_from_last_known_byte_offset() {
@@ -46,7 +40,7 @@ async fn http_stream_rejects_resume_when_server_ignores_range() {
 #[tokio::test]
 async fn http_stream_treats_416_at_resume_eof_as_end_of_stream() {
     let server = spawn_range_server_with_416_at_eof().await;
-    let payload_len = load_fixture_bytes("tests/fixtures/audio-itag250.webm").len() as u64 * 4;
+    let payload_len = load_fixture_bytes("audio-itag250.webm").len() as u64 * 4;
     let mut stream = HttpOpusStream::new(server.url());
 
     stream.set_resume_offset(payload_len);
@@ -61,7 +55,7 @@ async fn http_stream_treats_416_at_resume_eof_as_end_of_stream() {
 
 #[tokio::test]
 async fn http_stream_preserves_partial_body_before_late_eof_and_resumes() {
-    let payload_len = load_fixture_bytes("tests/fixtures/audio-itag250.webm").len() * 4;
+    let payload_len = load_fixture_bytes("audio-itag250.webm").len() * 4;
     let partial_len = payload_len / 2;
     let server = spawn_range_server_with_partial_body_then_close(partial_len).await;
     let mut stream = HttpOpusStream::new(server.url());

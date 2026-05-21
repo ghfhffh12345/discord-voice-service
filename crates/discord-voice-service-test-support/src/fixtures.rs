@@ -3,37 +3,46 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use bytes::Bytes;
 
-pub fn load_fixture_bytes(path: &str) -> Bytes {
-    Bytes::from(fs::read(path).expect("fixture should be readable"))
+pub fn fixture_path(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures")
+        .join(name)
 }
 
-pub async fn spawn_stream_server(path: &str) -> RangeServer {
-    let payload = load_fixture_bytes(path);
+pub fn load_fixture_bytes(name: &str) -> Bytes {
+    Bytes::from(fs::read(fixture_path(name)).expect("fixture should be readable"))
+}
+
+pub async fn spawn_stream_server(name: &str) -> RangeServer {
+    let payload = load_fixture_bytes(name);
     spawn_test_server(ServerBehavior::HonorRange, payload).await
 }
 
 pub async fn spawn_range_server() -> RangeServer {
-    let payload = load_fixture_bytes("tests/fixtures/audio-itag250.webm").repeat(4);
+    let payload = load_fixture_bytes("audio-itag250.webm").repeat(4);
     spawn_test_server(ServerBehavior::HonorRange, payload.into()).await
 }
 
 pub async fn spawn_non_range_server() -> RangeServer {
-    let payload = load_fixture_bytes("tests/fixtures/audio-itag250.webm").repeat(4);
+    let payload = load_fixture_bytes("audio-itag250.webm").repeat(4);
     spawn_test_server(ServerBehavior::IgnoreRange, payload.into()).await
 }
 
 pub async fn spawn_range_server_with_416_at_eof() -> RangeServer {
-    let payload = load_fixture_bytes("tests/fixtures/audio-itag250.webm").repeat(4);
+    let payload = load_fixture_bytes("audio-itag250.webm").repeat(4);
     spawn_test_server(ServerBehavior::HonorRangeWith416AtEof, payload.into()).await
 }
 
-pub async fn spawn_range_server_with_partial_body_then_close(bytes_before_close: usize) -> RangeServer {
-    let payload = load_fixture_bytes("tests/fixtures/audio-itag250.webm").repeat(4);
+pub async fn spawn_range_server_with_partial_body_then_close(
+    bytes_before_close: usize,
+) -> RangeServer {
+    let payload = load_fixture_bytes("audio-itag250.webm").repeat(4);
     spawn_test_server(
         ServerBehavior::PartialBodyThenCloseOnce { bytes_before_close },
         payload.into(),
@@ -108,12 +117,9 @@ async fn spawn_test_server(behavior: ServerBehavior, payload: Bytes) -> RangeSer
                 *request_count
             };
             let (body, status, content_range, content_length) = match behavior {
-                ServerBehavior::HonorRangeWith416AtEof if start >= payload.len() as u64 => (
-                    &[][..],
-                    "HTTP/1.1 416 Range Not Satisfiable",
-                    None,
-                    0,
-                ),
+                ServerBehavior::HonorRangeWith416AtEof if start >= payload.len() as u64 => {
+                    (&[][..], "HTTP/1.1 416 Range Not Satisfiable", None, 0)
+                }
                 ServerBehavior::HonorRange if start > 0 => (
                     payload.get(start as usize..).unwrap_or(&[]),
                     "HTTP/1.1 206 Partial Content",
@@ -207,7 +213,9 @@ impl RangeServer {
 enum ServerBehavior {
     HonorRange,
     HonorRangeWith416AtEof,
-    PartialBodyThenCloseOnce { bytes_before_close: usize },
+    PartialBodyThenCloseOnce {
+        bytes_before_close: usize,
+    },
     IgnoreRange,
     StaticStatus(&'static str),
     StaticStatusAfterRequests {

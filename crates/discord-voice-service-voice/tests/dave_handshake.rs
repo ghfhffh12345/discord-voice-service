@@ -1,4 +1,4 @@
-use discord_voice_service::discord_voice::dave::{
+use discord_voice_service_voice::dave::{
     DaveDecryptor, DaveEncryptor, DaveError, DaveExternalSender, DaveMediaType, DaveRuntimeContext,
     DaveSession,
 };

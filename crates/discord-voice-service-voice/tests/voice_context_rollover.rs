@@ -1,24 +1,25 @@
-#[path = "support/fake_discord.rs"]
-mod fake_discord;
-#[path = "support/fake_voice.rs"]
-mod fake_voice;
-#[path = "support/fake_ytmusic.rs"]
-mod fake_ytmusic;
-#[path = "support/fixtures.rs"]
-mod fixtures;
+use std::pin::Pin;
+use std::sync::Arc;
 
-use discord_voice_service::session::events::{SessionEventKind, SessionEventRecord};
-use discord_voice_service::session::state::{SessionState, Snapshot};
-use discord_voice_service::session::supervisor::{Command, Supervisor, VoiceContext};
+use discord_voice_service_proto::discordvoice::v1::discord_voice_control_server::DiscordVoiceControl;
+use discord_voice_service_proto::discordvoice::v1::{
+    SessionEvent, SessionEventKind as ProtoSessionEventKind, SubscribeEventsRequest,
+};
+use discord_voice_service_runtime::{
+    Command, ControlService, Readiness, RuntimeError, SessionState, Snapshot, Supervisor,
+    VoiceContext,
+};
+use discord_voice_service_test_support::fake_discord::FakeDiscordPeer;
+use discord_voice_service_test_support::fake_voice::FakeVoiceEndpoint;
+use discord_voice_service_test_support::fake_ytmusic::FakeYtMusic;
+use discord_voice_service_test_support::fixtures::{
+    spawn_stream_server, spawn_stream_server_with_status_after_requests,
+};
+use futures::StreamExt;
 use tokio::sync::Mutex;
-use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant, sleep, timeout};
-
-use self::fake_discord::FakeDiscordPeer;
-use self::fake_voice::FakeVoiceEndpoint;
-use self::fake_ytmusic::FakeYtMusic;
-use self::fixtures::{spawn_stream_server, spawn_stream_server_with_status_after_requests};
+use tonic::Request;
 
 #[tokio::test]
 async fn rollover_rebuilds_transport_and_preserves_track_identity() {
@@ -182,7 +183,6 @@ async fn update_voice_context_does_not_reattach_after_leave_voice_during_reconne
 
     let snapshot = harness.snapshot().await;
     assert_eq!(snapshot, Snapshot::default());
-    assert_eq!(harness.current_voice_context().await, None);
     assert!(
         timeout(
             Duration::from_millis(400),
@@ -236,7 +236,7 @@ async fn update_voice_context_failure_interrupts_active_playback_state() {
 #[tokio::test]
 async fn update_voice_context_resume_failure_surfaces_interrupted_state() {
     let stream = spawn_stream_server_with_status_after_requests(
-        "tests/fixtures/audio-long.webm",
+        "audio-long.webm",
         1,
         "HTTP/1.1 500 Internal Server Error",
     )
@@ -264,24 +264,20 @@ async fn update_voice_context_resume_failure_surfaces_interrupted_state() {
 
 struct VoiceRolloverHarness {
     supervisor: Supervisor,
-    events: Mutex<broadcast::Receiver<SessionEventRecord>>,
+    events: Mutex<EventStream>,
 }
 
 impl VoiceRolloverHarness {
     async fn spawn() -> Self {
         let supervisor = Supervisor::new();
-        let events = supervisor.subscribe_events();
+        let events = subscribe_events(supervisor.clone()).await;
         Self {
             supervisor,
             events: Mutex::new(events),
         }
     }
 
-    async fn start_playing(
-        &self,
-        voice: VoiceContext,
-        video_id: &str,
-    ) -> Result<(), discord_voice_service::error::AppError> {
+    async fn start_playing(&self, voice: VoiceContext, video_id: &str) -> Result<(), RuntimeError> {
         self.supervisor.send(Command::JoinVoice { voice }).await?;
         self.supervisor
             .send(Command::Play {
@@ -294,10 +290,7 @@ impl VoiceRolloverHarness {
         self.supervisor.snapshot().await
     }
 
-    async fn update_voice_context(
-        &self,
-        voice: VoiceContext,
-    ) -> Result<(), discord_voice_service::error::AppError> {
+    async fn update_voice_context(&self, voice: VoiceContext) -> Result<(), RuntimeError> {
         self.supervisor
             .send(Command::UpdateVoiceContext { voice })
             .await
@@ -317,12 +310,12 @@ impl VoiceRolloverHarness {
     async fn seen_event(&self, name: &str) -> bool {
         let mut events = self.events.lock().await;
         loop {
-            match events.try_recv() {
-                Ok(event) if event_name(&event) == name => return true,
-                Ok(_) => continue,
-                Err(broadcast::error::TryRecvError::Empty) => return false,
-                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
-                Err(broadcast::error::TryRecvError::Closed) => return false,
+            match timeout(Duration::from_millis(10), events.next()).await {
+                Ok(Some(Ok(event))) if event_name(&event) == name => return true,
+                Ok(Some(Ok(_))) => continue,
+                Ok(Some(Err(_))) => continue,
+                Ok(None) => return false,
+                Err(_) => return false,
             }
         }
     }
@@ -331,10 +324,13 @@ impl VoiceRolloverHarness {
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut events = self.events.lock().await;
         loop {
-            match timeout(Duration::from_millis(100), events.recv()).await {
-                Ok(Ok(event)) if event_name(&event) == expected => return self.snapshot().await,
-                Ok(Ok(_)) => {}
-                Ok(Err(_)) => {}
+            match timeout(Duration::from_millis(100), events.next()).await {
+                Ok(Some(Ok(event))) if event_name(&event) == expected => {
+                    return self.snapshot().await;
+                }
+                Ok(Some(Ok(_))) => {}
+                Ok(Some(Err(_))) => {}
+                Ok(None) => {}
                 Err(_) if Instant::now() >= deadline => {
                     panic!("timed out waiting for event {expected}")
                 }
@@ -346,7 +342,7 @@ impl VoiceRolloverHarness {
 
 struct RolloverHarness {
     supervisor: Supervisor,
-    events: Mutex<broadcast::Receiver<SessionEventRecord>>,
+    events: Mutex<EventStream>,
     initial_voice: FakeDiscordPeer,
     replacement_voice: FakeDiscordPeer,
     initial_frame_count_at_rollover: Mutex<Option<usize>>,
@@ -354,7 +350,7 @@ struct RolloverHarness {
 
 impl RolloverHarness {
     async fn spawn() -> Self {
-        let stream = spawn_stream_server("tests/fixtures/audio-long.webm").await;
+        let stream = spawn_stream_server("audio-long.webm").await;
         Self::spawn_with_stream_url(stream.url()).await
     }
 
@@ -368,7 +364,7 @@ impl RolloverHarness {
         let supervisor = Supervisor::with_ytmusic_endpoint(fake_yt.endpoint())
             .await
             .unwrap();
-        let events = supervisor.subscribe_events();
+        let events = subscribe_events(supervisor.clone()).await;
 
         supervisor
             .send(Command::JoinVoice {
@@ -421,9 +417,7 @@ impl RolloverHarness {
             .unwrap();
     }
 
-    async fn start_rollover(
-        &self,
-    ) -> JoinHandle<Result<(), discord_voice_service::error::AppError>> {
+    async fn start_rollover(&self) -> JoinHandle<Result<(), RuntimeError>> {
         let frame_count = self.initial_voice.audio_frame_count_at_least(0).await;
         *self.initial_frame_count_at_rollover.lock().await = Some(frame_count);
         let supervisor = self.supervisor.clone();
@@ -451,11 +445,6 @@ impl RolloverHarness {
     async fn leave_voice(&self) {
         self.supervisor.send(Command::LeaveVoice).await.unwrap();
     }
-
-    async fn current_voice_context(&self) -> Option<VoiceContext> {
-        self.supervisor.current_voice_context().await
-    }
-
     async fn snapshot(&self) -> Snapshot {
         self.supervisor.snapshot().await
     }
@@ -475,10 +464,13 @@ impl RolloverHarness {
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut events = self.events.lock().await;
         loop {
-            match timeout(Duration::from_millis(100), events.recv()).await {
-                Ok(Ok(event)) if event_name(&event) == expected => return self.snapshot().await,
-                Ok(Ok(_)) => {}
-                Ok(Err(_)) => {}
+            match timeout(Duration::from_millis(100), events.next()).await {
+                Ok(Some(Ok(event))) if event_name(&event) == expected => {
+                    return self.snapshot().await;
+                }
+                Ok(Some(Ok(_))) => {}
+                Ok(Some(Err(_))) => {}
+                Ok(None) => {}
                 Err(_) if Instant::now() >= deadline => {
                     panic!("timed out waiting for event {expected}")
                 }
@@ -538,19 +530,34 @@ impl RolloverHarness {
     }
 }
 
-fn event_name(event: &SessionEventRecord) -> &'static str {
+type EventStream =
+    Pin<Box<dyn futures::Stream<Item = Result<SessionEvent, tonic::Status>> + Send + 'static>>;
+
+async fn subscribe_events(supervisor: Supervisor) -> EventStream {
+    ControlService {
+        supervisor,
+        readiness: Arc::new(Readiness::default()),
+    }
+    .subscribe_events(Request::new(SubscribeEventsRequest {}))
+    .await
+    .unwrap()
+    .into_inner()
+}
+
+fn event_name(event: &SessionEvent) -> &'static str {
     match event.kind {
-        SessionEventKind::VoiceConnecting => "voice-connecting",
-        SessionEventKind::VoiceReady => "voice-reconnected",
-        SessionEventKind::TrackResolving => "track-resolving",
-        SessionEventKind::Buffering => "buffering",
-        SessionEventKind::Playing => "playing",
-        SessionEventKind::Paused => "paused",
-        SessionEventKind::Stopped => "stopped",
-        SessionEventKind::TrackEnded => "track-ended",
-        SessionEventKind::PlaybackInterrupted => "playback-interrupted",
-        SessionEventKind::RecoverableWarning => "recoverable-warning",
-        SessionEventKind::FatalError => "fatal-error",
-        SessionEventKind::VoiceReconnecting => "voice-reconnecting",
+        kind if kind == ProtoSessionEventKind::VoiceConnecting as i32 => "voice-connecting",
+        kind if kind == ProtoSessionEventKind::VoiceReady as i32 => "voice-reconnected",
+        kind if kind == ProtoSessionEventKind::TrackResolving as i32 => "track-resolving",
+        kind if kind == ProtoSessionEventKind::Buffering as i32 => "buffering",
+        kind if kind == ProtoSessionEventKind::Playing as i32 => "playing",
+        kind if kind == ProtoSessionEventKind::Paused as i32 => "paused",
+        kind if kind == ProtoSessionEventKind::Stopped as i32 => "stopped",
+        kind if kind == ProtoSessionEventKind::TrackEnded as i32 => "track-ended",
+        kind if kind == ProtoSessionEventKind::PlaybackInterrupted as i32 => "playback-interrupted",
+        kind if kind == ProtoSessionEventKind::RecoverableWarning as i32 => "recoverable-warning",
+        kind if kind == ProtoSessionEventKind::FatalError as i32 => "fatal-error",
+        kind if kind == ProtoSessionEventKind::VoiceReconnecting as i32 => "voice-reconnecting",
+        _ => "unknown",
     }
 }

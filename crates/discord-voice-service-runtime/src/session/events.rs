@@ -3,7 +3,7 @@ use tokio::sync::broadcast;
 use super::state::Snapshot;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum SessionEventKind {
+pub enum SessionEventKind {
     VoiceConnecting,
     VoiceReady,
     TrackResolving,
@@ -19,7 +19,7 @@ pub(crate) enum SessionEventKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SessionEventRecord {
+pub struct SessionEventRecord {
     pub kind: SessionEventKind,
     pub guild_id: Option<String>,
     pub channel_id: Option<String>,

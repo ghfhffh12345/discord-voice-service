@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use discord_voice_service::media::opus_queue::{OpusFrame, OpusFrameQueue};
+use discord_voice_service_playback::media::opus_queue::{OpusFrame, OpusFrameQueue};
 
 #[test]
 fn queue_enforces_capacity_and_fifo_order() {

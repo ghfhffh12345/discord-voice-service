@@ -1,37 +1,18 @@
-#[path = "support/fake_discord.rs"]
-mod fake_discord;
-#[path = "support/fake_ytmusic.rs"]
-mod fake_ytmusic;
-#[path = "support/fixtures.rs"]
-mod fixtures;
-
 use std::sync::Arc;
 
-use discord_voice_service::api::service::{ControlService, map_play_request};
-use discord_voice_service::proto::discordvoice::v1::discord_voice_control_server::DiscordVoiceControl;
-use discord_voice_service::proto::discordvoice::v1::{
+use discord_voice_service_proto::discordvoice::v1::discord_voice_control_server::DiscordVoiceControl;
+use discord_voice_service_proto::discordvoice::v1::{
     GetStateRequest, JoinVoiceRequest, PauseRequest, PlayRequest, ResumeRequest, SessionEvent,
     SessionEventKind, SessionStateSnapshot, SubscribeEventsRequest, UpdateVoiceContextRequest,
     join_voice_request,
 };
-use discord_voice_service::session::readiness::Readiness;
-use discord_voice_service::session::supervisor::{Supervisor, VoiceContext};
+use discord_voice_service_runtime::{ControlService, Readiness, Supervisor, VoiceContext};
+use discord_voice_service_test_support::fake_discord::FakeDiscordPeer;
+use discord_voice_service_test_support::fake_ytmusic::FakeYtMusic;
+use discord_voice_service_test_support::fixtures::spawn_stream_server;
 use futures::StreamExt;
 use tokio::time::{Duration, Instant};
 use tonic::{Code, Request};
-
-use self::fake_discord::FakeDiscordPeer;
-use self::fake_ytmusic::FakeYtMusic;
-use self::fixtures::spawn_stream_server;
-
-#[test]
-fn maps_proto_play_request_into_internal_video_id() {
-    let request = PlayRequest {
-        video_id: "video123".into(),
-    };
-
-    assert_eq!(map_play_request(request), "video123");
-}
 
 #[tokio::test]
 async fn play_before_join_voice_returns_failed_precondition() {
@@ -270,7 +251,7 @@ async fn subscribe_events_streams_runtime_events() {
 #[tokio::test]
 async fn join_voice_then_play_streams_end_to_end_playback_events_and_audio() {
     let fake_yt = FakeYtMusic::spawn().await;
-    let http = spawn_stream_server("tests/fixtures/audio-itag250.webm").await;
+    let http = spawn_stream_server("audio-itag250.webm").await;
     fake_yt.set_playable_url(http.url()).await;
     let fake_discord = FakeDiscordPeer::spawn().await;
     let speaking_observed = fake_discord.speaking_observed();
@@ -322,7 +303,7 @@ async fn join_voice_then_play_streams_end_to_end_playback_events_and_audio() {
         .into_inner();
     assert_eq!(
         state.state,
-        discord_voice_service::proto::discordvoice::v1::SessionState::VoiceReadyState as i32
+        discord_voice_service_proto::discordvoice::v1::SessionState::VoiceReadyState as i32
     );
     assert!(state.current_video_id.is_empty());
     assert_eq!(state.selected_itag, 0);
