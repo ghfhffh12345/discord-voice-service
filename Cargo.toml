@@ -9,7 +9,10 @@ members = [
     "crates/discord-voice-service-test-support",
     "crates/discord-voice-service-voice",
 ]
-default-members = ["crates/discord-voice-service"]
+default-members = [
+    "crates/discord-voice-service",
+    "crates/discord-voice-service-live-validation",
+]
 
 [workspace.package]
 version = "0.1.0"
