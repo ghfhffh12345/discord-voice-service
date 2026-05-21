@@ -5,22 +5,17 @@ use std::sync::{
 };
 use std::time::Duration;
 
-#[allow(dead_code)]
-#[path = "../src/bin/staging_live_check.rs"]
-mod staging_live_check;
-
 use anyhow::Result;
-use tokio::io::AsyncWriteExt;
-use tokio::net::TcpListener;
-use tokio::sync::oneshot;
-use tokio::time::{Duration as TokioDuration, Instant, timeout};
-
-use discord_voice_service::proto::discordvoice::v1::{SessionEvent, SessionEventKind};
-use staging_live_check::{
+use discord_voice_service_live_validation::{
     LiveContractState, LiveValidationEvidence, StagingConfig, combine_results,
     current_user_absent_from_guild_voice, finalize_success_evidence,
     leave_confirmed_by_rest_voice_state, wait_for_play_and_live_contract,
 };
+use discord_voice_service_proto::discordvoice::v1::{SessionEvent, SessionEventKind};
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpListener;
+use tokio::sync::oneshot;
+use tokio::time::{Duration as TokioDuration, Instant, timeout};
 use twilight_http::Client as HttpClient;
 use twilight_model::id::{
     Id,

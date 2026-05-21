@@ -1,17 +1,9 @@
-use std::{collections::HashMap, env, future::Future, str::FromStr, time::Duration};
+use std::{future::Future, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail};
-use discord_voice_service::proto::discordvoice::v1::discord_voice_control_client::DiscordVoiceControlClient;
-use discord_voice_service::proto::discordvoice::v1::join_voice_request::VoiceContext;
-use discord_voice_service::proto::discordvoice::v1::{
-    JoinVoiceRequest, LeaveVoiceRequest, PlayRequest, SessionEvent, SessionEventKind,
-    SubscribeEventsRequest,
-};
 use futures::StreamExt;
-use serde::Serialize;
 use tokio::time::{Instant, sleep_until, timeout};
 use tracing::{info, warn};
-use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 use twilight_gateway::error::ReceiveMessageErrorType;
 use twilight_gateway::{Event, EventTypeFlags, Intents, Shard, ShardId, StreamExt as _};
 use twilight_http::{Client as HttpClient, error::ErrorType as HttpErrorType};
@@ -22,51 +14,21 @@ use twilight_model::id::{
 };
 use twilight_model::voice::VoiceState;
 
+use discord_voice_service_proto::discordvoice::v1::discord_voice_control_client::DiscordVoiceControlClient;
+use discord_voice_service_proto::discordvoice::v1::join_voice_request::VoiceContext;
+use discord_voice_service_proto::discordvoice::v1::{
+    JoinVoiceRequest, LeaveVoiceRequest, PlayRequest, SessionEvent, SubscribeEventsRequest,
+};
+
+use crate::config::StagingConfig;
+use crate::contract::{
+    LiveContractState, LiveValidationEvidence, emit_validation_evidence, finalize_success_evidence,
+};
+
 const AUTHENTIC_VOICE_EVENT_TIMEOUT: Duration = Duration::from_secs(45);
 const GATEWAY_LEAVE_TIMEOUT: Duration = Duration::from_secs(30);
 const GATEWAY_LEAVE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const LIVE_CONTRACT_TIMEOUT: Duration = Duration::from_secs(240);
-const MIN_LIVE_INTERVAL: Duration = Duration::from_secs(5);
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StagingConfig {
-    pub(crate) application_id: String,
-    pub(crate) bot_token: String,
-    pub(crate) test_guild_id: String,
-    pub(crate) test_voice_channel_id: String,
-    pub(crate) test_video_id: String,
-    pub(crate) discord_voice_service_uri: String,
-    pub(crate) discord_voice_service_ytmusic_addr: String,
-}
-
-impl StagingConfig {
-    pub(crate) fn from_env() -> Result<Self> {
-        Self::from_env_map(env::vars().collect())
-    }
-
-    pub(crate) fn from_env_map(env: HashMap<String, String>) -> Result<Self> {
-        Ok(Self {
-            bot_token: required_env(&env, "BOT_TOKEN")?,
-            application_id: required_env(&env, "APPLICATION_ID")?,
-            test_guild_id: required_env(&env, "TEST_GUILD_ID")?,
-            test_voice_channel_id: required_env(&env, "TEST_VOICE_CHANNEL_ID")?,
-            test_video_id: required_env(&env, "TEST_VIDEO_ID")?,
-            discord_voice_service_uri: required_env(&env, "DISCORD_VOICE_SERVICE_URI")?,
-            discord_voice_service_ytmusic_addr: required_env(
-                &env,
-                "DISCORD_VOICE_SERVICE_YTMUSIC_ADDR",
-            )?,
-        })
-    }
-
-    pub(crate) fn guild_id(&self) -> Result<Id<GuildMarker>> {
-        parse_id(&self.test_guild_id, "TEST_GUILD_ID")
-    }
-
-    pub(crate) fn channel_id(&self) -> Result<Id<ChannelMarker>> {
-        parse_id(&self.test_voice_channel_id, "TEST_VOICE_CHANNEL_ID")
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ForwardedVoiceContext {
@@ -84,37 +46,7 @@ struct ServiceFlowOutcome {
     service_joined: bool,
 }
 
-#[derive(Debug, Default)]
-pub(crate) struct LiveContractState {
-    saw_voice_ready: bool,
-    saw_playing: bool,
-    satisfied_min_interval: bool,
-    min_interval_deadline: Option<Instant>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct LiveValidationEvidence {
-    pub(crate) outcome: String,
-    pub(crate) service_uri: String,
-    pub(crate) ytmusic_addr: String,
-    pub(crate) saw_voice_ready: bool,
-    pub(crate) saw_playing: bool,
-    pub(crate) saw_track_ended: bool,
-    pub(crate) satisfied_min_interval: bool,
-    pub(crate) failure_reason: Option<String>,
-}
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::registry()
-        .with(fmt::layer())
-        .with(EnvFilter::from_default_env())
-        .init();
-
-    run(StagingConfig::from_env()?).await
-}
-
-pub(crate) async fn run(config: StagingConfig) -> Result<()> {
+pub async fn run(config: StagingConfig) -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     info!(
@@ -288,7 +220,7 @@ async fn run_service_flow(
     }
 }
 
-pub(crate) async fn wait_for_play_and_live_contract<ContractFuture, PlayFuture>(
+pub async fn wait_for_play_and_live_contract<ContractFuture, PlayFuture>(
     contract_future: ContractFuture,
     play_future: PlayFuture,
 ) -> Result<LiveContractState>
@@ -436,128 +368,6 @@ async fn assert_live_success_contract(
     }
 }
 
-pub(crate) fn emit_validation_evidence(evidence: &LiveValidationEvidence) -> Result<()> {
-    println!(
-        "{}",
-        serde_json::to_string(evidence).context("serialize live validation evidence")?
-    );
-    Ok(())
-}
-
-pub(crate) fn finalize_success_evidence<BuildEvidence, EmitEvidence>(
-    flow_result: Result<LiveContractState>,
-    cleanup: Result<()>,
-    build_evidence: BuildEvidence,
-    emit_evidence: EmitEvidence,
-) -> Result<()>
-where
-    BuildEvidence: FnOnce(LiveContractState) -> LiveValidationEvidence,
-    EmitEvidence: FnOnce(&LiveValidationEvidence) -> Result<()>,
-{
-    match (flow_result, cleanup) {
-        (Ok(state), Ok(())) => {
-            let evidence = build_evidence(state);
-            emit_evidence(&evidence)
-        }
-        (Err(primary), Ok(())) => Err(primary),
-        (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
-        (Err(primary), Err(cleanup_error)) => {
-            Err(primary.context(format!("cleanup also failed: {cleanup_error}")))
-        }
-    }
-}
-
-impl LiveContractState {
-    pub(crate) fn waiting_for_live_interval(&self) -> bool {
-        self.saw_playing && !self.satisfied_min_interval
-    }
-
-    pub(crate) fn update_min_interval(&mut self, now: Instant) {
-        if let Some(deadline) = self.min_interval_deadline
-            && now >= deadline
-        {
-            self.satisfied_min_interval = true;
-        }
-    }
-
-    pub(crate) fn observe_event(&mut self, event: SessionEvent, now: Instant) -> Result<bool> {
-        let kind = SessionEventKind::try_from(event.kind).unwrap_or(SessionEventKind::Unspecified);
-
-        match kind {
-            SessionEventKind::VoiceReady => {
-                self.saw_voice_ready = true;
-            }
-            SessionEventKind::Playing => {
-                if !self.saw_playing {
-                    self.saw_playing = true;
-                    self.min_interval_deadline = Some(now + MIN_LIVE_INTERVAL);
-                }
-            }
-            SessionEventKind::TrackEnded => {
-                if !self.saw_voice_ready {
-                    bail!("TrackEnded observed before VoiceReady");
-                }
-                if !self.saw_playing {
-                    bail!("TrackEnded observed before Playing");
-                }
-                if !self.satisfied_min_interval {
-                    bail!("TrackEnded observed before 5 seconds of continuous live playback");
-                }
-
-                return Ok(true);
-            }
-            SessionEventKind::FatalError => {
-                bail!("FatalError observed: {}", display_event_message(&event));
-            }
-            SessionEventKind::PlaybackInterrupted => {
-                bail!(
-                    "PlaybackInterrupted observed: {}",
-                    display_event_message(&event)
-                );
-            }
-            SessionEventKind::VoiceReconnecting => {
-                bail!(
-                    "VoiceReconnecting observed: {}",
-                    display_event_message(&event)
-                );
-            }
-            SessionEventKind::VoiceConnecting
-            | SessionEventKind::TrackResolving
-            | SessionEventKind::Buffering
-            | SessionEventKind::Paused
-            | SessionEventKind::Stopped
-                if self.saw_playing =>
-            {
-                bail!(
-                    "playback left steady Playing state after start: {}",
-                    kind.as_str_name()
-                );
-            }
-            _ => {}
-        }
-
-        Ok(false)
-    }
-}
-
-fn next_session_event(
-    maybe_event: Option<Result<SessionEvent, tonic::Status>>,
-) -> Result<SessionEvent> {
-    match maybe_event {
-        Some(Ok(event)) => Ok(event),
-        Some(Err(error)) => Err(anyhow!("event stream failed: {error}")),
-        None => bail!("event stream ended before live contract completed"),
-    }
-}
-
-fn display_event_message(event: &SessionEvent) -> String {
-    if event.message.trim().is_empty() {
-        "no message".to_owned()
-    } else {
-        event.message.clone()
-    }
-}
-
 async fn cleanup_after_flow(
     service_addr: &str,
     service_joined: bool,
@@ -686,7 +496,7 @@ async fn wait_for_gateway_leave(
     }
 }
 
-pub(crate) async fn current_user_absent_from_guild_voice(
+pub async fn current_user_absent_from_guild_voice(
     http: &HttpClient,
     guild_id: Id<GuildMarker>,
 ) -> Result<bool> {
@@ -720,7 +530,7 @@ pub(crate) async fn current_user_absent_from_guild_voice(
     leave_confirmed_by_rest_voice_state(status.get(), Some(&voice_state))
 }
 
-pub(crate) fn leave_confirmed_by_rest_voice_state(
+pub fn leave_confirmed_by_rest_voice_state(
     status: u16,
     voice_state: Option<&VoiceState>,
 ) -> Result<bool> {
@@ -738,7 +548,7 @@ pub(crate) fn leave_confirmed_by_rest_voice_state(
     Ok(voice_state.channel_id.is_none())
 }
 
-pub(crate) fn combine_results(primary: Result<()>, cleanup: Result<()>) -> Result<()> {
+pub fn combine_results(primary: Result<()>, cleanup: Result<()>) -> Result<()> {
     match (primary, cleanup) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(primary), Ok(())) => Err(primary),
@@ -747,16 +557,14 @@ pub(crate) fn combine_results(primary: Result<()>, cleanup: Result<()>) -> Resul
     }
 }
 
-fn required_env(env: &HashMap<String, String>, key: &'static str) -> Result<String> {
-    match env.get(key).map(String::as_str) {
-        Some(value) if !value.trim().is_empty() => Ok(value.to_owned()),
-        Some(_) => bail!("required env var {key} must not be empty"),
-        None => bail!("missing required env var: {key}"),
+fn next_session_event(
+    maybe_event: Option<Result<SessionEvent, tonic::Status>>,
+) -> Result<SessionEvent> {
+    match maybe_event {
+        Some(Ok(event)) => Ok(event),
+        Some(Err(error)) => Err(anyhow!("event stream failed: {error}")),
+        None => bail!("event stream ended before live contract completed"),
     }
-}
-
-fn parse_id<T>(value: &str, field: &'static str) -> Result<Id<T>> {
-    Id::<T>::from_str(value).with_context(|| format!("invalid Discord snowflake in {field}"))
 }
 
 fn is_fatal_gateway_receive_error(error: &twilight_gateway::error::ReceiveMessageError) -> bool {

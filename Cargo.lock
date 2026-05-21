@@ -365,6 +365,21 @@ dependencies = [
 [[package]]
 name = "discord-voice-service-live-validation"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "discord-voice-service-proto",
+ "futures",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "twilight-gateway",
+ "twilight-http",
+ "twilight-model",
+]
 
 [[package]]
 name = "discord-voice-service-playback"
