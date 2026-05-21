@@ -3,7 +3,21 @@ use std::collections::VecDeque;
 use crate::media::http_stream::HttpOpusStream;
 use crate::media::position::{PlaybackPosition, SharedPlaybackPosition};
 use crate::media::webm_demux::{DemuxedPacket, WebmOpusDemux};
-use crate::ytmusic::client::ResolvedPlaybackSource;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedPlaybackSource {
+    pub selected_itag: u32,
+    pub playable_url: String,
+}
+
+impl ResolvedPlaybackSource {
+    pub(crate) fn from_parts(selected_itag: u32, playable_url: String) -> Self {
+        Self {
+            selected_itag,
+            playable_url,
+        }
+    }
+}
 
 pub struct PlaybackSource {
     resolved: ResolvedPlaybackSource,

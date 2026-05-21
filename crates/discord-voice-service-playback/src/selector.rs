@@ -1,11 +1,11 @@
 use std::cmp::Reverse;
 
-use crate::error::AppError;
-use crate::ytmusic::v1::SongStreamFormat;
+use crate::error::PlaybackError;
+use ytmusic_service_proto::ytmusic::v1::SongStreamFormat;
 
 pub fn select_song_stream_format(
     formats: &[SongStreamFormat],
-) -> Result<SongStreamFormat, AppError> {
+) -> Result<SongStreamFormat, PlaybackError> {
     let mut allowed = formats
         .iter()
         .filter(|format| {
@@ -21,7 +21,7 @@ pub fn select_song_stream_format(
     allowed
         .into_iter()
         .next()
-        .ok_or(AppError::UnsupportedFormat)
+        .ok_or(PlaybackError::UnsupportedFormat)
 }
 
 fn priority_for_itag(itag: u32) -> u8 {

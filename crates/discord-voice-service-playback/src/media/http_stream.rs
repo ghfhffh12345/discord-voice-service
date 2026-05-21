@@ -2,7 +2,7 @@ use bytes::{Bytes, BytesMut};
 use reqwest::StatusCode;
 use reqwest::header::{CONTENT_RANGE, RANGE};
 
-use crate::error::AppError;
+use crate::error::PlaybackError;
 
 use super::position::PlaybackPosition;
 
@@ -30,7 +30,7 @@ impl HttpOpusStream {
         self.position.set_byte_offset(byte_offset);
     }
 
-    pub async fn read_chunk(&mut self) -> Result<Option<Bytes>, AppError> {
+    pub async fn read_chunk(&mut self) -> Result<Option<Bytes>, PlaybackError> {
         let expected_start = self.position.byte_offset();
         let range = format!("bytes={expected_start}-");
         let mut response = self
@@ -67,32 +67,32 @@ impl HttpOpusStream {
 fn validate_resume_response(
     response: &reqwest::Response,
     expected_start: u64,
-) -> Result<(), AppError> {
+) -> Result<(), PlaybackError> {
     if expected_start == 0 {
         return Ok(());
     }
 
     if response.status() != StatusCode::PARTIAL_CONTENT {
-        return Err(AppError::MediaParseDetail(format!(
+        return Err(PlaybackError::MediaParseDetail(format!(
             "range request was not honored: expected 206 for resume at byte {expected_start}, got {}",
             response.status()
         )));
     }
 
     let Some(content_range) = response.headers().get(CONTENT_RANGE) else {
-        return Err(AppError::MediaParseDetail(format!(
+        return Err(PlaybackError::MediaParseDetail(format!(
             "range request was not honored: missing Content-Range for resume at byte {expected_start}"
         )));
     };
 
     let content_range = content_range.to_str().map_err(|_| {
-        AppError::MediaParseDetail(
+        PlaybackError::MediaParseDetail(
             "range request was not honored: invalid Content-Range header".into(),
         )
     })?;
 
     if !content_range.starts_with(&format!("bytes {expected_start}-")) {
-        return Err(AppError::MediaParseDetail(format!(
+        return Err(PlaybackError::MediaParseDetail(format!(
             "range request was not honored: expected Content-Range to start at byte {expected_start}, got {content_range}"
         )));
     }

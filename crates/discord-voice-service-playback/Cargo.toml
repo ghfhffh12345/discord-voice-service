@@ -4,3 +4,17 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+bytes.workspace = true
+http.workspace = true
+reqwest.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+webm-iterable.workspace = true
+ytmusic-service-proto.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true

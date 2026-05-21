@@ -1,22 +1,8 @@
-use crate::error::AppError;
-use crate::ytmusic::selector::select_song_stream_format;
-use crate::ytmusic::v1::yt_music_public_client::YtMusicPublicClient;
-use crate::ytmusic::v1::{DecipherRequest, GetSongRequest, SongStreamFormat};
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ResolvedPlaybackSource {
-    pub selected_itag: u32,
-    pub playable_url: String,
-}
-
-impl ResolvedPlaybackSource {
-    fn from_song(selected: SongStreamFormat, playable_url: String) -> Self {
-        Self {
-            selected_itag: selected.itag,
-            playable_url,
-        }
-    }
-}
+use crate::error::PlaybackError;
+use crate::selector::select_song_stream_format;
+use crate::source::ResolvedPlaybackSource;
+use ytmusic_service_proto::ytmusic::v1::yt_music_public_client::YtMusicPublicClient;
+use ytmusic_service_proto::ytmusic::v1::{DecipherRequest, GetSongRequest};
 
 #[derive(Debug)]
 pub struct YtMusicClient {
@@ -24,7 +10,7 @@ pub struct YtMusicClient {
 }
 
 impl YtMusicClient {
-    pub async fn connect(endpoint: String) -> Result<Self, AppError> {
+    pub async fn connect(endpoint: String) -> Result<Self, PlaybackError> {
         let channel = tonic::transport::Endpoint::from_shared(endpoint)?
             .connect()
             .await?;
@@ -36,7 +22,7 @@ impl YtMusicClient {
     pub async fn resolve_playback_source(
         &mut self,
         video_id: &str,
-    ) -> Result<ResolvedPlaybackSource, AppError> {
+    ) -> Result<ResolvedPlaybackSource, PlaybackError> {
         let song = self
             .inner
             .get_song(GetSongRequest {
@@ -44,7 +30,9 @@ impl YtMusicClient {
             })
             .await?
             .into_inner();
-        let streaming_data = song.streaming_data.ok_or(AppError::UnsupportedFormat)?;
+        let streaming_data = song
+            .streaming_data
+            .ok_or(PlaybackError::UnsupportedFormat)?;
         let selected = select_song_stream_format(&streaming_data.adaptive_formats)?;
         let deciphered = self
             .inner
@@ -54,8 +42,8 @@ impl YtMusicClient {
             .await?
             .into_inner();
 
-        Ok(ResolvedPlaybackSource::from_song(
-            selected,
+        Ok(ResolvedPlaybackSource::from_parts(
+            selected.itag,
             deciphered.playable_url,
         ))
     }

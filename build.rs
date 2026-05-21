@@ -11,12 +11,6 @@ fn build_protos() -> Result<(), Box<dyn std::error::Error>> {
     tonic_build::configure()
         .build_server(true)
         .build_client(true)
-        .compile_protos(
-            &[
-                "proto/discordvoice/v1/control.proto",
-                "proto/ytmusic/v1/public.proto",
-            ],
-            &["proto"],
-        )?;
+        .compile_protos(&["proto/discordvoice/v1/control.proto"], &["proto"])?;
     Ok(())
 }

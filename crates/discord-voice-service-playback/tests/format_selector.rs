@@ -1,9 +1,9 @@
 #[path = "support/fake_ytmusic.rs"]
 mod fake_ytmusic;
 
-use discord_voice_service::ytmusic::client::YtMusicClient;
-use discord_voice_service::ytmusic::selector::select_song_stream_format;
-use discord_voice_service::ytmusic::v1::SongStreamFormat;
+use discord_voice_service_playback::YtMusicClient;
+use discord_voice_service_playback::selector::select_song_stream_format;
+use ytmusic_service_proto::ytmusic::v1::SongStreamFormat;
 
 use self::fake_ytmusic::FakeYtMusic;
 

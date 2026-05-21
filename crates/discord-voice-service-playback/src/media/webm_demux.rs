@@ -6,7 +6,7 @@ use webm_iterable::WebmIterator;
 use webm_iterable::errors::{TagIteratorError, WebmCoercionError};
 use webm_iterable::matroska_spec::{Block, Frame, Master, MatroskaSpec, SimpleBlock};
 
-use crate::error::AppError;
+use crate::error::PlaybackError;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DemuxedPacket {
@@ -26,7 +26,7 @@ impl WebmOpusDemux {
         self.pending.extend_from_slice(&chunk);
     }
 
-    pub fn drain_packets(&mut self) -> Result<Vec<DemuxedPacket>, AppError> {
+    pub fn drain_packets(&mut self) -> Result<Vec<DemuxedPacket>, PlaybackError> {
         if self.pending.is_empty() {
             return Ok(Vec::new());
         }
@@ -34,7 +34,7 @@ impl WebmOpusDemux {
         match WebmDemuxState::parse(self.pending.as_ref())? {
             Some(packets) => {
                 if self.emitted_packets > packets.len() {
-                    return Err(AppError::MediaParse(
+                    return Err(PlaybackError::MediaParse(
                         "demux packet cursor exceeded parsed packet count",
                     ));
                 }
@@ -72,7 +72,7 @@ impl Default for WebmDemuxState {
 }
 
 impl WebmDemuxState {
-    fn parse(input: &[u8]) -> Result<Option<Vec<DemuxedPacket>>, AppError> {
+    fn parse(input: &[u8]) -> Result<Option<Vec<DemuxedPacket>>, PlaybackError> {
         let tags_to_buffer = [
             MatroskaSpec::TrackEntry(Master::Start),
             MatroskaSpec::BlockGroup(Master::Start),
@@ -101,7 +101,7 @@ impl WebmDemuxState {
         &mut self,
         tag: MatroskaSpec,
         packets: &mut Vec<DemuxedPacket>,
-    ) -> Result<(), AppError> {
+    ) -> Result<(), PlaybackError> {
         match tag {
             MatroskaSpec::TimestampScale(scale) => {
                 self.timestamp_scale_ns = scale;
@@ -150,7 +150,10 @@ impl WebmDemuxState {
         }
     }
 
-    fn extract_simple_block(&self, block: SimpleBlock<'_>) -> Result<Vec<DemuxedPacket>, AppError> {
+    fn extract_simple_block(
+        &self,
+        block: SimpleBlock<'_>,
+    ) -> Result<Vec<DemuxedPacket>, PlaybackError> {
         if !self.is_target_track(block.track) {
             return Ok(Vec::new());
         }
@@ -163,7 +166,7 @@ impl WebmDemuxState {
     fn extract_block_group(
         &self,
         children: Vec<MatroskaSpec>,
-    ) -> Result<Vec<DemuxedPacket>, AppError> {
+    ) -> Result<Vec<DemuxedPacket>, PlaybackError> {
         let mut block_data = None;
         let mut block_duration_ms = None;
 
@@ -204,7 +207,7 @@ impl WebmDemuxState {
         frames: Vec<Frame<'_>>,
         block_duration_ms: Option<u64>,
         fallback_duration_ms: Option<u64>,
-    ) -> Result<Vec<DemuxedPacket>, AppError> {
+    ) -> Result<Vec<DemuxedPacket>, PlaybackError> {
         if frames.is_empty() {
             return Ok(Vec::new());
         }
@@ -234,19 +237,19 @@ impl WebmDemuxState {
         Ok(packets)
     }
 
-    fn block_timestamp_ms(&self, relative_timestamp: i16) -> Result<u64, AppError> {
+    fn block_timestamp_ms(&self, relative_timestamp: i16) -> Result<u64, PlaybackError> {
         let total_ticks = i128::from(self.cluster_timestamp) + i128::from(relative_timestamp);
         if total_ticks < 0 {
-            return Err(AppError::MediaParse("negative block timestamp"));
+            return Err(PlaybackError::MediaParse("negative block timestamp"));
         }
 
         self.scale_timestamp_to_ms(total_ticks as u64)
     }
 
-    fn scale_timestamp_to_ms(&self, ticks: u64) -> Result<u64, AppError> {
+    fn scale_timestamp_to_ms(&self, ticks: u64) -> Result<u64, PlaybackError> {
         let scaled = u128::from(ticks)
             .checked_mul(u128::from(self.timestamp_scale_ns))
-            .ok_or(AppError::MediaParse("timestamp overflow"))?;
+            .ok_or(PlaybackError::MediaParse("timestamp overflow"))?;
         Ok((scaled / 1_000_000) as u64)
     }
 
@@ -311,6 +314,6 @@ fn distribute_duration(total_duration_ms: u64, parts: usize) -> Vec<u64> {
     durations
 }
 
-fn map_webm_coercion_error(error: WebmCoercionError) -> AppError {
-    AppError::MediaParseDetail(error.to_string())
+fn map_webm_coercion_error(error: WebmCoercionError) -> PlaybackError {
+    PlaybackError::MediaParseDetail(error.to_string())
 }

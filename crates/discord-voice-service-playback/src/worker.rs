@@ -1,12 +1,12 @@
-use crate::error::AppError;
+use crate::error::PlaybackError;
 use crate::media::opus_queue::{OpusFrame, OpusFrameQueue};
 use crate::media::position::{PlaybackPosition, SharedPlaybackPosition, shared_playback_position};
 use crate::media::webm_demux::DemuxedPacket;
-use crate::playback::recovery::PlaybackRecovery;
-use crate::playback::source::PlaybackSource;
-use crate::ytmusic::client::YtMusicClient;
-use crate::ytmusic::selector::select_song_stream_format;
-use crate::ytmusic::v1::SongStreamFormat;
+use crate::recovery::PlaybackRecovery;
+use crate::selector::select_song_stream_format;
+use crate::source::PlaybackSource;
+use crate::ytmusic_client::YtMusicClient;
+use ytmusic_service_proto::ytmusic::v1::SongStreamFormat;
 
 const DEFAULT_PREBUFFER_TARGET: usize = 4;
 
@@ -47,7 +47,7 @@ impl PlaybackWorker {
         &mut self,
         video_id: &str,
         queue: &mut OpusFrameQueue,
-    ) -> Result<PlaybackSource, AppError> {
+    ) -> Result<PlaybackSource, PlaybackError> {
         let resume_position_ms = if self.current_video_id.as_deref() == Some(video_id) {
             self.position.lock().unwrap().sent_duration_ms()
         } else {
@@ -60,7 +60,7 @@ impl PlaybackWorker {
 
         self.fill_queue(&mut source, queue).await?;
         if queue.is_empty() {
-            return Err(AppError::MediaParse("unexpected end of stream"));
+            return Err(PlaybackError::MediaParse("unexpected end of stream"));
         }
 
         self.current_video_id = Some(video_id.to_owned());
@@ -77,7 +77,7 @@ impl PlaybackWorker {
         &mut self,
         source: &mut PlaybackSource,
         queue: &mut OpusFrameQueue,
-    ) -> Result<(), AppError> {
+    ) -> Result<(), PlaybackError> {
         while queue.len() < self.prebuffer_target {
             if let Some(packet) = source.pending_packets_mut().pop_front() {
                 self.buffer_packet(queue, packet)?;
@@ -110,10 +110,10 @@ impl PlaybackWorker {
         &mut self,
         queue: &mut OpusFrameQueue,
         packet: DemuxedPacket,
-    ) -> Result<(), AppError> {
+    ) -> Result<(), PlaybackError> {
         self.position.lock().unwrap().record_buffered(&packet);
         queue
             .push(OpusFrame::new(packet.data.clone(), packet.duration_ms))
-            .map_err(|_| AppError::BufferFull)
+            .map_err(|_| PlaybackError::BufferFull)
     }
 }
