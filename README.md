@@ -83,11 +83,6 @@ Startup fails if either variable is missing or if `DISCORD_VOICE_SERVICE_YTMUSIC
 
 The staging controller is a separate contract. It reaches this service through `DISCORD_VOICE_SERVICE_URI`, while the service process itself binds from `DISCORD_VOICE_SERVICE_BIND_ADDR`.
 
-The current scaffold also hard-codes queue targets in code:
-
-- Prebuffer target: 150 Opus frames
-- Maximum queue depth: 300 Opus frames
-
 ## Run with Podman
 
 If you already have Podman, this is the fastest way to start the service next to `ytmusic-service`. Podman will pull `ghcr.io/ghfhffh12345/discord-voice-service:latest` automatically if it is not already present locally. The example below assumes a shared network and that `ytmusic-service` is reachable as `http://ytmusic-service:50051`.

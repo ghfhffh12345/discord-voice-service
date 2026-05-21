@@ -11,8 +11,6 @@ const INVALID_YTMUSIC_ADDR: &str = "invalid DISCORD_VOICE_SERVICE_YTMUSIC_ADDR";
 pub struct Settings {
     pub bind_addr: SocketAddr,
     pub ytmusic_addr: String,
-    pub prebuffer_frames: usize,
-    pub max_buffer_frames: usize,
 }
 
 impl Settings {
@@ -47,8 +45,6 @@ impl Settings {
         Ok(Self {
             bind_addr,
             ytmusic_addr: ytmusic_addr.to_owned(),
-            prebuffer_frames: 150,
-            max_buffer_frames: 300,
         })
     }
 

@@ -12,10 +12,13 @@ fn parses_required_env_and_defaults() {
     ])
     .expect("settings should parse");
 
-    assert_eq!(settings.bind_addr.to_string(), "127.0.0.1:55051");
-    assert_eq!(settings.ytmusic_addr, "http://127.0.0.1:50051");
-    assert_eq!(settings.prebuffer_frames, 150);
-    assert_eq!(settings.max_buffer_frames, 300);
+    let Settings {
+        bind_addr,
+        ytmusic_addr,
+    } = settings;
+
+    assert_eq!(bind_addr.to_string(), "127.0.0.1:55051");
+    assert_eq!(ytmusic_addr, "http://127.0.0.1:50051");
 }
 
 #[test]
