@@ -113,7 +113,7 @@ cd discord-voice-service
 export DISCORD_VOICE_SERVICE_BIND_ADDR=127.0.0.1:55051
 export DISCORD_VOICE_SERVICE_YTMUSIC_ADDR=http://127.0.0.1:50051
 
-cargo run
+cargo run -p discord-voice-service
 ```
 
 ## Live staging validation
@@ -155,7 +155,7 @@ Inside the live workflow, the service container still binds with `DISCORD_VOICE_
 For a manual or local staging run, the operator command is:
 
 ```bash
-cargo run --bin staging_live_check
+cargo run -p discord-voice-service-live-validation --bin staging_live_check
 ```
 
 For manual `workflow_dispatch` live-staging runs, provide `discord_voice_service_image_ref` or configure the runner fallback `DISCORD_VOICE_SERVICE_IMAGE_REF`. Optional digest validation is available through `discord_voice_service_image_digest` or `DISCORD_VOICE_SERVICE_IMAGE_DIGEST`.
@@ -173,7 +173,7 @@ The workflow intentionally starts the live dependencies itself instead of assumi
 1. check out the requested commit cleanly
 2. rely on the runner's pre-existing Node 24 action support for checkout, then validate tools, secrets, browser config, and candidate artifact identity before the live run
 3. copy the runner-local browser config into `${GITHUB_WORKSPACE}/browser.json`
-4. build the staging controller binary from the checked-out source
+4. build the staging controller binary from the checked-out source with `cargo build --locked -p discord-voice-service-live-validation --bin staging_live_check`
 5. start `ytmusic-service` in Podman with `./browser.json`
 6. start the exact candidate `discord-voice-service` container artifact from GHCR
 7. run the built `staging_live_check` binary
@@ -210,8 +210,8 @@ Fetch the current session state:
 
 ```bash
 grpcurl -plaintext \
-  -import-path proto \
-  -proto proto/discordvoice/v1/control.proto \
+  -import-path crates/discord-voice-service-proto/proto \
+  -proto crates/discord-voice-service-proto/proto/discordvoice/v1/control.proto \
   -d '{}' \
   127.0.0.1:55051 \
   discordvoice.v1.DiscordVoiceControl/GetState
@@ -221,8 +221,8 @@ Install Discord voice session details from the main bot:
 
 ```bash
 grpcurl -plaintext \
-  -import-path proto \
-  -proto proto/discordvoice/v1/control.proto \
+  -import-path crates/discord-voice-service-proto/proto \
+  -proto crates/discord-voice-service-proto/proto/discordvoice/v1/control.proto \
   -d '{
     "voice": {
       "guildId": "123456789012345678",
@@ -240,8 +240,8 @@ Start playback for a selected YouTube Music `videoId`:
 
 ```bash
 grpcurl -plaintext \
-  -import-path proto \
-  -proto proto/discordvoice/v1/control.proto \
+  -import-path crates/discord-voice-service-proto/proto \
+  -proto crates/discord-voice-service-proto/proto/discordvoice/v1/control.proto \
   -d '{"videoId":"dQw4w9WgXcQ"}' \
   127.0.0.1:55051 \
   discordvoice.v1.DiscordVoiceControl/Play
@@ -251,8 +251,8 @@ Pause, resume, stop, or leave:
 
 ```bash
 grpcurl -plaintext \
-  -import-path proto \
-  -proto proto/discordvoice/v1/control.proto \
+  -import-path crates/discord-voice-service-proto/proto \
+  -proto crates/discord-voice-service-proto/proto/discordvoice/v1/control.proto \
   -d '{}' \
   127.0.0.1:55051 \
   discordvoice.v1.DiscordVoiceControl/Pause
@@ -264,8 +264,8 @@ Stream session events:
 
 ```bash
 grpcurl -plaintext \
-  -import-path proto \
-  -proto proto/discordvoice/v1/control.proto \
+  -import-path crates/discord-voice-service-proto/proto \
+  -proto crates/discord-voice-service-proto/proto/discordvoice/v1/control.proto \
   -d '{}' \
   127.0.0.1:55051 \
   discordvoice.v1.DiscordVoiceControl/SubscribeEvents
@@ -282,7 +282,6 @@ grpcurl -plaintext \
 
 ## Further reference
 
-- [`proto/discordvoice/v1/control.proto`](proto/discordvoice/v1/control.proto)
+- [`crates/discord-voice-service-proto/proto/discordvoice/v1/control.proto`](crates/discord-voice-service-proto/proto/discordvoice/v1/control.proto)
 - [`docs/operations/live-staging-runner.md`](docs/operations/live-staging-runner.md)
-- [`docs/superpowers/specs/2026-05-18-discord-voice-service-design.md`](docs/superpowers/specs/2026-05-18-discord-voice-service-design.md)
 - [ghfhffh12345/ytmusic-service](https://github.com/ghfhffh12345/ytmusic-service)

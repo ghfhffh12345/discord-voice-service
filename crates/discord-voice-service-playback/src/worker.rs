@@ -1,10 +1,10 @@
+use super::ytmusic_client::YtMusicClient;
 use crate::error::PlaybackError;
 use crate::media::opus_queue::{OpusFrame, OpusFrameQueue};
 use crate::media::position::{PlaybackPosition, SharedPlaybackPosition, shared_playback_position};
 use crate::media::webm_demux::DemuxedPacket;
 use crate::recovery::PlaybackRecovery;
 use crate::source::PlaybackSource;
-use crate::ytmusic_client::YtMusicClient;
 
 const DEFAULT_PREBUFFER_TARGET: usize = 4;
 

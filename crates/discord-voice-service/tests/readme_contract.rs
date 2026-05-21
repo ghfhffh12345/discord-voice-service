@@ -2,7 +2,7 @@ use std::fs;
 
 #[test]
 fn readme_publishes_the_new_production_contract() {
-    let readme = fs::read_to_string("README.md").expect("README should exist");
+    let readme = fs::read_to_string("../../README.md").expect("README should exist");
 
     assert!(readme.contains("DISCORD_VOICE_SERVICE_BIND_ADDR"));
     assert!(readme.contains("DISCORD_VOICE_SERVICE_URI"));

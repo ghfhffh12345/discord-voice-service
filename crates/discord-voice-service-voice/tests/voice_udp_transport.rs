@@ -5,8 +5,8 @@ use bytes::Bytes;
 use discord_voice_service_voice::VoiceError;
 use discord_voice_service_voice::crypto::{EncryptionMode, choose_mode};
 use discord_voice_service_voice::test_support::{
-    build_ip_discovery_packet, discover_ip, parse_ip_discovery_response,
-    send_speaking, OPUS_SILENCE_FRAME, VoiceGatewayClient, VoiceUdpTransport,
+    OPUS_SILENCE_FRAME, VoiceGatewayClient, VoiceUdpTransport, build_ip_discovery_packet,
+    discover_ip, parse_ip_discovery_response, send_speaking,
 };
 use futures::StreamExt;
 use serde_json::Value;
@@ -241,7 +241,9 @@ impl TestConnectedVoiceSession {
         let server = lookup_host(udp)
             .await?
             .next()
-            .ok_or(VoiceError::InvalidState("voice session test udp unresolved"))?;
+            .ok_or(VoiceError::InvalidState(
+                "voice session test udp unresolved",
+            ))?;
 
         Ok(Self {
             gateway: VoiceGatewayClient::connect(url).await?,

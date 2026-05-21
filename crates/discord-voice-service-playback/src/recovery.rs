@@ -1,12 +1,12 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
+use super::ytmusic_client::YtMusicClient;
 use crate::error::PlaybackError;
 use crate::media::http_stream::HttpOpusStream;
 use crate::media::position::{PlaybackPosition, shared_playback_position};
 use crate::media::webm_demux::{DemuxedPacket, WebmOpusDemux};
 use crate::source::{PlaybackSource, ResolvedPlaybackSource};
-use crate::ytmusic_client::YtMusicClient;
 use reqwest::StatusCode;
 use tokio::time::timeout;
 

@@ -55,10 +55,12 @@ impl Observability {
 
     pub fn record_state_query(&self, snapshot: &Snapshot, readiness: ReadinessSnapshot) {
         let total = self.state_queries_total.fetch_add(1, Ordering::Relaxed) + 1;
+        let message = render_snapshot_message(snapshot, readiness);
         event!(
             target: "discord_voice_service.state",
             Level::DEBUG,
             state = ?snapshot.state,
+            message,
             ready = readiness.is_ready(),
             runtime_booted = readiness.runtime_booted,
             ytmusic_healthy = readiness.ytmusic_healthy,

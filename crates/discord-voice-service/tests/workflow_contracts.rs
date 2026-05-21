@@ -2,11 +2,11 @@ use std::fs;
 
 #[test]
 fn live_staging_workflow_targets_container_artifacts() {
-    let workflow = fs::read_to_string(".github/workflows/live-staging.yml")
+    let workflow = fs::read_to_string("../../.github/workflows/live-staging.yml")
         .expect("live-staging workflow should exist");
-    let preflight = fs::read_to_string("scripts/ci/live_staging_preflight.sh")
+    let preflight = fs::read_to_string("../../scripts/ci/live_staging_preflight.sh")
         .expect("live staging preflight script should exist");
-    let run_script = fs::read_to_string("scripts/ci/run_live_staging.sh")
+    let run_script = fs::read_to_string("../../scripts/ci/run_live_staging.sh")
         .expect("live staging runner script should exist");
 
     assert!(workflow.contains("discord_voice_service_image_ref"));
@@ -31,9 +31,9 @@ fn live_staging_workflow_targets_container_artifacts() {
 
 #[test]
 fn release_workflow_promotes_validated_candidate_digest() {
-    let workflow = fs::read_to_string(".github/workflows/release-image.yml")
+    let workflow = fs::read_to_string("../../.github/workflows/release-image.yml")
         .expect("release-image workflow should exist");
-    let promote_script = fs::read_to_string("scripts/ci/promote_candidate_image.sh")
+    let promote_script = fs::read_to_string("../../scripts/ci/promote_candidate_image.sh")
         .expect("promote candidate image script should exist");
 
     assert!(workflow.contains("candidate-"));
@@ -52,7 +52,7 @@ fn release_workflow_promotes_validated_candidate_digest() {
 
 #[test]
 fn live_confidence_workflow_exists() {
-    let workflow = fs::read_to_string(".github/workflows/live-confidence.yml")
+    let workflow = fs::read_to_string("../../.github/workflows/live-confidence.yml")
         .expect("live-confidence workflow should exist");
 
     assert!(workflow.contains("schedule:"));

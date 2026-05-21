@@ -2,9 +2,9 @@
 
 use std::sync::{Arc, Mutex as StdMutex};
 
+use discord_voice_service_voice::VoiceContext;
 use discord_voice_service_voice::crypto::{PREFERRED_MODE, REQUIRED_MODE};
 use discord_voice_service_voice::dave::{DaveExternalSender, DaveSession};
-use discord_voice_service_voice::VoiceContext;
 use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::net::{TcpListener, UdpSocket};

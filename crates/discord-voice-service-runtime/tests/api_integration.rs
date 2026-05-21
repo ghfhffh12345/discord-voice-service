@@ -338,7 +338,6 @@ async fn update_voice_context_is_accepted_during_playback() {
     assert_eq!(state.guild_id, rotated.guild_id);
     assert_eq!(state.channel_id, rotated.channel_id);
     assert_eq!(state.current_video_id, "video-1");
-
 }
 
 #[tokio::test]

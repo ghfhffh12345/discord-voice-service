@@ -1,9 +1,7 @@
-FROM docker.io/library/rust:1.88-bookworm AS builder
+FROM docker.io/library/rust:1.89-bookworm AS builder
 WORKDIR /app
-COPY Cargo.toml Cargo.lock build.rs ./
-COPY proto ./proto
-COPY src ./src
-RUN cargo build --release
+COPY . .
+RUN cargo build --release --locked -p discord-voice-service
 
 FROM gcr.io/distroless/cc-debian12
 WORKDIR /app

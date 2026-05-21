@@ -9,6 +9,10 @@ on:
         description: Optional override for the discord-voice-service image ref to validate
         required: false
         type: string
+      discord_voice_service_image_digest:
+        description: Optional expected digest for the discord-voice-service image ref
+        required: false
+        type: string
       ytmusic_service_image_ref:
         description: Optional override for the ytmusic-service image ref to validate
         required: false
@@ -19,5 +23,6 @@ jobs:
     uses: ./.github/workflows/live-staging.yml
     with:
       discord_voice_service_image_ref: ${{ inputs.discord_voice_service_image_ref || format('ghcr.io/{0}/discord-voice-service:latest', github.repository_owner) }}
+      discord_voice_service_image_digest: ${{ inputs.discord_voice_service_image_digest }}
       ytmusic_service_image_ref: ${{ inputs.ytmusic_service_image_ref }}
     secrets: inherit

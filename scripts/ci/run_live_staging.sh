@@ -57,7 +57,7 @@ trap cleanup EXIT
 browser_json_source_path="${BROWSER_JSON_SOURCE_PATH:-${STAGING_BROWSER_JSON_SOURCE_PATH:-}}"
 install -m 600 "${browser_json_source_path}" "${staged_browser_json}"
 
-cargo build --locked --bin staging_live_check
+cargo build --locked -p discord-voice-service-live-validation --bin staging_live_check
 
 if ! podman network inspect "${network_name}" >/dev/null 2>&1; then
   podman network create "${network_name}" >/dev/null

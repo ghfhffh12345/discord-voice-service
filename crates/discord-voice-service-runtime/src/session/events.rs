@@ -14,6 +14,7 @@ pub enum SessionEventKind {
     TrackEnded,
     PlaybackInterrupted,
     RecoverableWarning,
+    #[expect(dead_code, reason = "reserved for surfaced fatal session events")]
     FatalError,
     VoiceReconnecting,
 }
@@ -29,17 +30,6 @@ pub struct SessionEventRecord {
 }
 
 impl SessionEventRecord {
-    pub fn new(kind: SessionEventKind) -> Self {
-        Self {
-            kind,
-            guild_id: None,
-            channel_id: None,
-            current_video_id: None,
-            selected_itag: None,
-            message: None,
-        }
-    }
-
     pub fn from_snapshot(kind: SessionEventKind, snapshot: &Snapshot) -> Self {
         Self {
             kind,

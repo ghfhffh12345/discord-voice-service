@@ -9,16 +9,19 @@
 - Runner-local `browser.json` available through `STAGING_BROWSER_JSON_SOURCE_PATH`
 - Protected `live-staging` GitHub environment required to supply the Discord secrets and enforce any required reviewer approvals before the live gate starts
 
+The workflow checks out the workspace, builds `staging_live_check` from the `discord-voice-service-live-validation` package, then runs the resolved `discord-voice-service` container artifact under Podman.
+
 ## Preflight expectations
 
 - The workflow verifies tools, secrets, browser config, and candidate artifact identity before live execution.
+- The controller build command is `cargo build --locked -p discord-voice-service-live-validation --bin staging_live_check`.
 - A preflight failure is a configuration problem, not a flaky success condition.
 
 ## Failure diagnosis
 
 - Preflight failure: fix runner prerequisites or secret/config wiring.
 - Service container failure: inspect `discord-voice-service-live-staging` logs.
-- Controller failure: inspect the JSON evidence line from `staging_live_check`.
+- Controller failure: inspect the JSON evidence line from `target/debug/staging_live_check`.
 - Cleanup failure: inspect the workflow summary and rerun only after confirming the test bot has left voice.
 
 ## Rollback model
