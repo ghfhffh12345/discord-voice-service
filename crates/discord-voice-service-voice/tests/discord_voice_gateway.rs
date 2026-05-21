@@ -1,5 +1,5 @@
 use discord_voice_service_voice::crypto::{PREFERRED_MODE, REQUIRED_MODE, pick_mode};
-use discord_voice_service_voice::rtp::RtpPacketBuilder;
+use discord_voice_service_voice::test_support::RtpPacketBuilder;
 
 #[test]
 fn builds_rtp_header_for_discord_voice() {

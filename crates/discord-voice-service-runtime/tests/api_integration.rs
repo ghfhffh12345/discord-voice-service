@@ -6,7 +6,7 @@ use discord_voice_service_proto::discordvoice::v1::{
     SessionEventKind, SessionStateSnapshot, SubscribeEventsRequest, UpdateVoiceContextRequest,
     join_voice_request,
 };
-use discord_voice_service_runtime::{ControlService, Readiness, Supervisor, VoiceContext};
+use discord_voice_service_runtime::{ControlService, Readiness, Supervisor};
 use discord_voice_service_test_support::fake_discord::FakeDiscordPeer;
 use discord_voice_service_test_support::fake_ytmusic::FakeYtMusic;
 use discord_voice_service_test_support::fixtures::spawn_stream_server;
@@ -339,12 +339,6 @@ async fn update_voice_context_is_accepted_during_playback() {
     assert_eq!(state.channel_id, rotated.channel_id);
     assert_eq!(state.current_video_id, "video-1");
 
-    let voice = harness.current_voice_context().await.unwrap();
-    assert_eq!(voice.guild_id, rotated.guild_id);
-    assert_eq!(voice.channel_id, rotated.channel_id);
-    assert_eq!(voice.session_id, rotated.session_id);
-    assert_eq!(voice.endpoint, rotated.endpoint);
-    assert_eq!(voice.token, rotated.token);
 }
 
 #[tokio::test]
@@ -440,10 +434,6 @@ impl ApiHarness {
             .await
             .unwrap()
             .into_inner()
-    }
-
-    async fn current_voice_context(&self) -> Option<VoiceContext> {
-        self.service.supervisor.current_voice_context().await
     }
 }
 

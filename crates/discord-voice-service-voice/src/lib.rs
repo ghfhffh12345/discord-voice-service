@@ -1,19 +1,32 @@
 pub mod crypto;
 pub mod dave;
 pub(crate) mod dave_ffi;
-pub mod discovery;
+mod discovery;
 mod error;
-pub mod gateway;
+mod gateway;
 pub mod handshake;
-pub mod protection;
+mod protection;
 mod protocol;
-pub mod resume;
+mod resume;
 pub(crate) mod rollover;
-pub mod rtp;
+mod rtp;
 mod session;
-pub mod speaking;
-pub mod udp;
+mod speaking;
+mod udp;
 mod ws;
 
 pub use error::VoiceError;
 pub use session::{ConnectedVoiceSession, VoiceContext};
+
+#[doc(hidden)]
+pub mod test_support {
+    pub use crate::discovery::{
+        build_ip_discovery_packet, discover_ip, parse_ip_discovery_response,
+    };
+    pub use crate::gateway::VoiceGatewayClient;
+    pub use crate::protection::ProtectionContext;
+    pub use crate::resume::GatewayEvent;
+    pub use crate::rtp::RtpPacketBuilder;
+    pub use crate::speaking::{OPUS_SILENCE_FRAME, send_speaking};
+    pub use crate::udp::VoiceUdpTransport;
+}

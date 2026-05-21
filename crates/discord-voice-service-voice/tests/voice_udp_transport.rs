@@ -4,12 +4,10 @@ use std::sync::Arc;
 use bytes::Bytes;
 use discord_voice_service_voice::VoiceError;
 use discord_voice_service_voice::crypto::{EncryptionMode, choose_mode};
-use discord_voice_service_voice::discovery::{
+use discord_voice_service_voice::test_support::{
     build_ip_discovery_packet, discover_ip, parse_ip_discovery_response,
+    send_speaking, OPUS_SILENCE_FRAME, VoiceGatewayClient, VoiceUdpTransport,
 };
-use discord_voice_service_voice::gateway::VoiceGatewayClient;
-use discord_voice_service_voice::speaking::{OPUS_SILENCE_FRAME, send_speaking};
-use discord_voice_service_voice::udp::VoiceUdpTransport;
 use futures::StreamExt;
 use serde_json::Value;
 use tokio::net::{TcpListener, UdpSocket, lookup_host};
@@ -228,22 +226,22 @@ struct TestConnectedVoiceSession {
 }
 
 impl TestConnectedVoiceSession {
-    async fn new(url: &str, speaking_observed: Arc<Notify>) -> Result<Self, AppError> {
+    async fn new(url: &str, speaking_observed: Arc<Notify>) -> Result<Self, VoiceError> {
         let uri: http::Uri = url.parse()?;
         let query = uri
             .path_and_query()
             .and_then(|path_and_query| path_and_query.query())
-            .ok_or(AppError::InvalidState("voice session test query missing"))?;
+            .ok_or(VoiceError::InvalidState("voice session test query missing"))?;
         let udp = query_param(query, "udp")
-            .ok_or(AppError::InvalidState("voice session test udp missing"))?;
+            .ok_or(VoiceError::InvalidState("voice session test udp missing"))?;
         let ssrc = query_param(query, "ssrc")
-            .ok_or(AppError::InvalidState("voice session test ssrc missing"))?
+            .ok_or(VoiceError::InvalidState("voice session test ssrc missing"))?
             .parse::<u32>()
-            .map_err(|_| AppError::InvalidState("voice session test ssrc invalid"))?;
+            .map_err(|_| VoiceError::InvalidState("voice session test ssrc invalid"))?;
         let server = lookup_host(udp)
             .await?
             .next()
-            .ok_or(AppError::InvalidState("voice session test udp unresolved"))?;
+            .ok_or(VoiceError::InvalidState("voice session test udp unresolved"))?;
 
         Ok(Self {
             gateway: VoiceGatewayClient::connect(url).await?,
@@ -254,7 +252,7 @@ impl TestConnectedVoiceSession {
         })
     }
 
-    async fn send_audio_frame(&mut self, frame: Bytes) -> Result<(), AppError> {
+    async fn send_audio_frame(&mut self, frame: Bytes) -> Result<(), VoiceError> {
         if !self.speaking_started {
             let observed = self.speaking_observed.notified();
             send_speaking(&self.gateway, self.ssrc).await?;
