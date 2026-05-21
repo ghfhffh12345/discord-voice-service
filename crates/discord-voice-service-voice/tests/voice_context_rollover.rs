@@ -118,7 +118,7 @@ async fn update_voice_context_failure_while_not_playing_emits_terminal_warning()
         .unwrap();
 
     let err = harness.update_voice_context(invalid).await.unwrap_err();
-    assert!(err.to_string().contains("voice"));
+    assert!(matches!(err, RuntimeError::Voice(_)));
 
     let snapshot = harness.wait_for_event_snapshot("recoverable-warning").await;
     assert_eq!(snapshot.state, SessionState::VoiceReady);
@@ -216,7 +216,7 @@ async fn update_voice_context_failure_interrupts_active_playback_state() {
         .await
         .unwrap_err();
 
-    assert!(err.to_string().contains("voice"));
+    assert!(matches!(err, RuntimeError::Voice(_)));
     let snapshot = harness
         .wait_for_event_snapshot("playback-interrupted")
         .await;
