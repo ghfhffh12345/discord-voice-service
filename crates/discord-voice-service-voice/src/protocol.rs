@@ -495,15 +495,11 @@ fn seq_ack_i64(seq_ack: Option<u64>) -> i64 {
 }
 
 fn unsupported_text_gateway_op_error(op: u64) -> VoiceError {
-    VoiceError::InvalidState(Box::leak(
-        format!("voice gateway op unsupported: {op}").into_boxed_str(),
-    ))
+    VoiceError::UnsupportedGatewayOp(op)
 }
 
 fn unsupported_binary_gateway_op_error(op: u8) -> VoiceError {
-    VoiceError::InvalidState(Box::leak(
-        format!("voice gateway binary opcode unsupported: {op}").into_boxed_str(),
-    ))
+    VoiceError::UnsupportedBinaryGatewayOp(op)
 }
 
 fn parse_heartbeat_ack_nonce(value: &Value) -> Result<Option<u64>, VoiceError> {
@@ -894,7 +890,7 @@ mod tests {
 
         assert!(matches!(
             err,
-            crate::error::VoiceError::InvalidState("voice gateway op unsupported: 10")
+            crate::error::VoiceError::UnsupportedGatewayOp(10)
         ));
     }
 
@@ -904,7 +900,7 @@ mod tests {
 
         assert!(matches!(
             err,
-            crate::error::VoiceError::InvalidState("voice gateway binary opcode unsupported: 31")
+            crate::error::VoiceError::UnsupportedBinaryGatewayOp(31)
         ));
     }
 }

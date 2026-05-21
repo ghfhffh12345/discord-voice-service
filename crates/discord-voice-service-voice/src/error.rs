@@ -4,6 +4,10 @@ use thiserror::Error;
 pub enum VoiceError {
     #[error("unsupported encryption mode")]
     UnsupportedEncryptionMode,
+    #[error("voice gateway op unsupported: {0}")]
+    UnsupportedGatewayOp(u64),
+    #[error("voice gateway binary opcode unsupported: {0}")]
+    UnsupportedBinaryGatewayOp(u8),
     #[error("invalid state: {0}")]
     InvalidState(&'static str),
     #[error(transparent)]

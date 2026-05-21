@@ -76,7 +76,7 @@ impl ConnectedVoiceSession {
         })
     }
 
-    pub(crate) fn voice_context(&self) -> &VoiceContext {
+    pub fn voice_context(&self) -> &VoiceContext {
         &self.voice
     }
 
@@ -95,11 +95,11 @@ impl ConnectedVoiceSession {
         self.dave.is_some()
     }
 
-    pub(crate) fn media_started(&self) -> bool {
+    pub fn media_started(&self) -> bool {
         self.speaking_started
     }
 
-    pub(crate) async fn send_audio_frame(&mut self, frame: Bytes) -> Result<(), VoiceError> {
+    pub async fn send_audio_frame(&mut self, frame: Bytes) -> Result<(), VoiceError> {
         let ssrc = self
             .ssrc
             .ok_or(VoiceError::InvalidState("voice ssrc unavailable"))?;
@@ -130,7 +130,7 @@ impl ConnectedVoiceSession {
         Ok(())
     }
 
-    pub(crate) async fn stop_audio(&mut self) -> Result<(), VoiceError> {
+    pub async fn stop_audio(&mut self) -> Result<(), VoiceError> {
         for silence_frame_index in 0..5 {
             if let Err(err) = self
                 .send_audio_frame(Bytes::copy_from_slice(&OPUS_SILENCE_FRAME))
