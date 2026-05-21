@@ -1,26 +1,41 @@
-[package]
-name = "discord-voice-service"
+[workspace]
+resolver = "3"
+members = [
+    "crates/discord-voice-service",
+    "crates/discord-voice-service-live-validation",
+    "crates/discord-voice-service-playback",
+    "crates/discord-voice-service-proto",
+    "crates/discord-voice-service-runtime",
+    "crates/discord-voice-service-test-support",
+    "crates/discord-voice-service-voice",
+]
+default-members = ["crates/discord-voice-service"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
-build = "build.rs"
 
-[dependencies]
+[workspace.dependencies]
 aes-gcm = "0.10.3"
 anyhow = "1"
 bytes = "1"
+cc = "1.2"
 chacha20poly1305 = "0.10.1"
 futures = "0.3"
+hex = "0.4"
 http = "1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "stream"] }
 prost = "0.13"
+protoc-bin-vendored = "3.2.0"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "stream"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time", "test-util"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-native-roots"] }
 tonic = { version = "0.12", features = ["transport"] }
+tonic-build = "0.12"
 tonic-health = "0.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
@@ -29,12 +44,4 @@ twilight-http = "0.17.1"
 twilight-model = "0.17.1"
 twilight-util = "0.17.0"
 webm-iterable = "0.6.4"
-
-[build-dependencies]
-cc = "1.2"
-protoc-bin-vendored = "3.2.0"
-tonic-build = "0.12"
-
-[dev-dependencies]
-hex = "0.4"
-tokio = { version = "1", features = ["test-util"] }
+ytmusic-service-proto = { git = "https://github.com/ghfhffh12345/ytmusic-service", tag = "v0.1.0" }

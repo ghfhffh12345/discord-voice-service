@@ -1,0 +1,6 @@
+[package]
+name = "discord-voice-service-live-validation"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

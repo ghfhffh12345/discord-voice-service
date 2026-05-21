@@ -1,5 +1,5 @@
-use discord_voice_service::proto::discordvoice::v1::join_voice_request::VoiceContext;
-use discord_voice_service::proto::discordvoice::v1::{
+use discord_voice_service_proto::discordvoice::v1::join_voice_request::VoiceContext;
+use discord_voice_service_proto::discordvoice::v1::{
     PlayRequest, SessionEvent, SessionEventKind, SessionEventReason, UpdateVoiceContextRequest,
 };
 
@@ -38,7 +38,11 @@ fn generated_control_messages_expose_expected_fields() {
 
 #[test]
 fn control_proto_exposes_update_voice_context_and_reason_codes() {
-    let proto = std::fs::read_to_string("proto/discordvoice/v1/control.proto").unwrap();
+    let proto = std::fs::read_to_string(format!(
+        "{}/proto/discordvoice/v1/control.proto",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap();
     assert!(proto.contains("rpc UpdateVoiceContext"));
     assert!(proto.contains("string session_id = 3;"));
     assert!(proto.contains("string endpoint = 4;"));

@@ -1,0 +1,6 @@
+[package]
+name = "discord-voice-service-playback"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
