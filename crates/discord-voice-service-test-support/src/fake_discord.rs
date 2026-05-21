@@ -614,13 +614,10 @@ impl FakeDiscordPeer {
                                 if let Some(prepare_commit_message) =
                                     queued_init_prepare_commit_transition.take()
                                 {
-                                    *sent_dave_prepare_commit_transition_state.lock().await =
-                                        true;
-                                    ws.send(Message::Binary(Bytes::from(
-                                        prepare_commit_message,
-                                    )))
-                                    .await
-                                    .unwrap();
+                                    *sent_dave_prepare_commit_transition_state.lock().await = true;
+                                    ws.send(Message::Binary(Bytes::from(prepare_commit_message)))
+                                        .await
+                                        .unwrap();
                                 }
                             } else if transition_id == DAVE_UNMATCHED_TRANSITION_ID {
                                 *saw_unmatched_dave_transition_state.lock().await = true;
