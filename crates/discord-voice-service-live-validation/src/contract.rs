@@ -79,12 +79,11 @@ impl LiveContractState {
             SessionEventKind::VoiceReady => {
                 self.saw_voice_ready = true;
             }
-            SessionEventKind::Playing => {
-                if !self.saw_playing {
-                    self.saw_playing = true;
-                    self.min_interval_deadline = Some(now + MIN_LIVE_INTERVAL);
-                }
+            SessionEventKind::Playing if !self.saw_playing => {
+                self.saw_playing = true;
+                self.min_interval_deadline = Some(now + MIN_LIVE_INTERVAL);
             }
+            SessionEventKind::Playing => {}
             SessionEventKind::TrackEnded => {
                 if !self.saw_voice_ready {
                     anyhow::bail!("TrackEnded observed before VoiceReady");
