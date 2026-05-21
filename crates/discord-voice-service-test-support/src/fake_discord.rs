@@ -442,19 +442,15 @@ impl FakeDiscordPeer {
                             if dave_scenario != DaveScenario::Disabled {
                                 let announced_user_ids = match dave_scenario {
                                     DaveScenario::Disabled => Vec::new(),
+                                    DaveScenario::NewGroupSelfOnlyNoProposals => Vec::new(),
                                     DaveScenario::NewGroup
-                                    | DaveScenario::NewGroupSelfOnlyNoProposals
                                     | DaveScenario::NewGroupRequiresInitTransitionReadyBeforePrepareCommitTransition
                                     | DaveScenario::NewGroupCommitBeforePrepareEpoch
                                     | DaveScenario::NewGroupRequiresInitKeyPackage
                                     | DaveScenario::NewGroupRequiresRefreshedKeyPackage
                                     | DaveScenario::PrepareBackedWelcomeWithStrayFollowUp
                                     | DaveScenario::UnmatchedWelcome => {
-                                        if dave_scenario == DaveScenario::NewGroupSelfOnlyNoProposals {
-                                            Vec::new()
-                                        } else {
-                                            vec![DAVE_CREATOR_USER_ID]
-                                        }
+                                        vec![DAVE_CREATOR_USER_ID]
                                     }
                                     DaveScenario::EstablishedGroupJoin => {
                                         vec![DAVE_CREATOR_USER_ID, DAVE_EXISTING_MEMBER_USER_ID]
@@ -577,72 +573,70 @@ impl FakeDiscordPeer {
                                 dave_creator = Some(creator);
                             }
                         }
-                        Some(23) => {
-                            if dave_scenario != DaveScenario::Disabled {
-                                let Some(transition_id) = payload
-                                    .pointer("/d/transition_id")
-                                    .and_then(Value::as_u64)
-                                    .and_then(|value| u16::try_from(value).ok())
-                                else {
-                                    continue;
-                                };
+                        Some(23) if dave_scenario != DaveScenario::Disabled => {
+                            let Some(transition_id) = payload
+                                .pointer("/d/transition_id")
+                                .and_then(Value::as_u64)
+                                .and_then(|value| u16::try_from(value).ok())
+                            else {
+                                continue;
+                            };
 
-                                if transition_id == DAVE_TRANSITION_ID {
-                                    *saw_dave_transition_state.lock().await = true;
-                                    if let Some(stray_welcome) = queued_stray_welcome.take() {
-                                        ws.send(Message::Binary(Bytes::from(stray_welcome)))
-                                            .await
-                                            .unwrap();
-                                    }
-                                    ws.send(Message::Text(
-                                        json!({
-                                            "op": 22,
-                                            "seq": 3,
-                                            "d": {
-                                                "transition_id": DAVE_TRANSITION_ID,
-                                            }
-                                        })
-                                        .to_string()
-                                        .into(),
-                                    ))
-                                    .await
-                                    .unwrap();
-                                } else if transition_id == DAVE_INIT_TRANSITION_ID {
-                                    *saw_dave_init_transition_ready_state.lock().await = true;
-                                    if queued_init_prepare_commit_transition.is_some()
-                                        && !*sent_dave_prepare_commit_transition_state.lock().await
-                                    {
-                                        *saw_dave_init_transition_ready_before_prepare_commit_transition_state
-                                            .lock()
-                                            .await = true;
-                                    }
-                                    if let Some(prepare_commit_message) =
-                                        queued_init_prepare_commit_transition.take()
-                                    {
-                                        *sent_dave_prepare_commit_transition_state.lock().await =
-                                            true;
-                                        ws.send(Message::Binary(Bytes::from(
-                                            prepare_commit_message,
-                                        )))
+                            if transition_id == DAVE_TRANSITION_ID {
+                                *saw_dave_transition_state.lock().await = true;
+                                if let Some(stray_welcome) = queued_stray_welcome.take() {
+                                    ws.send(Message::Binary(Bytes::from(stray_welcome)))
                                         .await
                                         .unwrap();
-                                    }
-                                } else if transition_id == DAVE_UNMATCHED_TRANSITION_ID {
-                                    *saw_unmatched_dave_transition_state.lock().await = true;
-                                    ws.send(Message::Text(
-                                        json!({
-                                            "op": 22,
-                                            "seq": 3,
-                                            "d": {
-                                                "transition_id": DAVE_UNMATCHED_TRANSITION_ID,
-                                            }
-                                        })
-                                        .to_string()
-                                        .into(),
-                                    ))
+                                }
+                                ws.send(Message::Text(
+                                    json!({
+                                        "op": 22,
+                                        "seq": 3,
+                                        "d": {
+                                            "transition_id": DAVE_TRANSITION_ID,
+                                        }
+                                    })
+                                    .to_string()
+                                    .into(),
+                                ))
+                                .await
+                                .unwrap();
+                            } else if transition_id == DAVE_INIT_TRANSITION_ID {
+                                *saw_dave_init_transition_ready_state.lock().await = true;
+                                if queued_init_prepare_commit_transition.is_some()
+                                    && !*sent_dave_prepare_commit_transition_state.lock().await
+                                {
+                                    *saw_dave_init_transition_ready_before_prepare_commit_transition_state
+                                        .lock()
+                                        .await = true;
+                                }
+                                if let Some(prepare_commit_message) =
+                                    queued_init_prepare_commit_transition.take()
+                                {
+                                    *sent_dave_prepare_commit_transition_state.lock().await =
+                                        true;
+                                    ws.send(Message::Binary(Bytes::from(
+                                        prepare_commit_message,
+                                    )))
                                     .await
                                     .unwrap();
                                 }
+                            } else if transition_id == DAVE_UNMATCHED_TRANSITION_ID {
+                                *saw_unmatched_dave_transition_state.lock().await = true;
+                                ws.send(Message::Text(
+                                    json!({
+                                        "op": 22,
+                                        "seq": 3,
+                                        "d": {
+                                            "transition_id": DAVE_UNMATCHED_TRANSITION_ID,
+                                        }
+                                    })
+                                    .to_string()
+                                    .into(),
+                                ))
+                                .await
+                                .unwrap();
                             }
                         }
                         Some(5) => speaking_observed_state.notify_one(),
