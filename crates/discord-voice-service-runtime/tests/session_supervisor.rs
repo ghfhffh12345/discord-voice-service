@@ -1,8 +1,9 @@
 #[path = "support/fake_voice.rs"]
 mod fake_voice;
 
-use discord_voice_service::session::state::SessionState;
-use discord_voice_service::session::supervisor::{Command, Supervisor, VoiceContext};
+use discord_voice_service_runtime::session::state::SessionState;
+use discord_voice_service_runtime::session::supervisor::{Command, Supervisor};
+use discord_voice_service_voice::VoiceContext;
 
 use self::fake_voice::FakeVoiceEndpoint;
 

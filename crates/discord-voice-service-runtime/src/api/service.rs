@@ -1,19 +1,20 @@
 use std::pin::Pin;
 use std::sync::Arc;
 
-use futures::{Stream, stream};
-use tonic::{Request, Response, Status};
-
-use crate::proto::discordvoice::v1::discord_voice_control_server::DiscordVoiceControl;
-use crate::proto::discordvoice::v1::join_voice_request;
-use crate::proto::discordvoice::v1::{
+use discord_voice_service_proto::discordvoice::v1::discord_voice_control_server::DiscordVoiceControl;
+use discord_voice_service_proto::discordvoice::v1::join_voice_request;
+use discord_voice_service_proto::discordvoice::v1::{
     GetStateRequest, JoinVoiceRequest, JoinVoiceResponse, LeaveVoiceRequest, LeaveVoiceResponse,
     PauseRequest, PauseResponse, PlayRequest, PlayResponse, ResumeRequest, ResumeResponse,
     SessionEvent, SessionState as ProtoSessionState, SessionStateSnapshot, StopRequest,
     StopResponse, SubscribeEventsRequest, UpdateVoiceContextRequest, UpdateVoiceContextResponse,
 };
+use discord_voice_service_voice::VoiceContext;
+use futures::{Stream, stream};
+use tonic::{Request, Response, Status};
+
 use crate::session::state::SessionState;
-use crate::session::supervisor::{Command, Supervisor, VoiceContext};
+use crate::session::supervisor::{Command, Supervisor};
 use crate::{observability, session::readiness::Readiness};
 
 pub fn map_play_request(request: PlayRequest) -> String {
@@ -182,7 +183,7 @@ impl DiscordVoiceControl for ControlService {
     }
 }
 
-fn map_app_error(error: crate::error::AppError) -> Status {
+fn map_app_error(error: crate::error::RuntimeError) -> Status {
     Status::failed_precondition(error.to_string())
 }
 

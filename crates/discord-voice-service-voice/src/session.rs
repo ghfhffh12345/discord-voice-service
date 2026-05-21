@@ -80,10 +80,6 @@ impl ConnectedVoiceSession {
         &self.voice
     }
 
-    pub(crate) fn rollover(&self) -> &VoiceSessionRollover {
-        &self.rollover
-    }
-
     pub fn is_connected(&self) -> bool {
         self.gateway.is_some()
             && self.transport.is_some()
@@ -97,6 +93,14 @@ impl ConnectedVoiceSession {
 
     pub fn media_started(&self) -> bool {
         self.speaking_started
+    }
+
+    pub fn recovering(&self) -> bool {
+        self.rollover.recovering()
+    }
+
+    pub fn voice_reconnecting(&self) -> bool {
+        self.rollover.voice_reconnecting()
     }
 
     pub async fn send_audio_frame(&mut self, frame: Bytes) -> Result<(), VoiceError> {

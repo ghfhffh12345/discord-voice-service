@@ -2,7 +2,7 @@ use std::sync::{Arc, OnceLock};
 
 use tokio::sync::RwLock;
 
-use crate::error::AppError;
+use crate::error::RuntimeError;
 use crate::session::state::{SessionState, Snapshot};
 
 static GLOBAL_READINESS: OnceLock<Arc<Readiness>> = OnceLock::new();
@@ -67,7 +67,7 @@ impl Readiness {
     }
 }
 
-pub fn ensure_joinable_session(snapshot: &Snapshot) -> Result<(), AppError> {
+pub fn ensure_joinable_session(snapshot: &Snapshot) -> Result<(), RuntimeError> {
     if matches!(snapshot.state, SessionState::Idle)
         && snapshot.guild_id.is_none()
         && snapshot.channel_id.is_none()
@@ -75,7 +75,7 @@ pub fn ensure_joinable_session(snapshot: &Snapshot) -> Result<(), AppError> {
     {
         Ok(())
     } else {
-        Err(AppError::InvalidState(
+        Err(RuntimeError::InvalidState(
             "join_voice requires an idle session",
         ))
     }
@@ -84,11 +84,11 @@ pub fn ensure_joinable_session(snapshot: &Snapshot) -> Result<(), AppError> {
 pub fn ensure_active_voice_session(
     snapshot: &Snapshot,
     action: &'static str,
-) -> Result<(), AppError> {
+) -> Result<(), RuntimeError> {
     if snapshot.guild_id.is_some() && snapshot.channel_id.is_some() {
         Ok(())
     } else {
-        Err(AppError::InvalidState(match action {
+        Err(RuntimeError::InvalidState(match action {
             "play" => "play requires active voice session",
             "pause" => "pause requires active voice session",
             "resume" => "resume requires active voice session",
@@ -99,13 +99,13 @@ pub fn ensure_active_voice_session(
     }
 }
 
-pub fn ensure_track_loaded(snapshot: &Snapshot, action: &'static str) -> Result<(), AppError> {
+pub fn ensure_track_loaded(snapshot: &Snapshot, action: &'static str) -> Result<(), RuntimeError> {
     ensure_active_voice_session(snapshot, action)?;
 
     if snapshot.current_video_id.is_some() {
         Ok(())
     } else {
-        Err(AppError::InvalidState(match action {
+        Err(RuntimeError::InvalidState(match action {
             "pause" => "pause requires an active track",
             "resume" => "resume requires an active track",
             _ => "command requires an active track",
@@ -113,23 +113,23 @@ pub fn ensure_track_loaded(snapshot: &Snapshot, action: &'static str) -> Result<
     }
 }
 
-pub fn ensure_pauseable_track(snapshot: &Snapshot) -> Result<(), AppError> {
+pub fn ensure_pauseable_track(snapshot: &Snapshot) -> Result<(), RuntimeError> {
     ensure_track_loaded(snapshot, "pause")?;
 
     if matches!(snapshot.state, SessionState::Playing) {
         Ok(())
     } else {
-        Err(AppError::InvalidState("pause requires a playing track"))
+        Err(RuntimeError::InvalidState("pause requires a playing track"))
     }
 }
 
-pub fn ensure_resumable_track(snapshot: &Snapshot) -> Result<(), AppError> {
+pub fn ensure_resumable_track(snapshot: &Snapshot) -> Result<(), RuntimeError> {
     ensure_track_loaded(snapshot, "resume")?;
 
     if matches!(snapshot.state, SessionState::Paused | SessionState::Playing) {
         Ok(())
     } else {
-        Err(AppError::InvalidState(
+        Err(RuntimeError::InvalidState(
             "resume requires a paused or playing track",
         ))
     }

@@ -1,9 +1,9 @@
 use tokio::sync::broadcast;
 
-use crate::proto::discordvoice::v1::{
+use crate::session::state::Snapshot;
+use discord_voice_service_proto::discordvoice::v1::{
     SessionEvent, SessionEventKind as ProtoSessionEventKind, SessionEventReason,
 };
-use crate::session::state::Snapshot;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEventKind {

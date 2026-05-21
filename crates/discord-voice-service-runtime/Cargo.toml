@@ -4,3 +4,17 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+discord-voice-service-playback = { path = "../discord-voice-service-playback" }
+discord-voice-service-proto = { path = "../discord-voice-service-proto" }
+discord-voice-service-voice = { path = "../discord-voice-service-voice" }
+futures.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+futures.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true

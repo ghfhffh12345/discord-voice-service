@@ -384,6 +384,18 @@ dependencies = [
 [[package]]
 name = "discord-voice-service-runtime"
 version = "0.1.0"
+dependencies = [
+ "discord-voice-service-playback",
+ "discord-voice-service-proto",
+ "discord-voice-service-voice",
+ "futures",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite",
+ "tonic",
+ "tracing",
+]
 
 [[package]]
 name = "discord-voice-service-test-support"

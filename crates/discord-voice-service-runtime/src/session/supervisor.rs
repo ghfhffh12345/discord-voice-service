@@ -1,23 +1,13 @@
 use std::sync::Arc;
 
+use discord_voice_service_playback::{PlaybackWorker, YtMusicClient};
 use tokio::sync::broadcast;
 
-use crate::error::AppError;
-use crate::playback::worker::PlaybackWorker;
+use crate::error::RuntimeError;
 use crate::session::events::SessionEventRecord;
 use crate::session::runtime::VoiceSessionRuntime;
 use crate::session::state::Snapshot;
-use crate::ytmusic::client::YtMusicClient;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VoiceContext {
-    pub guild_id: String,
-    pub channel_id: String,
-    pub user_id: String,
-    pub session_id: String,
-    pub endpoint: String,
-    pub token: String,
-}
+pub use discord_voice_service_voice::VoiceContext;
 
 #[derive(Debug, Clone)]
 pub enum Command {
@@ -48,7 +38,7 @@ impl Supervisor {
         }
     }
 
-    pub async fn with_ytmusic_endpoint(endpoint: String) -> Result<Self, AppError> {
+    pub async fn with_ytmusic_endpoint(endpoint: String) -> Result<Self, RuntimeError> {
         let client = YtMusicClient::connect(endpoint).await?;
         Ok(Self {
             runtime: Arc::new(VoiceSessionRuntime::with_playback_worker(
@@ -57,7 +47,7 @@ impl Supervisor {
         })
     }
 
-    pub async fn send(&self, command: Command) -> Result<(), AppError> {
+    pub async fn send(&self, command: Command) -> Result<(), RuntimeError> {
         self.runtime.handle_command(command).await
     }
 

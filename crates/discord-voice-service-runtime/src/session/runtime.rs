@@ -1,20 +1,20 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use discord_voice_service_playback::PlaybackWorker;
+use discord_voice_service_playback::media::opus_queue::OpusFrameQueue;
+use discord_voice_service_playback::pacer::AudioPacer;
+use discord_voice_service_voice::{ConnectedVoiceSession, VoiceContext};
 use tokio::sync::{Mutex, RwLock, broadcast};
 
-use crate::discord_voice::session::ConnectedVoiceSession;
-use crate::error::AppError;
-use crate::media::opus_queue::OpusFrameQueue;
-use crate::playback::pacer::AudioPacer;
-use crate::playback::worker::PlaybackWorker;
+use crate::error::RuntimeError;
 use crate::session::events::{EventBus, SessionEventKind, SessionEventRecord};
 use crate::session::readiness::{
     ensure_active_voice_session, ensure_joinable_session, ensure_pauseable_track,
     ensure_resumable_track,
 };
 use crate::session::state::{SessionState, Snapshot};
-use crate::session::supervisor::{Command, VoiceContext};
+use crate::session::supervisor::Command;
 
 const PLAYBACK_QUEUE_CAPACITY: usize = 32;
 
@@ -59,7 +59,7 @@ impl VoiceSessionRuntime {
         }
     }
 
-    pub async fn handle_command(self: &Arc<Self>, command: Command) -> Result<(), AppError> {
+    pub async fn handle_command(self: &Arc<Self>, command: Command) -> Result<(), RuntimeError> {
         match command {
             Command::JoinVoice { voice } => self.join_voice(voice).await,
             Command::UpdateVoiceContext { voice } => self.update_voice_context(voice).await,
@@ -87,7 +87,7 @@ impl VoiceSessionRuntime {
         self.events.subscribe()
     }
 
-    async fn join_voice(&self, voice: VoiceContext) -> Result<(), AppError> {
+    async fn join_voice(&self, voice: VoiceContext) -> Result<(), RuntimeError> {
         {
             let state = self.state.read().await;
             ensure_joinable_session(&state)?;
@@ -122,16 +122,23 @@ impl VoiceSessionRuntime {
         Ok(())
     }
 
-    async fn update_voice_context(self: &Arc<Self>, voice: VoiceContext) -> Result<(), AppError> {
+    async fn update_voice_context(
+        self: &Arc<Self>,
+        voice: VoiceContext,
+    ) -> Result<(), RuntimeError> {
         self.rollover_voice_context(voice).await
     }
 
-    async fn play(&self, video_id: String) -> Result<(), AppError> {
+    async fn play(&self, video_id: String) -> Result<(), RuntimeError> {
         let playback_epoch = self.begin_playback();
         self.play_with_epoch(video_id, playback_epoch).await
     }
 
-    async fn play_with_epoch(&self, video_id: String, playback_epoch: u64) -> Result<(), AppError> {
+    async fn play_with_epoch(
+        &self,
+        video_id: String,
+        playback_epoch: u64,
+    ) -> Result<(), RuntimeError> {
         let resume_position_hint = {
             let state = self.state.read().await;
             if state.current_video_id.as_deref() == Some(video_id.as_str()) {
@@ -230,7 +237,7 @@ impl VoiceSessionRuntime {
                         error = ?err,
                         "playback fill_queue failed after queue drain"
                     );
-                    return Err(err);
+                    return Err(err.into());
                 }
                 if self.playback_interrupted(playback_epoch) {
                     return Ok(());
@@ -272,9 +279,9 @@ impl VoiceSessionRuntime {
                 if self.playback_interrupted(playback_epoch) {
                     return Ok(());
                 }
-                let session = voice
-                    .as_mut()
-                    .ok_or(AppError::InvalidState("play requires active voice session"))?;
+                let session = voice.as_mut().ok_or(RuntimeError::InvalidState(
+                    "play requires active voice session",
+                ))?;
                 let frame_duration_ms = frame.duration_ms;
                 if let Err(err) = session.send_audio_frame(frame.data).await {
                     tracing::debug!(
@@ -285,7 +292,7 @@ impl VoiceSessionRuntime {
                         error = ?err,
                         "playback send_audio_frame failed"
                     );
-                    return Err(err);
+                    return Err(err.into());
                 }
             }
             source.record_sent_packet(frame.duration_ms);
@@ -302,7 +309,7 @@ impl VoiceSessionRuntime {
                         error = ?err,
                         "playback fill_queue failed after frame send"
                     );
-                    return Err(err);
+                    return Err(err.into());
                 }
                 if queue.is_empty() {
                     tracing::debug!(
@@ -332,9 +339,9 @@ impl VoiceSessionRuntime {
 
         {
             let mut voice = self.voice.lock().await;
-            let session = voice
-                .as_mut()
-                .ok_or(AppError::InvalidState("play requires active voice session"))?;
+            let session = voice.as_mut().ok_or(RuntimeError::InvalidState(
+                "play requires active voice session",
+            ))?;
             tracing::debug!(
                 %video_id,
                 playback_epoch,
@@ -349,7 +356,7 @@ impl VoiceSessionRuntime {
                     error = ?err,
                     "playback stop_audio failed"
                 );
-                return Err(err);
+                return Err(err.into());
             }
             tracing::debug!(
                 %video_id,
@@ -380,7 +387,7 @@ impl VoiceSessionRuntime {
         Ok(())
     }
 
-    async fn pause(&self) -> Result<(), AppError> {
+    async fn pause(&self) -> Result<(), RuntimeError> {
         let event = {
             let mut state = self.state.write().await;
             ensure_pauseable_track(&state)?;
@@ -392,7 +399,7 @@ impl VoiceSessionRuntime {
         Ok(())
     }
 
-    async fn resume(&self) -> Result<(), AppError> {
+    async fn resume(&self) -> Result<(), RuntimeError> {
         let event = {
             let mut state = self.state.write().await;
             ensure_resumable_track(&state)?;
@@ -404,7 +411,7 @@ impl VoiceSessionRuntime {
         Ok(())
     }
 
-    async fn stop(&self) -> Result<(), AppError> {
+    async fn stop(&self) -> Result<(), RuntimeError> {
         {
             let state = self.state.read().await;
             ensure_active_voice_session(&state, "stop")?;
@@ -436,7 +443,7 @@ impl VoiceSessionRuntime {
         Ok(())
     }
 
-    async fn leave_voice(&self) -> Result<(), AppError> {
+    async fn leave_voice(&self) -> Result<(), RuntimeError> {
         self.invalidate_rollover();
         self.invalidate_playback();
         self.defer_playback_reset();
@@ -448,7 +455,7 @@ impl VoiceSessionRuntime {
     async fn rollover_voice_context(
         self: &Arc<Self>,
         new_voice: VoiceContext,
-    ) -> Result<(), AppError> {
+    ) -> Result<(), RuntimeError> {
         let resume_video_id = {
             let state = self.state.read().await;
             ensure_active_voice_session(&state, "update_voice_context")?;
@@ -496,7 +503,7 @@ impl VoiceSessionRuntime {
                     ))
                     .await;
                 }
-                return Err(err);
+                return Err(err.into());
             }
         };
 
@@ -513,11 +520,11 @@ impl VoiceSessionRuntime {
                 .map(|session| {
                     (
                         session.voice_context().clone(),
-                        session.rollover().recovering(),
-                        session.rollover().voice_reconnecting(),
+                        session.recovering(),
+                        session.voice_reconnecting(),
                     )
                 })
-                .ok_or(AppError::InvalidState(
+                .ok_or(RuntimeError::InvalidState(
                     "voice reconnect replacement missing",
                 ))?;
             drop(current_voice);
@@ -705,8 +712,8 @@ fn apply_voice_context(snapshot: &mut Snapshot, voice: &VoiceContext) {
 }
 
 fn apply_rollover_state(snapshot: &mut Snapshot, session: &ConnectedVoiceSession) {
-    snapshot.recovering = session.rollover().recovering();
-    snapshot.voice_reconnecting = session.rollover().voice_reconnecting();
+    snapshot.recovering = session.recovering();
+    snapshot.voice_reconnecting = session.voice_reconnecting();
 }
 
 #[cfg(test)]
