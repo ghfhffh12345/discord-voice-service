@@ -3,28 +3,10 @@ use crate::media::opus_queue::{OpusFrame, OpusFrameQueue};
 use crate::media::position::{PlaybackPosition, SharedPlaybackPosition, shared_playback_position};
 use crate::media::webm_demux::DemuxedPacket;
 use crate::recovery::PlaybackRecovery;
-use crate::selector::select_song_stream_format;
 use crate::source::PlaybackSource;
 use crate::ytmusic_client::YtMusicClient;
-use ytmusic_service_proto::ytmusic::v1::SongStreamFormat;
 
 const DEFAULT_PREBUFFER_TARGET: usize = 4;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlaybackPlan {
-    pub video_id: String,
-    pub selected_itag: u32,
-}
-
-impl PlaybackPlan {
-    pub fn from_formats(video_id: &str, formats: &[SongStreamFormat]) -> Option<Self> {
-        let selected = select_song_stream_format(formats).ok()?;
-        Some(Self {
-            video_id: video_id.to_owned(),
-            selected_itag: selected.itag,
-        })
-    }
-}
 
 pub struct PlaybackWorker {
     current_video_id: Option<String>,
