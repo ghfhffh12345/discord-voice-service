@@ -1,6 +1,8 @@
 use discord_voice_service_test_support::fake_voice::FakeVoiceEndpoint;
 
-use discord_voice_service_runtime::{Command, SessionState, Supervisor, VoiceContext};
+use discord_voice_service_runtime::{
+    Command, RuntimeError, SessionState, Supervisor, VoiceContext,
+};
 
 #[tokio::test]
 async fn join_then_play_advances_state_machine() {
@@ -96,7 +98,7 @@ async fn update_voice_context_failure_keeps_snapshot_on_previous_voice() {
         .await
         .unwrap_err();
 
-    assert!(err.to_string().contains("voice"));
+    assert!(matches!(err, RuntimeError::Voice(_)));
     let snapshot = supervisor.snapshot().await;
     assert_eq!(snapshot.guild_id, Some(joined.guild_id.clone()));
     assert_eq!(snapshot.channel_id, Some(joined.channel_id.clone()));
