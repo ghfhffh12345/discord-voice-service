@@ -1,5 +1,5 @@
 use discord_voice_service::config::Settings;
-use discord_voice_service::error::AppError;
+use discord_voice_service_runtime::RuntimeError;
 
 #[test]
 fn parses_required_env_and_defaults() {
@@ -31,7 +31,7 @@ fn rejects_legacy_bind_addr_variable_name() {
 
     assert!(matches!(
         err,
-        AppError::MissingEnv("DISCORD_VOICE_SERVICE_BIND_ADDR")
+        RuntimeError::InvalidState("missing DISCORD_VOICE_SERVICE_BIND_ADDR")
     ));
 }
 
@@ -45,13 +45,13 @@ fn rejects_invalid_ytmusic_endpoint() {
 
     assert!(matches!(
         err,
-        AppError::InvalidEnv("DISCORD_VOICE_SERVICE_YTMUSIC_ADDR")
+        RuntimeError::InvalidState("invalid DISCORD_VOICE_SERVICE_YTMUSIC_ADDR")
     ));
 }
 
 #[test]
 fn env_example_mentions_required_addresses() {
-    let env_file = std::fs::read_to_string(".env.example").expect("env example");
+    let env_file = std::fs::read_to_string("../../.env.example").expect("env example");
     assert!(env_file.contains("DISCORD_VOICE_SERVICE_BIND_ADDR="));
     assert!(env_file.contains("DISCORD_VOICE_SERVICE_YTMUSIC_ADDR="));
     assert!(!env_file.contains("DISCORD_VOICE_SERVICE_ADDR="));
