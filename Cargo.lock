@@ -430,7 +430,6 @@ name = "discord-voice-service-test-support"
 version = "0.1.0"
 dependencies = [
  "bytes",
- "discord-voice-service-runtime",
  "discord-voice-service-voice",
  "futures",
  "serde_json",
