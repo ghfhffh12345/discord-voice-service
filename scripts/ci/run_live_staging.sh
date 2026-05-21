@@ -86,7 +86,7 @@ podman run -d \
   --name "${service_container_name}" \
   --network "${network_name}" \
   -p 55051:55051 \
-  -e DISCORD_VOICE_SERVICE_BIND_ADDR="0.0.0.0:55051" \
+  -e DISCORD_VOICE_SERVICE_BIND_ADDR="${DISCORD_VOICE_SERVICE_BIND_ADDR}" \
   -e DISCORD_VOICE_SERVICE_YTMUSIC_ADDR="http://ytmusic-service-live-staging:50051" \
   "${service_image_ref}"
 

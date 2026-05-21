@@ -21,7 +21,7 @@ The workflow checks out the workspace, builds `staging_live_check` from the `dis
 
 - Preflight failure: fix runner prerequisites or secret/config wiring.
 - Service container failure: inspect `discord-voice-service-live-staging` logs.
-- Controller failure: inspect the JSON evidence line from `target/debug/staging_live_check`.
+- Controller failure: inspect the `staging_live_check log` workflow group or the runner temp log at `${RUNNER_TEMP}/staging-live-check.log`.
 - Cleanup failure: inspect the workflow summary and rerun only after confirming the test bot has left voice.
 
 ## Rollback model

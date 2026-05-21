@@ -147,10 +147,11 @@ The live validation controller contract is:
 | `TEST_GUILD_ID` | Dedicated staging guild ID | `234567890123456789` |
 | `TEST_VOICE_CHANNEL_ID` | Dedicated non-stage voice channel ID inside that guild | `345678901234567890` |
 | `TEST_VIDEO_ID` | YouTube video ID used for the live playback assertion | `dQw4w9WgXcQ` |
-| `DISCORD_VOICE_SERVICE_URI` | gRPC URI used by `staging_live_check` to reach this service | `http://127.0.0.1:55051` |
+| `DISCORD_VOICE_SERVICE_URI` | Host-side gRPC URI used by `staging_live_check` to reach the published service port | `http://127.0.0.1:55051` |
+| `DISCORD_VOICE_SERVICE_BIND_ADDR` | In-container bind address used by the `discord-voice-service` container during live staging | `0.0.0.0:55051` |
 | `DISCORD_VOICE_SERVICE_YTMUSIC_ADDR` | Base gRPC endpoint used by the service and controller to reach `ytmusic-service` | `http://127.0.0.1:50051` |
 
-Inside the live workflow, the service container still binds with `DISCORD_VOICE_SERVICE_BIND_ADDR`, while the staging controller talks to that listener through `DISCORD_VOICE_SERVICE_URI`.
+Inside the live workflow, `DISCORD_VOICE_SERVICE_BIND_ADDR` is the container-internal listen address and should remain `0.0.0.0:55051`, while `DISCORD_VOICE_SERVICE_URI` is the host-side controller endpoint and should remain `http://127.0.0.1:55051`.
 
 For a manual or local staging run, the operator command is:
 

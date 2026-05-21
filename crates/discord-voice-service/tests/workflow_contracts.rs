@@ -11,6 +11,7 @@ fn live_staging_workflow_targets_container_artifacts() {
 
     assert!(workflow.contains("discord_voice_service_image_ref"));
     assert!(workflow.contains("DISCORD_VOICE_SERVICE_URI"));
+    assert!(workflow.contains("DISCORD_VOICE_SERVICE_BIND_ADDR: 0.0.0.0:55051"));
     assert!(workflow.contains("scripts/ci/live_staging_preflight.sh"));
     assert!(workflow.contains("scripts/ci/run_live_staging.sh"));
     assert!(workflow.contains("DISCORD_VOICE_SERVICE_RESOLVED_IMAGE_REF"));
@@ -26,6 +27,10 @@ fn live_staging_workflow_targets_container_artifacts() {
     assert!(preflight.contains("DISCORD_VOICE_SERVICE_RESOLVED_IMAGE_REF"));
     assert!(run_script.contains("service_image_ref"));
     assert!(run_script.contains("podman pull \"${service_image_ref}\""));
+    assert!(
+        run_script
+            .contains("-e DISCORD_VOICE_SERVICE_BIND_ADDR=\"${DISCORD_VOICE_SERVICE_BIND_ADDR}\"")
+    );
     assert!(run_script.contains("\"${service_image_ref}\""));
 }
 
