@@ -1,1 +1,3 @@
-pub mod service;
+mod service;
+
+pub use service::ControlService;

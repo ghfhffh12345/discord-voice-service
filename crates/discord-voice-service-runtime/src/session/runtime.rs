@@ -7,14 +7,14 @@ use discord_voice_service_playback::pacer::AudioPacer;
 use discord_voice_service_voice::{ConnectedVoiceSession, VoiceContext};
 use tokio::sync::{Mutex, RwLock, broadcast};
 
-use crate::error::RuntimeError;
-use crate::session::events::{EventBus, SessionEventKind, SessionEventRecord};
-use crate::session::readiness::{
+use super::events::{EventBus, SessionEventKind, SessionEventRecord};
+use super::readiness::{
     ensure_active_voice_session, ensure_joinable_session, ensure_pauseable_track,
     ensure_resumable_track,
 };
-use crate::session::state::{SessionState, Snapshot};
-use crate::session::supervisor::Command;
+use super::state::{SessionState, Snapshot};
+use super::supervisor::Command;
+use crate::error::RuntimeError;
 
 const PLAYBACK_QUEUE_CAPACITY: usize = 32;
 
@@ -73,14 +73,6 @@ impl VoiceSessionRuntime {
 
     pub async fn snapshot(&self) -> Snapshot {
         self.state.read().await.clone()
-    }
-
-    pub async fn current_voice_context(&self) -> Option<VoiceContext> {
-        self.voice
-            .lock()
-            .await
-            .as_ref()
-            .map(|session| session.voice_context().clone())
     }
 
     pub fn subscribe_events(&self) -> broadcast::Receiver<SessionEventRecord> {

@@ -4,8 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tonic::{Code, Status};
 use tracing::{Level, event};
 
-use crate::session::readiness::ReadinessSnapshot;
-use crate::session::state::Snapshot;
+use crate::session::{ReadinessSnapshot, Snapshot};
 
 static OBSERVABILITY: OnceLock<Observability> = OnceLock::new();
 

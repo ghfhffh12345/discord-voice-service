@@ -1,9 +1,7 @@
 #[path = "support/fake_voice.rs"]
 mod fake_voice;
 
-use discord_voice_service_runtime::session::state::SessionState;
-use discord_voice_service_runtime::session::supervisor::{Command, Supervisor};
-use discord_voice_service_voice::VoiceContext;
+use discord_voice_service_runtime::{Command, SessionState, Supervisor, VoiceContext};
 
 use self::fake_voice::FakeVoiceEndpoint;
 
@@ -48,7 +46,7 @@ async fn snapshot_exposes_runtime_position_queue_depth_and_rollover_flags() {
 }
 
 #[tokio::test]
-async fn update_voice_context_replaces_full_runtime_voice_context() {
+async fn update_voice_context_reconnects_and_updates_snapshot() {
     let supervisor = Supervisor::new();
     let fake = FakeVoiceEndpoint::spawn().await;
     let joined = test_voice_context();
@@ -67,16 +65,14 @@ async fn update_voice_context_replaces_full_runtime_voice_context() {
         .await
         .unwrap();
 
-    assert_eq!(supervisor.current_voice_context().await, Some(updated));
     assert_eq!(supervisor.snapshot().await.channel_id, Some("9".into()));
-    assert_ne!(supervisor.current_voice_context().await, Some(joined));
     assert_eq!(fake.discovery_count().await, 1);
     assert!(fake.gateway_connected().await);
     assert!(fake.gateway_path().await.unwrap().contains("v=8"));
 }
 
 #[tokio::test]
-async fn update_voice_context_failure_keeps_snapshot_and_runtime_on_previous_voice() {
+async fn update_voice_context_failure_keeps_snapshot_on_previous_voice() {
     let supervisor = Supervisor::new();
     let fake = FakeVoiceEndpoint::spawn().await;
     let joined = fake.voice_context("1", "2", "user-1", "3", "token");
@@ -104,11 +100,6 @@ async fn update_voice_context_failure_keeps_snapshot_and_runtime_on_previous_voi
         .unwrap_err();
 
     assert!(err.to_string().contains("voice"));
-    assert_eq!(
-        supervisor.current_voice_context().await,
-        Some(joined.clone())
-    );
-
     let snapshot = supervisor.snapshot().await;
     assert_eq!(snapshot.guild_id, Some(joined.guild_id.clone()));
     assert_eq!(snapshot.channel_id, Some(joined.channel_id.clone()));

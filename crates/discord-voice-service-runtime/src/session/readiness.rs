@@ -2,8 +2,8 @@ use std::sync::{Arc, OnceLock};
 
 use tokio::sync::RwLock;
 
+use super::state::{SessionState, Snapshot};
 use crate::error::RuntimeError;
-use crate::session::state::{SessionState, Snapshot};
 
 static GLOBAL_READINESS: OnceLock<Arc<Readiness>> = OnceLock::new();
 

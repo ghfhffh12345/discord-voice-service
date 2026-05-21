@@ -1,12 +1,9 @@
 use tokio::sync::broadcast;
 
-use crate::session::state::Snapshot;
-use discord_voice_service_proto::discordvoice::v1::{
-    SessionEvent, SessionEventKind as ProtoSessionEventKind, SessionEventReason,
-};
+use super::state::Snapshot;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SessionEventKind {
+pub(crate) enum SessionEventKind {
     VoiceConnecting,
     VoiceReady,
     TrackResolving,
@@ -22,7 +19,7 @@ pub enum SessionEventKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionEventRecord {
+pub(crate) struct SessionEventRecord {
     pub kind: SessionEventKind,
     pub guild_id: Option<String>,
     pub channel_id: Option<String>,
@@ -53,23 +50,10 @@ impl SessionEventRecord {
             message: snapshot.last_reason.clone(),
         }
     }
-
-    pub fn into_proto(self) -> SessionEvent {
-        SessionEvent {
-            kind: map_session_event_kind(self.kind) as i32,
-            guild_id: self.guild_id.unwrap_or_default(),
-            channel_id: self.channel_id.unwrap_or_default(),
-            current_video_id: self.current_video_id.unwrap_or_default(),
-            selected_itag: self.selected_itag.unwrap_or_default(),
-            message: self.message.unwrap_or_default(),
-            reason: SessionEventReason::Unspecified as i32,
-            ..Default::default()
-        }
-    }
 }
 
 #[derive(Clone)]
-pub struct EventBus {
+pub(crate) struct EventBus {
     tx: broadcast::Sender<SessionEventRecord>,
 }
 
@@ -85,22 +69,5 @@ impl EventBus {
 
     pub fn emit(&self, event: SessionEventRecord) {
         let _ = self.tx.send(event);
-    }
-}
-
-fn map_session_event_kind(kind: SessionEventKind) -> ProtoSessionEventKind {
-    match kind {
-        SessionEventKind::VoiceConnecting => ProtoSessionEventKind::VoiceConnecting,
-        SessionEventKind::VoiceReady => ProtoSessionEventKind::VoiceReady,
-        SessionEventKind::TrackResolving => ProtoSessionEventKind::TrackResolving,
-        SessionEventKind::Buffering => ProtoSessionEventKind::Buffering,
-        SessionEventKind::Playing => ProtoSessionEventKind::Playing,
-        SessionEventKind::Paused => ProtoSessionEventKind::Paused,
-        SessionEventKind::Stopped => ProtoSessionEventKind::Stopped,
-        SessionEventKind::TrackEnded => ProtoSessionEventKind::TrackEnded,
-        SessionEventKind::PlaybackInterrupted => ProtoSessionEventKind::PlaybackInterrupted,
-        SessionEventKind::RecoverableWarning => ProtoSessionEventKind::RecoverableWarning,
-        SessionEventKind::FatalError => ProtoSessionEventKind::FatalError,
-        SessionEventKind::VoiceReconnecting => ProtoSessionEventKind::VoiceReconnecting,
     }
 }

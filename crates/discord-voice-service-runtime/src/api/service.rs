@@ -13,13 +13,8 @@ use discord_voice_service_voice::VoiceContext;
 use futures::{Stream, stream};
 use tonic::{Request, Response, Status};
 
-use crate::session::state::SessionState;
-use crate::session::supervisor::{Command, Supervisor};
-use crate::{observability, session::readiness::Readiness};
-
-pub fn map_play_request(request: PlayRequest) -> String {
-    request.video_id
-}
+use crate::session::events::{SessionEventKind, SessionEventRecord};
+use crate::{Command, Readiness, SessionState, Supervisor, observability};
 
 pub struct ControlService {
     pub supervisor: Supervisor,
@@ -171,7 +166,7 @@ impl DiscordVoiceControl for ControlService {
         let stream = stream::unfold(rx, |mut rx| async move {
             loop {
                 match rx.recv().await {
-                    Ok(event) => return Some((Ok(event.into_proto()), rx)),
+                    Ok(event) => return Some((Ok(map_session_event(event)), rx)),
                     // Broadcast channels drop the oldest retained events for lagging
                     // receivers; continue from the oldest event still available.
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -237,5 +232,62 @@ fn map_session_state(state: SessionState) -> ProtoSessionState {
         SessionState::Paused => ProtoSessionState::PausedState,
         SessionState::Stopping => ProtoSessionState::Stopping,
         SessionState::Error => ProtoSessionState::ErrorState,
+    }
+}
+
+fn map_session_event(event: SessionEventRecord) -> SessionEvent {
+    SessionEvent {
+        kind: map_session_event_kind(event.kind) as i32,
+        guild_id: event.guild_id.unwrap_or_default(),
+        channel_id: event.channel_id.unwrap_or_default(),
+        current_video_id: event.current_video_id.unwrap_or_default(),
+        selected_itag: event.selected_itag.unwrap_or_default(),
+        message: event.message.unwrap_or_default(),
+        reason: discord_voice_service_proto::discordvoice::v1::SessionEventReason::Unspecified
+            as i32,
+        ..Default::default()
+    }
+}
+
+fn map_session_event_kind(
+    kind: SessionEventKind,
+) -> discord_voice_service_proto::discordvoice::v1::SessionEventKind {
+    match kind {
+        SessionEventKind::VoiceConnecting => {
+            discord_voice_service_proto::discordvoice::v1::SessionEventKind::VoiceConnecting
+        }
+        SessionEventKind::VoiceReady => {
+            discord_voice_service_proto::discordvoice::v1::SessionEventKind::VoiceReady
+        }
+        SessionEventKind::TrackResolving => {
+            discord_voice_service_proto::discordvoice::v1::SessionEventKind::TrackResolving
+        }
+        SessionEventKind::Buffering => {
+            discord_voice_service_proto::discordvoice::v1::SessionEventKind::Buffering
+        }
+        SessionEventKind::Playing => {
+            discord_voice_service_proto::discordvoice::v1::SessionEventKind::Playing
+        }
+        SessionEventKind::Paused => {
+            discord_voice_service_proto::discordvoice::v1::SessionEventKind::Paused
+        }
+        SessionEventKind::Stopped => {
+            discord_voice_service_proto::discordvoice::v1::SessionEventKind::Stopped
+        }
+        SessionEventKind::TrackEnded => {
+            discord_voice_service_proto::discordvoice::v1::SessionEventKind::TrackEnded
+        }
+        SessionEventKind::PlaybackInterrupted => {
+            discord_voice_service_proto::discordvoice::v1::SessionEventKind::PlaybackInterrupted
+        }
+        SessionEventKind::RecoverableWarning => {
+            discord_voice_service_proto::discordvoice::v1::SessionEventKind::RecoverableWarning
+        }
+        SessionEventKind::FatalError => {
+            discord_voice_service_proto::discordvoice::v1::SessionEventKind::FatalError
+        }
+        SessionEventKind::VoiceReconnecting => {
+            discord_voice_service_proto::discordvoice::v1::SessionEventKind::VoiceReconnecting
+        }
     }
 }

@@ -3,10 +3,10 @@ use std::sync::Arc;
 use discord_voice_service_playback::{PlaybackWorker, YtMusicClient};
 use tokio::sync::broadcast;
 
+use super::events::SessionEventRecord;
+use super::runtime::VoiceSessionRuntime;
+use super::state::Snapshot;
 use crate::error::RuntimeError;
-use crate::session::events::SessionEventRecord;
-use crate::session::runtime::VoiceSessionRuntime;
-use crate::session::state::Snapshot;
 pub use discord_voice_service_voice::VoiceContext;
 
 #[derive(Debug, Clone)]
@@ -55,11 +55,7 @@ impl Supervisor {
         self.runtime.snapshot().await
     }
 
-    pub async fn current_voice_context(&self) -> Option<VoiceContext> {
-        self.runtime.current_voice_context().await
-    }
-
-    pub fn subscribe_events(&self) -> broadcast::Receiver<SessionEventRecord> {
+    pub(crate) fn subscribe_events(&self) -> broadcast::Receiver<SessionEventRecord> {
         self.runtime.subscribe_events()
     }
 }
