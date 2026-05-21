@@ -1,7 +1,7 @@
 #[path = "support/fake_discord.rs"]
 mod fake_discord;
 
-use discord_voice_service::discord_voice::{handshake, session::ConnectedVoiceSession};
+use discord_voice_service_voice::{ConnectedVoiceSession, handshake};
 use tokio::time::Duration;
 
 use self::fake_discord::FakeDiscordPeer;
@@ -84,8 +84,8 @@ async fn voice_session_completes_prepare_backed_dave_join() {
 }
 
 #[tokio::test]
-async fn voice_session_sends_init_transition_ready_before_prepare_commit_transition_for_new_group_creator_path(
-) {
+async fn voice_session_sends_init_transition_ready_before_prepare_commit_transition_for_new_group_creator_path()
+ {
     let fake =
         FakeDiscordPeer::spawn_with_dave_requiring_init_transition_ready_before_prepare_commit_transition()
             .await;

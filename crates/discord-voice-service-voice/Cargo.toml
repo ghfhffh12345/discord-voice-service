@@ -2,5 +2,23 @@
 name = "discord-voice-service-voice"
 version.workspace = true
 edition.workspace = true
+build = "build.rs"
 
 [dependencies]
+aes-gcm.workspace = true
+bytes.workspace = true
+chacha20poly1305.workspace = true
+futures.workspace = true
+http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tracing.workspace = true
+twilight-gateway.workspace = true
+twilight-http.workspace = true
+twilight-model.workspace = true
+
+[build-dependencies]
+cc.workspace = true

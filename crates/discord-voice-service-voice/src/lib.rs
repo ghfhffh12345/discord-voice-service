@@ -1,0 +1,19 @@
+pub mod crypto;
+pub mod dave;
+pub(crate) mod dave_ffi;
+pub mod discovery;
+pub mod error;
+pub mod gateway;
+pub mod handshake;
+pub mod protection;
+pub mod protocol;
+pub mod resume;
+pub(crate) mod rollover;
+pub mod rtp;
+pub mod session;
+pub mod speaking;
+pub mod udp;
+pub mod ws;
+
+pub use error::VoiceError;
+pub use session::{ConnectedVoiceSession, VoiceContext};
