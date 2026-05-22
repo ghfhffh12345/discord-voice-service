@@ -55,7 +55,7 @@ cleanup() {
 trap cleanup EXIT
 
 browser_json_source_path="${BROWSER_JSON_SOURCE_PATH:-${STAGING_BROWSER_JSON_SOURCE_PATH:-}}"
-install -m 600 "${browser_json_source_path}" "${staged_browser_json}"
+install -m 644 "${browser_json_source_path}" "${staged_browser_json}"
 
 cargo build --locked -p discord-voice-service-live-validation --bin staging_live_check
 

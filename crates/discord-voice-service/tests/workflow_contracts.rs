@@ -35,6 +35,24 @@ fn live_staging_workflow_targets_container_artifacts() {
 }
 
 #[test]
+fn live_staging_browser_json_is_materialized_with_container_readable_permissions() {
+    let workflow = fs::read_to_string("../../.github/workflows/live-staging.yml")
+        .expect("live-staging workflow should exist");
+    let run_script = fs::read_to_string("../../scripts/ci/run_live_staging.sh")
+        .expect("live staging runner script should exist");
+
+    assert!(workflow.contains("scripts/ci/run_live_staging.sh"));
+    assert!(
+        run_script.contains("install -m 644"),
+        "hosted live staging must materialize browser.json with container-readable permissions before the read-only bind mount",
+    );
+    assert!(
+        !run_script.contains("install -m 600"),
+        "hosted live staging must not regress to host-only browser.json permissions",
+    );
+}
+
+#[test]
 fn release_workflow_promotes_validated_candidate_digest() {
     let workflow = fs::read_to_string("../../.github/workflows/release-image.yml")
         .expect("release-image workflow should exist");
