@@ -81,6 +81,26 @@ async fn voice_session_completes_prepare_backed_dave_join() {
 }
 
 #[tokio::test]
+async fn voice_session_ignores_no_op_dave_revoke_before_proposals() {
+    let fake = FakeDiscordPeer::spawn_with_dave_no_op_revoke_before_proposals().await;
+    let voice = fake.voice_context("1", "2", "1111111111111111", "session-1", "token-1");
+
+    let session = ConnectedVoiceSession::connect(voice).await.unwrap();
+
+    assert!(session.dave_enabled());
+    assert!(fake.saw_dave_prepare_epoch().await);
+    assert!(fake.saw_dave_key_package_before_prepare_epoch().await);
+    assert!(fake.saw_dave_commit_welcome().await);
+    assert!(fake.sent_dave_prepare_commit_transition().await);
+    assert!(
+        !fake
+            .saw_dave_transition_within(Duration::from_millis(100))
+            .await
+    );
+    assert!(fake.saw_dave_init_transition_ready().await);
+}
+
+#[tokio::test]
 async fn voice_session_sends_init_transition_ready_before_prepare_commit_transition_for_new_group_creator_path()
  {
     let fake =

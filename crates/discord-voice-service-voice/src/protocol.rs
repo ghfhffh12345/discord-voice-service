@@ -506,10 +506,8 @@ pub fn dave_mls_key_package_payload(key_package: &[u8]) -> Vec<u8> {
 pub fn split_dave_mls_commit_welcome_payload(
     commit_welcome: &[u8],
 ) -> Result<(Vec<u8>, Option<Vec<u8>>), VoiceError> {
-    let (_commit_message, welcome) =
-        MlsMessageIn::tls_deserialize_bytes(commit_welcome).map_err(|_| {
-            VoiceError::InvalidState("voice dave commit welcome commit invalid")
-        })?;
+    let (_commit_message, welcome) = MlsMessageIn::tls_deserialize_bytes(commit_welcome)
+        .map_err(|_| VoiceError::InvalidState("voice dave commit welcome commit invalid"))?;
     let commit_len = commit_welcome.len() - welcome.len();
     let commit = commit_welcome[..commit_len].to_vec();
     let welcome = (!welcome.is_empty()).then(|| welcome.to_vec());

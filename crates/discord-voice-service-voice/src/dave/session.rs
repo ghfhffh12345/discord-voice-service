@@ -120,6 +120,7 @@ impl DaveSession {
             proposals,
             recognized_user_ids,
         )
+        .and_then(|commit_welcome| commit_welcome.ok_or(DaveError::EmptyOutput("commit welcome")))
     }
 
     pub fn process_proposals_with_operation(
@@ -127,18 +128,15 @@ impl DaveSession {
         operation: DaveMlsProposalsOperation,
         proposals: &[u8],
         recognized_user_ids: &[&str],
-    ) -> Result<Vec<u8>, DaveError> {
+    ) -> Result<Option<Vec<u8>>, DaveError> {
         let recognized_user_ids = parse_user_ids(recognized_user_ids)?;
-        let commit_welcome = self
+        Ok(self
             .inner_mut()?
             .process_proposals(operation.into(), proposals, Some(&recognized_user_ids))
             .map_err(|err| DaveError::operation("process proposals", err))?
-            .ok_or(DaveError::EmptyOutput("commit welcome"))?;
-
-        Ok(pack_commit_welcome(
-            &commit_welcome.commit,
-            commit_welcome.welcome.as_deref(),
-        ))
+            .map(|commit_welcome| {
+                pack_commit_welcome(&commit_welcome.commit, commit_welcome.welcome.as_deref())
+            }))
     }
 
     pub fn process_commit(&mut self, commit: &[u8]) -> Result<DaveCommitResult, DaveError> {

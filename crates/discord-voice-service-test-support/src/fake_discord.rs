@@ -27,6 +27,7 @@ const DAVE_UNMATCHED_TRANSITION_ID: u16 = 9;
 enum DaveScenario {
     Disabled,
     NewGroup,
+    NewGroupWithNoOpRevokeBeforeProposals,
     NewGroupSelfOnlyNoProposals,
     NewGroupRequiresInitTransitionReadyBeforePrepareCommitTransition,
     NewGroupCommitBeforePrepareEpoch,
@@ -115,6 +116,17 @@ impl FakeDiscordPeer {
         Self::spawn_with_options_and_ready_delay(
             1_000,
             DaveScenario::NewGroup,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .await
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn spawn_with_dave_no_op_revoke_before_proposals() -> Self {
+        Self::spawn_with_options_and_ready_delay(
+            1_000,
+            DaveScenario::NewGroupWithNoOpRevokeBeforeProposals,
             Duration::ZERO,
             Duration::ZERO,
         )
@@ -332,6 +344,7 @@ impl FakeDiscordPeer {
                 matches!(
                     dave_scenario,
                     DaveScenario::NewGroup
+                        | DaveScenario::NewGroupWithNoOpRevokeBeforeProposals
                         | DaveScenario::NewGroupRequiresInitTransitionReadyBeforePrepareCommitTransition
                 );
             let mut delayed_prepare_epoch_after_commit =
@@ -445,6 +458,7 @@ impl FakeDiscordPeer {
                                     DaveScenario::Disabled => Vec::new(),
                                     DaveScenario::NewGroupSelfOnlyNoProposals => Vec::new(),
                                     DaveScenario::NewGroup
+                                    | DaveScenario::NewGroupWithNoOpRevokeBeforeProposals
                                     | DaveScenario::NewGroupRequiresInitTransitionReadyBeforePrepareCommitTransition
                                     | DaveScenario::NewGroupCommitBeforePrepareEpoch
                                     | DaveScenario::NewGroupRequiresInitKeyPackage
@@ -540,6 +554,7 @@ impl FakeDiscordPeer {
                                     && !matches!(
                                         dave_scenario,
                                         DaveScenario::NewGroup
+                                            | DaveScenario::NewGroupWithNoOpRevokeBeforeProposals
                                             | DaveScenario::NewGroupSelfOnlyNoProposals
                                             | DaveScenario::NewGroupRequiresInitTransitionReadyBeforePrepareCommitTransition
                                     )
@@ -547,6 +562,7 @@ impl FakeDiscordPeer {
                                     let transition_id = if matches!(
                                         dave_scenario,
                                         DaveScenario::NewGroup
+                                            | DaveScenario::NewGroupWithNoOpRevokeBeforeProposals
                                             | DaveScenario::NewGroupRequiresInitTransitionReadyBeforePrepareCommitTransition
                                     ) {
                                         DAVE_INIT_TRANSITION_ID
@@ -709,6 +725,7 @@ impl FakeDiscordPeer {
                                     dave_scenario,
                                     DaveScenario::NewGroup
                                         | DaveScenario::NewGroupSelfOnlyNoProposals
+                                        | DaveScenario::NewGroupWithNoOpRevokeBeforeProposals
                                         | DaveScenario::NewGroupRequiresInitTransitionReadyBeforePrepareCommitTransition
                                         | DaveScenario::EstablishedGroupJoin
                                         | DaveScenario::PrepareBackedWelcomeWithStrayFollowUp
@@ -764,6 +781,7 @@ impl FakeDiscordPeer {
                             let transition_id = match dave_scenario {
                                 DaveScenario::NewGroup
                                 | DaveScenario::NewGroupSelfOnlyNoProposals
+                                | DaveScenario::NewGroupWithNoOpRevokeBeforeProposals
                                 | DaveScenario::NewGroupRequiresInitTransitionReadyBeforePrepareCommitTransition
                                 | DaveScenario::NewGroupCommitBeforePrepareEpoch
                                 | DaveScenario::NewGroupRequiresInitKeyPackage
@@ -779,6 +797,7 @@ impl FakeDiscordPeer {
                             } else if matches!(
                                 dave_scenario,
                                 DaveScenario::NewGroup
+                                    | DaveScenario::NewGroupWithNoOpRevokeBeforeProposals
                                     | DaveScenario::NewGroupRequiresInitTransitionReadyBeforePrepareCommitTransition
                                     | DaveScenario::NewGroupCommitBeforePrepareEpoch
                                     | DaveScenario::NewGroupRequiresInitKeyPackage
@@ -792,6 +811,16 @@ impl FakeDiscordPeer {
                                         .expect("runtime proposal");
                                     dave_proposals_message(4, &proposal)
                                 };
+                                if dave_scenario
+                                    == DaveScenario::NewGroupWithNoOpRevokeBeforeProposals
+                                {
+                                    ws.send(Message::Binary(Bytes::from(dave_revoke_message(
+                                        4,
+                                        &[0],
+                                    ))))
+                                    .await
+                                    .unwrap();
+                                }
                                 ws.send(Message::Binary(Bytes::from(proposal_message)))
                                     .await
                                     .unwrap();
@@ -841,6 +870,7 @@ impl FakeDiscordPeer {
                             if matches!(
                                 dave_scenario,
                                 DaveScenario::NewGroup
+                                    | DaveScenario::NewGroupWithNoOpRevokeBeforeProposals
                                     | DaveScenario::NewGroupRequiresInitTransitionReadyBeforePrepareCommitTransition
                                     | DaveScenario::NewGroupCommitBeforePrepareEpoch
                                     | DaveScenario::NewGroupRequiresInitKeyPackage
@@ -1109,6 +1139,15 @@ fn dave_proposals_message(sequence: u16, proposals: &[u8]) -> Vec<u8> {
     message
 }
 
+fn dave_revoke_message(sequence: u16, refs: &[u8]) -> Vec<u8> {
+    let mut message = Vec::with_capacity(4 + refs.len());
+    message.extend_from_slice(&sequence.to_be_bytes());
+    message.push(27);
+    message.push(1);
+    message.extend_from_slice(refs);
+    message
+}
+
 fn dave_prepare_commit_transition_message(
     sequence: u16,
     transition_id: u16,
@@ -1134,6 +1173,7 @@ fn dave_welcome_message(
     let proposal_epoch = match dave_scenario {
         DaveScenario::Disabled => unreachable!("disabled DAVE scenario cannot emit welcome"),
         DaveScenario::NewGroup
+        | DaveScenario::NewGroupWithNoOpRevokeBeforeProposals
         | DaveScenario::NewGroupSelfOnlyNoProposals
         | DaveScenario::NewGroupRequiresInitTransitionReadyBeforePrepareCommitTransition
         | DaveScenario::NewGroupCommitBeforePrepareEpoch
@@ -1149,6 +1189,7 @@ fn dave_welcome_message(
     let recognized_user_ids = match dave_scenario {
         DaveScenario::Disabled => unreachable!("disabled DAVE scenario cannot emit welcome"),
         DaveScenario::NewGroup
+        | DaveScenario::NewGroupWithNoOpRevokeBeforeProposals
         | DaveScenario::NewGroupSelfOnlyNoProposals
         | DaveScenario::NewGroupRequiresInitTransitionReadyBeforePrepareCommitTransition
         | DaveScenario::NewGroupCommitBeforePrepareEpoch

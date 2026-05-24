@@ -422,6 +422,10 @@ async fn complete_initial_dave_transition(
                 let commit_welcome = dave_session_mut(&mut session)?
                     .process_proposals_with_operation(operation, &proposals, &recognized)
                     .map_err(|_| VoiceError::InvalidState("voice dave proposals invalid"))?;
+                let Some(commit_welcome) = commit_welcome else {
+                    tracing::debug!("voice dave handshake proposal result did not require commit");
+                    continue;
+                };
                 let (commit, _welcome) = local_external_sender
                     .split_commit_welcome(&commit_welcome)
                     .map_err(|_| VoiceError::InvalidState("voice dave commit welcome invalid"))?;
