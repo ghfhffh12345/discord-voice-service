@@ -46,21 +46,3 @@ jobs:
       - name: Run full cargo test suite
         shell: bash
         run: cargo test --workspace -v
-
-      - name: Run fake-peer critical subset
-        shell: bash
-        run: |
-          cargo test -p discord-voice-service-voice \
-            --test voice_handshake \
-            --test voice_gateway_v8 \
-            --test voice_udp_transport \
-            --test voice_context_rollover \
-            -v
-          cargo test -p discord-voice-service-playback \
-            --test pacer_runtime \
-            --test recovery_reresolve \
-            --test recovery_reopen \
-            -v
-          cargo test -p discord-voice-service-runtime \
-            --test runtime_end_to_end_playback \
-            -v
