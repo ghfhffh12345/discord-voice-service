@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use discord_voice_service_voice::VoiceContext;
 use discord_voice_service_voice::crypto::{PREFERRED_MODE, REQUIRED_MODE};
 use discord_voice_service_voice::dave::{DaveExternalSender, DaveSession};
+use discord_voice_service_voice::test_support::split_dave_mls_commit_welcome_payload;
 use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::net::{TcpListener, UdpSocket};
@@ -853,15 +854,13 @@ impl FakeDiscordPeer {
                                 .clone()
                                 .unwrap_or_else(|| "1111111111111111".to_owned());
                             let prepare_commit_message = {
-                                let external_sender = dave_external_sender
-                                    .as_ref()
-                                    .expect("external sender missing");
                                 let creator =
                                     dave_creator.as_mut().expect("creator session missing");
                                 let recognized_user_ids = [DAVE_CREATOR_USER_ID, user_id.as_str()];
-                                let (commit, welcome) = external_sender
-                                    .split_commit_welcome(&bytes[1..])
-                                    .expect("split commit/welcome");
+                                let (commit, welcome) =
+                                    split_dave_mls_commit_welcome_payload(&bytes[1..])
+                                        .expect("split raw commit/welcome");
+                                let welcome = welcome.expect("commit/welcome includes welcome");
                                 creator
                                     .process_welcome(&welcome, &recognized_user_ids)
                                     .expect("creator process welcome");
@@ -1102,9 +1101,10 @@ fn dave_external_sender_message(sequence: u16, external_sender_bytes: &[u8]) -> 
 }
 
 fn dave_proposals_message(sequence: u16, proposals: &[u8]) -> Vec<u8> {
-    let mut message = Vec::with_capacity(3 + proposals.len());
+    let mut message = Vec::with_capacity(4 + proposals.len());
     message.extend_from_slice(&sequence.to_be_bytes());
     message.push(27);
+    message.push(0);
     message.extend_from_slice(proposals);
     message
 }

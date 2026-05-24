@@ -24,6 +24,7 @@ pub mod test_support {
     };
     pub use crate::gateway::VoiceGatewayClient;
     pub use crate::protection::ProtectionContext;
+    pub use crate::protocol::split_dave_mls_commit_welcome_payload;
     pub use crate::resume::GatewayEvent;
     pub use crate::rtp::RtpPacketBuilder;
     pub use crate::speaking::{OPUS_SILENCE_FRAME, send_speaking};

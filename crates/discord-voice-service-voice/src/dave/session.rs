@@ -8,6 +8,21 @@ use super::DaveError;
 use super::wire::pack_commit_welcome;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaveMlsProposalsOperation {
+    Append,
+    Revoke,
+}
+
+impl From<DaveMlsProposalsOperation> for ProposalsOperationType {
+    fn from(value: DaveMlsProposalsOperation) -> Self {
+        match value {
+            DaveMlsProposalsOperation::Append => Self::APPEND,
+            DaveMlsProposalsOperation::Revoke => Self::REVOKE,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DaveMediaType {
     Audio,
     Video,
@@ -100,14 +115,23 @@ impl DaveSession {
         proposals: &[u8],
         recognized_user_ids: &[&str],
     ) -> Result<Vec<u8>, DaveError> {
+        self.process_proposals_with_operation(
+            DaveMlsProposalsOperation::Append,
+            proposals,
+            recognized_user_ids,
+        )
+    }
+
+    pub fn process_proposals_with_operation(
+        &mut self,
+        operation: DaveMlsProposalsOperation,
+        proposals: &[u8],
+        recognized_user_ids: &[&str],
+    ) -> Result<Vec<u8>, DaveError> {
         let recognized_user_ids = parse_user_ids(recognized_user_ids)?;
         let commit_welcome = self
             .inner_mut()?
-            .process_proposals(
-                ProposalsOperationType::APPEND,
-                proposals,
-                Some(&recognized_user_ids),
-            )
+            .process_proposals(operation.into(), proposals, Some(&recognized_user_ids))
             .map_err(|err| DaveError::operation("process proposals", err))?
             .ok_or(DaveError::EmptyOutput("commit welcome"))?;
 

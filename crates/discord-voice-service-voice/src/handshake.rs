@@ -401,7 +401,10 @@ async fn complete_initial_dave_transition(
                 .await?;
                 pending_prepared_transitions.insert(transition_id, prepare_protocol_version);
             }
-            VoiceGatewayEvent::DaveMlsProposals(DaveMlsProposals { proposals }) => {
+            VoiceGatewayEvent::DaveMlsProposals(DaveMlsProposals {
+                operation,
+                proposals,
+            }) => {
                 if !pending_key_package {
                     return Err(VoiceError::InvalidState(
                         "voice dave proposals missing pending group creation",
@@ -417,7 +420,7 @@ async fn complete_initial_dave_transition(
                     "voice dave handshake processing proposals"
                 );
                 let commit_welcome = dave_session_mut(&mut session)?
-                    .process_proposals(&proposals, &recognized)
+                    .process_proposals_with_operation(operation, &proposals, &recognized)
                     .map_err(|_| VoiceError::InvalidState("voice dave proposals invalid"))?;
                 let (commit, _welcome) = local_external_sender
                     .split_commit_welcome(&commit_welcome)

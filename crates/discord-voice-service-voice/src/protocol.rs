@@ -1,6 +1,8 @@
+use openmls::prelude::{MlsMessageIn, tls_codec::DeserializeBytes};
 use serde_json::{Value, json};
 
 use crate::crypto;
+use crate::dave::{DaveMlsProposalsOperation, unpack_commit_welcome};
 use crate::error::VoiceError;
 use crate::session::VoiceContext;
 use crate::udp::DiscoveredUdpAddress;
@@ -91,6 +93,7 @@ pub struct DaveMlsExternalSenderPackage {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaveMlsProposals {
+    pub operation: DaveMlsProposalsOperation,
     pub proposals: Vec<u8>,
 }
 
@@ -383,9 +386,12 @@ pub fn dave_transition_ready_payload(transition_id: u16) -> Value {
 }
 
 pub fn dave_mls_commit_welcome_payload(commit_welcome: &[u8]) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(1 + commit_welcome.len());
+    let (commit, welcome) =
+        unpack_commit_welcome(commit_welcome).expect("internal commit/welcome framing is valid");
+    let mut payload = Vec::with_capacity(1 + commit.len() + welcome.len());
     payload.push(28);
-    payload.extend_from_slice(commit_welcome);
+    payload.extend_from_slice(&commit);
+    payload.extend_from_slice(&welcome);
     payload
 }
 
@@ -448,9 +454,17 @@ pub fn parse_gateway_binary_message(bytes: &[u8]) -> Result<VoiceGatewayPayload,
         25 => VoiceGatewayEvent::DaveMlsExternalSenderPackage(DaveMlsExternalSenderPackage {
             external_sender: bytes[3..].to_vec(),
         }),
-        27 => VoiceGatewayEvent::DaveMlsProposals(DaveMlsProposals {
-            proposals: bytes[3..].to_vec(),
-        }),
+        27 => {
+            if bytes.len() < 4 {
+                return Err(VoiceError::InvalidState(
+                    "voice dave proposals payload too short",
+                ));
+            }
+            VoiceGatewayEvent::DaveMlsProposals(DaveMlsProposals {
+                operation: parse_dave_proposals_operation(bytes[3])?,
+                proposals: bytes[4..].to_vec(),
+            })
+        }
         29 => {
             if bytes.len() < 5 {
                 return Err(VoiceError::InvalidState(
@@ -488,10 +502,34 @@ pub fn dave_mls_key_package_payload(key_package: &[u8]) -> Vec<u8> {
     payload
 }
 
+#[doc(hidden)]
+pub fn split_dave_mls_commit_welcome_payload(
+    commit_welcome: &[u8],
+) -> Result<(Vec<u8>, Option<Vec<u8>>), VoiceError> {
+    let (_commit_message, welcome) =
+        MlsMessageIn::tls_deserialize_bytes(commit_welcome).map_err(|_| {
+            VoiceError::InvalidState("voice dave commit welcome commit invalid")
+        })?;
+    let commit_len = commit_welcome.len() - welcome.len();
+    let commit = commit_welcome[..commit_len].to_vec();
+    let welcome = (!welcome.is_empty()).then(|| welcome.to_vec());
+    Ok((commit, welcome))
+}
+
 fn seq_ack_i64(seq_ack: Option<u64>) -> i64 {
     seq_ack
         .and_then(|seq| i64::try_from(seq).ok())
         .unwrap_or(-1)
+}
+
+fn parse_dave_proposals_operation(value: u8) -> Result<DaveMlsProposalsOperation, VoiceError> {
+    match value {
+        0 => Ok(DaveMlsProposalsOperation::Append),
+        1 => Ok(DaveMlsProposalsOperation::Revoke),
+        _ => Err(VoiceError::InvalidState(
+            "voice dave proposals operation invalid",
+        )),
+    }
 }
 
 fn unsupported_text_gateway_op_error(op: u64) -> VoiceError {
@@ -587,6 +625,7 @@ mod tests {
         dave_transition_ready_payload, identify_payload, parse_gateway_binary_message,
         parse_gateway_message,
     };
+    use crate::dave::DaveMlsProposalsOperation;
     use crate::session::VoiceContext;
 
     #[test]
@@ -639,11 +678,21 @@ mod tests {
             VoiceGatewayEvent::DaveMlsExternalSenderPackage(_)
         ));
 
-        let proposals = parse_gateway_binary_message(&[0, 8, 27, 4, 5, 6]).unwrap();
+        let proposals = parse_gateway_binary_message(&[0, 8, 27, 0, 4, 5, 6]).unwrap();
         assert_eq!(proposals.seq(), Some(8));
         match proposals.into_event() {
             VoiceGatewayEvent::DaveMlsProposals(proposals) => {
+                assert_eq!(proposals.operation, DaveMlsProposalsOperation::Append);
                 assert_eq!(proposals.proposals, vec![4, 5, 6]);
+            }
+            other => panic!("expected dave proposals event, got {other:?}"),
+        }
+
+        let revoke = parse_gateway_binary_message(&[0, 8, 27, 1, 9, 10]).unwrap();
+        match revoke.into_event() {
+            VoiceGatewayEvent::DaveMlsProposals(proposals) => {
+                assert_eq!(proposals.operation, DaveMlsProposalsOperation::Revoke);
+                assert_eq!(proposals.proposals, vec![9, 10]);
             }
             other => panic!("expected dave proposals event, got {other:?}"),
         }
@@ -677,8 +726,8 @@ mod tests {
 
         assert_eq!(dave_mls_key_package_payload(&[1, 2, 3]), vec![26, 1, 2, 3]);
         assert_eq!(
-            dave_mls_commit_welcome_payload(&[4, 5, 6]),
-            vec![28, 4, 5, 6]
+            dave_mls_commit_welcome_payload(&[0, 0, 0, 2, 4, 5, 0, 0, 0, 3, 6, 7, 8]),
+            vec![28, 4, 5, 6, 7, 8]
         );
     }
 
