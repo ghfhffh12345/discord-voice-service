@@ -93,7 +93,7 @@ pub struct DaveMlsExternalSenderPackage {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaveMlsProposals {
-    pub operation: DaveMlsProposalsOperation,
+    pub(crate) operation: DaveMlsProposalsOperation,
     pub proposals: Vec<u8>,
 }
 

@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, SocketAddr};
 
+use davey::ProposalsOperationType;
 use tokio::net::lookup_host;
 use tokio::sync::oneshot;
 use tokio::time::{Duration, sleep, timeout};
@@ -422,9 +423,21 @@ async fn complete_initial_dave_transition(
                 let commit_welcome = dave_session_mut(&mut session)?
                     .process_proposals_with_operation(operation, &proposals, &recognized)
                     .map_err(|_| VoiceError::InvalidState("voice dave proposals invalid"))?;
-                let Some(commit_welcome) = commit_welcome else {
-                    tracing::debug!("voice dave handshake proposal result did not require commit");
-                    continue;
+                let commit_welcome = match commit_welcome {
+                    Some(commit_welcome) => commit_welcome,
+                    None if ProposalsOperationType::from(operation)
+                        == ProposalsOperationType::REVOKE =>
+                    {
+                        tracing::debug!(
+                            "voice dave handshake proposal result did not require commit"
+                        );
+                        continue;
+                    }
+                    None => {
+                        return Err(VoiceError::InvalidState(
+                            "voice dave append proposals produced no commit",
+                        ));
+                    }
                 };
                 let (commit, _welcome) = local_external_sender
                     .split_commit_welcome(&commit_welcome)

@@ -8,7 +8,7 @@ use super::DaveError;
 use super::wire::pack_commit_welcome;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DaveMlsProposalsOperation {
+pub(crate) enum DaveMlsProposalsOperation {
     Append,
     Revoke,
 }
@@ -123,20 +123,28 @@ impl DaveSession {
         .and_then(|commit_welcome| commit_welcome.ok_or(DaveError::EmptyOutput("commit welcome")))
     }
 
-    pub fn process_proposals_with_operation(
+    pub(crate) fn process_proposals_with_operation(
         &mut self,
         operation: DaveMlsProposalsOperation,
         proposals: &[u8],
         recognized_user_ids: &[&str],
     ) -> Result<Option<Vec<u8>>, DaveError> {
         let recognized_user_ids = parse_user_ids(recognized_user_ids)?;
-        Ok(self
+        let commit_welcome = self
             .inner_mut()?
             .process_proposals(operation.into(), proposals, Some(&recognized_user_ids))
-            .map_err(|err| DaveError::operation("process proposals", err))?
-            .map(|commit_welcome| {
-                pack_commit_welcome(&commit_welcome.commit, commit_welcome.welcome.as_deref())
-            }))
+            .map_err(|err| DaveError::operation("process proposals", err))?;
+        match (operation, commit_welcome) {
+            (DaveMlsProposalsOperation::Revoke, None) => Ok(None),
+            (_, Some(commit_welcome)) => Ok(Some(pack_commit_welcome(
+                &commit_welcome.commit,
+                commit_welcome.welcome.as_deref(),
+            ))),
+            (DaveMlsProposalsOperation::Append, None) => Err(DaveError::operation(
+                "process proposals",
+                "append proposals returned no commit/welcome",
+            )),
+        }
     }
 
     pub fn process_commit(&mut self, commit: &[u8]) -> Result<DaveCommitResult, DaveError> {
