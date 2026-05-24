@@ -15,7 +15,7 @@ webm-iterable.workspace = true
 ytmusic-service-proto.workspace = true
 
 [dev-dependencies]
-discord-voice-service-test-support = { path = "../discord-voice-service-test-support" }
+discord-voice-service-test-support = { workspace = true }
 tokio.workspace = true
 tokio-stream.workspace = true
 tonic.workspace = true

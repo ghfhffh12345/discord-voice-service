@@ -5,8 +5,8 @@ edition.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-discord-voice-service-proto = { path = "../discord-voice-service-proto" }
-discord-voice-service-runtime = { path = "../discord-voice-service-runtime" }
+discord-voice-service-proto = { workspace = true }
+discord-voice-service-runtime = { workspace = true }
 http.workspace = true
 tokio.workspace = true
 tonic.workspace = true
