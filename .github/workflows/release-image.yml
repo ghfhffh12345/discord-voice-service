@@ -17,37 +17,96 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  verify-fake-peer-ci:
-    name: Verify Fake Peer CI Gate
-    runs-on: ubuntu-22.04
+  prepare:
+    name: Prepare Release Metadata
+    runs-on: ubuntu-24.04
     outputs:
-      release_ref: ${{ steps.release-target.outputs.release_ref }}
-      release_sha: ${{ steps.release-target.outputs.release_sha }}
-
+      release_ref: ${{ steps.meta.outputs.release_ref }}
+      release_sha: ${{ steps.meta.outputs.release_sha }}
+      image_ref: ${{ steps.meta.outputs.image_ref }}
+      candidate_tag: ${{ steps.meta.outputs.candidate_tag }}
+      final_tags: ${{ steps.meta.outputs.final_tags }}
+      version_tag: ${{ steps.meta.outputs.version_tag }}
+      oci_labels: ${{ steps.meta.outputs.oci_labels }}
+      image_annotations: ${{ steps.meta.outputs.image_annotations }}
+      oci_annotations: ${{ steps.meta.outputs.oci_annotations }}
     steps:
       - name: Check out release tag
         uses: actions/checkout@v5
         with:
           ref: ${{ github.event.release.tag_name }}
 
-      - name: Resolve release target
-        id: release-target
+      - name: Validate release tag and derive metadata
+        id: meta
         shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
         run: |
           set -euo pipefail
 
-          release_ref="refs/tags/${{ github.event.release.tag_name }}"
-          release_sha="$(git rev-list -n 1 "${{ github.event.release.tag_name }}")"
+          release_sha="$(git rev-list -n 1 "${RELEASE_TAG}")"
+          release_ref="refs/tags/${RELEASE_TAG}"
+          owner="${REPOSITORY_OWNER,,}"
+          image_ref="ghcr.io/${owner}/discord-voice-service"
+          candidate_tag="candidate-${release_sha}"
+
+          if [[ "${RELEASE_TAG}" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            version_tag="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}"
+            final_tags="$(printf '%s\n%s\n%s\nlatest' \
+              "${version_tag}" \
+              "${BASH_REMATCH[1]}.${BASH_REMATCH[2]}" \
+              "${BASH_REMATCH[1]}")"
+          elif [[ "${RELEASE_TAG}" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)-(.+)$ ]]; then
+            version_tag="${RELEASE_TAG#v}"
+            final_tags="${version_tag}"
+          else
+            echo "Release tags must match vX.Y.Z or vX.Y.Z-suffix; received '${RELEASE_TAG}'." >&2
+            exit 1
+          fi
 
           {
             echo "release_ref=${release_ref}"
             echo "release_sha=${release_sha}"
+            echo "image_ref=${image_ref}"
+            echo "candidate_tag=${candidate_tag}"
+            echo "version_tag=${version_tag}"
+            echo "final_tags<<EOF"
+            printf '%s\n' "${final_tags}"
+            echo "EOF"
+            echo "oci_labels<<EOF"
+            echo "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}"
+            echo "org.opencontainers.image.title=discord-voice-service"
+            echo "org.opencontainers.image.description=Rust microservice for direct Discord Voice playback from YouTube Music streams"
+            echo "org.opencontainers.image.documentation=https://github.com/${GITHUB_REPOSITORY}#readme"
+            echo "org.opencontainers.image.revision=${release_sha}"
+            echo "org.opencontainers.image.version=${version_tag}"
+            echo "EOF"
+            echo "image_annotations<<EOF"
+            echo "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}"
+            echo "org.opencontainers.image.title=discord-voice-service"
+            echo "org.opencontainers.image.description=Rust microservice for direct Discord Voice playback from YouTube Music streams"
+            echo "org.opencontainers.image.documentation=https://github.com/${GITHUB_REPOSITORY}#readme"
+            echo "org.opencontainers.image.revision=${release_sha}"
+            echo "org.opencontainers.image.version=${version_tag}"
+            echo "EOF"
+            echo "oci_annotations<<EOF"
+            echo "index:org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}"
+            echo "manifest-descriptor:org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}"
+            echo "index:org.opencontainers.image.version=${version_tag}"
+            echo "manifest-descriptor:org.opencontainers.image.version=${version_tag}"
+            echo "EOF"
           } >> "${GITHUB_OUTPUT}"
 
+  verify-fake-peer-ci:
+    name: Verify Fake Peer CI Gate
+    runs-on: ubuntu-24.04
+    needs: prepare
+    steps:
       - name: Require successful Fake Peer CI run for release commit
         uses: actions/github-script@v8
         env:
-          RELEASE_SHA: ${{ steps.release-target.outputs.release_sha }}
+          RELEASE_SHA: ${{ needs.prepare.outputs.release_sha }}
         with:
           script: |
             const { owner, repo } = context.repo;
@@ -79,167 +138,91 @@ jobs:
               `Fake Peer CI gate satisfied by run ${success.id} (${success.html_url}) for ${releaseSha}.`
             );
 
-  build-candidate:
-    name: Build Candidate GHCR Image
-    needs: verify-fake-peer-ci
-    runs-on: ubuntu-22.04
+  build-amd64:
+    name: Build amd64 Image
+    needs: [prepare, verify-fake-peer-ci]
+    runs-on: ubuntu-24.04
     outputs:
-      image_repo: ${{ steps.meta.outputs.image_repo }}
-      candidate_tag: ${{ steps.meta.outputs.candidate_tag }}
-      target_tags: ${{ steps.meta.outputs.target_tags }}
-      candidate_digest: ${{ steps.candidate-digest.outputs.candidate_digest }}
-
+      digest: ${{ steps.build.outputs.digest }}
     steps:
       - name: Check out release tag
         uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ needs.prepare.outputs.release_ref }}
 
-      - name: Install QEMU and skopeo
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y qemu-user-static skopeo
-
-      - name: Derive image metadata
-        id: meta
-        shell: bash
-        env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-          RELEASE_SHA: ${{ needs.verify-fake-peer-ci.outputs.release_sha }}
-          IS_PRERELEASE: ${{ github.event.release.prerelease }}
-          REPOSITORY_OWNER: ${{ github.repository_owner }}
-        run: |
-          set -euo pipefail
-
-          owner="${REPOSITORY_OWNER,,}"
-          image_name="discord-voice-service"
-          registry_namespace="ghcr.io/${owner}"
-          image_repo="${registry_namespace}/${image_name}"
-          candidate_tag="candidate-${RELEASE_SHA}"
-
-          release_tag="${RELEASE_TAG}"
-          stripped_tag="${release_tag#v}"
-          prerelease="${IS_PRERELEASE}"
-
-          declare -a tag_candidates=()
-          declare -A seen=()
-
-          add_tag() {
-            local candidate="$1"
-            if [[ -n "${candidate}" && -z "${seen[$candidate]:-}" ]]; then
-              tag_candidates+=("${candidate}")
-              seen["$candidate"]=1
-            fi
-          }
-
-          add_tag "${stripped_tag}"
-
-          if [[ "${prerelease}" != "true" && "${stripped_tag}" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
-            add_tag "${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
-            add_tag "${BASH_REMATCH[1]}"
-            add_tag "latest"
-          fi
-
-          {
-            echo "image_name=${image_name}"
-            echo "registry_namespace=${registry_namespace}"
-            echo "image_repo=${image_repo}"
-            echo "candidate_tag=${candidate_tag}"
-            echo "candidate_ref=${image_repo}:${candidate_tag}"
-            echo "target_tags=${tag_candidates[*]}"
-            echo "release_version=${stripped_tag}"
-            echo "is_prerelease=${prerelease}"
-            echo "oci_labels<<EOF"
-            echo "org.opencontainers.image.title=discord-voice-service"
-            echo "org.opencontainers.image.description=Rust microservice for direct Discord Voice playback from YouTube Music streams"
-            echo "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}"
-            echo "org.opencontainers.image.revision=${RELEASE_SHA}"
-            echo "org.opencontainers.image.version=${stripped_tag}"
-            echo "org.opencontainers.image.url=https://github.com/${GITHUB_REPOSITORY}/releases/tag/${release_tag}"
-            echo "org.opencontainers.image.documentation=https://github.com/${GITHUB_REPOSITORY}#readme"
-            echo "EOF"
-          } >> "${GITHUB_OUTPUT}"
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GHCR
-        uses: redhat-actions/podman-login@v1
+        uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
-      - name: Build multi-arch candidate image manifest
-        id: build-image
-        uses: redhat-actions/buildah-build@v2
+      - name: Build amd64 image by digest
+        id: build
+        uses: docker/build-push-action@v7
         with:
-          image: ${{ steps.meta.outputs.image_name }}
-          tags: ${{ steps.meta.outputs.candidate_tag }}
           context: .
-          containerfiles: |
-            ./Containerfile
-          platforms: linux/amd64,linux/arm64
-          oci: true
-          labels: ${{ steps.meta.outputs.oci_labels }}
+          file: ./Containerfile
+          platforms: linux/amd64
+          provenance: false
+          outputs: type=image,name=${{ needs.prepare.outputs.image_ref }},push-by-digest=true,name-canonical=true,push=true
+          labels: ${{ needs.prepare.outputs.oci_labels }}
+          annotations: ${{ needs.prepare.outputs.image_annotations }}
 
-      - name: Push candidate image manifest to GHCR
-        id: push-image
-        uses: redhat-actions/push-to-registry@v2
-        with:
-          image: ${{ steps.build-image.outputs.image }}
-          tags: ${{ steps.build-image.outputs.tags }}
-          registry: ${{ steps.meta.outputs.registry_namespace }}
-
-      - name: Resolve candidate digest
-        id: candidate-digest
-        shell: bash
-        env:
-          CANDIDATE_REF: ${{ steps.meta.outputs.candidate_ref }}
-        run: |
-          set -euo pipefail
-
-          candidate_digest="$(skopeo inspect --format '{{.Digest}}' "docker://${CANDIDATE_REF}")"
-          echo "candidate_digest=${candidate_digest}" >> "${GITHUB_OUTPUT}"
-
-      - name: Summarize candidate image
-        shell: bash
-        run: |
-          {
-            echo "## Candidate GHCR image"
-            echo
-            echo "- Image repo: \`${{ steps.meta.outputs.image_repo }}\`"
-            echo "- Candidate tag: \`${{ steps.meta.outputs.candidate_tag }}\`"
-            echo "- Candidate digest: \`${{ steps.candidate-digest.outputs.candidate_digest }}\`"
-            echo "- Promotion tags: \`${{ steps.meta.outputs.target_tags }}\`"
-            echo "- Registry paths: \`${{ steps.push-image.outputs.registry-paths }}\`"
-          } >> "${GITHUB_STEP_SUMMARY}"
-
-  live-staging:
-    name: Live Staging Release Gate
-    needs:
-      - verify-fake-peer-ci
-      - build-candidate
-    uses: ./.github/workflows/live-staging.yml
-    with:
-      source_ref: ${{ needs.verify-fake-peer-ci.outputs.release_ref }}
-      source_sha: ${{ needs.verify-fake-peer-ci.outputs.release_sha }}
-      discord_voice_service_image_ref: ${{ needs.build-candidate.outputs.image_repo }}@${{ needs.build-candidate.outputs.candidate_digest }}
-      discord_voice_service_image_digest: ${{ needs.build-candidate.outputs.candidate_digest }}
-    secrets: inherit
-
-  promote-image:
-    name: Promote Validated Candidate Image
-    runs-on: ubuntu-22.04
-    needs:
-      - verify-fake-peer-ci
-      - build-candidate
-      - live-staging
-
+  build-arm64:
+    name: Build arm64 Image
+    needs: [prepare, verify-fake-peer-ci]
+    runs-on: ubuntu-24.04-arm
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
     steps:
       - name: Check out release tag
         uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ needs.prepare.outputs.release_ref }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build arm64 image by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Containerfile
+          platforms: linux/arm64
+          provenance: false
+          outputs: type=image,name=${{ needs.prepare.outputs.image_ref }},push-by-digest=true,name-canonical=true,push=true
+          labels: ${{ needs.prepare.outputs.oci_labels }}
+          annotations: ${{ needs.prepare.outputs.image_annotations }}
+
+  publish-candidate-manifest:
+    name: Publish Candidate Manifest
+    needs: [prepare, build-amd64, build-arm64]
+    runs-on: ubuntu-24.04
+    outputs:
+      candidate_ref: ${{ steps.publish.outputs.candidate_ref }}
+      candidate_digest: ${{ steps.publish.outputs.candidate_digest }}
+    steps:
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
 
       - name: Install skopeo
         shell: bash
@@ -248,30 +231,85 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y skopeo
 
+      - name: Publish candidate manifest
+        id: publish
+        shell: bash
+        env:
+          IMAGE_REF: ${{ needs.prepare.outputs.image_ref }}
+          CANDIDATE_TAG: ${{ needs.prepare.outputs.candidate_tag }}
+          OCI_ANNOTATIONS: ${{ needs.prepare.outputs.oci_annotations }}
+          AMD64_DIGEST: ${{ needs.build-amd64.outputs.digest }}
+          ARM64_DIGEST: ${{ needs.build-arm64.outputs.digest }}
+        run: |
+          set -euo pipefail
+
+          create_args=(
+            --tag "${IMAGE_REF}:${CANDIDATE_TAG}"
+          )
+
+          while IFS= read -r annotation; do
+            if [[ -n "${annotation}" ]]; then
+              create_args+=(--annotation "${annotation}")
+            fi
+          done <<< "${OCI_ANNOTATIONS}"
+
+          create_args+=(
+            "${IMAGE_REF}@${AMD64_DIGEST}"
+            "${IMAGE_REF}@${ARM64_DIGEST}"
+          )
+
+          docker buildx imagetools create "${create_args[@]}"
+
+          candidate_ref="${IMAGE_REF}:${CANDIDATE_TAG}"
+          candidate_digest="$(skopeo inspect --format '{{.Digest}}' "docker://${candidate_ref}")"
+
+          {
+            echo "candidate_ref=${candidate_ref}"
+            echo "candidate_digest=${candidate_digest}"
+          } >> "${GITHUB_OUTPUT}"
+
+  live-staging:
+    name: Live Staging Release Gate
+    needs: [prepare, publish-candidate-manifest]
+    uses: ./.github/workflows/live-staging.yml
+    with:
+      source_ref: ${{ needs.prepare.outputs.release_ref }}
+      source_sha: ${{ needs.prepare.outputs.release_sha }}
+      discord_voice_service_image_ref: ${{ needs.publish-candidate-manifest.outputs.candidate_ref }}
+      discord_voice_service_image_digest: ${{ needs.publish-candidate-manifest.outputs.candidate_digest }}
+    secrets: inherit
+
+  publish-release-tags:
+    name: Publish Release Tags
+    needs: [prepare, publish-candidate-manifest, live-staging]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
       - name: Log in to GHCR
-        uses: redhat-actions/podman-login@v1
+        uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
-      - name: Promote validated candidate digest
+      - name: Publish release tags from the validated candidate digest
         shell: bash
         env:
-          SOURCE_IMAGE_REPO: ${{ needs.build-candidate.outputs.image_repo }}
-          SOURCE_IMAGE_DIGEST: ${{ needs.build-candidate.outputs.candidate_digest }}
-          TARGET_TAGS: ${{ needs.build-candidate.outputs.target_tags }}
-        run: ./scripts/ci/promote_candidate_image.sh
-
-      - name: Summarize promoted image tags
-        shell: bash
+          IMAGE_REF: ${{ needs.prepare.outputs.image_ref }}
+          FINAL_TAGS: ${{ needs.prepare.outputs.final_tags }}
+          CANDIDATE_DIGEST: ${{ needs.publish-candidate-manifest.outputs.candidate_digest }}
         run: |
-          {
-            echo "## Promoted GHCR image"
-            echo
-            echo "- Release commit: \`${{ needs.verify-fake-peer-ci.outputs.release_sha }}\`"
-            echo "- Candidate digest: \`${{ needs.build-candidate.outputs.candidate_digest }}\`"
-            echo "- Promoted tags: \`${{ needs.build-candidate.outputs.target_tags }}\`"
-            echo "- Fake Peer CI: passed before promotion"
-            echo "- Live staging: validated the candidate image digest in the protected self-hosted \`live-staging\` gate"
-          } >> "${GITHUB_STEP_SUMMARY}"
+          set -euo pipefail
+
+          create_args=()
+
+          while IFS= read -r tag; do
+            if [[ -n "${tag}" ]]; then
+              create_args+=(--tag "${IMAGE_REF}:${tag}")
+            fi
+          done <<< "${FINAL_TAGS}"
+
+          create_args+=("${IMAGE_REF}@${CANDIDATE_DIGEST}")
+          docker buildx imagetools create "${create_args[@]}"
