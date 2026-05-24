@@ -7,6 +7,7 @@ required_vars=(
   TEST_GUILD_ID
   TEST_VOICE_CHANNEL_ID
   TEST_VIDEO_ID
+  BROWSER_JSON
   DISCORD_VOICE_SERVICE_URI
   DISCORD_VOICE_SERVICE_BIND_ADDR
   DISCORD_VOICE_SERVICE_IMAGE_REF
@@ -14,7 +15,7 @@ required_vars=(
 )
 
 required_tools=(
-  podman
+  docker
   cargo
   rustc
   skopeo
@@ -22,7 +23,7 @@ required_tools=(
 
 for tool in "${required_tools[@]}"; do
   if ! command -v "${tool}" >/dev/null 2>&1; then
-    echo "::error::${tool} must already be installed on the self-hosted staging runner"
+    echo "::error::${tool} must be available on the GitHub-hosted live-staging runner"
     exit 1
   fi
 done
@@ -33,17 +34,6 @@ for required_var in "${required_vars[@]}"; do
     exit 1
   fi
 done
-
-browser_json_source_path="${BROWSER_JSON_SOURCE_PATH:-${STAGING_BROWSER_JSON_SOURCE_PATH:-}}"
-if [[ -z "${browser_json_source_path}" ]]; then
-  echo "::error::Set BROWSER_JSON_SOURCE_PATH or STAGING_BROWSER_JSON_SOURCE_PATH to a browser.json path outside the workspace"
-  exit 1
-fi
-
-if [[ ! -f "${browser_json_source_path}" ]]; then
-  echo "::error::browser.json source path does not exist: ${browser_json_source_path}"
-  exit 1
-fi
 
 resolved_digest="$(
   skopeo inspect --format '{{.Digest}}' "docker://${DISCORD_VOICE_SERVICE_IMAGE_REF}"
@@ -65,7 +55,7 @@ if [[ -n "${GITHUB_ENV:-}" ]]; then
   } >> "${GITHUB_ENV}"
 fi
 
-podman --version
+docker --version
 cargo --version
 rustc --version
 skopeo --version

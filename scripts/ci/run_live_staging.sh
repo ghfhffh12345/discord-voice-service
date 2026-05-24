@@ -30,7 +30,7 @@ cleanup() {
 
   if [[ "${status}" -ne 0 ]]; then
     echo "::group::discord-voice-service container log"
-    podman logs "${service_container_name}" || true
+    docker logs "${service_container_name}" || true
     echo "::endgroup::"
 
     echo "::group::staging_live_check log"
@@ -42,33 +42,34 @@ cleanup() {
     echo "::endgroup::"
 
     echo "::group::ytmusic-service container log"
-    podman logs "${ytmusic_container_name}" || true
+    docker logs "${ytmusic_container_name}" || true
     echo "::endgroup::"
   fi
 
-  podman rm -f "${service_container_name}" >/dev/null 2>&1 || true
-  podman rm -f "${ytmusic_container_name}" >/dev/null 2>&1 || true
-  podman network rm "${network_name}" >/dev/null 2>&1 || true
+  docker rm -f "${service_container_name}" >/dev/null 2>&1 || true
+  docker rm -f "${ytmusic_container_name}" >/dev/null 2>&1 || true
+  docker network rm "${network_name}" >/dev/null 2>&1 || true
   rm -f "${staged_browser_json}"
 }
 
 trap cleanup EXIT
 
-browser_json_source_path="${BROWSER_JSON_SOURCE_PATH:-${STAGING_BROWSER_JSON_SOURCE_PATH:-}}"
-install -m 644 "${browser_json_source_path}" "${staged_browser_json}"
+install -m 644 /dev/null "${staged_browser_json}"
+printf '%s' "${BROWSER_JSON}" > "${staged_browser_json}"
 
 cargo build --locked -p discord-voice-service-live-validation --bin staging_live_check
 
-if ! podman network inspect "${network_name}" >/dev/null 2>&1; then
-  podman network create "${network_name}" >/dev/null
+if ! docker network inspect "${network_name}" >/dev/null 2>&1; then
+  docker network create "${network_name}" >/dev/null
 fi
 
-podman rm -f "${service_container_name}" >/dev/null 2>&1 || true
-podman rm -f "${ytmusic_container_name}" >/dev/null 2>&1 || true
+docker rm -f "${service_container_name}" >/dev/null 2>&1 || true
+docker rm -f "${ytmusic_container_name}" >/dev/null 2>&1 || true
 
-podman pull "${service_image_ref}"
+docker pull "${YTMUSIC_SERVICE_IMAGE_REF}"
+docker pull "${service_image_ref}"
 
-podman run -d \
+docker run -d \
   --name "${ytmusic_container_name}" \
   --network "${network_name}" \
   --network-alias "${ytmusic_container_name}" \
@@ -77,12 +78,13 @@ podman run -d \
   -e YTMUSIC_SERVICE_PUBLIC_ADDR="${YTMUSIC_SERVICE_PUBLIC_ADDR}" \
   -e YTMUSIC_SERVICE_ADMIN_ADDR="${YTMUSIC_SERVICE_ADMIN_ADDR}" \
   -e YTMUSIC_SERVICE_BROWSER_JSON="${YTMUSIC_SERVICE_BROWSER_JSON}" \
-  -v "${staged_browser_json}:${YTMUSIC_SERVICE_BROWSER_JSON}:ro,Z" \
+  -e BROWSER_JSON="${BROWSER_JSON}" \
+  -v "${staged_browser_json}:${YTMUSIC_SERVICE_BROWSER_JSON}:ro" \
   "${YTMUSIC_SERVICE_IMAGE_REF}"
 
 wait_for_port 50051 "ytmusic-service public gRPC listener"
 
-podman run -d \
+docker run -d \
   --name "${service_container_name}" \
   --network "${network_name}" \
   -p 55051:55051 \
