@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use tokio::sync::oneshot;
 
-use crate::dave::{DaveMediaType, DaveRuntimeContext};
+use crate::dave::DaveRuntimeContext;
 use crate::error::VoiceError;
 use crate::gateway::VoiceGatewayClient;
 use crate::handshake;
@@ -118,8 +118,7 @@ impl ConnectedVoiceSession {
 
         let frame = if let Some(dave) = self.dave.as_mut() {
             Bytes::from(
-                dave.encryptor
-                    .encrypt(DaveMediaType::Audio, ssrc, frame.as_ref())
+                dave.encrypt_audio_frame(frame.as_ref())
                     .map_err(|_| VoiceError::InvalidState("voice dave frame encryption failed"))?,
             )
         } else {
