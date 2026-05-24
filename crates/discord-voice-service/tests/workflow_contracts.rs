@@ -73,3 +73,33 @@ fn live_confidence_workflow_exists() {
     assert!(workflow.contains("workflow_dispatch:"));
     assert!(workflow.contains("uses: ./.github/workflows/live-staging.yml"));
 }
+
+#[test]
+fn release_workflow_builds_native_arch_images_before_live_validation() {
+    let workflow = fs::read_to_string("../../.github/workflows/release-image.yml")
+        .expect("release-image workflow should exist");
+
+    assert!(workflow.contains("prepare:"));
+    assert!(workflow.contains("build-amd64:"));
+    assert!(workflow.contains("build-arm64:"));
+    assert!(workflow.contains("publish-candidate-manifest:"));
+    assert!(workflow.contains("publish-release-tags:"));
+    assert!(workflow.contains("runs-on: ubuntu-24.04-arm"));
+    assert!(workflow.contains("docker/setup-buildx-action@v4"));
+    assert!(workflow.contains("docker/build-push-action@v7"));
+    assert!(workflow.contains("docker buildx imagetools create"));
+    assert!(workflow.contains("discord_voice_service_image_ref: ${{ needs.publish-candidate-manifest.outputs.candidate_ref }}"));
+    assert!(workflow.contains("discord_voice_service_image_digest: ${{ needs.publish-candidate-manifest.outputs.candidate_digest }}"));
+    assert!(!workflow.contains("redhat-actions/buildah-build@v2"));
+}
+
+#[test]
+fn release_workflow_encodes_stable_and_prerelease_tag_policy() {
+    let workflow = fs::read_to_string("../../.github/workflows/release-image.yml")
+        .expect("release-image workflow should exist");
+
+    assert!(workflow.contains("^v([0-9]+)\\.([0-9]+)\\.([0-9]+)$"));
+    assert!(workflow.contains("^v([0-9]+)\\.([0-9]+)\\.([0-9]+)-"));
+    assert!(workflow.contains("latest"));
+    assert!(workflow.contains("candidate-"));
+}
