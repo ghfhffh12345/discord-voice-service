@@ -1,7 +1,7 @@
 use std::fs;
 
 #[test]
-fn live_staging_workflow_targets_container_artifacts() {
+fn live_staging_workflow_uses_github_hosted_runner_and_secret_browser_json() {
     let workflow = fs::read_to_string("../../.github/workflows/live-staging.yml")
         .expect("live-staging workflow should exist");
     let preflight = fs::read_to_string("../../scripts/ci/live_staging_preflight.sh")
@@ -9,47 +9,38 @@ fn live_staging_workflow_targets_container_artifacts() {
     let run_script = fs::read_to_string("../../scripts/ci/run_live_staging.sh")
         .expect("live staging runner script should exist");
 
-    assert!(workflow.contains("discord_voice_service_image_ref"));
-    assert!(workflow.contains("DISCORD_VOICE_SERVICE_URI"));
-    assert!(workflow.contains("DISCORD_VOICE_SERVICE_BIND_ADDR: 0.0.0.0:55051"));
+    assert!(workflow.contains("runs-on: ubuntu-24.04"));
+    assert!(workflow.contains("environment: live-staging"));
+    assert!(workflow.contains("BROWSER_JSON: ${{ secrets.BROWSER_JSON }}"));
     assert!(workflow.contains("scripts/ci/live_staging_preflight.sh"));
     assert!(workflow.contains("scripts/ci/run_live_staging.sh"));
     assert!(workflow.contains("DISCORD_VOICE_SERVICE_RESOLVED_IMAGE_REF"));
     assert!(workflow.contains("${DISCORD_VOICE_SERVICE_IMAGE_REF:-not resolved}"));
     assert!(workflow.contains("${YTMUSIC_SERVICE_IMAGE_REF:-not resolved}"));
     assert!(workflow.contains("packages: read"));
-    assert!(workflow.contains("redhat-actions/podman-login@v1"));
-    assert!(workflow.contains("registry: ghcr.io"));
-    assert!(
-        !workflow.contains("Build local binaries"),
-        "live staging should no longer build local binaries",
-    );
-    assert!(preflight.contains("DISCORD_VOICE_SERVICE_RESOLVED_IMAGE_REF"));
-    assert!(run_script.contains("service_image_ref"));
-    assert!(run_script.contains("podman pull \"${service_image_ref}\""));
-    assert!(
-        run_script
-            .contains("-e DISCORD_VOICE_SERVICE_BIND_ADDR=\"${DISCORD_VOICE_SERVICE_BIND_ADDR}\"")
-    );
-    assert!(run_script.contains("\"${service_image_ref}\""));
+    assert!(workflow.contains("docker/login-action@v3"));
+    assert!(!workflow.contains("self-hosted"));
+    assert!(!workflow.contains("discord-voice-staging"));
+    assert!(!workflow.contains("STAGING_BROWSER_JSON_SOURCE_PATH"));
+
+    assert!(preflight.contains("BROWSER_JSON"));
+    assert!(!preflight.contains("STAGING_BROWSER_JSON_SOURCE_PATH"));
+
+    assert!(run_script.contains("printf '%s' \"${BROWSER_JSON}\""));
+    assert!(run_script.contains("docker pull \"${service_image_ref}\""));
+    assert!(run_script.contains("docker run -d"));
+    assert!(!run_script.contains("podman "));
 }
 
 #[test]
-fn live_staging_browser_json_is_materialized_with_container_readable_permissions() {
-    let workflow = fs::read_to_string("../../.github/workflows/live-staging.yml")
-        .expect("live-staging workflow should exist");
-    let run_script = fs::read_to_string("../../scripts/ci/run_live_staging.sh")
-        .expect("live staging runner script should exist");
+fn fake_peer_ci_runs_a_single_mock_gate() {
+    let workflow = fs::read_to_string("../../.github/workflows/fake-peer-ci.yml")
+        .expect("fake-peer workflow should exist");
 
-    assert!(workflow.contains("scripts/ci/run_live_staging.sh"));
-    assert!(
-        run_script.contains("install -m 644"),
-        "hosted live staging must materialize browser.json with container-readable permissions before the read-only bind mount",
-    );
-    assert!(
-        !run_script.contains("install -m 600"),
-        "hosted live staging must not regress to host-only browser.json permissions",
-    );
+    assert!(workflow.contains("cargo fmt --all --check"));
+    assert!(workflow.contains("cargo clippy --workspace --all-targets --all-features -- -D warnings"));
+    assert_eq!(workflow.matches("cargo test --workspace -v").count(), 1);
+    assert!(!workflow.contains("Run fake-peer critical subset"));
 }
 
 #[test]
