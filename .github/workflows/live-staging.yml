@@ -46,6 +46,8 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
   APPLICATION_ID: ${{ secrets.APPLICATION_ID }}
   BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+  OBSERVER_APPLICATION_ID: ${{ secrets.OBSERVER_APPLICATION_ID }}
+  OBSERVER_BOT_TOKEN: ${{ secrets.OBSERVER_BOT_TOKEN }}
   TEST_GUILD_ID: ${{ secrets.TEST_GUILD_ID }}
   TEST_VOICE_CHANNEL_ID: ${{ secrets.TEST_VOICE_CHANNEL_ID }}
   TEST_VIDEO_ID: ${{ secrets.TEST_VIDEO_ID }}
@@ -177,4 +179,5 @@ jobs:
             echo "- Source commit: \`${{ steps.source.outputs.source_sha }}\`"
             echo "- ytmusic-service image ref: \`${YTMUSIC_SERVICE_IMAGE_REF:-not resolved}\`"
             echo "- browser.json source: \`BROWSER_JSON\` secret materialized for the run"
+            echo "- Observer bot proof: enabled for Discord-delivered validation-track matching"
           } >> "${GITHUB_STEP_SUMMARY}"

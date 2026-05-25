@@ -127,6 +127,8 @@ The staging environment must provide:
 
 - `APPLICATION_ID`
 - `BOT_TOKEN`
+- `OBSERVER_APPLICATION_ID`
+- `OBSERVER_BOT_TOKEN`
 - `TEST_GUILD_ID`
 - `TEST_VOICE_CHANNEL_ID`
 - `TEST_VIDEO_ID`
@@ -142,6 +144,8 @@ The live validation controller contract is:
 | --- | --- | --- |
 | `APPLICATION_ID` | Discord application ID for the dedicated staging bot | `123456789012345678` |
 | `BOT_TOKEN` | Bot token for the dedicated staging bot | `discord-bot-token` |
+| `OBSERVER_APPLICATION_ID` | Discord application ID for the observer bot that verifies delivered audio | `456789012345678901` |
+| `OBSERVER_BOT_TOKEN` | Bot token for the observer bot that verifies delivered audio | `observer-bot-token` |
 | `TEST_GUILD_ID` | Dedicated staging guild ID | `234567890123456789` |
 | `TEST_VOICE_CHANNEL_ID` | Dedicated non-stage voice channel ID inside that guild | `345678901234567890` |
 | `TEST_VIDEO_ID` | YouTube video ID for the short dedicated validation track used by live staging | `dQw4w9WgXcQ` |
@@ -164,6 +168,7 @@ For reproducible staging, pin `YTMUSIC_SERVICE_IMAGE_REF` to an immutable tag or
 
 During live staging, human listeners may remain in the channel while the staging bot validates playback against the short dedicated validation track.
 Live-staging success waits for the natural end of the validation track before the run is treated as release-ready.
+Live-staging success requires the observer bot to verify that Discord-delivered audio matched the dedicated validation track.
 
 The workflow intentionally starts the live dependencies itself instead of assuming external staging processes:
 

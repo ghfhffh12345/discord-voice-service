@@ -14,6 +14,8 @@
 - Secrets:
   - `APPLICATION_ID`
   - `BOT_TOKEN`
+  - `OBSERVER_APPLICATION_ID`
+  - `OBSERVER_BOT_TOKEN`
   - `TEST_GUILD_ID`
   - `TEST_VOICE_CHANNEL_ID`
   - `TEST_VIDEO_ID` for a short dedicated validation track
@@ -30,6 +32,7 @@ During live staging, human listeners may remain in the channel while the staging
 - The controller build command remains `cargo build --locked -p discord-voice-service-live-validation --bin staging_live_check`.
 - The workflow materializes `BROWSER_JSON` into `${GITHUB_WORKSPACE}/browser.json`, mounts it into `ytmusic-service`, and removes it during cleanup.
 - Live-staging success waits for the natural end of the validation track before the run is treated as release-ready.
+- Live-staging success requires the observer bot to verify that Discord-delivered audio matched the dedicated validation track.
 - A preflight failure is a configuration problem, not a flaky success condition.
 
 ## Failure diagnosis
