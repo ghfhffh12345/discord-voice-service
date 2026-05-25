@@ -18,7 +18,7 @@ const MAX_UDP_PACKET_LEN: usize = 2048;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObservedAudioFrame {
-    pub user_id: Option<String>,
+    pub user_id: String,
     pub ssrc: u32,
     pub sequence: u16,
     pub timestamp: u32,
@@ -109,7 +109,7 @@ impl ObservedVoiceSession {
                         .map_err(|_| VoiceError::InvalidState("voice receive timed out"))??;
                     let header = parse_rtp_header(&packet)?;
                     if !self.speaker_ssrcs.contains_key(&header.ssrc) {
-                        self.wait_for_speaker_mapping(header.ssrc, remaining).await?;
+                        self.wait_for_speaker_mapping(header.ssrc, deadline).await?;
                     }
                     return self.decode_audio_packet(&packet);
                 }
@@ -141,23 +141,22 @@ impl ObservedVoiceSession {
     async fn wait_for_speaker_mapping(
         &mut self,
         ssrc: u32,
-        timeout_duration: Duration,
+        deadline: Instant,
     ) -> Result<(), VoiceError> {
         let gateway = self
             .gateway
             .as_ref()
             .cloned()
             .ok_or(VoiceError::InvalidState("voice gateway unavailable"))?;
-        let deadline = Instant::now() + timeout_duration;
         while !self.speaker_ssrcs.contains_key(&ssrc) {
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                return Ok(());
+                return Err(VoiceError::InvalidState("voice receive timed out"));
             };
             let gateway_event = match tokio::time::timeout(remaining, gateway.receive_event()).await
             {
                 Ok(Ok(event)) => event,
                 Ok(Err(err)) => return Err(err),
-                Err(_) => return Ok(()),
+                Err(_) => return Err(VoiceError::InvalidState("voice receive timed out")),
             };
             self.apply_gateway_payload(gateway_event);
         }
@@ -170,11 +169,15 @@ impl ObservedVoiceSession {
             .as_ref()
             .ok_or(VoiceError::InvalidState("voice protection unavailable"))?;
         let (header, payload) = protection.unprotect_packet(packet)?;
+        let user_id = self
+            .speaker_ssrcs
+            .get(&header.ssrc)
+            .cloned()
+            .ok_or(VoiceError::InvalidState("voice speaker mapping missing"))?;
         let payload = self.decrypt_audio_payload(header, payload)?;
-        let user_id = self.speaker_ssrcs.get(&header.ssrc).cloned();
 
         Ok(ObservedAudioFrame {
-            user_id: user_id.clone(),
+            user_id,
             ssrc: header.ssrc,
             sequence: header.sequence,
             timestamp: header.timestamp,
@@ -187,9 +190,11 @@ impl ObservedVoiceSession {
         header: RtpHeader,
         payload: Bytes,
     ) -> Result<Bytes, VoiceError> {
-        let Some(user_id) = self.speaker_ssrcs.get(&header.ssrc).cloned() else {
-            return Ok(payload);
-        };
+        let user_id = self
+            .speaker_ssrcs
+            .get(&header.ssrc)
+            .cloned()
+            .ok_or(VoiceError::InvalidState("voice speaker mapping missing"))?;
 
         let Some(dave) = self.dave.as_mut() else {
             return Ok(payload);

@@ -75,13 +75,16 @@ impl VoiceUdpTransport {
             return Err(VoiceError::InvalidState("voice udp receive size invalid"));
         }
 
-        let mut packet = vec![0u8; max_packet_len];
-        let (len, from) = self.socket.recv_from(&mut packet).await?;
-        if from != self.server {
-            return Err(VoiceError::InvalidState("voice udp packet source invalid"));
+        loop {
+            let mut packet = vec![0u8; max_packet_len];
+            let (len, from) = self.socket.recv_from(&mut packet).await?;
+            if from != self.server {
+                tracing::debug!(source = %from, expected = %self.server, "ignoring stray voice udp packet");
+                continue;
+            }
+            packet.truncate(len);
+            return Ok(packet);
         }
-        packet.truncate(len);
-        Ok(packet)
     }
 
     pub async fn send_audio_frame(&mut self, frame: Bytes) -> Result<(), VoiceError> {

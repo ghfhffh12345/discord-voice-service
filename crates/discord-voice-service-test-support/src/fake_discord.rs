@@ -14,7 +14,7 @@ use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, oneshot};
 use tokio::time::{Duration, Instant, sleep};
 use tokio_tungstenite::accept_hdr_async;
 use tokio_tungstenite::tungstenite::Bytes;
@@ -51,10 +51,18 @@ enum PreSessionDescriptionEvent {
     HeartbeatAck(Option<u64>),
 }
 
+enum FakeDiscordControl {
+    EncryptDaveAudioFrame {
+        frame: Vec<u8>,
+        response: oneshot::Sender<Result<Vec<u8>, VoiceError>>,
+    },
+}
+
 pub struct FakeDiscordPeer {
     endpoint_host: String,
     udp_socket: Arc<UdpSocket>,
     gateway_messages: UnboundedSender<Message>,
+    control_messages: UnboundedSender<FakeDiscordControl>,
     gateway_path: Arc<StdMutex<Option<String>>>,
     dave_group_id: Arc<StdMutex<Option<u64>>>,
     encryption_mode: Arc<StdMutex<Option<EncryptionMode>>>,
@@ -330,6 +338,7 @@ impl FakeDiscordPeer {
         let ws_addr = listener.local_addr().unwrap();
         let udp_addr = udp_socket.local_addr().unwrap();
         let (gateway_messages, mut gateway_messages_rx) = unbounded_channel::<Message>();
+        let (control_messages, mut control_messages_rx) = unbounded_channel::<FakeDiscordControl>();
         let gateway_path = Arc::new(StdMutex::new(None));
         let dave_group_id = Arc::new(StdMutex::new(None));
         let encryption_mode = Arc::new(StdMutex::new(None));
@@ -462,6 +471,22 @@ impl FakeDiscordPeer {
                     Some(outbound) = gateway_messages_rx.recv() => {
                         if ws.send(outbound).await.is_err() {
                             break;
+                        }
+                        continue;
+                    }
+                    Some(control) = control_messages_rx.recv() => {
+                        match control {
+                            FakeDiscordControl::EncryptDaveAudioFrame { frame, response } => {
+                                let result = dave_creator
+                                    .as_mut()
+                                    .ok_or(VoiceError::InvalidState("fake dave creator unavailable"))
+                                    .and_then(|creator| {
+                                        creator
+                                            .encrypt_audio_frame(&frame)
+                                            .map_err(|_| VoiceError::InvalidState("fake dave encrypt failed"))
+                                    });
+                                let _ = response.send(result);
+                            }
                         }
                         continue;
                     }
@@ -1088,6 +1113,7 @@ impl FakeDiscordPeer {
             endpoint_host: ws_addr.to_string(),
             udp_socket,
             gateway_messages,
+            control_messages,
             gateway_path,
             dave_group_id,
             encryption_mode,
@@ -1172,6 +1198,22 @@ impl FakeDiscordPeer {
                 .into(),
             ))
             .map_err(|_| VoiceError::InvalidState("fake gateway send failed"))
+    }
+
+    pub async fn encrypt_dave_audio_frame_from_creator(
+        &self,
+        frame: &[u8],
+    ) -> Result<Vec<u8>, VoiceError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.control_messages
+            .send(FakeDiscordControl::EncryptDaveAudioFrame {
+                frame: frame.to_vec(),
+                response: response_tx,
+            })
+            .map_err(|_| VoiceError::InvalidState("fake dave control send failed"))?;
+        response_rx
+            .await
+            .map_err(|_| VoiceError::InvalidState("fake dave control closed"))?
     }
 
     pub async fn send_protected_audio_packet(

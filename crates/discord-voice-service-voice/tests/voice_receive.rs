@@ -4,10 +4,12 @@ use discord_voice_service_voice::ObservedVoiceSession;
 use discord_voice_service_voice::dave::{
     DaveExternalSender, DaveMediaType, DaveRuntimeContext, DaveSession,
 };
-use tokio::time::Duration;
+use tokio::net::UdpSocket;
+use tokio::time::{Duration, Instant, sleep};
 
 const CREATOR_USER_ID: &str = "1234123412341234";
 const OBSERVER_USER_ID: &str = "5678567856785678";
+const FAKE_DAVE_CREATOR_USER_ID: &str = "9999999999999999";
 
 #[tokio::test]
 async fn observed_voice_session_receives_protected_audio_and_resolves_speaker_from_gateway() {
@@ -15,6 +17,11 @@ async fn observed_voice_session_receives_protected_audio_and_resolves_speaker_fr
     let voice = fake.voice_context("1", "2", "observer-1", "session-1", "token-1");
 
     let mut session = ObservedVoiceSession::connect(voice).await.unwrap();
+    let foreign = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    foreign
+        .send_to(b"stray-packet", fake.last_udp_peer().await.unwrap())
+        .await
+        .unwrap();
     fake.send_speaking("speaker-1", 42).await.unwrap();
     fake.send_protected_audio_packet(42, b"opus-frame")
         .await
@@ -25,9 +32,68 @@ async fn observed_voice_session_receives_protected_audio_and_resolves_speaker_fr
         .await
         .unwrap();
 
-    assert_eq!(frame.user_id.as_deref(), Some("speaker-1"));
+    assert_eq!(frame.user_id, "speaker-1");
     assert_eq!(frame.ssrc, 42);
     assert_eq!(frame.payload, Bytes::from_static(b"opus-frame"));
+}
+
+#[tokio::test]
+async fn observed_voice_session_times_out_when_speaker_mapping_never_arrives() {
+    let fake = FakeDiscordPeer::spawn_real_shape().await;
+    let voice = fake.voice_context("1", "2", "observer-1", "session-1", "token-1");
+
+    let mut session = ObservedVoiceSession::connect(voice).await.unwrap();
+    tokio::spawn({
+        let fake = fake;
+        async move {
+            sleep(Duration::from_millis(150)).await;
+            fake.send_protected_audio_packet(42, b"still-encrypted")
+                .await
+                .unwrap();
+        }
+    });
+
+    let start = Instant::now();
+    let error = session
+        .receive_audio_frame(Duration::from_millis(200))
+        .await
+        .unwrap_err();
+    let elapsed = start.elapsed();
+
+    assert!(error.to_string().contains("timed out"));
+    assert!(
+        elapsed < Duration::from_millis(300),
+        "receive exceeded timeout budget: {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn observed_voice_session_receives_and_dave_decrypts_audio_for_numeric_speaker() {
+    let fake = FakeDiscordPeer::spawn_with_dave().await;
+    let voice = fake.voice_context("1", "2", OBSERVER_USER_ID, "session-1", "token-1");
+
+    let mut session = ObservedVoiceSession::connect(voice).await.unwrap();
+    assert!(fake.sent_dave_prepare_commit_transition().await);
+    assert!(fake.saw_dave_init_transition_ready().await);
+    let opus = hex::decode("0dc5aedd5bdc3f20be5697e54dd1f437").unwrap();
+    let encrypted = fake
+        .encrypt_dave_audio_frame_from_creator(&opus)
+        .await
+        .unwrap();
+    fake.send_speaking(FAKE_DAVE_CREATOR_USER_ID, 42)
+        .await
+        .unwrap();
+    fake.send_protected_audio_packet(42, &encrypted)
+        .await
+        .unwrap();
+
+    let frame = session
+        .receive_audio_frame(Duration::from_secs(1))
+        .await
+        .unwrap();
+
+    assert_eq!(frame.user_id, FAKE_DAVE_CREATOR_USER_ID);
+    assert_eq!(frame.payload, Bytes::from(opus));
 }
 
 #[test]
