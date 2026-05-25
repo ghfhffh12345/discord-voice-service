@@ -14,6 +14,7 @@ fn readme_publishes_the_hosted_live_staging_contract() {
     assert!(readme.contains("exact container artifact"));
     assert!(readme.contains("GitHub-hosted"));
     assert!(readme.contains("BROWSER_JSON"));
+    assert!(readme.contains("OBSERVER_APPLICATION_ID"));
     assert!(readme.contains("OBSERVER_BOT_TOKEN"));
     assert!(readme.contains("protected `live-staging` environment"));
     assert!(readme.contains("candidate manifest digest"));
