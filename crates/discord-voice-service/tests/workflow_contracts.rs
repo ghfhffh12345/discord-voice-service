@@ -2,8 +2,7 @@ use std::fs;
 
 const OCCUPIED_LISTENER_CONTRACT: &str = "During live staging, human listeners may remain in the channel while the staging bot validates playback against the short dedicated validation track.";
 const NATURAL_END_SUCCESS_CONTRACT: &str = "Live-staging success waits for the natural end of the validation track before the run is treated as release-ready.";
-const OBSERVER_PROOF_CONTRACT: &str =
-    "Live-staging success requires the observer bot to verify that Discord-delivered audio matched the dedicated validation track.";
+const OBSERVER_PROOF_CONTRACT: &str = "Live-staging success requires the observer bot to verify that Discord-delivered audio matched the dedicated validation track.";
 
 #[test]
 fn live_staging_workflow_uses_github_hosted_runner_and_secret_browser_json() {
@@ -17,12 +16,8 @@ fn live_staging_workflow_uses_github_hosted_runner_and_secret_browser_json() {
     assert!(workflow.contains("runs-on: ubuntu-24.04"));
     assert!(workflow.contains("environment: live-staging"));
     assert!(workflow.contains("BROWSER_JSON: ${{ secrets.BROWSER_JSON }}"));
-    assert!(workflow.contains(
-        "OBSERVER_APPLICATION_ID: ${{ secrets.OBSERVER_APPLICATION_ID }}"
-    ));
-    assert!(workflow.contains(
-        "OBSERVER_BOT_TOKEN: ${{ secrets.OBSERVER_BOT_TOKEN }}"
-    ));
+    assert!(workflow.contains("OBSERVER_APPLICATION_ID: ${{ secrets.OBSERVER_APPLICATION_ID }}"));
+    assert!(workflow.contains("OBSERVER_BOT_TOKEN: ${{ secrets.OBSERVER_BOT_TOKEN }}"));
     assert!(workflow.contains("scripts/ci/live_staging_preflight.sh"));
     assert!(workflow.contains("scripts/ci/run_live_staging.sh"));
     assert!(workflow.contains("DISCORD_VOICE_SERVICE_RESOLVED_IMAGE_REF"));

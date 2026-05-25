@@ -504,7 +504,10 @@ name = "discord-voice-service-live-validation"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
+ "discord-voice-service-playback",
  "discord-voice-service-proto",
+ "discord-voice-service-voice",
  "futures",
  "rustls",
  "serde",

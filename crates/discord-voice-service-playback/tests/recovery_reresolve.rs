@@ -127,11 +127,9 @@ async fn recovery_errors_when_requested_position_cannot_be_reached() {
 #[tokio::test]
 async fn recovery_tolerates_a_slow_but_valid_first_media_chunk() {
     let fake = FakeYtMusic::spawn().await;
-    let http = spawn_stream_server_with_initial_delay(
-        "audio-itag250.webm",
-        Duration::from_millis(750),
-    )
-    .await;
+    let http =
+        spawn_stream_server_with_initial_delay("audio-itag250.webm", Duration::from_millis(750))
+            .await;
     fake.set_playable_url(http.url()).await;
 
     let mut recovery =
@@ -162,7 +160,10 @@ async fn recovery_fails_when_the_first_media_chunk_never_arrives_within_policy()
         .await
         .map(|_| ())
         .expect_err("open should time out");
-    assert!(err.to_string().contains("timed out opening playback source"));
+    assert!(
+        err.to_string()
+            .contains("timed out opening playback source")
+    );
     assert_eq!(
         fake.calls()
             .iter()

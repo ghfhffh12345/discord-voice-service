@@ -27,7 +27,11 @@ pub async fn spawn_stream_server(name: &str) -> RangeServer {
 
 pub async fn spawn_stream_server_with_initial_delay(path: &str, delay: Duration) -> RangeServer {
     let payload = load_fixture_bytes(path);
-    spawn_test_server(ServerBehavior::HonorRangeWithInitialDelay { delay }, payload).await
+    spawn_test_server(
+        ServerBehavior::HonorRangeWithInitialDelay { delay },
+        payload,
+    )
+    .await
 }
 
 pub async fn spawn_range_server() -> RangeServer {
@@ -128,15 +132,17 @@ async fn spawn_test_server(behavior: ServerBehavior, payload: Bytes) -> RangeSer
                 }
                 ServerBehavior::HonorRange | ServerBehavior::HonorRangeWithInitialDelay { .. }
                     if start > 0 =>
-                (
-                    payload.get(start as usize..).unwrap_or(&[]),
-                    "HTTP/1.1 206 Partial Content",
-                    Some(format!(
-                        "bytes {start}-{}/*",
-                        payload.len().saturating_sub(1)
-                    )),
-                    payload.len().saturating_sub(start as usize),
-                ),
+                {
+                    (
+                        payload.get(start as usize..).unwrap_or(&[]),
+                        "HTTP/1.1 206 Partial Content",
+                        Some(format!(
+                            "bytes {start}-{}/*",
+                            payload.len().saturating_sub(1)
+                        )),
+                        payload.len().saturating_sub(start as usize),
+                    )
+                }
                 ServerBehavior::PartialBodyThenCloseOnce { bytes_before_close }
                     if request_number == 1 =>
                 {
