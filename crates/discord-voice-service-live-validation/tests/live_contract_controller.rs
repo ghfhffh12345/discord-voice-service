@@ -110,11 +110,11 @@ fn live_contract_requires_voice_ready_before_track_end() {
     let mut state = LiveContractState::default();
 
     state
-        .observe_event(event(SessionEventKind::Playing))
+        .observe_event(event(SessionEventKind::Playing, Some("video")), "video")
         .unwrap();
 
     let error = state
-        .observe_event(event(SessionEventKind::TrackEnded))
+        .observe_event(event(SessionEventKind::TrackEnded, Some("video")), "video")
         .expect_err("track end should fail");
 
     assert!(error.to_string().contains("VoiceReady"));
@@ -125,11 +125,11 @@ fn live_contract_requires_playing_before_track_end() {
     let mut state = LiveContractState::default();
 
     state
-        .observe_event(event(SessionEventKind::VoiceReady))
+        .observe_event(event(SessionEventKind::VoiceReady, None), "video")
         .unwrap();
 
     let error = state
-        .observe_event(event(SessionEventKind::TrackEnded))
+        .observe_event(event(SessionEventKind::TrackEnded, Some("video")), "video")
         .expect_err("track end should fail");
 
     assert!(error.to_string().contains("Playing"));
@@ -140,19 +140,52 @@ fn live_contract_passes_when_track_ends_after_voice_ready_and_playing() {
     let mut state = LiveContractState::default();
 
     state
-        .observe_event(event(SessionEventKind::VoiceReady))
+        .observe_event(event(SessionEventKind::VoiceReady, None), "video")
         .unwrap();
     assert!(
         !state
-            .observe_event(event(SessionEventKind::Playing))
+            .observe_event(event(SessionEventKind::Playing, Some("video")), "video")
             .unwrap()
     );
 
     assert!(
         state
-            .observe_event(event(SessionEventKind::TrackEnded))
+            .observe_event(event(SessionEventKind::TrackEnded, Some("video")), "video")
             .unwrap()
     );
+}
+
+#[test]
+fn live_contract_fails_when_track_end_video_id_differs_after_playing() {
+    let mut state = LiveContractState::default();
+
+    state
+        .observe_event(event(SessionEventKind::VoiceReady, None), "video")
+        .unwrap();
+    state
+        .observe_event(event(SessionEventKind::Playing, Some("video")), "video")
+        .unwrap();
+
+    let error = state
+        .observe_event(event(SessionEventKind::TrackEnded, Some("other-video")), "video")
+        .expect_err("mismatched track end should fail");
+
+    assert!(error.to_string().contains("expected video"));
+}
+
+#[test]
+fn live_contract_fails_when_playing_video_id_differs_from_expected() {
+    let mut state = LiveContractState::default();
+
+    state
+        .observe_event(event(SessionEventKind::VoiceReady, None), "video")
+        .unwrap();
+
+    let error = state
+        .observe_event(event(SessionEventKind::Playing, Some("other-video")), "video")
+        .expect_err("wrong playing video should fail");
+
+    assert!(error.to_string().contains("expected video"));
 }
 
 #[test]
@@ -160,14 +193,14 @@ fn live_contract_fails_on_reconnecting_after_playing() {
     let mut state = LiveContractState::default();
 
     state
-        .observe_event(event(SessionEventKind::VoiceReady))
+        .observe_event(event(SessionEventKind::VoiceReady, None), "video")
         .unwrap();
     state
-        .observe_event(event(SessionEventKind::Playing))
+        .observe_event(event(SessionEventKind::Playing, Some("video")), "video")
         .unwrap();
 
     let error = state
-        .observe_event(event(SessionEventKind::VoiceReconnecting))
+        .observe_event(event(SessionEventKind::VoiceReconnecting, Some("video")), "video")
         .expect_err("reconnecting should fail");
 
     assert!(error.to_string().contains("VoiceReconnecting"));
@@ -367,9 +400,10 @@ fn valid_env() -> HashMap<String, String> {
     ])
 }
 
-fn event(kind: SessionEventKind) -> SessionEvent {
+fn event(kind: SessionEventKind, current_video_id: Option<&str>) -> SessionEvent {
     SessionEvent {
         kind: kind as i32,
+        current_video_id: current_video_id.unwrap_or_default().to_owned(),
         ..Default::default()
     }
 }

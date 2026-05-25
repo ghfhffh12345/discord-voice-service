@@ -199,7 +199,7 @@ async fn run_service_flow(
     let live_contract = async {
         match timeout(
             LIVE_CONTRACT_TIMEOUT,
-            assert_live_success_contract(&mut events),
+            assert_live_success_contract(&mut events, &config.test_video_id),
         )
         .await
         {
@@ -332,13 +332,14 @@ async fn wait_for_authentic_voice_context(
 
 async fn assert_live_success_contract(
     events: &mut tonic::Streaming<SessionEvent>,
+    expected_video_id: &str,
 ) -> Result<LiveContractState> {
     let mut state = LiveContractState::default();
 
     loop {
         let maybe_event = events.next().await;
         let event = next_session_event(maybe_event)?;
-        if state.observe_event(event)? {
+        if state.observe_event(event, expected_video_id)? {
             return Ok(state);
         }
     }

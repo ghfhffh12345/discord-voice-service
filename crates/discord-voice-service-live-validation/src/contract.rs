@@ -52,7 +52,7 @@ where
 }
 
 impl LiveContractState {
-    pub fn observe_event(&mut self, event: SessionEvent) -> Result<bool> {
+    pub fn observe_event(&mut self, event: SessionEvent, expected_video_id: &str) -> Result<bool> {
         let kind = SessionEventKind::try_from(event.kind).unwrap_or(SessionEventKind::Unspecified);
 
         match kind {
@@ -60,9 +60,12 @@ impl LiveContractState {
                 self.saw_voice_ready = true;
             }
             SessionEventKind::Playing if !self.saw_playing => {
+                validate_expected_video_id(&event, expected_video_id, kind)?;
                 self.saw_playing = true;
             }
-            SessionEventKind::Playing => {}
+            SessionEventKind::Playing => {
+                validate_expected_video_id(&event, expected_video_id, kind)?;
+            }
             SessionEventKind::TrackEnded => {
                 if !self.saw_voice_ready {
                     anyhow::bail!("TrackEnded observed before VoiceReady");
@@ -70,6 +73,7 @@ impl LiveContractState {
                 if !self.saw_playing {
                     anyhow::bail!("TrackEnded observed before Playing");
                 }
+                validate_expected_video_id(&event, expected_video_id, kind)?;
 
                 return Ok(true);
             }
@@ -105,6 +109,27 @@ impl LiveContractState {
 
         Ok(false)
     }
+}
+
+fn validate_expected_video_id(
+    event: &SessionEvent,
+    expected_video_id: &str,
+    kind: SessionEventKind,
+) -> Result<()> {
+    let current_video_id = event.current_video_id.trim();
+    if current_video_id == expected_video_id {
+        return Ok(());
+    }
+
+    let observed = if current_video_id.is_empty() {
+        "none".to_owned()
+    } else {
+        current_video_id.to_owned()
+    };
+    anyhow::bail!(
+        "{} observed wrong current_video_id: expected video `{expected_video_id}`, got `{observed}`",
+        kind.as_str_name()
+    );
 }
 
 fn display_event_message(event: &SessionEvent) -> String {
