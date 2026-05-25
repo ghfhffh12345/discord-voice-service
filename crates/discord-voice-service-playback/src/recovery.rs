@@ -110,7 +110,7 @@ impl PlaybackRecovery {
         }
 
         while pending_packets.is_empty() || position.timestamp_ms() < position_ms {
-            let Some(chunk) = stream.read_chunk().await?
+            let Some(chunk) = read_chunk_with_timeout(&mut stream, &resolved.playable_url).await?
             else {
                 break;
             };
@@ -173,6 +173,19 @@ async fn read_opening_chunk(
     }
 
     unreachable!("open chunk attempts loop must return")
+}
+
+async fn read_chunk_with_timeout(
+    stream: &mut HttpOpusStream,
+    playable_url: &str,
+) -> Result<Option<bytes::Bytes>, PlaybackError> {
+    timeout(OPEN_CHUNK_TIMEOUT, stream.read_chunk())
+        .await
+        .map_err(|_| {
+            PlaybackError::MediaParseDetail(format!(
+                "timed out opening playback source for {playable_url}"
+            ))
+        })?
 }
 
 fn should_reresolve_after_open_failure(err: &PlaybackError) -> bool {
