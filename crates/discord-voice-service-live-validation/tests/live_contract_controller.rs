@@ -1,8 +1,3 @@
-use std::collections::HashMap;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
 use anyhow::Result;
 use discord_voice_service_live_validation::{
     LiveContractState, LiveValidationEvidence, StagingConfig, combine_results,
@@ -10,6 +5,11 @@ use discord_voice_service_live_validation::{
     leave_confirmed_by_rest_voice_state, wait_for_play_and_live_contract,
 };
 use discord_voice_service_proto::discordvoice::v1::{SessionEvent, SessionEventKind};
+use std::collections::HashMap;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;

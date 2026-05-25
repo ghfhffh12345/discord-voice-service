@@ -1,9 +1,7 @@
 use std::fs;
 
-const OCCUPIED_LISTENER_CONTRACT: &str =
-    "During live staging, human listeners may remain in the channel while the staging bot validates playback against the short dedicated validation track.";
-const NATURAL_END_SUCCESS_CONTRACT: &str =
-    "Live-staging success waits for the natural end of the validation track before the run is treated as release-ready.";
+const OCCUPIED_LISTENER_CONTRACT: &str = "During live staging, human listeners may remain in the channel while the staging bot validates playback against the short dedicated validation track.";
+const NATURAL_END_SUCCESS_CONTRACT: &str = "Live-staging success waits for the natural end of the validation track before the run is treated as release-ready.";
 
 #[test]
 fn readme_publishes_the_hosted_live_staging_contract() {
