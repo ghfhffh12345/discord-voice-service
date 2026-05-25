@@ -1,5 +1,7 @@
 use discord_voice_service_test_support::fake_ytmusic::FakeYtMusic;
-use discord_voice_service_test_support::fixtures::{spawn_status_server, spawn_stream_server};
+use discord_voice_service_test_support::fixtures::{
+    spawn_status_server, spawn_stream_server, spawn_stream_server_with_initial_delay,
+};
 
 use std::time::{Duration, Instant};
 
@@ -120,4 +122,42 @@ async fn recovery_errors_when_requested_position_cannot_be_reached() {
             .count(),
         1
     );
+}
+
+#[tokio::test]
+async fn recovery_tolerates_a_slow_but_valid_first_media_chunk() {
+    let fake = FakeYtMusic::spawn().await;
+    let http = spawn_stream_server_with_initial_delay(
+        "audio-itag250.webm",
+        Duration::from_millis(750),
+    )
+    .await;
+    fake.set_playable_url(http.url()).await;
+
+    let mut recovery =
+        PlaybackRecovery::new(YtMusicClient::connect(fake.endpoint()).await.unwrap());
+    let result = recovery.recover("video-1", 180).await;
+
+    match result {
+        Ok(_) => {}
+        Err(err) => panic!("slow first chunk should still open successfully: {err}"),
+    }
+}
+
+#[tokio::test]
+async fn recovery_fails_when_the_first_media_chunk_never_arrives_within_policy() {
+    let fake = FakeYtMusic::spawn().await;
+    let http =
+        spawn_stream_server_with_initial_delay("audio-itag250.webm", Duration::from_secs(5)).await;
+    fake.set_playable_url(http.url()).await;
+
+    let mut recovery =
+        PlaybackRecovery::new(YtMusicClient::connect(fake.endpoint()).await.unwrap());
+    let result = recovery.recover("video-1", 180).await;
+
+    let err = match result {
+        Ok(_) => panic!("recovery should fail when the first media chunk is too slow"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("timed out opening playback source"));
 }

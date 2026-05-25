@@ -6,6 +6,7 @@ use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use bytes::Bytes;
 
@@ -22,6 +23,11 @@ pub fn load_fixture_bytes(name: &str) -> Bytes {
 pub async fn spawn_stream_server(name: &str) -> RangeServer {
     let payload = load_fixture_bytes(name);
     spawn_test_server(ServerBehavior::HonorRange, payload).await
+}
+
+pub async fn spawn_stream_server_with_initial_delay(path: &str, delay: Duration) -> RangeServer {
+    let payload = load_fixture_bytes(path);
+    spawn_test_server(ServerBehavior::HonorRangeWithInitialDelay { delay }, payload).await
 }
 
 pub async fn spawn_range_server() -> RangeServer {
@@ -120,7 +126,9 @@ async fn spawn_test_server(behavior: ServerBehavior, payload: Bytes) -> RangeSer
                 ServerBehavior::HonorRangeWith416AtEof if start >= payload.len() as u64 => {
                     (&[][..], "HTTP/1.1 416 Range Not Satisfiable", None, 0)
                 }
-                ServerBehavior::HonorRange if start > 0 => (
+                ServerBehavior::HonorRange | ServerBehavior::HonorRangeWithInitialDelay { .. }
+                    if start > 0 =>
+                (
                     payload.get(start as usize..).unwrap_or(&[]),
                     "HTTP/1.1 206 Partial Content",
                     Some(format!(
@@ -178,6 +186,9 @@ async fn spawn_test_server(behavior: ServerBehavior, payload: Bytes) -> RangeSer
             };
             let response = format!("{status}\r\n{headers}",);
 
+            if let ServerBehavior::HonorRangeWithInitialDelay { delay } = behavior {
+                thread::sleep(delay);
+            }
             if stream.write_all(response.as_bytes()).is_err() {
                 continue;
             }
@@ -212,6 +223,9 @@ impl RangeServer {
 #[derive(Clone, Copy)]
 enum ServerBehavior {
     HonorRange,
+    HonorRangeWithInitialDelay {
+        delay: Duration,
+    },
     HonorRangeWith416AtEof,
     PartialBodyThenCloseOnce {
         bytes_before_close: usize,
