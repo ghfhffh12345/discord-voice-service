@@ -9,7 +9,7 @@ pub struct LiveContractState {
     pub saw_playing: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct LiveValidationEvidence {
     pub outcome: String,
     pub service_uri: String,
@@ -17,6 +17,10 @@ pub struct LiveValidationEvidence {
     pub saw_voice_ready: bool,
     pub saw_playing: bool,
     pub saw_track_ended: bool,
+    pub observer_verified: bool,
+    pub observer_received_frames: usize,
+    pub observer_matched_frames: usize,
+    pub observer_match_ratio: f32,
     pub failure_reason: Option<String>,
 }
 
@@ -28,14 +32,14 @@ pub fn emit_validation_evidence(evidence: &LiveValidationEvidence) -> Result<()>
     Ok(())
 }
 
-pub fn finalize_success_evidence<BuildEvidence, EmitEvidence>(
-    flow_result: Result<LiveContractState>,
+pub fn finalize_success_evidence<State, BuildEvidence, EmitEvidence>(
+    flow_result: Result<State>,
     cleanup: Result<()>,
     build_evidence: BuildEvidence,
     emit_evidence: EmitEvidence,
 ) -> Result<()>
 where
-    BuildEvidence: FnOnce(LiveContractState) -> LiveValidationEvidence,
+    BuildEvidence: FnOnce(State) -> LiveValidationEvidence,
     EmitEvidence: FnOnce(&LiveValidationEvidence) -> Result<()>,
 {
     match (flow_result, cleanup) {

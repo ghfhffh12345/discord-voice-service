@@ -1,10 +1,15 @@
 use anyhow::Result;
+use bytes::Bytes;
 use discord_voice_service_live_validation::{
-    LiveContractState, LiveValidationEvidence, StagingConfig, combine_results,
-    current_user_absent_from_guild_voice, finalize_success_evidence,
-    leave_confirmed_by_rest_voice_state, wait_for_play_and_live_contract,
+    LiveContractState, LiveValidationEvidence, ObserverAudioEvidence, StagingConfig,
+    combine_results, compare_expected_and_observed, current_user_absent_from_guild_voice,
+    finalize_success_evidence, leave_confirmed_by_rest_voice_state,
+    wait_for_play_and_live_contract, wait_for_play_live_contract_and_observer,
 };
+use discord_voice_service_playback::media::opus_queue::OpusFrame;
 use discord_voice_service_proto::discordvoice::v1::{SessionEvent, SessionEventKind};
+use discord_voice_service_voice::ObservedAudioFrame;
+use discord_voice_service_voice::test_support::OPUS_SILENCE_FRAME;
 use std::collections::HashMap;
 use std::sync::{
     Arc,
@@ -67,6 +72,19 @@ fn staging_controller_requires_service_uri() {
 }
 
 #[test]
+fn staging_controller_requires_observer_env_vars() {
+    let mut env = valid_env();
+    env.remove("OBSERVER_BOT_TOKEN");
+
+    let error = StagingConfig::from_env_map(env).expect_err("config should fail");
+
+    assert!(
+        error.to_string().contains("OBSERVER_BOT_TOKEN"),
+        "expected OBSERVER_BOT_TOKEN in error, got: {error}",
+    );
+}
+
+#[test]
 fn staging_controller_parses_valid_discord_ids() {
     let config = valid_config();
 
@@ -94,6 +112,10 @@ fn evidence_json_captures_success_contract() {
         saw_voice_ready: true,
         saw_playing: true,
         saw_track_ended: true,
+        observer_verified: true,
+        observer_received_frames: 64,
+        observer_matched_frames: 61,
+        observer_match_ratio: 0.953125,
         failure_reason: None,
     };
 
@@ -102,7 +124,37 @@ fn evidence_json_captures_success_contract() {
     assert!(json.contains("\"outcome\":\"success\""));
     assert!(json.contains("\"service_uri\":\"http://127.0.0.1:55051\""));
     assert!(json.contains("\"saw_track_ended\":true"));
+    assert!(json.contains("\"observer_verified\":true"));
+    assert!(json.contains("\"observer_received_frames\":64"));
+    assert!(json.contains("\"observer_match_ratio\":0.953125"));
     assert!(!json.contains("satisfied_min_interval"));
+}
+
+#[test]
+fn audio_match_accepts_expected_track_with_small_packet_gap() {
+    let expected = opus_frames(["a", "b", "c", "d", "e"]);
+    let observed = observed_frames(["a", "b", "d", "e"]);
+
+    let evidence = compare_expected_and_observed(&expected, &observed);
+
+    assert!(evidence.verified, "evidence: {evidence:?}");
+    assert_eq!(evidence.received_frames, 4);
+    assert_eq!(evidence.matched_frames, 4);
+    assert_eq!(evidence.match_ratio, 0.8);
+}
+
+#[test]
+fn audio_match_rejects_sustained_silence() {
+    let expected = silence_opus_frames(12);
+    let observed = silence_observed_frames(12);
+
+    let evidence = compare_expected_and_observed(&expected, &observed);
+
+    assert!(
+        !evidence.verified,
+        "sustained silence must not verify audio proof"
+    );
+    assert_eq!(evidence.received_frames, 12);
 }
 
 #[test]
@@ -245,6 +297,10 @@ fn success_evidence_waits_for_cleanup_success() {
                 saw_voice_ready: false,
                 saw_playing: false,
                 saw_track_ended: true,
+                observer_verified: true,
+                observer_received_frames: 1,
+                observer_matched_frames: 1,
+                observer_match_ratio: 1.0,
                 failure_reason: None,
             }
         },
@@ -337,6 +393,43 @@ async fn orchestration_waits_for_contract_after_play_succeeds() {
     orchestration.await.unwrap().unwrap();
 }
 
+#[tokio::test]
+async fn orchestration_waits_for_observer_after_play_and_contract_succeed() {
+    let (play_tx, play_rx) = oneshot::channel::<Result<()>>();
+    let (contract_tx, contract_rx) = oneshot::channel::<Result<LiveContractState>>();
+    let (observer_tx, observer_rx) = oneshot::channel::<Result<ObserverAudioEvidence>>();
+
+    let mut orchestration = tokio::spawn(wait_for_play_live_contract_and_observer(
+        async move { contract_rx.await.expect("contract sender should complete") },
+        async move { observer_rx.await.expect("observer sender should complete") },
+        async move { play_rx.await.expect("play sender should complete") },
+    ));
+
+    contract_tx
+        .send(Ok(LiveContractState::default()))
+        .expect("contract result should be sent");
+    play_tx.send(Ok(())).expect("play result should be sent");
+
+    assert!(
+        timeout(TokioDuration::from_millis(25), &mut orchestration)
+            .await
+            .is_err(),
+        "orchestration should keep waiting for observer proof",
+    );
+
+    observer_tx
+        .send(Ok(ObserverAudioEvidence {
+            verified: true,
+            received_frames: 4,
+            matched_frames: 4,
+            match_ratio: 1.0,
+        }))
+        .expect("observer result should be sent");
+
+    let (_contract, observer) = orchestration.await.unwrap().unwrap();
+    assert!(observer.verified);
+}
+
 #[test]
 fn cleanup_confirms_absence_when_voice_state_lookup_returns_not_found() {
     assert!(
@@ -395,6 +488,8 @@ fn valid_env() -> HashMap<String, String> {
     HashMap::from([
         ("BOT_TOKEN".to_owned(), "token".to_owned()),
         ("APPLICATION_ID".to_owned(), "1".to_owned()),
+        ("OBSERVER_BOT_TOKEN".to_owned(), "observer-token".to_owned()),
+        ("OBSERVER_APPLICATION_ID".to_owned(), "9".to_owned()),
         ("TEST_GUILD_ID".to_owned(), "2".to_owned()),
         ("TEST_VOICE_CHANNEL_ID".to_owned(), "3".to_owned()),
         ("TEST_VIDEO_ID".to_owned(), "video".to_owned()),
@@ -444,6 +539,45 @@ fn present_voice_state() -> VoiceState {
         channel_id: Some(Id::<ChannelMarker>::new(3)),
         ..absent_voice_state()
     }
+}
+
+fn opus_frames<const N: usize>(payloads: [&'static str; N]) -> Vec<OpusFrame> {
+    payloads
+        .into_iter()
+        .map(|payload| OpusFrame::new(Bytes::from_static(payload.as_bytes()), 20))
+        .collect()
+}
+
+fn observed_frames<const N: usize>(payloads: [&'static str; N]) -> Vec<ObservedAudioFrame> {
+    payloads
+        .into_iter()
+        .enumerate()
+        .map(|(index, payload)| ObservedAudioFrame {
+            user_id: "speaker".to_owned(),
+            ssrc: 42,
+            sequence: index as u16,
+            timestamp: (index as u32) * 960,
+            payload: Bytes::from_static(payload.as_bytes()),
+        })
+        .collect()
+}
+
+fn silence_opus_frames(count: usize) -> Vec<OpusFrame> {
+    (0..count)
+        .map(|_| OpusFrame::new(Bytes::copy_from_slice(&OPUS_SILENCE_FRAME), 20))
+        .collect()
+}
+
+fn silence_observed_frames(count: usize) -> Vec<ObservedAudioFrame> {
+    (0..count)
+        .map(|index| ObservedAudioFrame {
+            user_id: "speaker".to_owned(),
+            ssrc: 42,
+            sequence: index as u16,
+            timestamp: (index as u32) * 960,
+            payload: Bytes::copy_from_slice(&OPUS_SILENCE_FRAME),
+        })
+        .collect()
 }
 
 async fn mock_http_client(status: u16, body: &'static str) -> HttpClient {

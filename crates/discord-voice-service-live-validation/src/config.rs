@@ -10,6 +10,8 @@ use twilight_model::id::{
 pub struct StagingConfig {
     pub application_id: String,
     pub bot_token: String,
+    pub observer_application_id: String,
+    pub observer_bot_token: String,
     pub test_guild_id: String,
     pub test_voice_channel_id: String,
     pub test_video_id: String,
@@ -26,6 +28,8 @@ impl StagingConfig {
         Ok(Self {
             bot_token: required_env(&env, "BOT_TOKEN")?,
             application_id: required_env(&env, "APPLICATION_ID")?,
+            observer_bot_token: required_env(&env, "OBSERVER_BOT_TOKEN")?,
+            observer_application_id: required_env(&env, "OBSERVER_APPLICATION_ID")?,
             test_guild_id: required_env(&env, "TEST_GUILD_ID")?,
             test_voice_channel_id: required_env(&env, "TEST_VOICE_CHANNEL_ID")?,
             test_video_id: required_env(&env, "TEST_VIDEO_ID")?,

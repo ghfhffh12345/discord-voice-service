@@ -2,6 +2,7 @@ use std::{future::Future, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures::StreamExt;
+use tokio::sync::oneshot;
 use tokio::time::{Instant, timeout};
 use tracing::{info, warn};
 use twilight_gateway::error::ReceiveMessageErrorType;
@@ -20,10 +21,12 @@ use discord_voice_service_proto::discordvoice::v1::{
     JoinVoiceRequest, LeaveVoiceRequest, PlayRequest, SessionEvent, SubscribeEventsRequest,
 };
 
+use crate::audio_match::ObserverAudioEvidence;
 use crate::config::StagingConfig;
 use crate::contract::{
     LiveContractState, LiveValidationEvidence, emit_validation_evidence, finalize_success_evidence,
 };
+use crate::observer::verify_observer_audio_with_ready;
 
 const AUTHENTIC_VOICE_EVENT_TIMEOUT: Duration = Duration::from_secs(45);
 const GATEWAY_LEAVE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -42,7 +45,7 @@ struct ForwardedVoiceContext {
 
 #[derive(Debug)]
 struct ServiceFlowOutcome {
-    result: Result<LiveContractState>,
+    result: Result<(LiveContractState, ObserverAudioEvidence)>,
     service_joined: bool,
 }
 
@@ -51,6 +54,7 @@ pub async fn run(config: StagingConfig) -> Result<()> {
 
     info!(
         application_id = %config.application_id,
+        observer_application_id = %config.observer_application_id,
         guild_id = %config.test_guild_id,
         channel_id = %config.test_voice_channel_id,
         service_uri = %config.discord_voice_service_uri,
@@ -110,13 +114,17 @@ pub async fn run(config: StagingConfig) -> Result<()> {
     finalize_success_evidence(
         flow.result,
         cleanup,
-        |state| LiveValidationEvidence {
+        |(state, observer)| LiveValidationEvidence {
             outcome: "success".to_owned(),
             service_uri: config.discord_voice_service_uri.clone(),
             ytmusic_addr: config.discord_voice_service_ytmusic_addr.clone(),
             saw_voice_ready: state.saw_voice_ready,
             saw_playing: state.saw_playing,
             saw_track_ended: true,
+            observer_verified: observer.verified,
+            observer_received_frames: observer.received_frames,
+            observer_matched_frames: observer.matched_frames,
+            observer_match_ratio: observer.match_ratio,
             failure_reason: None,
         },
         emit_validation_evidence,
@@ -187,7 +195,11 @@ async fn run_service_flow(
         };
     }
 
+    let (observer_ready_tx, observer_ready_rx) = oneshot::channel::<()>();
     let play_rpc = async {
+        observer_ready_rx
+            .await
+            .context("observer audio proof ended before it was ready")?;
         join_client
             .play(PlayRequest {
                 video_id: config.test_video_id.clone(),
@@ -211,7 +223,9 @@ async fn run_service_flow(
         }
     };
 
-    let result = wait_for_play_and_live_contract(live_contract, play_rpc).await;
+    let observer_proof = verify_observer_audio_with_ready(config.clone(), Some(observer_ready_tx));
+    let result =
+        wait_for_play_live_contract_and_observer(live_contract, observer_proof, play_rpc).await;
 
     ServiceFlowOutcome {
         result,
@@ -227,24 +241,68 @@ where
     ContractFuture: Future<Output = Result<LiveContractState>>,
     PlayFuture: Future<Output = Result<()>>,
 {
+    let observer_future = async {
+        Ok(ObserverAudioEvidence {
+            verified: true,
+            received_frames: 0,
+            matched_frames: 0,
+            match_ratio: 1.0,
+        })
+    };
+
+    wait_for_play_live_contract_and_observer(contract_future, observer_future, play_future)
+        .await
+        .map(|(state, _)| state)
+}
+
+pub async fn wait_for_play_live_contract_and_observer<ContractFuture, ObserverFuture, PlayFuture>(
+    contract_future: ContractFuture,
+    observer_future: ObserverFuture,
+    play_future: PlayFuture,
+) -> Result<(LiveContractState, ObserverAudioEvidence)>
+where
+    ContractFuture: Future<Output = Result<LiveContractState>>,
+    ObserverFuture: Future<Output = Result<ObserverAudioEvidence>>,
+    PlayFuture: Future<Output = Result<()>>,
+{
     let mut contract_finished = false;
+    let mut observer_finished = false;
     let mut play_finished = false;
-    let mut contract_state = None;
+    let mut contract_state: Option<LiveContractState> = None;
+    let mut observer_evidence: Option<ObserverAudioEvidence> = None;
 
     tokio::pin!(contract_future);
+    tokio::pin!(observer_future);
     tokio::pin!(play_future);
 
     loop {
-        if contract_finished && play_finished {
-            return contract_state.ok_or_else(|| {
+        if contract_finished && observer_finished && play_finished {
+            let contract_state = contract_state.ok_or_else(|| {
                 anyhow!("internal controller error: live contract completed without state")
-            });
+            })?;
+            let observer = observer_evidence.ok_or_else(|| {
+                anyhow!("internal controller error: observer proof completed without evidence")
+            })?;
+            if !observer.verified {
+                bail!(
+                    "observer audio proof did not verify: received_frames={}, matched_frames={}, match_ratio={}",
+                    observer.received_frames,
+                    observer.matched_frames,
+                    observer.match_ratio,
+                );
+            }
+
+            return Ok((contract_state, observer));
         }
 
         tokio::select! {
             contract_result = &mut contract_future, if !contract_finished => {
                 contract_finished = true;
                 contract_state = Some(contract_result?);
+            }
+            observer_result = &mut observer_future, if !observer_finished => {
+                observer_finished = true;
+                observer_evidence = Some(observer_result?);
             }
             play_result = &mut play_future, if !play_finished => {
                 play_finished = true;
@@ -544,6 +602,8 @@ fn next_session_event(
     }
 }
 
-fn is_fatal_gateway_receive_error(error: &twilight_gateway::error::ReceiveMessageError) -> bool {
+pub(crate) fn is_fatal_gateway_receive_error(
+    error: &twilight_gateway::error::ReceiveMessageError,
+) -> bool {
     matches!(error.kind(), ReceiveMessageErrorType::Reconnect)
 }

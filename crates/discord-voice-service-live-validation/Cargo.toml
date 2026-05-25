@@ -9,7 +9,10 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+bytes.workspace = true
+discord-voice-service-playback = { workspace = true }
 discord-voice-service-proto = { workspace = true }
+discord-voice-service-voice = { workspace = true }
 futures.workspace = true
 rustls.workspace = true
 serde.workspace = true
