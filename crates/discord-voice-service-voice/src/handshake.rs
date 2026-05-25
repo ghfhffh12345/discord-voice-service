@@ -230,12 +230,42 @@ async fn expect_session_description(
     gateway: &VoiceGatewayClient,
     timeout_duration: Duration,
 ) -> Result<SessionDescription, VoiceError> {
-    match next_event(gateway, timeout_duration).await?.into_event() {
-        VoiceGatewayEvent::SessionDescription(description) => Ok(description),
-        _ => Err(VoiceError::InvalidState(
-            "voice handshake session description missing",
-        )),
+    let deadline = tokio::time::Instant::now() + timeout_duration;
+
+    loop {
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .ok_or(VoiceError::InvalidState("voice handshake timed out"))?;
+
+        match next_event(gateway, remaining).await?.into_event() {
+            VoiceGatewayEvent::SessionDescription(description) => return Ok(description),
+            event if is_benign_pre_session_description_event(&event) => {
+                tracing::debug!(
+                    event = dave_handshake_event_name(&event),
+                    "voice handshake ignoring benign pre-session-description event"
+                );
+            }
+            _ => {
+                return Err(VoiceError::InvalidState(
+                    "voice handshake session description missing",
+                ));
+            }
+        }
     }
+}
+
+fn is_benign_pre_session_description_event(event: &VoiceGatewayEvent) -> bool {
+    matches!(
+        event,
+        VoiceGatewayEvent::ClientsConnect(_)
+            | VoiceGatewayEvent::ClientDisconnect(_)
+            | VoiceGatewayEvent::Speaking(_)
+            | VoiceGatewayEvent::HeartbeatAck(_)
+            | VoiceGatewayEvent::Video(_)
+            | VoiceGatewayEvent::MediaSinkWants
+            | VoiceGatewayEvent::ClientFlags(_)
+            | VoiceGatewayEvent::ClientPlatform(_)
+    )
 }
 
 async fn complete_initial_dave_transition(
