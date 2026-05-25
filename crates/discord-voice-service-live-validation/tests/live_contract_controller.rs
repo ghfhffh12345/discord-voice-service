@@ -2,9 +2,10 @@ use anyhow::Result;
 use bytes::Bytes;
 use discord_voice_service_live_validation::{
     LiveContractState, LiveValidationEvidence, ObserverAudioEvidence, StagingConfig,
-    combine_results, compare_expected_and_observed, current_user_absent_from_guild_voice,
-    finalize_success_evidence, leave_confirmed_by_rest_voice_state,
-    wait_for_play_and_live_contract, wait_for_play_live_contract_and_observer,
+    combine_results, compare_expected_and_observed, compare_expected_and_observed_from_speaker,
+    current_user_absent_from_guild_voice, finalize_success_evidence,
+    leave_confirmed_by_rest_voice_state, wait_for_play_and_live_contract,
+    wait_for_play_live_contract_and_observer, wait_for_play_live_contract_and_observer_task,
 };
 use discord_voice_service_playback::media::opus_queue::OpusFrame;
 use discord_voice_service_proto::discordvoice::v1::{SessionEvent, SessionEventKind};
@@ -104,6 +105,19 @@ fn staging_controller_rejects_invalid_discord_ids() {
 }
 
 #[test]
+fn staging_controller_rejects_same_service_and_observer_application_id() {
+    let mut env = valid_env();
+    env.insert("OBSERVER_APPLICATION_ID".to_owned(), "1".to_owned());
+
+    let error = StagingConfig::from_env_map(env).expect_err("config should fail");
+
+    assert!(
+        error.to_string().contains("OBSERVER_APPLICATION_ID"),
+        "expected observer application id in error, got: {error}",
+    );
+}
+
+#[test]
 fn evidence_json_captures_success_contract() {
     let evidence = LiveValidationEvidence {
         outcome: "success".to_owned(),
@@ -155,6 +169,22 @@ fn audio_match_rejects_sustained_silence() {
         "sustained silence must not verify audio proof"
     );
     assert_eq!(evidence.received_frames, 12);
+}
+
+#[test]
+fn audio_match_ignores_frames_from_non_service_speakers() {
+    let expected = opus_frames(["a", "b", "c", "d", "e"]);
+    let mut observed = observed_frames_for_user("other-bot", ["a", "b", "c", "d", "e"]);
+    observed.extend(observed_frames_for_user("service-bot", ["a"]));
+
+    let evidence = compare_expected_and_observed_from_speaker(&expected, &observed, "service-bot");
+
+    assert!(
+        !evidence.verified,
+        "foreign speaker frames must not verify proof: {evidence:?}",
+    );
+    assert_eq!(evidence.received_frames, 1);
+    assert_eq!(evidence.matched_frames, 1);
 }
 
 #[test]
@@ -430,6 +460,50 @@ async fn orchestration_waits_for_observer_after_play_and_contract_succeed() {
     assert!(observer.verified);
 }
 
+#[tokio::test]
+async fn orchestration_cancels_and_awaits_observer_task_when_play_errors_first() {
+    let (play_tx, play_rx) = oneshot::channel::<Result<()>>();
+    let (_contract_tx, contract_rx) = oneshot::channel::<Result<LiveContractState>>();
+    let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+    let (cleanup_tx, cleanup_rx) = oneshot::channel::<()>();
+    let observer_task = tokio::spawn(async move {
+        cancel_rx.await.expect("observer should be cancelled");
+        cleanup_tx
+            .send(())
+            .expect("cleanup marker should be delivered");
+        Ok(ObserverAudioEvidence {
+            verified: false,
+            received_frames: 0,
+            matched_frames: 0,
+            match_ratio: 0.0,
+        })
+    });
+
+    let orchestration = tokio::spawn(wait_for_play_live_contract_and_observer_task(
+        async move {
+            contract_rx
+                .await
+                .expect("contract sender should stay pending")
+        },
+        observer_task,
+        cancel_tx,
+        async move { play_rx.await.expect("play sender should complete") },
+    ));
+
+    play_tx
+        .send(fail("call Play failed early"))
+        .expect("play error should be sent");
+
+    let error = orchestration
+        .await
+        .unwrap()
+        .expect_err("play error should fail");
+    assert!(error.to_string().contains("call Play failed early"));
+    cleanup_rx
+        .await
+        .expect("orchestration must await observer cleanup before returning");
+}
+
 #[test]
 fn cleanup_confirms_absence_when_voice_state_lookup_returns_not_found() {
     assert!(
@@ -549,11 +623,18 @@ fn opus_frames<const N: usize>(payloads: [&'static str; N]) -> Vec<OpusFrame> {
 }
 
 fn observed_frames<const N: usize>(payloads: [&'static str; N]) -> Vec<ObservedAudioFrame> {
+    observed_frames_for_user("speaker", payloads)
+}
+
+fn observed_frames_for_user<const N: usize>(
+    user_id: &'static str,
+    payloads: [&'static str; N],
+) -> Vec<ObservedAudioFrame> {
     payloads
         .into_iter()
         .enumerate()
         .map(|(index, payload)| ObservedAudioFrame {
-            user_id: "speaker".to_owned(),
+            user_id: user_id.to_owned(),
             ssrc: 42,
             sequence: index as u16,
             timestamp: (index as u32) * 960,

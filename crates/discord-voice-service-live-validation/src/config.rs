@@ -25,7 +25,7 @@ impl StagingConfig {
     }
 
     pub fn from_env_map(env: HashMap<String, String>) -> Result<Self> {
-        Ok(Self {
+        let config = Self {
             bot_token: required_env(&env, "BOT_TOKEN")?,
             application_id: required_env(&env, "APPLICATION_ID")?,
             observer_bot_token: required_env(&env, "OBSERVER_BOT_TOKEN")?,
@@ -38,7 +38,13 @@ impl StagingConfig {
                 &env,
                 "DISCORD_VOICE_SERVICE_YTMUSIC_ADDR",
             )?,
-        })
+        };
+
+        if config.application_id == config.observer_application_id {
+            bail!("OBSERVER_APPLICATION_ID must differ from APPLICATION_ID");
+        }
+
+        Ok(config)
     }
 
     pub fn guild_id(&self) -> Result<Id<GuildMarker>> {

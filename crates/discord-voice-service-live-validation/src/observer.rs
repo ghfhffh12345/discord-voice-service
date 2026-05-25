@@ -7,18 +7,15 @@ use tracing::warn;
 use twilight_gateway::{Event, EventTypeFlags, Intents, Shard, ShardId, StreamExt as _};
 use twilight_http::Client as HttpClient;
 use twilight_model::gateway::payload::outgoing::UpdateVoiceState;
-use twilight_model::id::{
-    Id,
-    marker::{ChannelMarker, UserMarker},
-};
+use twilight_model::id::{Id, marker::UserMarker};
 
-use discord_voice_service_voice::{ObservedAudioFrame, ObservedVoiceSession, VoiceContext};
+use discord_voice_service_voice::{ObservedVoiceSession, VoiceContext};
 
 use crate::audio_match::{
-    ObserverAudioEvidence, build_expected_track_frames, compare_expected_and_observed,
+    ObserverAudioEvidence, StreamingAudioMatcher, build_expected_track_frames,
 };
 use crate::config::StagingConfig;
-use crate::controller::is_fatal_gateway_receive_error;
+use crate::controller::{cleanup_gateway_voice, is_fatal_gateway_receive_error};
 
 const OBSERVER_VOICE_EVENT_TIMEOUT: Duration = Duration::from_secs(45);
 const OBSERVER_AUDIO_PROOF_TIMEOUT: Duration = Duration::from_secs(240);
@@ -34,22 +31,34 @@ struct ObserverGatewayVoiceContext {
     token: String,
 }
 
-pub async fn verify_observer_audio(config: StagingConfig) -> Result<ObserverAudioEvidence> {
-    verify_observer_audio_with_ready(config, None).await
+pub async fn verify_observer_audio(
+    config: StagingConfig,
+    expected_speaker_user_id: String,
+) -> Result<ObserverAudioEvidence> {
+    let (cancel_tx, cancel_rx) = oneshot::channel();
+    let result =
+        verify_observer_audio_with_ready(config, expected_speaker_user_id, None, cancel_rx).await;
+    drop(cancel_tx);
+    result
 }
 
 pub(crate) async fn verify_observer_audio_with_ready(
     config: StagingConfig,
+    expected_speaker_user_id: String,
     ready: Option<oneshot::Sender<()>>,
+    mut cancel_rx: oneshot::Receiver<()>,
 ) -> Result<ObserverAudioEvidence> {
+    let proof_started = Instant::now();
     let http = HttpClient::new(config.observer_bot_token.clone());
-    let current_user = http
-        .current_user()
-        .await
-        .context("fetch observer Discord user")?
-        .model()
-        .await
-        .context("decode observer Discord user response")?;
+    let current_user = tokio::select! {
+        result = timeout(remaining_observer_budget(proof_started)?, fetch_observer_user(&http)) => {
+            result
+                .map_err(|_| anyhow!("observer audio proof timed out after {} seconds", OBSERVER_AUDIO_PROOF_TIMEOUT.as_secs()))??
+        }
+        _ = wait_for_observer_cancel(&mut cancel_rx) => {
+            bail!("observer audio proof cancelled before join");
+        }
+    };
     let observer_user_id = current_user.id;
 
     let mut shard = Shard::new(
@@ -69,7 +78,51 @@ pub(crate) async fn verify_observer_audio_with_ready(
         ))
         .context("send observer gateway voice join command")?;
 
-    let context = wait_for_observer_voice_context(&mut shard, &config, observer_user_id).await?;
+    let result = tokio::select! {
+        result = timeout(
+            remaining_observer_budget(proof_started)?,
+            run_joined_observer_proof(
+                &mut shard,
+                &config,
+                observer_user_id,
+                expected_speaker_user_id,
+                ready,
+                proof_started,
+            ),
+        ) => {
+            result
+                .map_err(|_| anyhow!("observer audio proof timed out after {} seconds", OBSERVER_AUDIO_PROOF_TIMEOUT.as_secs()))?
+        }
+        _ = wait_for_observer_cancel(&mut cancel_rx) => {
+            Err(anyhow!("observer audio proof cancelled"))
+        }
+    };
+
+    let cleanup =
+        cleanup_gateway_voice(&http, &sender, &mut shard, guild_id, observer_user_id).await;
+
+    combine_observer_result(result, cleanup)
+}
+
+async fn fetch_observer_user(http: &HttpClient) -> Result<twilight_model::user::CurrentUser> {
+    Ok(http
+        .current_user()
+        .await
+        .context("fetch observer Discord user")?
+        .model()
+        .await
+        .context("decode observer Discord user response")?)
+}
+
+async fn run_joined_observer_proof(
+    shard: &mut Shard,
+    config: &StagingConfig,
+    observer_user_id: Id<UserMarker>,
+    expected_speaker_user_id: String,
+    ready: Option<oneshot::Sender<()>>,
+    proof_started: Instant,
+) -> Result<ObserverAudioEvidence> {
+    let context = wait_for_observer_voice_context(shard, config, observer_user_id).await?;
     let expected_frames = build_expected_track_frames(
         &config.discord_voice_service_ytmusic_addr,
         &config.test_video_id,
@@ -81,24 +134,14 @@ pub(crate) async fn verify_observer_audio_with_ready(
     if let Some(ready) = ready {
         let _ = ready.send(());
     }
-    let result = receive_and_compare(&mut session, &expected_frames).await;
 
-    if let Err(error) = sender
-        .command(&UpdateVoiceState::new(
-            guild_id,
-            None::<Id<ChannelMarker>>,
-            false,
-            false,
-        ))
-        .context("send observer gateway voice leave command")
-    {
-        return match result {
-            Ok(_evidence) => Err(error),
-            Err(primary) => Err(primary.context(format!("observer cleanup also failed: {error}"))),
-        };
-    }
-
-    result
+    receive_and_compare(
+        &mut session,
+        &expected_frames,
+        &expected_speaker_user_id,
+        proof_started + OBSERVER_AUDIO_PROOF_TIMEOUT,
+    )
+    .await
 }
 
 async fn wait_for_observer_voice_context(
@@ -182,10 +225,11 @@ async fn wait_for_observer_voice_context(
 async fn receive_and_compare(
     session: &mut ObservedVoiceSession,
     expected_frames: &[discord_voice_service_playback::media::opus_queue::OpusFrame],
+    expected_speaker_user_id: &str,
+    deadline: Instant,
 ) -> Result<ObserverAudioEvidence> {
-    let deadline = Instant::now() + OBSERVER_AUDIO_PROOF_TIMEOUT;
-    let mut observed = Vec::<ObservedAudioFrame>::new();
-    let mut latest_evidence = compare_expected_and_observed(expected_frames, &observed);
+    let mut matcher = StreamingAudioMatcher::new(expected_frames);
+    let mut latest_evidence = matcher.evidence();
 
     while Instant::now() < deadline {
         let remaining = deadline
@@ -194,18 +238,51 @@ async fn receive_and_compare(
         let frame_timeout = remaining.min(OBSERVER_FRAME_RECEIVE_TIMEOUT);
 
         match session.receive_audio_frame(frame_timeout).await {
-            Ok(frame) => observed.push(frame),
+            Ok(frame) => {
+                latest_evidence = matcher.observe_from_speaker(&frame, expected_speaker_user_id);
+            }
             Err(error) if error.to_string().contains("timed out") => continue,
             Err(error) => return Err(error).context("receive observer audio frame"),
         }
 
-        latest_evidence = compare_expected_and_observed(expected_frames, &observed);
         if latest_evidence.verified {
             return Ok(latest_evidence);
         }
     }
 
     Ok(latest_evidence)
+}
+
+async fn wait_for_observer_cancel(cancel_rx: &mut oneshot::Receiver<()>) {
+    match cancel_rx.await {
+        Ok(()) => {}
+        Err(_) => std::future::pending::<()>().await,
+    }
+}
+
+fn remaining_observer_budget(started: Instant) -> Result<Duration> {
+    (started + OBSERVER_AUDIO_PROOF_TIMEOUT)
+        .checked_duration_since(Instant::now())
+        .ok_or_else(|| {
+            anyhow!(
+                "observer audio proof timed out after {} seconds",
+                OBSERVER_AUDIO_PROOF_TIMEOUT.as_secs()
+            )
+        })
+}
+
+fn combine_observer_result(
+    primary: Result<ObserverAudioEvidence>,
+    cleanup: Result<()>,
+) -> Result<ObserverAudioEvidence> {
+    match (primary, cleanup) {
+        (Ok(evidence), Ok(())) => Ok(evidence),
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(_), Err(cleanup)) => Err(cleanup),
+        (Err(primary), Err(cleanup)) => {
+            Err(primary.context(format!("observer cleanup also failed: {cleanup}")))
+        }
+    }
 }
 
 impl ObserverGatewayVoiceContext {
