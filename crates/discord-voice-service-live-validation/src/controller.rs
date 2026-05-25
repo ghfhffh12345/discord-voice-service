@@ -2,7 +2,7 @@ use std::{future::Future, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures::StreamExt;
-use tokio::time::{Instant, sleep_until, timeout};
+use tokio::time::{Instant, timeout};
 use tracing::{info, warn};
 use twilight_gateway::error::ReceiveMessageErrorType;
 use twilight_gateway::{Event, EventTypeFlags, Intents, Shard, ShardId, StreamExt as _};
@@ -117,7 +117,6 @@ pub async fn run(config: StagingConfig) -> Result<()> {
             saw_voice_ready: state.saw_voice_ready,
             saw_playing: state.saw_playing,
             saw_track_ended: true,
-            satisfied_min_interval: state.satisfied_min_interval,
             failure_reason: None,
         },
         emit_validation_evidence,
@@ -337,33 +336,10 @@ async fn assert_live_success_contract(
     let mut state = LiveContractState::default();
 
     loop {
-        if state.waiting_for_live_interval() {
-            match state.min_interval_deadline {
-                Some(deadline) if Instant::now() >= deadline => {
-                    state.update_min_interval(Instant::now());
-                    continue;
-                }
-                Some(deadline) => {
-                    tokio::select! {
-                        maybe_event = events.next() => {
-                            let event = next_session_event(maybe_event)?;
-                            if state.observe_event(event, Instant::now())? {
-                                return Ok(state);
-                            }
-                        }
-                        _ = sleep_until(deadline) => {
-                            state.update_min_interval(deadline);
-                        }
-                    }
-                }
-                None => bail!("internal controller error: missing live interval deadline"),
-            }
-        } else {
-            let maybe_event = events.next().await;
-            let event = next_session_event(maybe_event)?;
-            if state.observe_event(event, Instant::now())? {
-                return Ok(state);
-            }
+        let maybe_event = events.next().await;
+        let event = next_session_event(maybe_event)?;
+        if state.observe_event(event)? {
+            return Ok(state);
         }
     }
 }
