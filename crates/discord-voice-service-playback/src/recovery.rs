@@ -97,14 +97,23 @@ impl PlaybackRecovery {
         let mut demux = WebmOpusDemux::default();
         let mut pending_packets = VecDeque::new();
         let mut position = PlaybackPosition::default();
-        let mut saw_chunk = false;
+
+        let Some(chunk) = read_opening_chunk(&mut stream, &resolved.playable_url).await? else {
+            return Err(PlaybackError::MediaParse("unexpected end of stream"));
+        };
+        demux.push_bytes(chunk);
+        for packet in demux.drain_packets()? {
+            position.record_buffered(&packet);
+            if packet_end_ms(&packet) > position_ms {
+                pending_packets.push_back(packet);
+            }
+        }
 
         while pending_packets.is_empty() || position.timestamp_ms() < position_ms {
-            let Some(chunk) = read_opening_chunk(&mut stream, &resolved.playable_url).await?
+            let Some(chunk) = stream.read_chunk().await?
             else {
                 break;
             };
-            saw_chunk = true;
 
             demux.push_bytes(chunk);
             for packet in demux.drain_packets()? {
@@ -113,10 +122,6 @@ impl PlaybackRecovery {
                     pending_packets.push_back(packet);
                 }
             }
-        }
-
-        if !saw_chunk {
-            return Err(PlaybackError::MediaParse("unexpected end of stream"));
         }
 
         if position.timestamp_ms() < position_ms {

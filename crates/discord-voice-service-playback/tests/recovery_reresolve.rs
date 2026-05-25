@@ -163,4 +163,18 @@ async fn recovery_fails_when_the_first_media_chunk_never_arrives_within_policy()
         .map(|_| ())
         .expect_err("open should time out");
     assert!(err.to_string().contains("timed out opening playback source"));
+    assert_eq!(
+        fake.calls()
+            .iter()
+            .filter(|call| *call == "GetSong")
+            .count(),
+        2
+    );
+    assert_eq!(
+        fake.calls()
+            .iter()
+            .filter(|call| *call == "Decipher")
+            .count(),
+        2
+    );
 }
