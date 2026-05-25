@@ -16,25 +16,27 @@
   - `BOT_TOKEN`
   - `TEST_GUILD_ID`
   - `TEST_VOICE_CHANNEL_ID`
-  - `TEST_VIDEO_ID`
+  - `TEST_VIDEO_ID` for a short dedicated validation track
   - `BROWSER_JSON`
 - Optional variable:
   - `YTMUSIC_SERVICE_IMAGE_REF`
 
 No self-hosted runner labels, runner registration, or runner-local browser file path are required.
+During live staging, human listeners may remain in the channel while the staging bot plays the short dedicated validation track.
 
 ## Preflight expectations
 
 - The workflow verifies the secret contract, Docker/Rust tooling, and candidate artifact identity before live execution.
 - The controller build command remains `cargo build --locked -p discord-voice-service-live-validation --bin staging_live_check`.
 - The workflow materializes `BROWSER_JSON` into `${GITHUB_WORKSPACE}/browser.json`, mounts it into `ytmusic-service`, and removes it during cleanup.
+- Success waits for the natural end of the validation track.
 - A preflight failure is a configuration problem, not a flaky success condition.
 
 ## Failure diagnosis
 
 - Preflight failure: fix environment secrets, Docker/Rust tooling, or candidate artifact wiring.
 - Service container failure: inspect `discord-voice-service-live-staging` logs.
-- Controller failure: inspect the `staging_live_check log` workflow group or the runner temp log at `${RUNNER_TEMP}/staging-live-check.log`.
+- Controller failure: inspect the `staging_live_check log` workflow group or the runner temp log at `${RUNNER_TEMP}/staging-live-check.log` for missing voice events before the natural end of the validation track.
 - Cleanup failure: inspect the workflow summary and rerun only after confirming the test bot has left voice.
 
 ## Rollback model

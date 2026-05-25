@@ -96,3 +96,14 @@ fn release_workflow_encodes_stable_and_prerelease_tag_policy() {
     assert!(workflow.contains("latest"));
     assert!(workflow.contains("candidate-"));
 }
+
+#[test]
+fn live_staging_runner_doc_matches_the_live_validation_contract() {
+    let doc = fs::read_to_string("../../docs/operations/live-staging-runner.md")
+        .expect("live staging runner doc should exist");
+
+    assert!(doc.contains("short dedicated validation track"));
+    assert!(doc.contains("human listeners may remain in the channel"));
+    assert!(doc.contains("natural end of the validation track"));
+    assert!(!doc.contains("5-second live interval"));
+}

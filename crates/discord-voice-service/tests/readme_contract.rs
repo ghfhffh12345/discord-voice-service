@@ -12,7 +12,11 @@ fn readme_publishes_the_hosted_live_staging_contract() {
     assert!(readme.contains("protected `live-staging` environment"));
     assert!(readme.contains("candidate manifest digest"));
     assert!(readme.contains("rollback"));
+    assert!(readme.contains("short dedicated validation track"));
+    assert!(readme.contains("human listeners may remain in the channel"));
+    assert!(readme.contains("natural end of the validation track"));
     assert!(!readme.contains("DISCORD_VOICE_SERVICE_ADDR"));
     assert!(!readme.contains("self-hosted runner profile"));
+    assert!(!readme.contains("5-second live interval"));
     assert!(!readme.contains("STAGING_BROWSER_JSON_SOURCE_PATH"));
 }
