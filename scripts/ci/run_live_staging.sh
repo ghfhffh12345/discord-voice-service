@@ -6,6 +6,7 @@ ytmusic_container_name="ytmusic-service-live-staging"
 service_container_name="discord-voice-service-live-staging"
 controller_log="${RUNNER_TEMP}/staging-live-check.log"
 controller_binary="${GITHUB_WORKSPACE}/target/debug/staging_live_check"
+ytmusic_probe_binary="${GITHUB_WORKSPACE}/target/debug/ytmusic_ready_check"
 staged_browser_json="${GITHUB_WORKSPACE}/browser.json"
 service_image_ref="${DISCORD_VOICE_SERVICE_RESOLVED_IMAGE_REF:-${DISCORD_VOICE_SERVICE_IMAGE_REF}}"
 
@@ -22,6 +23,24 @@ wait_for_port() {
   done
 
   echo "::error::Timed out waiting for ${label} on 127.0.0.1:${port}"
+  return 1
+}
+
+wait_for_ytmusic_grpc() {
+  local endpoint="$1"
+  local attempts="${2:-30}"
+
+  for _ in $(seq 1 "${attempts}"); do
+    if "${ytmusic_probe_binary}" "${endpoint}" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+
+  echo "::group::ytmusic-service container log"
+  docker logs "${ytmusic_container_name}" || true
+  echo "::endgroup::"
+  echo "::error::Timed out waiting for ytmusic-service gRPC readiness at ${endpoint}"
   return 1
 }
 
@@ -57,7 +76,7 @@ trap cleanup EXIT
 install -m 644 /dev/null "${staged_browser_json}"
 printf '%s' "${BROWSER_JSON}" > "${staged_browser_json}"
 
-cargo build --locked -p discord-voice-service-live-validation --bin staging_live_check
+cargo build --locked -p discord-voice-service-live-validation --bin staging_live_check --bin ytmusic_ready_check
 
 if ! docker network inspect "${network_name}" >/dev/null 2>&1; then
   docker network create "${network_name}" >/dev/null
@@ -81,7 +100,7 @@ docker run -d \
   -v "${staged_browser_json}:${YTMUSIC_SERVICE_BROWSER_JSON}:ro" \
   "${YTMUSIC_SERVICE_IMAGE_REF}"
 
-wait_for_port 50051 "ytmusic-service public gRPC listener"
+wait_for_ytmusic_grpc "http://127.0.0.1:50051"
 
 docker run -d \
   --name "${service_container_name}" \
