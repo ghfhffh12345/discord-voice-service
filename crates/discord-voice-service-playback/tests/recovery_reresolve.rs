@@ -136,12 +136,16 @@ async fn recovery_tolerates_a_slow_but_valid_first_media_chunk() {
 
     let mut recovery =
         PlaybackRecovery::new(YtMusicClient::connect(fake.endpoint()).await.unwrap());
-    let result = recovery.recover("video-1", 180).await;
+    let result = recovery.recover("video-1", 0).await.unwrap();
 
-    match result {
-        Ok(_) => {}
-        Err(err) => panic!("slow first chunk should still open successfully: {err}"),
-    }
+    assert!(result.playable_url().starts_with("http://"));
+    assert_eq!(
+        fake.calls()
+            .iter()
+            .filter(|call| *call == "GetSong")
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -153,11 +157,10 @@ async fn recovery_fails_when_the_first_media_chunk_never_arrives_within_policy()
 
     let mut recovery =
         PlaybackRecovery::new(YtMusicClient::connect(fake.endpoint()).await.unwrap());
-    let result = recovery.recover("video-1", 180).await;
-
-    let err = match result {
-        Ok(_) => panic!("recovery should fail when the first media chunk is too slow"),
-        Err(err) => err,
-    };
+    let err = recovery
+        .recover("video-1", 0)
+        .await
+        .map(|_| ())
+        .expect_err("open should time out");
     assert!(err.to_string().contains("timed out opening playback source"));
 }
