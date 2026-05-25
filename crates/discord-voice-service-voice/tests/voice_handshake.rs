@@ -26,6 +26,35 @@ async fn voice_handshake_performs_identify_discovery_select_protocol_and_session
 }
 
 #[tokio::test]
+async fn voice_handshake_tolerates_clients_connect_before_session_description() {
+    let fake =
+        FakeDiscordPeer::spawn_real_shape_with_clients_connect_before_session_description().await;
+    let voice = fake.voice_context("1", "2", "user-1", "session-1", "token-1");
+
+    let session = ConnectedVoiceSession::connect(voice).await.unwrap();
+
+    assert!(session.is_connected());
+    assert!(fake.saw_identify().await);
+    assert!(fake.saw_select_protocol().await);
+    assert!(fake.session_description_sent().await);
+}
+
+#[tokio::test]
+async fn voice_handshake_tolerates_speaking_and_heartbeat_ack_before_session_description() {
+    let fake =
+        FakeDiscordPeer::spawn_real_shape_with_speaking_and_heartbeat_ack_before_session_description()
+            .await;
+    let voice = fake.voice_context("1", "2", "user-1", "session-1", "token-1");
+
+    let session = ConnectedVoiceSession::connect(voice).await.unwrap();
+
+    assert!(session.is_connected());
+    assert!(fake.saw_identify().await);
+    assert!(fake.saw_select_protocol().await);
+    assert!(fake.session_description_sent().await);
+}
+
+#[tokio::test]
 async fn voice_handshake_can_resume_instead_of_identify() {
     let fake = FakeDiscordPeer::spawn_real_shape().await;
     let voice = fake.voice_context("1", "2", "user-1", "session-1", "token-1");
