@@ -22,14 +22,14 @@
   - `YTMUSIC_SERVICE_IMAGE_REF`
 
 No self-hosted runner labels, runner registration, or runner-local browser file path are required.
-During live staging, human listeners may remain in the channel while the staging bot plays the short dedicated validation track.
+During live staging, human listeners may remain in the channel while the staging bot validates playback against the short dedicated validation track.
 
 ## Preflight expectations
 
 - The workflow verifies the secret contract, Docker/Rust tooling, and candidate artifact identity before live execution.
 - The controller build command remains `cargo build --locked -p discord-voice-service-live-validation --bin staging_live_check`.
 - The workflow materializes `BROWSER_JSON` into `${GITHUB_WORKSPACE}/browser.json`, mounts it into `ytmusic-service`, and removes it during cleanup.
-- Success waits for the natural end of the validation track.
+- Live-staging success waits for the natural end of the validation track before the run is treated as release-ready.
 - A preflight failure is a configuration problem, not a flaky success condition.
 
 ## Failure diagnosis

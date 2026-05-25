@@ -1,5 +1,10 @@
 use std::fs;
 
+const OCCUPIED_LISTENER_CONTRACT: &str =
+    "During live staging, human listeners may remain in the channel while the staging bot validates playback against the short dedicated validation track.";
+const NATURAL_END_SUCCESS_CONTRACT: &str =
+    "Live-staging success waits for the natural end of the validation track before the run is treated as release-ready.";
+
 #[test]
 fn live_staging_workflow_uses_github_hosted_runner_and_secret_browser_json() {
     let workflow = fs::read_to_string("../../.github/workflows/live-staging.yml")
@@ -102,8 +107,7 @@ fn live_staging_runner_doc_matches_the_live_validation_contract() {
     let doc = fs::read_to_string("../../docs/operations/live-staging-runner.md")
         .expect("live staging runner doc should exist");
 
-    assert!(doc.contains("short dedicated validation track"));
-    assert!(doc.contains("human listeners may remain in the channel"));
-    assert!(doc.contains("natural end of the validation track"));
+    assert!(doc.contains(OCCUPIED_LISTENER_CONTRACT));
+    assert!(doc.contains(NATURAL_END_SUCCESS_CONTRACT));
     assert!(!doc.contains("5-second live interval"));
 }
