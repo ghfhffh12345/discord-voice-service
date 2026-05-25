@@ -231,10 +231,7 @@ pub fn parse_gateway_message(text: &str) -> Result<VoiceGatewayPayload, VoiceErr
                 .get("speaking")
                 .and_then(Value::as_u64)
                 .ok_or(VoiceError::InvalidState("voice speaking flags missing"))?,
-            delay: data
-                .get("delay")
-                .and_then(Value::as_u64)
-                .ok_or(VoiceError::InvalidState("voice speaking delay missing"))?,
+            delay: data.get("delay").and_then(Value::as_u64).unwrap_or(0),
             ssrc: data
                 .get("ssrc")
                 .and_then(Value::as_u64)
@@ -777,6 +774,29 @@ mod tests {
                 assert_eq!(speaking.delay, 0);
                 assert_eq!(speaking.ssrc, 42);
                 assert_eq!(speaking.user_id.as_deref(), Some("user-1"));
+            }
+            other => panic!("expected speaking event, got {other:?}"),
+        }
+
+        let speaking_without_delay = parse_gateway_message(
+            r#"{
+                "op": 5,
+                "seq": 11,
+                "d": {
+                    "speaking": 1,
+                    "ssrc": 43,
+                    "user_id": "user-2"
+                }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(speaking_without_delay.seq(), Some(11));
+        match speaking_without_delay.into_event() {
+            VoiceGatewayEvent::Speaking(speaking) => {
+                assert_eq!(speaking.speaking, 1);
+                assert_eq!(speaking.delay, 0);
+                assert_eq!(speaking.ssrc, 43);
+                assert_eq!(speaking.user_id.as_deref(), Some("user-2"));
             }
             other => panic!("expected speaking event, got {other:?}"),
         }
