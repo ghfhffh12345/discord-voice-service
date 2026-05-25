@@ -515,11 +515,13 @@ impl FakeDiscordPeer {
                                         "seq": 1,
                                         "d": { "user_ids": user_ids }
                                     }),
-                                    PreSessionDescriptionEvent::ClientDisconnect(user_id) => json!({
-                                        "op": 13,
-                                        "seq": 2,
-                                        "d": { "user_id": user_id }
-                                    }),
+                                    PreSessionDescriptionEvent::ClientDisconnect(user_id) => {
+                                        json!({
+                                            "op": 13,
+                                            "seq": 2,
+                                            "d": { "user_id": user_id }
+                                        })
+                                    }
                                     PreSessionDescriptionEvent::Speaking { user_id, ssrc } => {
                                         json!({
                                             "op": 5,

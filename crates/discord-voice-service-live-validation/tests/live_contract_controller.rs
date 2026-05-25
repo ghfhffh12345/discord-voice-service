@@ -167,7 +167,10 @@ fn live_contract_fails_when_track_end_video_id_differs_after_playing() {
         .unwrap();
 
     let error = state
-        .observe_event(event(SessionEventKind::TrackEnded, Some("other-video")), "video")
+        .observe_event(
+            event(SessionEventKind::TrackEnded, Some("other-video")),
+            "video",
+        )
         .expect_err("mismatched track end should fail");
 
     assert!(error.to_string().contains("expected video"));
@@ -182,7 +185,10 @@ fn live_contract_fails_when_playing_video_id_differs_from_expected() {
         .unwrap();
 
     let error = state
-        .observe_event(event(SessionEventKind::Playing, Some("other-video")), "video")
+        .observe_event(
+            event(SessionEventKind::Playing, Some("other-video")),
+            "video",
+        )
         .expect_err("wrong playing video should fail");
 
     assert!(error.to_string().contains("expected video"));
@@ -200,7 +206,10 @@ fn live_contract_fails_on_reconnecting_after_playing() {
         .unwrap();
 
     let error = state
-        .observe_event(event(SessionEventKind::VoiceReconnecting, Some("video")), "video")
+        .observe_event(
+            event(SessionEventKind::VoiceReconnecting, Some("video")),
+            "video",
+        )
         .expect_err("reconnecting should fail");
 
     assert!(error.to_string().contains("VoiceReconnecting"));

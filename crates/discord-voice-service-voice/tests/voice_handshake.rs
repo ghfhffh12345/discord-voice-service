@@ -56,8 +56,8 @@ async fn voice_handshake_tolerates_speaking_and_heartbeat_ack_before_session_des
 
 #[tokio::test]
 async fn voice_handshake_rejects_self_disconnect_before_session_description() {
-    let fake = FakeDiscordPeer::spawn_real_shape_with_self_disconnect_before_session_description()
-        .await;
+    let fake =
+        FakeDiscordPeer::spawn_real_shape_with_self_disconnect_before_session_description().await;
     let voice = fake.voice_context("1", "2", "user-1", "session-1", "token-1");
 
     let error = ConnectedVoiceSession::connect(voice)
@@ -77,8 +77,8 @@ async fn voice_handshake_rejects_self_disconnect_before_session_description() {
 
 #[tokio::test]
 async fn voice_handshake_tolerates_non_self_disconnect_before_session_description() {
-    let fake = FakeDiscordPeer::spawn_real_shape_with_self_disconnect_before_session_description()
-        .await;
+    let fake =
+        FakeDiscordPeer::spawn_real_shape_with_self_disconnect_before_session_description().await;
     let voice = fake.voice_context("1", "2", "user-9", "session-1", "token-1");
 
     let session = ConnectedVoiceSession::connect(voice).await.unwrap();
