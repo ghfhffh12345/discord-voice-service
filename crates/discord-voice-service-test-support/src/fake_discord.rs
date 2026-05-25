@@ -139,10 +139,10 @@ impl FakeDiscordPeer {
     pub async fn spawn_real_shape_with_speaking_and_heartbeat_ack_before_session_description()
     -> Self {
         Self::spawn_with_options_and_ready_delay(
-            1_000,
+            25,
             DaveScenario::Disabled,
             Duration::ZERO,
-            Duration::ZERO,
+            Duration::from_millis(100),
             vec![
                 PreSessionDescriptionEvent::Speaking {
                     user_id: "user-2".to_owned(),
