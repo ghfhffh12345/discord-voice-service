@@ -15,6 +15,7 @@ fn readme_publishes_the_hosted_live_staging_contract() {
     assert!(readme.contains("short dedicated validation track"));
     assert!(readme.contains("human listeners may remain in the channel"));
     assert!(readme.contains("natural end of the validation track"));
+    assert!(readme.contains("success waits for the natural end of the validation track"));
     assert!(!readme.contains("DISCORD_VOICE_SERVICE_ADDR"));
     assert!(!readme.contains("self-hosted runner profile"));
     assert!(!readme.contains("5-second live interval"));

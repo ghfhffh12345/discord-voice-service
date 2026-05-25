@@ -163,6 +163,7 @@ For manual `workflow_dispatch` live-staging runs, provide `discord_voice_service
 For reproducible staging, pin `YTMUSIC_SERVICE_IMAGE_REF` to an immutable tag or digest instead of relying on `:latest`.
 
 During live staging, human listeners may remain in the channel while the staging bot validates playback against the short dedicated validation track.
+Live-staging success waits for the natural end of the validation track before the run is treated as release-ready.
 
 The workflow intentionally starts the live dependencies itself instead of assuming external staging processes:
 
