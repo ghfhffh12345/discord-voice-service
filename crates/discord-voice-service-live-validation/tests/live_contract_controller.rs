@@ -504,6 +504,54 @@ async fn orchestration_cancels_and_awaits_observer_task_when_play_errors_first()
         .expect("orchestration must await observer cleanup before returning");
 }
 
+#[tokio::test]
+async fn orchestration_does_not_reawait_observer_task_when_play_errors_after_observer_finished() {
+    let (play_tx, play_rx) = oneshot::channel::<Result<()>>();
+    let (_contract_tx, contract_rx) = oneshot::channel::<Result<LiveContractState>>();
+    let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+    let observer_task = tokio::spawn(async move {
+        drop(cancel_rx);
+        Ok(ObserverAudioEvidence {
+            verified: true,
+            received_frames: 4,
+            matched_frames: 4,
+            match_ratio: 1.0,
+        })
+    });
+
+    let mut orchestration = tokio::spawn(wait_for_play_live_contract_and_observer_task(
+        async move {
+            contract_rx
+                .await
+                .expect("contract sender should stay pending")
+        },
+        observer_task,
+        cancel_tx,
+        async move { play_rx.await.expect("play sender should complete") },
+    ));
+
+    assert!(
+        timeout(TokioDuration::from_millis(25), &mut orchestration)
+            .await
+            .is_err(),
+        "orchestration should keep waiting after observer completes",
+    );
+
+    play_tx
+        .send(fail("call Play failed after observer"))
+        .expect("play error should be sent");
+
+    let error = orchestration
+        .await
+        .expect("orchestration task must not panic")
+        .expect_err("play error should fail");
+    assert!(
+        error
+            .to_string()
+            .contains("call Play failed after observer")
+    );
+}
+
 #[test]
 fn cleanup_confirms_absence_when_voice_state_lookup_returns_not_found() {
     assert!(

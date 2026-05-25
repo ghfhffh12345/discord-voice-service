@@ -326,7 +326,7 @@ where
 
 pub async fn wait_for_play_live_contract_and_observer_task<ContractFuture, PlayFuture>(
     contract_future: ContractFuture,
-    mut observer_task: tokio::task::JoinHandle<Result<ObserverAudioEvidence>>,
+    observer_task: tokio::task::JoinHandle<Result<ObserverAudioEvidence>>,
     cancel_observer: oneshot::Sender<()>,
     play_future: PlayFuture,
 ) -> Result<(LiveContractState, ObserverAudioEvidence)>
@@ -340,6 +340,7 @@ where
     let mut contract_state: Option<LiveContractState> = None;
     let mut observer_evidence: Option<ObserverAudioEvidence> = None;
     let mut cancel_observer = Some(cancel_observer);
+    let mut observer_task = Some(observer_task);
 
     tokio::pin!(contract_future);
     tokio::pin!(play_future);
@@ -372,13 +373,24 @@ where
                         contract_state = Some(state);
                     }
                     Err(error) => {
-                        return cancel_and_await_observer(error, cancel_observer.take(), observer_task).await;
+                        return cancel_and_await_observer(
+                            error,
+                            cancel_observer.take(),
+                            observer_task.take(),
+                        )
+                        .await;
                     }
                 }
             }
-            observer_result = &mut observer_task, if !observer_finished => {
+            observer_result = async {
+                match observer_task.as_mut() {
+                    Some(task) => task.await,
+                    None => std::future::pending().await,
+                }
+            }, if observer_task.is_some() => {
                 observer_finished = true;
                 observer_evidence = Some(flatten_observer_task_result(observer_result)?);
+                observer_task = None;
             }
             play_result = &mut play_future, if !play_finished => {
                 match play_result {
@@ -386,7 +398,12 @@ where
                         play_finished = true;
                     }
                     Err(error) => {
-                        return cancel_and_await_observer(error, cancel_observer.take(), observer_task).await;
+                        return cancel_and_await_observer(
+                            error,
+                            cancel_observer.take(),
+                            observer_task.take(),
+                        )
+                        .await;
                     }
                 }
             }
@@ -397,8 +414,12 @@ where
 async fn cancel_and_await_observer(
     primary: anyhow::Error,
     cancel_observer: Option<oneshot::Sender<()>>,
-    observer_task: tokio::task::JoinHandle<Result<ObserverAudioEvidence>>,
+    observer_task: Option<tokio::task::JoinHandle<Result<ObserverAudioEvidence>>>,
 ) -> Result<(LiveContractState, ObserverAudioEvidence)> {
+    let Some(observer_task) = observer_task else {
+        return Err(primary);
+    };
+
     if let Some(cancel_observer) = cancel_observer {
         let _ = cancel_observer.send(());
     }
