@@ -31,7 +31,10 @@ wait_for_ytmusic_grpc() {
   local attempts="${2:-30}"
 
   for _ in $(seq 1 "${attempts}"); do
-    if "${ytmusic_probe_binary}" "${endpoint}" >/dev/null 2>&1; then
+    if docker run --rm --network "${network_name}" \
+      -v "${ytmusic_probe_binary}:/ytmusic_ready_check:ro" \
+      ubuntu:24.04 \
+      /ytmusic_ready_check "${endpoint}" >/dev/null 2>&1; then
       return 0
     fi
     sleep 1
@@ -100,7 +103,7 @@ docker run -d \
   -v "${staged_browser_json}:${YTMUSIC_SERVICE_BROWSER_JSON}:ro" \
   "${YTMUSIC_SERVICE_IMAGE_REF}"
 
-wait_for_ytmusic_grpc "http://127.0.0.1:50051"
+wait_for_ytmusic_grpc "http://${ytmusic_container_name}:50051"
 
 docker run -d \
   --name "${service_container_name}" \

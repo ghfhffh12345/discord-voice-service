@@ -29,9 +29,15 @@ fn live_staging_workflow_uses_github_hosted_runner_and_secret_browser_json() {
     assert!(run_script.contains("printf '%s' \"${BROWSER_JSON}\""));
     assert!(run_script.contains("docker pull \"${service_image_ref}\""));
     assert!(run_script.contains("docker run -d"));
+    assert!(run_script.contains("docker run --rm --network \"${network_name}\""));
     assert!(run_script.contains("ytmusic_ready_check"));
+    assert!(run_script.contains("-v \"${ytmusic_probe_binary}:/ytmusic_ready_check:ro\""));
+    assert!(run_script.contains("ubuntu:24.04"));
+    assert!(run_script.contains("/ytmusic_ready_check \"${endpoint}\""));
     assert!(run_script.contains("wait_for_ytmusic_grpc"));
+    assert!(run_script.contains("wait_for_ytmusic_grpc \"http://${ytmusic_container_name}:50051\""));
     assert!(run_script.contains("Timed out waiting for ytmusic-service gRPC readiness"));
+    assert!(!run_script.contains("wait_for_ytmusic_grpc \"http://127.0.0.1:50051\""));
     assert!(!run_script.contains("wait_for_port 50051 \"ytmusic-service public gRPC listener\""));
     assert!(!run_script.contains("podman "));
 }
