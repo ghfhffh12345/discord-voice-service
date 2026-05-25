@@ -186,7 +186,9 @@ async fn spawn_test_server(behavior: ServerBehavior, payload: Bytes) -> RangeSer
             };
             let response = format!("{status}\r\n{headers}",);
 
-            if let ServerBehavior::HonorRangeWithInitialDelay { delay } = behavior {
+            if let ServerBehavior::HonorRangeWithInitialDelay { delay } = behavior
+                && request_number == 1
+            {
                 thread::sleep(delay);
             }
             if stream.write_all(response.as_bytes()).is_err() {
@@ -242,4 +244,48 @@ fn parse_range_start(header: &str) -> Option<u64> {
     let value = header.strip_prefix("bytes=")?;
     let (start, _) = value.split_once('-')?;
     start.parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::spawn_stream_server_with_initial_delay;
+
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::time::{Duration, Instant};
+
+    fn fetch(url: &str) {
+        let address = url.strip_prefix("http://").expect("fixture URLs are http");
+        let mut stream = TcpStream::connect(address).expect("server should accept connections");
+        let request =
+            format!("GET / HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n");
+        stream
+            .write_all(request.as_bytes())
+            .expect("request should be written");
+
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .expect("response should be readable");
+        assert!(!response.is_empty());
+    }
+
+    #[test]
+    fn stream_server_initial_delay_only_applies_to_first_response() {
+        let server = futures::executor::block_on(async {
+            spawn_stream_server_with_initial_delay("audio-itag250.webm", Duration::from_millis(200))
+                .await
+        });
+
+        let first_started = Instant::now();
+        fetch(&server.url());
+        let first_elapsed = first_started.elapsed();
+
+        let second_started = Instant::now();
+        fetch(&server.url());
+        let second_elapsed = second_started.elapsed();
+
+        assert!(first_elapsed >= Duration::from_millis(150));
+        assert!(second_elapsed < Duration::from_millis(100));
+    }
 }
