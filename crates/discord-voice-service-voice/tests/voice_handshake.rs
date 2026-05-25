@@ -76,6 +76,20 @@ async fn voice_handshake_rejects_self_disconnect_before_session_description() {
 }
 
 #[tokio::test]
+async fn voice_handshake_tolerates_non_self_disconnect_before_session_description() {
+    let fake = FakeDiscordPeer::spawn_real_shape_with_self_disconnect_before_session_description()
+        .await;
+    let voice = fake.voice_context("1", "2", "user-9", "session-1", "token-1");
+
+    let session = ConnectedVoiceSession::connect(voice).await.unwrap();
+
+    assert!(session.is_connected());
+    assert!(fake.saw_identify().await);
+    assert!(fake.saw_select_protocol().await);
+    assert!(fake.session_description_sent().await);
+}
+
+#[tokio::test]
 async fn voice_handshake_can_resume_instead_of_identify() {
     let fake = FakeDiscordPeer::spawn_real_shape().await;
     let voice = fake.voice_context("1", "2", "user-1", "session-1", "token-1");
