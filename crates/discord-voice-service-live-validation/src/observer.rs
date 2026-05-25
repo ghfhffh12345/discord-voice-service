@@ -105,13 +105,12 @@ pub(crate) async fn verify_observer_audio_with_ready(
 }
 
 async fn fetch_observer_user(http: &HttpClient) -> Result<twilight_model::user::CurrentUser> {
-    Ok(http
-        .current_user()
+    http.current_user()
         .await
         .context("fetch observer Discord user")?
         .model()
         .await
-        .context("decode observer Discord user response")?)
+        .context("decode observer Discord user response")
 }
 
 async fn run_joined_observer_proof(
