@@ -84,6 +84,24 @@ impl ObservedVoiceSession {
         &mut self,
         timeout_duration: Duration,
     ) -> Result<ObservedAudioFrame, VoiceError> {
+        self.receive_audio_frame_internal(None, timeout_duration)
+            .await
+    }
+
+    pub async fn receive_audio_frame_from(
+        &mut self,
+        expected_user_id: &str,
+        timeout_duration: Duration,
+    ) -> Result<ObservedAudioFrame, VoiceError> {
+        self.receive_audio_frame_internal(Some(expected_user_id), timeout_duration)
+            .await
+    }
+
+    async fn receive_audio_frame_internal(
+        &mut self,
+        expected_user_id: Option<&str>,
+        timeout_duration: Duration,
+    ) -> Result<ObservedAudioFrame, VoiceError> {
         let deadline = Instant::now() + timeout_duration;
         loop {
             let remaining = deadline
@@ -111,7 +129,15 @@ impl ObservedVoiceSession {
                     if !self.speaker_ssrcs.contains_key(&header.ssrc) {
                         self.wait_for_speaker_mapping(header.ssrc, deadline).await?;
                     }
-                    return self.decode_audio_packet(&packet);
+                    let user_id = self
+                        .speaker_ssrcs
+                        .get(&header.ssrc)
+                        .cloned()
+                        .ok_or(VoiceError::InvalidState("voice speaker mapping missing"))?;
+                    if expected_user_id.is_some_and(|expected| user_id != expected) {
+                        continue;
+                    }
+                    return self.decode_audio_packet(&packet, header, user_id);
                 }
             }
         }
@@ -163,18 +189,18 @@ impl ObservedVoiceSession {
         Ok(())
     }
 
-    fn decode_audio_packet(&mut self, packet: &[u8]) -> Result<ObservedAudioFrame, VoiceError> {
+    fn decode_audio_packet(
+        &mut self,
+        packet: &[u8],
+        header: RtpHeader,
+        user_id: String,
+    ) -> Result<ObservedAudioFrame, VoiceError> {
         let protection = self
             .protection
             .as_ref()
             .ok_or(VoiceError::InvalidState("voice protection unavailable"))?;
-        let (header, payload) = protection.unprotect_packet(packet)?;
-        let user_id = self
-            .speaker_ssrcs
-            .get(&header.ssrc)
-            .cloned()
-            .ok_or(VoiceError::InvalidState("voice speaker mapping missing"))?;
-        let payload = self.decrypt_audio_payload(header, payload)?;
+        let (_, payload) = protection.unprotect_packet(packet)?;
+        let payload = self.decrypt_audio_payload(&user_id, payload)?;
 
         Ok(ObservedAudioFrame {
             user_id,
@@ -187,21 +213,15 @@ impl ObservedVoiceSession {
 
     fn decrypt_audio_payload(
         &mut self,
-        header: RtpHeader,
+        user_id: &str,
         payload: Bytes,
     ) -> Result<Bytes, VoiceError> {
-        let user_id = self
-            .speaker_ssrcs
-            .get(&header.ssrc)
-            .cloned()
-            .ok_or(VoiceError::InvalidState("voice speaker mapping missing"))?;
-
         let Some(dave) = self.dave.as_mut() else {
             return Ok(payload);
         };
 
         let decrypted = dave
-            .decrypt_audio_frame_from(&user_id, DaveMediaType::Audio, payload.as_ref())
+            .decrypt_audio_frame_from(user_id, DaveMediaType::Audio, payload.as_ref())
             .map_err(|_| VoiceError::InvalidState("voice dave frame decryption failed"))?;
         Ok(Bytes::from(decrypted))
     }

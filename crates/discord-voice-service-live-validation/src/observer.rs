@@ -236,7 +236,10 @@ async fn receive_and_compare(
             .unwrap_or_default();
         let frame_timeout = remaining.min(OBSERVER_FRAME_RECEIVE_TIMEOUT);
 
-        match session.receive_audio_frame(frame_timeout).await {
+        match session
+            .receive_audio_frame_from(expected_speaker_user_id, frame_timeout)
+            .await
+        {
             Ok(frame) => {
                 latest_evidence = matcher.observe_from_speaker(&frame, expected_speaker_user_id);
             }
