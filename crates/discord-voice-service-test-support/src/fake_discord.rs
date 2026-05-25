@@ -38,6 +38,13 @@ enum DaveScenario {
     UnmatchedWelcome,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PreSessionDescriptionEvent {
+    ClientsConnect(Vec<String>),
+    Speaking { user_id: String, ssrc: u32 },
+    HeartbeatAck(Option<u64>),
+}
+
 pub struct FakeDiscordPeer {
     endpoint_host: String,
     gateway_path: Arc<StdMutex<Option<String>>>,
@@ -72,7 +79,7 @@ impl FakeDiscordPeer {
 
     #[allow(clippy::result_large_err)]
     pub async fn spawn_real_shape() -> Self {
-        Self::spawn_with_options(1_000, DaveScenario::Disabled, Duration::ZERO).await
+        Self::spawn_with_options(1_000, DaveScenario::Disabled, Duration::ZERO, vec![]).await
     }
 
     #[allow(clippy::result_large_err)]
@@ -82,6 +89,7 @@ impl FakeDiscordPeer {
             DaveScenario::Disabled,
             Duration::ZERO,
             Duration::ZERO,
+            vec![],
         )
         .await
     }
@@ -93,6 +101,7 @@ impl FakeDiscordPeer {
             DaveScenario::Disabled,
             delay,
             Duration::ZERO,
+            vec![],
         )
         .await
     }
@@ -107,6 +116,40 @@ impl FakeDiscordPeer {
             DaveScenario::Disabled,
             Duration::ZERO,
             ready_delay,
+            vec![],
+        )
+        .await
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn spawn_real_shape_with_clients_connect_before_session_description() -> Self {
+        Self::spawn_with_options_and_ready_delay(
+            1_000,
+            DaveScenario::Disabled,
+            Duration::ZERO,
+            Duration::ZERO,
+            vec![PreSessionDescriptionEvent::ClientsConnect(vec![
+                "user-2".to_owned(),
+            ])],
+        )
+        .await
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn spawn_real_shape_with_speaking_and_heartbeat_ack_before_session_description()
+    -> Self {
+        Self::spawn_with_options_and_ready_delay(
+            1_000,
+            DaveScenario::Disabled,
+            Duration::ZERO,
+            Duration::ZERO,
+            vec![
+                PreSessionDescriptionEvent::Speaking {
+                    user_id: "user-2".to_owned(),
+                    ssrc: 42,
+                },
+                PreSessionDescriptionEvent::HeartbeatAck(Some(7)),
+            ],
         )
         .await
     }
@@ -118,6 +161,7 @@ impl FakeDiscordPeer {
             DaveScenario::NewGroup,
             Duration::ZERO,
             Duration::ZERO,
+            vec![],
         )
         .await
     }
@@ -129,6 +173,7 @@ impl FakeDiscordPeer {
             DaveScenario::NewGroupWithNoOpRevokeBeforeProposals,
             Duration::ZERO,
             Duration::ZERO,
+            vec![],
         )
         .await
     }
@@ -140,6 +185,7 @@ impl FakeDiscordPeer {
             DaveScenario::NewGroupSelfOnlyNoProposals,
             Duration::ZERO,
             Duration::ZERO,
+            vec![],
         )
         .await
     }
@@ -152,6 +198,7 @@ impl FakeDiscordPeer {
             DaveScenario::NewGroupRequiresInitTransitionReadyBeforePrepareCommitTransition,
             Duration::ZERO,
             Duration::ZERO,
+            vec![],
         )
         .await
     }
@@ -163,6 +210,7 @@ impl FakeDiscordPeer {
             DaveScenario::NewGroupCommitBeforePrepareEpoch,
             Duration::ZERO,
             Duration::ZERO,
+            vec![],
         )
         .await
     }
@@ -174,6 +222,7 @@ impl FakeDiscordPeer {
             DaveScenario::NewGroupRequiresInitKeyPackage,
             Duration::ZERO,
             Duration::ZERO,
+            vec![],
         )
         .await
     }
@@ -185,6 +234,7 @@ impl FakeDiscordPeer {
             DaveScenario::NewGroupRequiresRefreshedKeyPackage,
             Duration::ZERO,
             Duration::ZERO,
+            vec![],
         )
         .await
     }
@@ -196,6 +246,7 @@ impl FakeDiscordPeer {
             DaveScenario::EstablishedGroupJoin,
             Duration::ZERO,
             Duration::ZERO,
+            vec![],
         )
         .await
     }
@@ -207,6 +258,7 @@ impl FakeDiscordPeer {
             DaveScenario::UnmatchedWelcome,
             Duration::ZERO,
             Duration::ZERO,
+            vec![],
         )
         .await
     }
@@ -218,6 +270,7 @@ impl FakeDiscordPeer {
             DaveScenario::PrepareBackedWelcomeWithStrayFollowUp,
             Duration::ZERO,
             Duration::ZERO,
+            vec![],
         )
         .await
     }
@@ -227,12 +280,14 @@ impl FakeDiscordPeer {
         heartbeat_interval_ms: u64,
         dave_scenario: DaveScenario,
         gateway_delay: Duration,
+        pre_session_description_events: Vec<PreSessionDescriptionEvent>,
     ) -> Self {
         Self::spawn_with_options_and_ready_delay(
             heartbeat_interval_ms,
             dave_scenario,
             gateway_delay,
             Duration::ZERO,
+            pre_session_description_events,
         )
         .await
     }
@@ -243,6 +298,7 @@ impl FakeDiscordPeer {
         dave_scenario: DaveScenario,
         gateway_delay: Duration,
         ready_delay: Duration,
+        pre_session_description_events: Vec<PreSessionDescriptionEvent>,
     ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let udp_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -437,6 +493,36 @@ impl FakeDiscordPeer {
                                 .pointer("/d/data/mode")
                                 .and_then(Value::as_str)
                                 .unwrap_or(PREFERRED_MODE);
+                            for event in &pre_session_description_events {
+                                let payload = match event {
+                                    PreSessionDescriptionEvent::ClientsConnect(user_ids) => json!({
+                                        "op": 11,
+                                        "seq": 1,
+                                        "d": { "user_ids": user_ids }
+                                    }),
+                                    PreSessionDescriptionEvent::Speaking { user_id, ssrc } => {
+                                        json!({
+                                            "op": 5,
+                                            "seq": 2,
+                                            "d": {
+                                                "speaking": 1,
+                                                "delay": 0,
+                                                "ssrc": ssrc,
+                                                "user_id": user_id,
+                                            }
+                                        })
+                                    }
+                                    PreSessionDescriptionEvent::HeartbeatAck(nonce) => json!({
+                                        "op": 6,
+                                        "seq": 3,
+                                        "d": nonce
+                                    }),
+                                };
+
+                                ws.send(Message::Text(payload.to_string().into()))
+                                    .await
+                                    .unwrap();
+                            }
                             ws.send(Message::Text(
                                 json!({
                                     "op": 4,
