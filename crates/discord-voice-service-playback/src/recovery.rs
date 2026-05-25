@@ -9,8 +9,10 @@ use crate::media::webm_demux::{DemuxedPacket, WebmOpusDemux};
 use crate::source::{PlaybackSource, ResolvedPlaybackSource};
 use reqwest::StatusCode;
 use tokio::time::timeout;
+use tracing::warn;
 
-const OPEN_CHUNK_TIMEOUT: Duration = Duration::from_millis(500);
+const OPEN_CHUNK_TIMEOUT: Duration = Duration::from_secs(2);
+const OPEN_CHUNK_ATTEMPTS: usize = 2;
 
 #[derive(Debug)]
 pub struct PlaybackRecovery {
@@ -98,14 +100,7 @@ impl PlaybackRecovery {
         let mut saw_chunk = false;
 
         while pending_packets.is_empty() || position.timestamp_ms() < position_ms {
-            let Some(chunk) = timeout(OPEN_CHUNK_TIMEOUT, stream.read_chunk())
-                .await
-                .map_err(|_| {
-                    PlaybackError::MediaParseDetail(format!(
-                        "timed out opening playback source for {}",
-                        resolved.playable_url
-                    ))
-                })??
+            let Some(chunk) = read_opening_chunk(&mut stream, &resolved.playable_url).await?
             else {
                 break;
             };
@@ -147,6 +142,32 @@ impl PlaybackRecovery {
 
 fn packet_end_ms(packet: &DemuxedPacket) -> u64 {
     packet.timestamp_ms.saturating_add(packet.duration_ms)
+}
+
+async fn read_opening_chunk(
+    stream: &mut HttpOpusStream,
+    playable_url: &str,
+) -> Result<Option<bytes::Bytes>, PlaybackError> {
+    for attempt in 1..=OPEN_CHUNK_ATTEMPTS {
+        match timeout(OPEN_CHUNK_TIMEOUT, stream.read_chunk()).await {
+            Ok(result) => return result,
+            Err(_) if attempt < OPEN_CHUNK_ATTEMPTS => {
+                warn!(
+                    attempt,
+                    timeout_ms = OPEN_CHUNK_TIMEOUT.as_millis(),
+                    url = playable_url,
+                    "playback source open attempt timed out; retrying"
+                );
+            }
+            Err(_) => {
+                return Err(PlaybackError::MediaParseDetail(format!(
+                    "timed out opening playback source for {playable_url}"
+                )));
+            }
+        }
+    }
+
+    unreachable!("open chunk attempts loop must return")
 }
 
 fn should_reresolve_after_open_failure(err: &PlaybackError) -> bool {
