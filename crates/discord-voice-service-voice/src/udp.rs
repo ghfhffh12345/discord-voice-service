@@ -70,6 +70,20 @@ impl VoiceUdpTransport {
         self.local_addr
     }
 
+    pub async fn receive_packet(&self, max_packet_len: usize) -> Result<Vec<u8>, VoiceError> {
+        if max_packet_len == 0 {
+            return Err(VoiceError::InvalidState("voice udp receive size invalid"));
+        }
+
+        let mut packet = vec![0u8; max_packet_len];
+        let (len, from) = self.socket.recv_from(&mut packet).await?;
+        if from != self.server {
+            return Err(VoiceError::InvalidState("voice udp packet source invalid"));
+        }
+        packet.truncate(len);
+        Ok(packet)
+    }
+
     pub async fn send_audio_frame(&mut self, frame: Bytes) -> Result<(), VoiceError> {
         let (sequence, timestamp) = self.sequence.advance();
         let rtp_header = self.packet_builder.build_header(sequence, timestamp);

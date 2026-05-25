@@ -6,6 +6,7 @@ mod gateway;
 pub mod handshake;
 mod protection;
 mod protocol;
+mod receive;
 mod resume;
 pub(crate) mod rollover;
 mod rtp;
@@ -15,6 +16,7 @@ mod udp;
 mod ws;
 
 pub use error::VoiceError;
+pub use receive::{ObservedAudioFrame, ObservedVoiceSession};
 pub use session::{ConnectedVoiceSession, VoiceContext};
 
 #[doc(hidden)]

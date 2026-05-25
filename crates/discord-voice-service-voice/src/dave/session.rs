@@ -258,7 +258,7 @@ impl DaveWelcomeResult {
 
 pub struct DaveRuntimeContext {
     pub protocol_version: u16,
-    pub encryptor: DaveRuntimeEncryptor,
+    session: davey::DaveSession,
 }
 
 impl DaveRuntimeContext {
@@ -266,28 +266,26 @@ impl DaveRuntimeContext {
         let protocol_version = session.protocol_version();
         Ok(Self {
             protocol_version,
-            encryptor: DaveRuntimeEncryptor {
-                session: session.into_inner()?,
-            },
+            session: session.into_inner()?,
         })
     }
 
     pub fn encrypt_audio_frame(&mut self, frame: &[u8]) -> Result<Vec<u8>, DaveError> {
-        self.encryptor.encrypt(DaveMediaType::Audio, 0, frame)
+        self.encrypt(DaveMediaType::Audio, frame)
     }
-}
 
-pub struct DaveRuntimeEncryptor {
-    session: davey::DaveSession,
-}
-
-impl DaveRuntimeEncryptor {
-    pub fn encrypt(
+    pub fn decrypt_audio_frame_from(
         &mut self,
+        user_id: &str,
         media_type: DaveMediaType,
-        _ssrc: u32,
-        frame: &[u8],
+        encrypted_frame: &[u8],
     ) -> Result<Vec<u8>, DaveError> {
+        self.session
+            .decrypt(parse_user_id(user_id)?, media_type.into(), encrypted_frame)
+            .map_err(|err| DaveError::operation("decrypt audio frame", err))
+    }
+
+    fn encrypt(&mut self, media_type: DaveMediaType, frame: &[u8]) -> Result<Vec<u8>, DaveError> {
         let codec = match media_type {
             DaveMediaType::Audio => Codec::OPUS,
             DaveMediaType::Video => Codec::UNKNOWN,

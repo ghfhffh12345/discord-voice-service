@@ -1,3 +1,19 @@
+use crate::error::VoiceError;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RtpHeader {
+    pub version: u8,
+    pub padding: bool,
+    pub extension: bool,
+    pub csrc_count: u8,
+    pub marker: bool,
+    pub payload_type: u8,
+    pub sequence: u16,
+    pub timestamp: u32,
+    pub ssrc: u32,
+    pub header_len: usize,
+}
+
 pub struct RtpPacketBuilder {
     ssrc: u32,
 }
@@ -22,6 +38,57 @@ impl RtpPacketBuilder {
         packet.extend_from_slice(payload);
         packet
     }
+}
+
+pub fn parse_rtp_header(packet: &[u8]) -> Result<RtpHeader, VoiceError> {
+    if packet.len() < 12 {
+        return Err(VoiceError::InvalidState("voice rtp packet too short"));
+    }
+
+    let first = packet[0];
+    let version = first >> 6;
+    if version != 2 {
+        return Err(VoiceError::InvalidState("voice rtp version unsupported"));
+    }
+
+    let padding = first & 0b0010_0000 != 0;
+    let extension = first & 0b0001_0000 != 0;
+    let csrc_count = first & 0b0000_1111;
+    let second = packet[1];
+    let marker = second & 0b1000_0000 != 0;
+    let payload_type = second & 0b0111_1111;
+
+    let mut header_len = 12 + usize::from(csrc_count) * 4;
+    if packet.len() < header_len {
+        return Err(VoiceError::InvalidState("voice rtp csrc list truncated"));
+    }
+
+    if extension {
+        if packet.len() < header_len + 4 {
+            return Err(VoiceError::InvalidState(
+                "voice rtp extension header truncated",
+            ));
+        }
+        let extension_len_words =
+            u16::from_be_bytes([packet[header_len + 2], packet[header_len + 3]]);
+        header_len += 4 + usize::from(extension_len_words) * 4;
+        if packet.len() < header_len {
+            return Err(VoiceError::InvalidState("voice rtp extension truncated"));
+        }
+    }
+
+    Ok(RtpHeader {
+        version,
+        padding,
+        extension,
+        csrc_count,
+        marker,
+        payload_type,
+        sequence: u16::from_be_bytes([packet[2], packet[3]]),
+        timestamp: u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]),
+        ssrc: u32::from_be_bytes([packet[8], packet[9], packet[10], packet[11]]),
+        header_len,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

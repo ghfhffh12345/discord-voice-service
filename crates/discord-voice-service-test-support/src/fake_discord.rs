@@ -1,14 +1,19 @@
 #![allow(dead_code)]
 
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use discord_voice_service_voice::VoiceContext;
-use discord_voice_service_voice::crypto::{PREFERRED_MODE, REQUIRED_MODE};
+use discord_voice_service_voice::VoiceError;
+use discord_voice_service_voice::crypto::{EncryptionMode, PREFERRED_MODE, REQUIRED_MODE};
 use discord_voice_service_voice::dave::{DaveExternalSender, DaveSession};
-use discord_voice_service_voice::test_support::split_dave_mls_commit_welcome_payload;
+use discord_voice_service_voice::test_support::{
+    ProtectionContext, RtpPacketBuilder, split_dave_mls_commit_welcome_payload,
+};
 use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::net::{TcpListener, UdpSocket};
+use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio::sync::{Mutex, Notify};
 use tokio::time::{Duration, Instant, sleep};
 use tokio_tungstenite::accept_hdr_async;
@@ -48,8 +53,13 @@ enum PreSessionDescriptionEvent {
 
 pub struct FakeDiscordPeer {
     endpoint_host: String,
+    udp_socket: Arc<UdpSocket>,
+    gateway_messages: UnboundedSender<Message>,
     gateway_path: Arc<StdMutex<Option<String>>>,
     dave_group_id: Arc<StdMutex<Option<u64>>>,
+    encryption_mode: Arc<StdMutex<Option<EncryptionMode>>>,
+    secret_key: Arc<StdMutex<Option<Vec<u8>>>>,
+    last_udp_peer: Arc<StdMutex<Option<SocketAddr>>>,
     discovery_count: Arc<Mutex<usize>>,
     speaking_observed: Arc<Notify>,
     audio_frame_count: Arc<Mutex<usize>>,
@@ -316,11 +326,15 @@ impl FakeDiscordPeer {
         pre_session_description_events: Vec<PreSessionDescriptionEvent>,
     ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let udp_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let ws_addr = listener.local_addr().unwrap();
         let udp_addr = udp_socket.local_addr().unwrap();
+        let (gateway_messages, mut gateway_messages_rx) = unbounded_channel::<Message>();
         let gateway_path = Arc::new(StdMutex::new(None));
         let dave_group_id = Arc::new(StdMutex::new(None));
+        let encryption_mode = Arc::new(StdMutex::new(None));
+        let secret_key = Arc::new(StdMutex::new(None));
+        let last_udp_peer = Arc::new(StdMutex::new(None));
         let discovery_count = Arc::new(Mutex::new(0usize));
         let speaking_observed = Arc::new(Notify::new());
         let audio_frame_count = Arc::new(Mutex::new(0usize));
@@ -347,15 +361,18 @@ impl FakeDiscordPeer {
         let discovery_count_state = Arc::clone(&discovery_count);
         let audio_frame_count_state = Arc::clone(&audio_frame_count);
         let audio_frame_times_state = Arc::clone(&audio_frame_times);
+        let last_udp_peer_state = Arc::clone(&last_udp_peer);
+        let udp_socket_state = Arc::clone(&udp_socket);
         tokio::spawn(async move {
             let mut buf = [0u8; 512];
             loop {
-                let Ok((len, from)) = udp_socket.recv_from(&mut buf).await else {
+                let Ok((len, from)) = udp_socket_state.recv_from(&mut buf).await else {
                     break;
                 };
 
                 if len == 74 && buf[..2] == 1u16.to_be_bytes() {
                     *discovery_count_state.lock().await += 1;
+                    *last_udp_peer_state.lock().unwrap() = Some(from);
 
                     let mut response = [0u8; 74];
                     response[..2].copy_from_slice(&2u16.to_be_bytes());
@@ -363,7 +380,7 @@ impl FakeDiscordPeer {
                     response[4..8].copy_from_slice(&buf[4..8]);
                     response[8..17].copy_from_slice(b"127.0.0.1");
                     response[72..74].copy_from_slice(&from.port().to_be_bytes());
-                    udp_socket.send_to(&response, from).await.unwrap();
+                    udp_socket_state.send_to(&response, from).await.unwrap();
                     continue;
                 }
 
@@ -400,6 +417,8 @@ impl FakeDiscordPeer {
             Arc::clone(&sent_dave_prepare_commit_transition);
         let identified_user_id_state = Arc::clone(&identified_user_id);
         let dave_group_id_state = Arc::clone(&dave_group_id);
+        let encryption_mode_state = Arc::clone(&encryption_mode);
+        let secret_key_state = Arc::clone(&secret_key);
         tokio::spawn(async move {
             let Ok((stream, _)) = listener.accept().await else {
                 return;
@@ -438,9 +457,23 @@ impl FakeDiscordPeer {
             .await
             .unwrap();
 
-            while let Some(message) = ws.next().await {
-                let Ok(message) = message else {
-                    break;
+            loop {
+                let message = tokio::select! {
+                    Some(outbound) = gateway_messages_rx.recv() => {
+                        if ws.send(outbound).await.is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                    message = ws.next() => {
+                        let Some(message) = message else {
+                            break;
+                        };
+                        let Ok(message) = message else {
+                            break;
+                        };
+                        message
+                    }
                 };
                 if let Message::Text(text) = message {
                     let payload: Value = serde_json::from_str(text.as_ref()).unwrap();
@@ -508,6 +541,12 @@ impl FakeDiscordPeer {
                                 .pointer("/d/data/mode")
                                 .and_then(Value::as_str)
                                 .unwrap_or(PREFERRED_MODE);
+                            let mode = mode
+                                .parse::<EncryptionMode>()
+                                .unwrap_or(EncryptionMode::AeadXChaCha20Poly1305Rtpsize);
+                            let secret_key_bytes = vec![0u8; 32];
+                            *encryption_mode_state.lock().unwrap() = Some(mode);
+                            *secret_key_state.lock().unwrap() = Some(secret_key_bytes.clone());
                             for event in &pre_session_description_events {
                                 let payload = match event {
                                     PreSessionDescriptionEvent::ClientsConnect(user_ids) => json!({
@@ -549,8 +588,8 @@ impl FakeDiscordPeer {
                                 json!({
                                     "op": 4,
                                     "d": {
-                                        "mode": mode,
-                                        "secret_key": vec![0u8; 32],
+                                        "mode": mode.as_str(),
+                                        "secret_key": secret_key_bytes,
                                         "dave_protocol_version": (dave_scenario
                                             != DaveScenario::Disabled)
                                             .then_some(DAVE_PROTOCOL_VERSION),
@@ -1047,8 +1086,13 @@ impl FakeDiscordPeer {
 
         Self {
             endpoint_host: ws_addr.to_string(),
+            udp_socket,
+            gateway_messages,
             gateway_path,
             dave_group_id,
+            encryption_mode,
+            secret_key,
+            last_udp_peer,
             discovery_count,
             speaking_observed,
             audio_frame_count,
@@ -1097,6 +1141,61 @@ impl FakeDiscordPeer {
 
     pub async fn gateway_path(&self) -> Option<String> {
         wait_for_sync_value(&self.gateway_path).await
+    }
+
+    pub async fn encryption_mode(&self) -> Option<EncryptionMode> {
+        wait_for_sync_value(&self.encryption_mode).await
+    }
+
+    pub async fn secret_key(&self) -> Option<Vec<u8>> {
+        wait_for_sync_value(&self.secret_key).await
+    }
+
+    pub async fn last_udp_peer(&self) -> Option<SocketAddr> {
+        wait_for_sync_value(&self.last_udp_peer).await
+    }
+
+    pub async fn send_speaking(&self, user_id: &str, ssrc: u32) -> Result<(), VoiceError> {
+        self.gateway_messages
+            .send(Message::Text(
+                json!({
+                    "op": 5,
+                    "seq": 10,
+                    "d": {
+                        "speaking": 1,
+                        "delay": 0,
+                        "ssrc": ssrc,
+                        "user_id": user_id,
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .map_err(|_| VoiceError::InvalidState("fake gateway send failed"))
+    }
+
+    pub async fn send_protected_audio_packet(
+        &self,
+        ssrc: u32,
+        payload: &[u8],
+    ) -> Result<(), VoiceError> {
+        let mode = self
+            .encryption_mode()
+            .await
+            .ok_or(VoiceError::InvalidState("fake encryption mode unavailable"))?;
+        let secret_key = self
+            .secret_key()
+            .await
+            .ok_or(VoiceError::InvalidState("fake secret key unavailable"))?;
+        let peer = self
+            .last_udp_peer()
+            .await
+            .ok_or(VoiceError::InvalidState("fake udp peer unavailable"))?;
+        let protection = ProtectionContext::new(mode, secret_key)?;
+        let header = RtpPacketBuilder::new(ssrc).build_header(0, 0);
+        let packet = protection.protect_packet(&header, payload)?;
+        self.udp_socket.send_to(&packet, peer).await?;
+        Ok(())
     }
 
     pub async fn discovery_count(&self) -> usize {
