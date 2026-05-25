@@ -1,10 +1,3 @@
-use std::collections::HashMap;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
-use std::time::Duration;
-
 use anyhow::Result;
 use discord_voice_service_live_validation::{
     LiveContractState, LiveValidationEvidence, StagingConfig, combine_results,
@@ -12,10 +5,15 @@ use discord_voice_service_live_validation::{
     leave_confirmed_by_rest_voice_state, wait_for_play_and_live_contract,
 };
 use discord_voice_service_proto::discordvoice::v1::{SessionEvent, SessionEventKind};
+use std::collections::HashMap;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
-use tokio::time::{Duration as TokioDuration, Instant, timeout};
+use tokio::time::{Duration as TokioDuration, timeout};
 use twilight_http::Client as HttpClient;
 use twilight_model::id::{
     Id,
@@ -96,7 +94,6 @@ fn evidence_json_captures_success_contract() {
         saw_voice_ready: true,
         saw_playing: true,
         saw_track_ended: true,
-        satisfied_min_interval: true,
         failure_reason: None,
     };
 
@@ -105,91 +102,113 @@ fn evidence_json_captures_success_contract() {
     assert!(json.contains("\"outcome\":\"success\""));
     assert!(json.contains("\"service_uri\":\"http://127.0.0.1:55051\""));
     assert!(json.contains("\"saw_track_ended\":true"));
+    assert!(!json.contains("satisfied_min_interval"));
 }
 
 #[test]
 fn live_contract_requires_voice_ready_before_track_end() {
     let mut state = LiveContractState::default();
-    let start = Instant::now();
 
     state
-        .observe_event(event(SessionEventKind::Playing), start)
+        .observe_event(event(SessionEventKind::Playing, Some("video")), "video")
         .unwrap();
-    state.update_min_interval(start + Duration::from_secs(5));
 
     let error = state
-        .observe_event(
-            event(SessionEventKind::TrackEnded),
-            start + Duration::from_secs(5),
-        )
+        .observe_event(event(SessionEventKind::TrackEnded, Some("video")), "video")
         .expect_err("track end should fail");
 
     assert!(error.to_string().contains("VoiceReady"));
 }
 
 #[test]
-fn live_contract_requires_five_seconds_of_playing() {
+fn live_contract_requires_playing_before_track_end() {
     let mut state = LiveContractState::default();
-    let start = Instant::now();
 
     state
-        .observe_event(event(SessionEventKind::VoiceReady), start)
+        .observe_event(event(SessionEventKind::VoiceReady, None), "video")
+        .unwrap();
+
+    let error = state
+        .observe_event(event(SessionEventKind::TrackEnded, Some("video")), "video")
+        .expect_err("track end should fail");
+
+    assert!(error.to_string().contains("Playing"));
+}
+
+#[test]
+fn live_contract_passes_when_track_ends_after_voice_ready_and_playing() {
+    let mut state = LiveContractState::default();
+
+    state
+        .observe_event(event(SessionEventKind::VoiceReady, None), "video")
+        .unwrap();
+    assert!(
+        !state
+            .observe_event(event(SessionEventKind::Playing, Some("video")), "video")
+            .unwrap()
+    );
+
+    assert!(
+        state
+            .observe_event(event(SessionEventKind::TrackEnded, Some("video")), "video")
+            .unwrap()
+    );
+}
+
+#[test]
+fn live_contract_fails_when_track_end_video_id_differs_after_playing() {
+    let mut state = LiveContractState::default();
+
+    state
+        .observe_event(event(SessionEventKind::VoiceReady, None), "video")
         .unwrap();
     state
-        .observe_event(event(SessionEventKind::Playing), start)
+        .observe_event(event(SessionEventKind::Playing, Some("video")), "video")
         .unwrap();
 
     let error = state
         .observe_event(
-            event(SessionEventKind::TrackEnded),
-            start + Duration::from_secs(4),
+            event(SessionEventKind::TrackEnded, Some("other-video")),
+            "video",
         )
-        .expect_err("track end should fail");
+        .expect_err("mismatched track end should fail");
 
-    assert!(error.to_string().contains("5 seconds"));
+    assert!(error.to_string().contains("expected video"));
 }
 
 #[test]
-fn live_contract_passes_after_minimum_interval_and_track_end() {
+fn live_contract_fails_when_playing_video_id_differs_from_expected() {
     let mut state = LiveContractState::default();
-    let start = Instant::now();
 
     state
-        .observe_event(event(SessionEventKind::VoiceReady), start)
+        .observe_event(event(SessionEventKind::VoiceReady, None), "video")
         .unwrap();
-    assert!(
-        !state
-            .observe_event(event(SessionEventKind::Playing), start)
-            .unwrap()
-    );
-    state.update_min_interval(start + Duration::from_secs(5));
 
-    assert!(
-        state
-            .observe_event(
-                event(SessionEventKind::TrackEnded),
-                start + Duration::from_secs(5),
-            )
-            .unwrap()
-    );
+    let error = state
+        .observe_event(
+            event(SessionEventKind::Playing, Some("other-video")),
+            "video",
+        )
+        .expect_err("wrong playing video should fail");
+
+    assert!(error.to_string().contains("expected video"));
 }
 
 #[test]
 fn live_contract_fails_on_reconnecting_after_playing() {
     let mut state = LiveContractState::default();
-    let start = Instant::now();
 
     state
-        .observe_event(event(SessionEventKind::VoiceReady), start)
+        .observe_event(event(SessionEventKind::VoiceReady, None), "video")
         .unwrap();
     state
-        .observe_event(event(SessionEventKind::Playing), start)
+        .observe_event(event(SessionEventKind::Playing, Some("video")), "video")
         .unwrap();
 
     let error = state
         .observe_event(
-            event(SessionEventKind::VoiceReconnecting),
-            start + Duration::from_secs(1),
+            event(SessionEventKind::VoiceReconnecting, Some("video")),
+            "video",
         )
         .expect_err("reconnecting should fail");
 
@@ -226,7 +245,6 @@ fn success_evidence_waits_for_cleanup_success() {
                 saw_voice_ready: false,
                 saw_playing: false,
                 saw_track_ended: true,
-                satisfied_min_interval: false,
                 failure_reason: None,
             }
         },
@@ -391,9 +409,10 @@ fn valid_env() -> HashMap<String, String> {
     ])
 }
 
-fn event(kind: SessionEventKind) -> SessionEvent {
+fn event(kind: SessionEventKind, current_video_id: Option<&str>) -> SessionEvent {
     SessionEvent {
         kind: kind as i32,
+        current_video_id: current_video_id.unwrap_or_default().to_owned(),
         ..Default::default()
     }
 }

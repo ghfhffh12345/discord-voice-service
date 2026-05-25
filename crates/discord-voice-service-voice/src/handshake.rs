@@ -59,7 +59,8 @@ pub async fn connect(voice: &VoiceContext) -> Result<Option<VoiceHandshakeResult
         };
 
         gateway.send_select_protocol(&discovered, &mode).await?;
-        let session_description = expect_session_description(&gateway, post_hello_timeout).await?;
+        let session_description =
+            expect_session_description(&gateway, post_hello_timeout, &voice.user_id).await?;
         let dave = if let Some(protocol_version) = session_description.dave_protocol_version {
             Some(
                 complete_initial_dave_transition(
@@ -229,13 +230,46 @@ async fn expect_ready(
 async fn expect_session_description(
     gateway: &VoiceGatewayClient,
     timeout_duration: Duration,
+    self_user_id: &str,
 ) -> Result<SessionDescription, VoiceError> {
-    match next_event(gateway, timeout_duration).await?.into_event() {
-        VoiceGatewayEvent::SessionDescription(description) => Ok(description),
-        _ => Err(VoiceError::InvalidState(
-            "voice handshake session description missing",
-        )),
+    let deadline = tokio::time::Instant::now() + timeout_duration;
+
+    loop {
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .ok_or(VoiceError::InvalidState("voice handshake timed out"))?;
+
+        match next_event(gateway, remaining).await?.into_event() {
+            VoiceGatewayEvent::SessionDescription(description) => return Ok(description),
+            event if is_benign_pre_session_description_event(&event, self_user_id) => {
+                tracing::debug!(
+                    event = dave_handshake_event_name(&event),
+                    "voice handshake ignoring benign pre-session-description event"
+                );
+            }
+            _ => {
+                return Err(VoiceError::InvalidState(
+                    "voice handshake session description missing",
+                ));
+            }
+        }
     }
+}
+
+fn is_benign_pre_session_description_event(event: &VoiceGatewayEvent, self_user_id: &str) -> bool {
+    matches!(
+        event,
+        VoiceGatewayEvent::ClientsConnect(_)
+            | VoiceGatewayEvent::Speaking(_)
+            | VoiceGatewayEvent::HeartbeatAck(_)
+            | VoiceGatewayEvent::Video(_)
+            | VoiceGatewayEvent::MediaSinkWants
+            | VoiceGatewayEvent::ClientFlags(_)
+            | VoiceGatewayEvent::ClientPlatform(_)
+    ) || matches!(
+        event,
+        VoiceGatewayEvent::ClientDisconnect(disconnect) if disconnect.user_id != self_user_id
+    )
 }
 
 async fn complete_initial_dave_transition(

@@ -41,6 +41,7 @@ enum DaveScenario {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum PreSessionDescriptionEvent {
     ClientsConnect(Vec<String>),
+    ClientDisconnect(String),
     Speaking { user_id: String, ssrc: u32 },
     HeartbeatAck(Option<u64>),
 }
@@ -150,6 +151,20 @@ impl FakeDiscordPeer {
                 },
                 PreSessionDescriptionEvent::HeartbeatAck(Some(7)),
             ],
+        )
+        .await
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn spawn_real_shape_with_self_disconnect_before_session_description() -> Self {
+        Self::spawn_with_options_and_ready_delay(
+            1_000,
+            DaveScenario::Disabled,
+            Duration::ZERO,
+            Duration::ZERO,
+            vec![PreSessionDescriptionEvent::ClientDisconnect(
+                "user-1".to_owned(),
+            )],
         )
         .await
     }
@@ -500,10 +515,17 @@ impl FakeDiscordPeer {
                                         "seq": 1,
                                         "d": { "user_ids": user_ids }
                                     }),
+                                    PreSessionDescriptionEvent::ClientDisconnect(user_id) => {
+                                        json!({
+                                            "op": 13,
+                                            "seq": 2,
+                                            "d": { "user_id": user_id }
+                                        })
+                                    }
                                     PreSessionDescriptionEvent::Speaking { user_id, ssrc } => {
                                         json!({
                                             "op": 5,
-                                            "seq": 2,
+                                            "seq": 3,
                                             "d": {
                                                 "speaking": 1,
                                                 "delay": 0,
@@ -514,7 +536,7 @@ impl FakeDiscordPeer {
                                     }
                                     PreSessionDescriptionEvent::HeartbeatAck(nonce) => json!({
                                         "op": 6,
-                                        "seq": 3,
+                                        "seq": 4,
                                         "d": nonce
                                     }),
                                 };

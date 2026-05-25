@@ -144,7 +144,7 @@ The live validation controller contract is:
 | `BOT_TOKEN` | Bot token for the dedicated staging bot | `discord-bot-token` |
 | `TEST_GUILD_ID` | Dedicated staging guild ID | `234567890123456789` |
 | `TEST_VOICE_CHANNEL_ID` | Dedicated non-stage voice channel ID inside that guild | `345678901234567890` |
-| `TEST_VIDEO_ID` | YouTube video ID used for the live playback assertion | `dQw4w9WgXcQ` |
+| `TEST_VIDEO_ID` | YouTube video ID for the short dedicated validation track used by live staging | `dQw4w9WgXcQ` |
 | `BROWSER_JSON` | Browser configuration contents materialized into a temporary `browser.json` file for `ytmusic-service` | `{"cookies":[]}` |
 | `DISCORD_VOICE_SERVICE_URI` | Host-side gRPC URI used by `staging_live_check` to reach the published service port | `http://127.0.0.1:55051` |
 | `DISCORD_VOICE_SERVICE_BIND_ADDR` | In-container bind address used by the `discord-voice-service` container during live staging | `0.0.0.0:55051` |
@@ -161,6 +161,9 @@ cargo run -p discord-voice-service-live-validation --bin staging_live_check
 For manual `workflow_dispatch` live-staging runs, provide `discord_voice_service_image_ref`. The workflow also accepts an optional `ytmusic_service_image_ref` input and an optional environment variable `YTMUSIC_SERVICE_IMAGE_REF`; otherwise it falls back to `ghcr.io/ghfhffh12345/ytmusic-service:latest`.
 
 For reproducible staging, pin `YTMUSIC_SERVICE_IMAGE_REF` to an immutable tag or digest instead of relying on `:latest`.
+
+During live staging, human listeners may remain in the channel while the staging bot validates playback against the short dedicated validation track.
+Live-staging success waits for the natural end of the validation track before the run is treated as release-ready.
 
 The workflow intentionally starts the live dependencies itself instead of assuming external staging processes:
 
@@ -179,8 +182,7 @@ Every successful live staging validation should record this evidence in the impl
 - runner type used
 - candidate manifest digest
 - whether authentic voice context was acquired
-- whether `VoiceReady`, `Playing`, and `TrackEnded` were observed
-- whether the 5-second live interval passed
+- whether `VoiceReady`, `Playing`, and `TrackEnded` were observed through the natural end of the validation track
 - whether cleanup succeeded
 
 ## Rollback
