@@ -63,12 +63,13 @@ fn live_staging_workflow_uses_github_hosted_runner_and_secret_browser_json() {
 
     assert!(local_helper.contains("source \"${env_file}\""));
     assert!(local_helper.contains("cat \"${browser_json_file}\""));
+    assert!(local_helper.contains("browser_json=\"$(cat \"${browser_json_file}\")\""));
+    assert!(local_helper.contains("cargo build -p discord-voice-service --bin discord-voice-service"));
     assert!(local_helper.contains(
-        "cargo build -p discord-voice-service -p discord-voice-service-live-validation --bin staging_live_check"
+        "cargo build -p discord-voice-service-live-validation --bin staging_live_check"
     ));
-    assert!(local_helper.contains(
-        "BROWSER_JSON=\"${browser_json}\" cargo run -p discord-voice-service >\"${service_log}\" 2>&1 &"
-    ));
+    assert!(local_helper.contains("cargo run -p discord-voice-service"));
+    assert!(local_helper.contains("service_pid=$!"));
     assert!(local_helper.contains(
         "cargo run -p discord-voice-service-live-validation --bin staging_live_check"
     ));

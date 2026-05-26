@@ -22,6 +22,10 @@ source "${env_file}"
 set +a
 
 browser_json="$(cat "${browser_json_file}")"
+if [[ -z "${browser_json}" ]]; then
+  echo "browser.json at ${browser_json_file} was empty" >&2
+  exit 1
+fi
 export DISCORD_VOICE_SERVICE_BIND_ADDR="${DISCORD_VOICE_SERVICE_BIND_ADDR:-127.0.0.1:55051}"
 export DISCORD_VOICE_SERVICE_URI="${DISCORD_VOICE_SERVICE_URI:-http://127.0.0.1:55051}"
 
@@ -33,12 +37,14 @@ fi
 probe_host="${BASH_REMATCH[1]}"
 probe_port="${BASH_REMATCH[2]}"
 
-cargo build -p discord-voice-service -p discord-voice-service-live-validation --bin staging_live_check
+cargo build -p discord-voice-service --bin discord-voice-service
+cargo build -p discord-voice-service-live-validation --bin staging_live_check
 
-BROWSER_JSON="${browser_json}" cargo run -p discord-voice-service >"${service_log}" 2>&1 &
+unset browser_json
+
+cargo run -p discord-voice-service >"${service_log}" 2>&1 &
 service_pid=$!
 trap 'kill "${service_pid}" >/dev/null 2>&1 || true' EXIT
-unset browser_json
 
 for _ in $(seq 1 30); do
   if bash -lc "</dev/tcp/${probe_host}/${probe_port}" >/dev/null 2>&1; then
