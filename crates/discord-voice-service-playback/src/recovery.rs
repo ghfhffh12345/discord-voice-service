@@ -11,7 +11,8 @@ use reqwest::StatusCode;
 use tokio::time::timeout;
 use tracing::warn;
 
-const OPEN_CHUNK_TIMEOUT: Duration = Duration::from_secs(2);
+const INITIAL_OPEN_CHUNK_TIMEOUT: Duration = Duration::from_secs(3);
+const STEADY_STATE_CHUNK_TIMEOUT: Duration = Duration::from_secs(2);
 const OPEN_CHUNK_ATTEMPTS: usize = 2;
 
 #[derive(Debug)]
@@ -154,12 +155,12 @@ async fn read_opening_chunk(
     playable_url: &str,
 ) -> Result<Option<bytes::Bytes>, PlaybackError> {
     for attempt in 1..=OPEN_CHUNK_ATTEMPTS {
-        match timeout(OPEN_CHUNK_TIMEOUT, stream.read_chunk()).await {
+        match timeout(INITIAL_OPEN_CHUNK_TIMEOUT, stream.read_chunk()).await {
             Ok(result) => return result,
             Err(_) if attempt < OPEN_CHUNK_ATTEMPTS => {
                 warn!(
                     attempt,
-                    timeout_ms = OPEN_CHUNK_TIMEOUT.as_millis(),
+                    timeout_ms = INITIAL_OPEN_CHUNK_TIMEOUT.as_millis(),
                     url = playable_url,
                     "playback source open attempt timed out; retrying"
                 );
@@ -179,11 +180,11 @@ async fn read_chunk_with_timeout(
     stream: &mut HttpOpusStream,
     playable_url: &str,
 ) -> Result<Option<bytes::Bytes>, PlaybackError> {
-    timeout(OPEN_CHUNK_TIMEOUT, stream.read_chunk())
+    timeout(STEADY_STATE_CHUNK_TIMEOUT, stream.read_chunk())
         .await
         .map_err(|_| {
             PlaybackError::MediaParseDetail(format!(
-                "timed out opening playback source for {playable_url}"
+                "timed out reading playback source for {playable_url}"
             ))
         })?
 }

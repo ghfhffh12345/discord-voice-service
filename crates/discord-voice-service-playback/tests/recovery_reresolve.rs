@@ -147,6 +147,28 @@ async fn recovery_tolerates_a_slow_but_valid_first_media_chunk() {
 }
 
 #[tokio::test]
+async fn recovery_tolerates_a_ci_slow_first_media_chunk() {
+    let fake = FakeYtMusic::spawn().await;
+    let http =
+        spawn_stream_server_with_initial_delay("audio-itag250.webm", Duration::from_millis(2500))
+            .await;
+    fake.set_playable_url(http.url()).await;
+
+    let mut recovery =
+        PlaybackRecovery::new(YtMusicClient::connect(fake.endpoint()).await.unwrap());
+    let result = recovery.recover("video-1", 0).await.unwrap();
+
+    assert!(result.playable_url().starts_with("http://"));
+    assert_eq!(
+        fake.calls()
+            .iter()
+            .filter(|call| *call == "GetSong")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn recovery_fails_when_the_first_media_chunk_never_arrives_within_policy() {
     let fake = FakeYtMusic::spawn().await;
     let http =
