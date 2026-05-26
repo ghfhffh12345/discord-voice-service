@@ -97,6 +97,7 @@ fn live_staging_workflow_uses_github_hosted_runner_and_secret_browser_json() {
     assert!(local_helper.contains("probe_host=\"${BASH_REMATCH[1]}\""));
     assert!(local_helper.contains("probe_port=\"${BASH_REMATCH[2]}\""));
     assert!(local_helper.contains("Unsupported DISCORD_VOICE_SERVICE_URI"));
+    assert!(!local_helper.contains("(?:"));
     assert!(local_helper.contains("kill -0 \"${service_pid}\""));
     assert!(local_helper.contains("discord-voice-service exited before readiness"));
     assert!(local_helper.contains("attempt=0"));

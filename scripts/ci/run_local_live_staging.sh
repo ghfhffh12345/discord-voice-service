@@ -50,7 +50,7 @@ if [[ -n "${RUSTUP_HOME:-}" ]]; then
   runtime_env+=(RUSTUP_HOME="${RUSTUP_HOME}")
 fi
 
-if [[ ! "${service_uri}" =~ ^http://([A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?):([0-9]+)$ ]]; then
+if [[ ! "${service_uri}" =~ ^http://([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9]):([0-9]+)$ ]]; then
   echo "Unsupported DISCORD_VOICE_SERVICE_URI: ${service_uri}. Expected http://host:port" >&2
   exit 1
 fi
