@@ -17,10 +17,6 @@ pub struct LiveValidationEvidence {
     pub saw_voice_ready: bool,
     pub saw_playing: bool,
     pub saw_track_ended: bool,
-    pub observer_verified: bool,
-    pub observer_received_frames: usize,
-    pub observer_matched_frames: usize,
-    pub observer_match_ratio: f32,
     pub failure_reason: Option<String>,
 }
 

@@ -10,8 +10,6 @@ use twilight_model::id::{
 pub struct StagingConfig {
     pub application_id: String,
     pub bot_token: String,
-    pub observer_application_id: String,
-    pub observer_bot_token: String,
     pub test_guild_id: String,
     pub test_voice_channel_id: String,
     pub test_video_id: String,
@@ -25,11 +23,9 @@ impl StagingConfig {
     }
 
     pub fn from_env_map(env: HashMap<String, String>) -> Result<Self> {
-        let config = Self {
-            bot_token: required_env(&env, "BOT_TOKEN")?,
+        Ok(Self {
             application_id: required_env(&env, "APPLICATION_ID")?,
-            observer_bot_token: required_env(&env, "OBSERVER_BOT_TOKEN")?,
-            observer_application_id: required_env(&env, "OBSERVER_APPLICATION_ID")?,
+            bot_token: required_env(&env, "BOT_TOKEN")?,
             test_guild_id: required_env(&env, "TEST_GUILD_ID")?,
             test_voice_channel_id: required_env(&env, "TEST_VOICE_CHANNEL_ID")?,
             test_video_id: required_env(&env, "TEST_VIDEO_ID")?,
@@ -38,13 +34,7 @@ impl StagingConfig {
                 &env,
                 "DISCORD_VOICE_SERVICE_YTMUSIC_ADDR",
             )?,
-        };
-
-        if config.application_id == config.observer_application_id {
-            bail!("OBSERVER_APPLICATION_ID must differ from APPLICATION_ID");
-        }
-
-        Ok(config)
+        })
     }
 
     pub fn guild_id(&self) -> Result<Id<GuildMarker>> {

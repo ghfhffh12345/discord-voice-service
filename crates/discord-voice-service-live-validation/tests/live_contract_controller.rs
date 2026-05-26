@@ -28,7 +28,7 @@ use twilight_model::id::{
 use twilight_model::voice::VoiceState;
 
 #[test]
-fn staging_controller_requires_all_live_env_vars() {
+fn staging_controller_requires_send_side_live_env_vars() {
     let error = StagingConfig::from_env_map(HashMap::new()).expect_err("config should fail");
 
     assert!(
@@ -73,16 +73,25 @@ fn staging_controller_requires_service_uri() {
 }
 
 #[test]
-fn staging_controller_requires_observer_env_vars() {
-    let mut env = valid_env();
-    env.remove("OBSERVER_BOT_TOKEN");
+fn staging_controller_does_not_require_observer_env_vars() {
+    let config = StagingConfig::from_env_map(HashMap::from([
+        ("BOT_TOKEN".to_owned(), "bot-token".to_owned()),
+        ("APPLICATION_ID".to_owned(), "1".to_owned()),
+        ("TEST_GUILD_ID".to_owned(), "2".to_owned()),
+        ("TEST_VOICE_CHANNEL_ID".to_owned(), "3".to_owned()),
+        ("TEST_VIDEO_ID".to_owned(), "video".to_owned()),
+        (
+            "DISCORD_VOICE_SERVICE_URI".to_owned(),
+            "http://127.0.0.1:55051".to_owned(),
+        ),
+        (
+            "DISCORD_VOICE_SERVICE_YTMUSIC_ADDR".to_owned(),
+            "http://127.0.0.1:50051".to_owned(),
+        ),
+    ]))
+    .expect("observer env vars should not be required anymore");
 
-    let error = StagingConfig::from_env_map(env).expect_err("config should fail");
-
-    assert!(
-        error.to_string().contains("OBSERVER_BOT_TOKEN"),
-        "expected OBSERVER_BOT_TOKEN in error, got: {error}",
-    );
+    assert_eq!(config.application_id, "1");
 }
 
 #[test]
@@ -105,20 +114,7 @@ fn staging_controller_rejects_invalid_discord_ids() {
 }
 
 #[test]
-fn staging_controller_rejects_same_service_and_observer_application_id() {
-    let mut env = valid_env();
-    env.insert("OBSERVER_APPLICATION_ID".to_owned(), "1".to_owned());
-
-    let error = StagingConfig::from_env_map(env).expect_err("config should fail");
-
-    assert!(
-        error.to_string().contains("OBSERVER_APPLICATION_ID"),
-        "expected observer application id in error, got: {error}",
-    );
-}
-
-#[test]
-fn evidence_json_captures_success_contract() {
+fn evidence_json_captures_send_side_success_contract() {
     let evidence = LiveValidationEvidence {
         outcome: "success".to_owned(),
         service_uri: "http://127.0.0.1:55051".to_owned(),
@@ -126,22 +122,15 @@ fn evidence_json_captures_success_contract() {
         saw_voice_ready: true,
         saw_playing: true,
         saw_track_ended: true,
-        observer_verified: true,
-        observer_received_frames: 64,
-        observer_matched_frames: 61,
-        observer_match_ratio: 0.953125,
         failure_reason: None,
     };
 
     let json = serde_json::to_string(&evidence).expect("evidence should serialize");
 
-    assert!(json.contains("\"outcome\":\"success\""));
-    assert!(json.contains("\"service_uri\":\"http://127.0.0.1:55051\""));
     assert!(json.contains("\"saw_track_ended\":true"));
-    assert!(json.contains("\"observer_verified\":true"));
-    assert!(json.contains("\"observer_received_frames\":64"));
-    assert!(json.contains("\"observer_match_ratio\":0.953125"));
-    assert!(!json.contains("satisfied_min_interval"));
+    assert!(!json.contains("observer_verified"));
+    assert!(!json.contains("observer_received_frames"));
+    assert!(!json.contains("observer_match_ratio"));
 }
 
 #[test]
@@ -327,10 +316,6 @@ fn success_evidence_waits_for_cleanup_success() {
                 saw_voice_ready: false,
                 saw_playing: false,
                 saw_track_ended: true,
-                observer_verified: true,
-                observer_received_frames: 1,
-                observer_matched_frames: 1,
-                observer_match_ratio: 1.0,
                 failure_reason: None,
             }
         },
@@ -610,8 +595,6 @@ fn valid_env() -> HashMap<String, String> {
     HashMap::from([
         ("BOT_TOKEN".to_owned(), "token".to_owned()),
         ("APPLICATION_ID".to_owned(), "1".to_owned()),
-        ("OBSERVER_BOT_TOKEN".to_owned(), "observer-token".to_owned()),
-        ("OBSERVER_APPLICATION_ID".to_owned(), "9".to_owned()),
         ("TEST_GUILD_ID".to_owned(), "2".to_owned()),
         ("TEST_VOICE_CHANNEL_ID".to_owned(), "3".to_owned()),
         ("TEST_VIDEO_ID".to_owned(), "video".to_owned()),
