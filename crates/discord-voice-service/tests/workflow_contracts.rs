@@ -3,35 +3,45 @@ use std::fs;
 const OCCUPIED_LISTENER_CONTRACT: &str = "During live staging, human listeners may remain in the channel while the staging bot validates playback against the short dedicated validation track.";
 const NATURAL_END_SUCCESS_CONTRACT: &str = "Live-staging success waits for the natural end of the validation track before the run is treated as release-ready.";
 const OBSERVER_PROOF_CONTRACT: &str = "Live-staging success requires the observer bot to verify that Discord-delivered audio matched the dedicated validation track.";
+const LOCAL_LIVE_STAGING_CONTRACT: &str =
+    "For local real-Discord live staging, load secrets from `.env`, load `BROWSER_JSON` from `./browser.json`, start a source-built `discord-voice-service`, and then run `scripts/ci/run_local_live_staging.sh`.";
+const SEND_SIDE_SUCCESS_CONTRACT: &str =
+    "Live-staging success is based on Discord-supported send-side proof: authentic voice context, VoiceReady, Playing, natural TrackEnded, and no reconnect/interruption/fatal error during validation.";
 
 #[test]
 fn live_staging_workflow_uses_github_hosted_runner_and_secret_browser_json() {
+    let _ = (LOCAL_LIVE_STAGING_CONTRACT, SEND_SIDE_SUCCESS_CONTRACT);
     let workflow = fs::read_to_string("../../.github/workflows/live-staging.yml")
         .expect("live-staging workflow should exist");
     let preflight = fs::read_to_string("../../scripts/ci/live_staging_preflight.sh")
         .expect("live staging preflight script should exist");
     let run_script = fs::read_to_string("../../scripts/ci/run_live_staging.sh")
         .expect("live staging runner script should exist");
+    let local_helper = fs::read_to_string("../../scripts/ci/run_local_live_staging.sh")
+        .expect("live staging local helper script should exist");
 
     assert!(workflow.contains("runs-on: ubuntu-24.04"));
     assert!(workflow.contains("environment: live-staging"));
     assert!(workflow.contains("BROWSER_JSON: ${{ secrets.BROWSER_JSON }}"));
-    assert!(workflow.contains("OBSERVER_APPLICATION_ID: ${{ secrets.OBSERVER_APPLICATION_ID }}"));
-    assert!(workflow.contains("OBSERVER_BOT_TOKEN: ${{ secrets.OBSERVER_BOT_TOKEN }}"));
+    assert!(!workflow.contains("OBSERVER_APPLICATION_ID"));
+    assert!(!workflow.contains("OBSERVER_BOT_TOKEN"));
     assert!(workflow.contains("scripts/ci/live_staging_preflight.sh"));
     assert!(workflow.contains("scripts/ci/run_live_staging.sh"));
     assert!(workflow.contains("DISCORD_VOICE_SERVICE_RESOLVED_IMAGE_REF"));
     assert!(workflow.contains("${DISCORD_VOICE_SERVICE_IMAGE_REF:-not resolved}"));
     assert!(workflow.contains("${YTMUSIC_SERVICE_IMAGE_REF:-not resolved}"));
+    assert!(workflow.contains("Validation mode: Discord-supported send-side live contract"));
     assert!(workflow.contains("packages: read"));
     assert!(workflow.contains("docker/login-action@v3"));
     assert!(!workflow.contains("self-hosted"));
     assert!(!workflow.contains("discord-voice-staging"));
     assert!(!workflow.contains("STAGING_BROWSER_JSON_SOURCE_PATH"));
 
+    assert!(preflight.contains("APPLICATION_ID"));
+    assert!(preflight.contains("BOT_TOKEN"));
     assert!(preflight.contains("BROWSER_JSON"));
-    assert!(preflight.contains("OBSERVER_APPLICATION_ID"));
-    assert!(preflight.contains("OBSERVER_BOT_TOKEN"));
+    assert!(!preflight.contains("OBSERVER_APPLICATION_ID"));
+    assert!(!preflight.contains("OBSERVER_BOT_TOKEN"));
     assert!(!preflight.contains("STAGING_BROWSER_JSON_SOURCE_PATH"));
 
     assert!(run_script.contains("printf '%s' \"${BROWSER_JSON}\""));
@@ -50,6 +60,13 @@ fn live_staging_workflow_uses_github_hosted_runner_and_secret_browser_json() {
     assert!(!run_script.contains("wait_for_ytmusic_grpc \"http://127.0.0.1:50051\""));
     assert!(!run_script.contains("wait_for_port 50051 \"ytmusic-service public gRPC listener\""));
     assert!(!run_script.contains("podman "));
+
+    assert!(local_helper.contains("source \"${env_file}\""));
+    assert!(local_helper.contains("cat \"${browser_json_file}\""));
+    assert!(local_helper.contains("cargo run -p discord-voice-service"));
+    assert!(local_helper.contains(
+        "cargo run -p discord-voice-service-live-validation --bin staging_live_check"
+    ));
 }
 
 #[test]
