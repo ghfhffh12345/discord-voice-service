@@ -62,14 +62,30 @@ fn live_staging_workflow_uses_github_hosted_runner_and_secret_browser_json() {
     assert!(!run_script.contains("podman "));
 
     assert!(local_helper.contains("source \"${env_file}\""));
+    assert!(!local_helper.contains("set -a"));
     assert!(local_helper.contains("cat \"${browser_json_file}\""));
-    assert!(local_helper.contains("browser_json=\"$(cat \"${browser_json_file}\")\""));
+    assert!(local_helper.contains("cat \"${browser_json_file}\" >/dev/null"));
+    assert!(local_helper.contains("[[ ! -s \"${browser_json_file}\" ]]"));
     assert!(local_helper.contains("cargo build -p discord-voice-service --bin discord-voice-service"));
     assert!(local_helper.contains(
         "cargo build -p discord-voice-service-live-validation --bin staging_live_check"
     ));
+    assert!(local_helper.contains("DISCORD_VOICE_SERVICE_BIND_ADDR=\"${service_bind_addr}\""));
+    assert!(local_helper.contains(
+        "DISCORD_VOICE_SERVICE_YTMUSIC_ADDR=\"${service_ytmusic_addr}\""
+    ));
     assert!(local_helper.contains("cargo run -p discord-voice-service"));
     assert!(local_helper.contains("service_pid=$!"));
+    assert!(local_helper.contains("APPLICATION_ID=\"${application_id}\""));
+    assert!(local_helper.contains("BOT_TOKEN=\"${bot_token}\""));
+    assert!(local_helper.contains("TEST_GUILD_ID=\"${test_guild_id}\""));
+    assert!(local_helper.contains(
+        "TEST_VOICE_CHANNEL_ID=\"${test_voice_channel_id}\""
+    ));
+    assert!(local_helper.contains("TEST_VIDEO_ID=\"${test_video_id}\""));
+    assert!(local_helper.contains(
+        "DISCORD_VOICE_SERVICE_URI=\"${service_uri}\""
+    ));
     assert!(local_helper.contains(
         "cargo run -p discord-voice-service-live-validation --bin staging_live_check"
     ));

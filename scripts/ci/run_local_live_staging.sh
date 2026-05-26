@@ -17,20 +17,27 @@ if [[ ! -f "${browser_json_file}" ]]; then
 fi
 
 cd "${repo_root}"
-set -a
 source "${env_file}"
-set +a
-
-browser_json="$(cat "${browser_json_file}")"
-if [[ -z "${browser_json}" ]]; then
+cat "${browser_json_file}" >/dev/null
+if [[ ! -s "${browser_json_file}" ]]; then
   echo "browser.json at ${browser_json_file} was empty" >&2
   exit 1
 fi
-export DISCORD_VOICE_SERVICE_BIND_ADDR="${DISCORD_VOICE_SERVICE_BIND_ADDR:-127.0.0.1:55051}"
-export DISCORD_VOICE_SERVICE_URI="${DISCORD_VOICE_SERVICE_URI:-http://127.0.0.1:55051}"
 
-if [[ ! "${DISCORD_VOICE_SERVICE_URI}" =~ ^http://([^/:]+):([0-9]+)$ ]]; then
-  echo "Unsupported DISCORD_VOICE_SERVICE_URI: ${DISCORD_VOICE_SERVICE_URI}. Expected http://host:port" >&2
+application_id="${APPLICATION_ID:?APPLICATION_ID must be set in ${env_file}}"
+bot_token="${BOT_TOKEN:?BOT_TOKEN must be set in ${env_file}}"
+test_guild_id="${TEST_GUILD_ID:?TEST_GUILD_ID must be set in ${env_file}}"
+test_voice_channel_id="${TEST_VOICE_CHANNEL_ID:?TEST_VOICE_CHANNEL_ID must be set in ${env_file}}"
+test_video_id="${TEST_VIDEO_ID:?TEST_VIDEO_ID must be set in ${env_file}}"
+service_bind_addr="${DISCORD_VOICE_SERVICE_BIND_ADDR:-127.0.0.1:55051}"
+service_uri="${DISCORD_VOICE_SERVICE_URI:-http://127.0.0.1:55051}"
+service_ytmusic_addr="${DISCORD_VOICE_SERVICE_YTMUSIC_ADDR:?DISCORD_VOICE_SERVICE_YTMUSIC_ADDR must be set in ${env_file}}"
+
+unset APPLICATION_ID BOT_TOKEN TEST_GUILD_ID TEST_VOICE_CHANNEL_ID TEST_VIDEO_ID
+unset DISCORD_VOICE_SERVICE_BIND_ADDR DISCORD_VOICE_SERVICE_URI DISCORD_VOICE_SERVICE_YTMUSIC_ADDR
+
+if [[ ! "${service_uri}" =~ ^http://([A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?):([0-9]+)$ ]]; then
+  echo "Unsupported DISCORD_VOICE_SERVICE_URI: ${service_uri}. Expected http://host:port" >&2
   exit 1
 fi
 
@@ -40,14 +47,21 @@ probe_port="${BASH_REMATCH[2]}"
 cargo build -p discord-voice-service --bin discord-voice-service
 cargo build -p discord-voice-service-live-validation --bin staging_live_check
 
-unset browser_json
-
+DISCORD_VOICE_SERVICE_BIND_ADDR="${service_bind_addr}" \
+DISCORD_VOICE_SERVICE_YTMUSIC_ADDR="${service_ytmusic_addr}" \
 cargo run -p discord-voice-service >"${service_log}" 2>&1 &
 service_pid=$!
 trap 'kill "${service_pid}" >/dev/null 2>&1 || true' EXIT
 
 for _ in $(seq 1 30); do
   if bash -lc "</dev/tcp/${probe_host}/${probe_port}" >/dev/null 2>&1; then
+    APPLICATION_ID="${application_id}" \
+    BOT_TOKEN="${bot_token}" \
+    TEST_GUILD_ID="${test_guild_id}" \
+    TEST_VOICE_CHANNEL_ID="${test_voice_channel_id}" \
+    TEST_VIDEO_ID="${test_video_id}" \
+    DISCORD_VOICE_SERVICE_URI="${service_uri}" \
+    DISCORD_VOICE_SERVICE_YTMUSIC_ADDR="${service_ytmusic_addr}" \
     cargo run -p discord-voice-service-live-validation --bin staging_live_check
     exit 0
   fi
