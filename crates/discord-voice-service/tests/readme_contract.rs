@@ -1,9 +1,7 @@
 use std::fs;
 
-const LOCAL_LIVE_STAGING_CONTRACT: &str =
-    "For local real-Discord live staging, load secrets from `.env`, load `BROWSER_JSON` from `./browser.json`, start a source-built `discord-voice-service`, and then run `scripts/ci/run_local_live_staging.sh`.";
-const SEND_SIDE_SUCCESS_CONTRACT: &str =
-    "Live-staging success is based on Discord-supported send-side proof: authentic voice context, VoiceReady, Playing, natural TrackEnded, and no reconnect/interruption/fatal error during validation.";
+const LOCAL_LIVE_STAGING_CONTRACT: &str = "For local real-Discord live staging, load secrets from `.env`, load `BROWSER_JSON` from `./browser.json`, start a source-built `discord-voice-service`, and then run `scripts/ci/run_local_live_staging.sh`.";
+const SEND_SIDE_SUCCESS_CONTRACT: &str = "Live-staging success is based on Discord-supported send-side proof: authentic voice context, VoiceReady, Playing, natural TrackEnded, and no reconnect/interruption/fatal error during validation.";
 
 #[test]
 fn readme_publishes_the_hosted_live_staging_contract() {

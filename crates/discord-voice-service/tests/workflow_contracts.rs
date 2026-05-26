@@ -2,10 +2,8 @@ use std::fs;
 
 const OCCUPIED_LISTENER_CONTRACT: &str = "During live staging, human listeners may remain in the channel while the staging bot validates playback against the short dedicated validation track.";
 const NATURAL_END_SUCCESS_CONTRACT: &str = "Live-staging success waits for the natural end of the validation track before the run is treated as release-ready.";
-const LOCAL_LIVE_STAGING_CONTRACT: &str =
-    "For local real-Discord live staging, load secrets from `.env`, load `BROWSER_JSON` from `./browser.json`, start a source-built `discord-voice-service`, and then run `scripts/ci/run_local_live_staging.sh`.";
-const SEND_SIDE_SUCCESS_CONTRACT: &str =
-    "Live-staging success is based on Discord-supported send-side proof: authentic voice context, VoiceReady, Playing, natural TrackEnded, and no reconnect/interruption/fatal error during validation.";
+const LOCAL_LIVE_STAGING_CONTRACT: &str = "For local real-Discord live staging, load secrets from `.env`, load `BROWSER_JSON` from `./browser.json`, start a source-built `discord-voice-service`, and then run `scripts/ci/run_local_live_staging.sh`.";
+const SEND_SIDE_SUCCESS_CONTRACT: &str = "Live-staging success is based on Discord-supported send-side proof: authentic voice context, VoiceReady, Playing, natural TrackEnded, and no reconnect/interruption/fatal error during validation.";
 
 #[test]
 fn live_staging_workflow_uses_github_hosted_runner_and_secret_browser_json() {
@@ -76,24 +74,22 @@ fn live_staging_workflow_uses_github_hosted_runner_and_secret_browser_json() {
     assert!(local_helper.contains("env -i"));
     assert!(local_helper.contains("PATH=\"${PATH}\""));
     assert!(local_helper.contains("DISCORD_VOICE_SERVICE_BIND_ADDR=\"${service_bind_addr}\""));
-    assert!(local_helper.contains(
-        "DISCORD_VOICE_SERVICE_YTMUSIC_ADDR=\"${service_ytmusic_addr}\""
-    ));
+    assert!(
+        local_helper.contains("DISCORD_VOICE_SERVICE_YTMUSIC_ADDR=\"${service_ytmusic_addr}\"")
+    );
     assert!(local_helper.contains("cargo run -p discord-voice-service"));
     assert!(local_helper.contains("service_pid=$!"));
     assert!(local_helper.contains("APPLICATION_ID=\"${application_id}\""));
     assert!(local_helper.contains("BOT_TOKEN=\"${bot_token}\""));
     assert!(local_helper.contains("TEST_GUILD_ID=\"${test_guild_id}\""));
-    assert!(local_helper.contains(
-        "TEST_VOICE_CHANNEL_ID=\"${test_voice_channel_id}\""
-    ));
+    assert!(local_helper.contains("TEST_VOICE_CHANNEL_ID=\"${test_voice_channel_id}\""));
     assert!(local_helper.contains("TEST_VIDEO_ID=\"${test_video_id}\""));
-    assert!(local_helper.contains(
-        "DISCORD_VOICE_SERVICE_URI=\"${service_uri}\""
-    ));
-    assert!(local_helper.contains(
-        "cargo run -p discord-voice-service-live-validation --bin staging_live_check"
-    ));
+    assert!(local_helper.contains("DISCORD_VOICE_SERVICE_URI=\"${service_uri}\""));
+    assert!(
+        local_helper.contains(
+            "cargo run -p discord-voice-service-live-validation --bin staging_live_check"
+        )
+    );
     assert!(local_helper.contains("probe_host=\"${BASH_REMATCH[1]}\""));
     assert!(local_helper.contains("probe_port=\"${BASH_REMATCH[2]}\""));
     assert!(local_helper.contains("Unsupported DISCORD_VOICE_SERVICE_URI"));
