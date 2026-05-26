@@ -1,16 +1,10 @@
 use anyhow::Result;
-use bytes::Bytes;
 use discord_voice_service_live_validation::{
-    LiveContractState, LiveValidationEvidence, ObserverAudioEvidence, StagingConfig,
-    combine_results, compare_expected_and_observed, compare_expected_and_observed_from_speaker,
+    LiveContractState, LiveValidationEvidence, StagingConfig, combine_results,
     current_user_absent_from_guild_voice, finalize_success_evidence,
     leave_confirmed_by_rest_voice_state, wait_for_play_and_live_contract,
-    wait_for_play_live_contract_and_observer, wait_for_play_live_contract_and_observer_task,
 };
-use discord_voice_service_playback::media::opus_queue::OpusFrame;
 use discord_voice_service_proto::discordvoice::v1::{SessionEvent, SessionEventKind};
-use discord_voice_service_voice::ObservedAudioFrame;
-use discord_voice_service_voice::test_support::OPUS_SILENCE_FRAME;
 use std::collections::HashMap;
 use std::sync::{
     Arc,
@@ -125,55 +119,20 @@ fn evidence_json_captures_send_side_success_contract() {
         failure_reason: None,
     };
 
-    let json = serde_json::to_string(&evidence).expect("evidence should serialize");
+    let json = serde_json::to_value(&evidence).expect("evidence should serialize");
 
-    assert!(json.contains("\"saw_track_ended\":true"));
-    assert!(!json.contains("observer_verified"));
-    assert!(!json.contains("observer_received_frames"));
-    assert!(!json.contains("observer_match_ratio"));
-}
-
-#[test]
-fn audio_match_accepts_expected_track_with_small_packet_gap() {
-    let expected = opus_frames(["a", "b", "c", "d", "e"]);
-    let observed = observed_frames(["a", "b", "d", "e"]);
-
-    let evidence = compare_expected_and_observed(&expected, &observed);
-
-    assert!(evidence.verified, "evidence: {evidence:?}");
-    assert_eq!(evidence.received_frames, 4);
-    assert_eq!(evidence.matched_frames, 4);
-    assert_eq!(evidence.match_ratio, 0.8);
-}
-
-#[test]
-fn audio_match_rejects_sustained_silence() {
-    let expected = silence_opus_frames(12);
-    let observed = silence_observed_frames(12);
-
-    let evidence = compare_expected_and_observed(&expected, &observed);
-
-    assert!(
-        !evidence.verified,
-        "sustained silence must not verify audio proof"
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "outcome": "success",
+            "service_uri": "http://127.0.0.1:55051",
+            "ytmusic_addr": "http://127.0.0.1:50051",
+            "saw_voice_ready": true,
+            "saw_playing": true,
+            "saw_track_ended": true,
+            "failure_reason": null,
+        })
     );
-    assert_eq!(evidence.received_frames, 12);
-}
-
-#[test]
-fn audio_match_ignores_frames_from_non_service_speakers() {
-    let expected = opus_frames(["a", "b", "c", "d", "e"]);
-    let mut observed = observed_frames_for_user("other-bot", ["a", "b", "c", "d", "e"]);
-    observed.extend(observed_frames_for_user("service-bot", ["a"]));
-
-    let evidence = compare_expected_and_observed_from_speaker(&expected, &observed, "service-bot");
-
-    assert!(
-        !evidence.verified,
-        "foreign speaker frames must not verify proof: {evidence:?}",
-    );
-    assert_eq!(evidence.received_frames, 1);
-    assert_eq!(evidence.matched_frames, 1);
 }
 
 #[test]
@@ -332,7 +291,7 @@ fn success_evidence_waits_for_cleanup_success() {
 }
 
 #[tokio::test]
-async fn orchestration_waits_for_long_running_play_after_contract_success() {
+async fn orchestration_returns_when_play_and_live_contract_succeed() {
     let (play_tx, play_rx) = oneshot::channel::<Result<()>>();
     let (contract_tx, contract_rx) = oneshot::channel::<Result<LiveContractState>>();
 
@@ -358,7 +317,7 @@ async fn orchestration_waits_for_long_running_play_after_contract_success() {
 }
 
 #[tokio::test]
-async fn orchestration_fails_immediately_when_play_errors_first() {
+async fn orchestration_returns_play_error_without_observer_cleanup() {
     let (play_tx, play_rx) = oneshot::channel::<Result<()>>();
     let (_contract_tx, contract_rx) = oneshot::channel::<Result<LiveContractState>>();
 
@@ -380,161 +339,6 @@ async fn orchestration_fails_immediately_when_play_errors_first() {
         .unwrap()
         .expect_err("play error should fail");
     assert!(error.to_string().contains("call Play failed early"));
-}
-
-#[tokio::test]
-async fn orchestration_waits_for_contract_after_play_succeeds() {
-    let (play_tx, play_rx) = oneshot::channel::<Result<()>>();
-    let (contract_tx, contract_rx) = oneshot::channel::<Result<LiveContractState>>();
-
-    let mut orchestration = tokio::spawn(wait_for_play_and_live_contract(
-        async move { contract_rx.await.expect("contract sender should complete") },
-        async move { play_rx.await.expect("play sender should complete") },
-    ));
-
-    play_tx.send(Ok(())).expect("play result should be sent");
-
-    assert!(
-        timeout(TokioDuration::from_millis(25), &mut orchestration)
-            .await
-            .is_err(),
-        "orchestration should keep waiting for contract completion",
-    );
-
-    contract_tx
-        .send(Ok(LiveContractState::default()))
-        .expect("contract result should be sent");
-
-    orchestration.await.unwrap().unwrap();
-}
-
-#[tokio::test]
-async fn orchestration_waits_for_observer_after_play_and_contract_succeed() {
-    let (play_tx, play_rx) = oneshot::channel::<Result<()>>();
-    let (contract_tx, contract_rx) = oneshot::channel::<Result<LiveContractState>>();
-    let (observer_tx, observer_rx) = oneshot::channel::<Result<ObserverAudioEvidence>>();
-
-    let mut orchestration = tokio::spawn(wait_for_play_live_contract_and_observer(
-        async move { contract_rx.await.expect("contract sender should complete") },
-        async move { observer_rx.await.expect("observer sender should complete") },
-        async move { play_rx.await.expect("play sender should complete") },
-    ));
-
-    contract_tx
-        .send(Ok(LiveContractState::default()))
-        .expect("contract result should be sent");
-    play_tx.send(Ok(())).expect("play result should be sent");
-
-    assert!(
-        timeout(TokioDuration::from_millis(25), &mut orchestration)
-            .await
-            .is_err(),
-        "orchestration should keep waiting for observer proof",
-    );
-
-    observer_tx
-        .send(Ok(ObserverAudioEvidence {
-            verified: true,
-            received_frames: 4,
-            matched_frames: 4,
-            match_ratio: 1.0,
-        }))
-        .expect("observer result should be sent");
-
-    let (_contract, observer) = orchestration.await.unwrap().unwrap();
-    assert!(observer.verified);
-}
-
-#[tokio::test]
-async fn orchestration_cancels_and_awaits_observer_task_when_play_errors_first() {
-    let (play_tx, play_rx) = oneshot::channel::<Result<()>>();
-    let (_contract_tx, contract_rx) = oneshot::channel::<Result<LiveContractState>>();
-    let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
-    let (cleanup_tx, cleanup_rx) = oneshot::channel::<()>();
-    let observer_task = tokio::spawn(async move {
-        cancel_rx.await.expect("observer should be cancelled");
-        cleanup_tx
-            .send(())
-            .expect("cleanup marker should be delivered");
-        Ok(ObserverAudioEvidence {
-            verified: false,
-            received_frames: 0,
-            matched_frames: 0,
-            match_ratio: 0.0,
-        })
-    });
-
-    let orchestration = tokio::spawn(wait_for_play_live_contract_and_observer_task(
-        async move {
-            contract_rx
-                .await
-                .expect("contract sender should stay pending")
-        },
-        observer_task,
-        cancel_tx,
-        async move { play_rx.await.expect("play sender should complete") },
-    ));
-
-    play_tx
-        .send(fail("call Play failed early"))
-        .expect("play error should be sent");
-
-    let error = orchestration
-        .await
-        .unwrap()
-        .expect_err("play error should fail");
-    assert!(error.to_string().contains("call Play failed early"));
-    cleanup_rx
-        .await
-        .expect("orchestration must await observer cleanup before returning");
-}
-
-#[tokio::test]
-async fn orchestration_does_not_reawait_observer_task_when_play_errors_after_observer_finished() {
-    let (play_tx, play_rx) = oneshot::channel::<Result<()>>();
-    let (_contract_tx, contract_rx) = oneshot::channel::<Result<LiveContractState>>();
-    let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
-    let observer_task = tokio::spawn(async move {
-        drop(cancel_rx);
-        Ok(ObserverAudioEvidence {
-            verified: true,
-            received_frames: 4,
-            matched_frames: 4,
-            match_ratio: 1.0,
-        })
-    });
-
-    let mut orchestration = tokio::spawn(wait_for_play_live_contract_and_observer_task(
-        async move {
-            contract_rx
-                .await
-                .expect("contract sender should stay pending")
-        },
-        observer_task,
-        cancel_tx,
-        async move { play_rx.await.expect("play sender should complete") },
-    ));
-
-    assert!(
-        timeout(TokioDuration::from_millis(25), &mut orchestration)
-            .await
-            .is_err(),
-        "orchestration should keep waiting after observer completes",
-    );
-
-    play_tx
-        .send(fail("call Play failed after observer"))
-        .expect("play error should be sent");
-
-    let error = orchestration
-        .await
-        .expect("orchestration task must not panic")
-        .expect_err("play error should fail");
-    assert!(
-        error
-            .to_string()
-            .contains("call Play failed after observer")
-    );
 }
 
 #[test]
@@ -644,52 +448,6 @@ fn present_voice_state() -> VoiceState {
         channel_id: Some(Id::<ChannelMarker>::new(3)),
         ..absent_voice_state()
     }
-}
-
-fn opus_frames<const N: usize>(payloads: [&'static str; N]) -> Vec<OpusFrame> {
-    payloads
-        .into_iter()
-        .map(|payload| OpusFrame::new(Bytes::from_static(payload.as_bytes()), 20))
-        .collect()
-}
-
-fn observed_frames<const N: usize>(payloads: [&'static str; N]) -> Vec<ObservedAudioFrame> {
-    observed_frames_for_user("speaker", payloads)
-}
-
-fn observed_frames_for_user<const N: usize>(
-    user_id: &'static str,
-    payloads: [&'static str; N],
-) -> Vec<ObservedAudioFrame> {
-    payloads
-        .into_iter()
-        .enumerate()
-        .map(|(index, payload)| ObservedAudioFrame {
-            user_id: user_id.to_owned(),
-            ssrc: 42,
-            sequence: index as u16,
-            timestamp: (index as u32) * 960,
-            payload: Bytes::from_static(payload.as_bytes()),
-        })
-        .collect()
-}
-
-fn silence_opus_frames(count: usize) -> Vec<OpusFrame> {
-    (0..count)
-        .map(|_| OpusFrame::new(Bytes::copy_from_slice(&OPUS_SILENCE_FRAME), 20))
-        .collect()
-}
-
-fn silence_observed_frames(count: usize) -> Vec<ObservedAudioFrame> {
-    (0..count)
-        .map(|index| ObservedAudioFrame {
-            user_id: "speaker".to_owned(),
-            ssrc: 42,
-            sequence: index as u16,
-            timestamp: (index as u32) * 960,
-            payload: Bytes::copy_from_slice(&OPUS_SILENCE_FRAME),
-        })
-        .collect()
 }
 
 async fn mock_http_client(status: u16, body: &'static str) -> HttpClient {

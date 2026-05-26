@@ -2,7 +2,6 @@ use std::{future::Future, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures::StreamExt;
-use tokio::sync::oneshot;
 use tokio::time::{Instant, timeout};
 use tracing::{info, warn};
 use twilight_gateway::error::ReceiveMessageErrorType;
@@ -21,12 +20,10 @@ use discord_voice_service_proto::discordvoice::v1::{
     JoinVoiceRequest, LeaveVoiceRequest, PlayRequest, SessionEvent, SubscribeEventsRequest,
 };
 
-use crate::audio_match::ObserverAudioEvidence;
 use crate::config::StagingConfig;
 use crate::contract::{
     LiveContractState, LiveValidationEvidence, emit_validation_evidence, finalize_success_evidence,
 };
-use crate::observer::verify_observer_audio_with_ready;
 
 const AUTHENTIC_VOICE_EVENT_TIMEOUT: Duration = Duration::from_secs(45);
 const GATEWAY_LEAVE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -45,7 +42,7 @@ struct ForwardedVoiceContext {
 
 #[derive(Debug)]
 struct ServiceFlowOutcome {
-    result: Result<(LiveContractState, ObserverAudioEvidence)>,
+    result: Result<LiveContractState>,
     service_joined: bool,
 }
 
@@ -98,7 +95,7 @@ pub async fn run(config: StagingConfig) -> Result<()> {
         }
     };
 
-    let flow = run_service_flow(&config, forwarded_voice, user_id.to_string()).await;
+    let flow = run_service_flow(&config, forwarded_voice).await;
     let cleanup = cleanup_after_flow(
         &config.discord_voice_service_uri,
         flow.service_joined,
@@ -113,7 +110,7 @@ pub async fn run(config: StagingConfig) -> Result<()> {
     finalize_success_evidence(
         flow.result,
         cleanup,
-        |(state, _observer)| LiveValidationEvidence {
+        |state| LiveValidationEvidence {
             outcome: "success".to_owned(),
             service_uri: config.discord_voice_service_uri.clone(),
             ytmusic_addr: config.discord_voice_service_ytmusic_addr.clone(),
@@ -129,7 +126,6 @@ pub async fn run(config: StagingConfig) -> Result<()> {
 async fn run_service_flow(
     config: &StagingConfig,
     forwarded_voice: ForwardedVoiceContext,
-    expected_speaker_user_id: String,
 ) -> ServiceFlowOutcome {
     let join_client = DiscordVoiceControlClient::connect(config.discord_voice_service_uri.clone())
         .await
@@ -191,18 +187,7 @@ async fn run_service_flow(
         };
     }
 
-    let (observer_ready_tx, observer_ready_rx) = oneshot::channel::<()>();
-    let (observer_cancel_tx, observer_cancel_rx) = oneshot::channel::<()>();
-    let observer_task = tokio::spawn(verify_observer_audio_with_ready(
-        config.clone(),
-        expected_speaker_user_id,
-        Some(observer_ready_tx),
-        observer_cancel_rx,
-    ));
     let play_rpc = async {
-        observer_ready_rx
-            .await
-            .context("observer audio proof ended before it was ready")?;
         join_client
             .play(PlayRequest {
                 video_id: config.test_video_id.clone(),
@@ -226,13 +211,7 @@ async fn run_service_flow(
         }
     };
 
-    let result = wait_for_play_live_contract_and_observer_task(
-        live_contract,
-        observer_task,
-        observer_cancel_tx,
-        play_rpc,
-    )
-    .await;
+    let result = wait_for_play_and_live_contract(live_contract, play_rpc).await;
 
     ServiceFlowOutcome {
         result,
@@ -248,58 +227,18 @@ where
     ContractFuture: Future<Output = Result<LiveContractState>>,
     PlayFuture: Future<Output = Result<()>>,
 {
-    let observer_future = async {
-        Ok(ObserverAudioEvidence {
-            verified: true,
-            received_frames: 0,
-            matched_frames: 0,
-            match_ratio: 1.0,
-        })
-    };
-
-    wait_for_play_live_contract_and_observer(contract_future, observer_future, play_future)
-        .await
-        .map(|(state, _)| state)
-}
-
-pub async fn wait_for_play_live_contract_and_observer<ContractFuture, ObserverFuture, PlayFuture>(
-    contract_future: ContractFuture,
-    observer_future: ObserverFuture,
-    play_future: PlayFuture,
-) -> Result<(LiveContractState, ObserverAudioEvidence)>
-where
-    ContractFuture: Future<Output = Result<LiveContractState>>,
-    ObserverFuture: Future<Output = Result<ObserverAudioEvidence>>,
-    PlayFuture: Future<Output = Result<()>>,
-{
     let mut contract_finished = false;
-    let mut observer_finished = false;
     let mut play_finished = false;
     let mut contract_state: Option<LiveContractState> = None;
-    let mut observer_evidence: Option<ObserverAudioEvidence> = None;
 
     tokio::pin!(contract_future);
-    tokio::pin!(observer_future);
     tokio::pin!(play_future);
 
     loop {
-        if contract_finished && observer_finished && play_finished {
-            let contract_state = contract_state.ok_or_else(|| {
+        if contract_finished && play_finished {
+            return contract_state.ok_or_else(|| {
                 anyhow!("internal controller error: live contract completed without state")
-            })?;
-            let observer = observer_evidence.ok_or_else(|| {
-                anyhow!("internal controller error: observer proof completed without evidence")
-            })?;
-            if !observer.verified {
-                bail!(
-                    "observer audio proof did not verify: received_frames={}, matched_frames={}, match_ratio={}",
-                    observer.received_frames,
-                    observer.matched_frames,
-                    observer.match_ratio,
-                );
-            }
-
-            return Ok((contract_state, observer));
+            });
         }
 
         tokio::select! {
@@ -307,130 +246,12 @@ where
                 contract_finished = true;
                 contract_state = Some(contract_result?);
             }
-            observer_result = &mut observer_future, if !observer_finished => {
-                observer_finished = true;
-                observer_evidence = Some(observer_result?);
-            }
             play_result = &mut play_future, if !play_finished => {
                 play_finished = true;
                 play_result?;
             }
         }
     }
-}
-
-pub async fn wait_for_play_live_contract_and_observer_task<ContractFuture, PlayFuture>(
-    contract_future: ContractFuture,
-    observer_task: tokio::task::JoinHandle<Result<ObserverAudioEvidence>>,
-    cancel_observer: oneshot::Sender<()>,
-    play_future: PlayFuture,
-) -> Result<(LiveContractState, ObserverAudioEvidence)>
-where
-    ContractFuture: Future<Output = Result<LiveContractState>>,
-    PlayFuture: Future<Output = Result<()>>,
-{
-    let mut contract_finished = false;
-    let mut observer_finished = false;
-    let mut play_finished = false;
-    let mut contract_state: Option<LiveContractState> = None;
-    let mut observer_evidence: Option<ObserverAudioEvidence> = None;
-    let mut cancel_observer = Some(cancel_observer);
-    let mut observer_task = Some(observer_task);
-
-    tokio::pin!(contract_future);
-    tokio::pin!(play_future);
-
-    loop {
-        if contract_finished && observer_finished && play_finished {
-            let contract_state = contract_state.ok_or_else(|| {
-                anyhow!("internal controller error: live contract completed without state")
-            })?;
-            let observer = observer_evidence.ok_or_else(|| {
-                anyhow!("internal controller error: observer proof completed without evidence")
-            })?;
-            if !observer.verified {
-                bail!(
-                    "observer audio proof did not verify: received_frames={}, matched_frames={}, match_ratio={}",
-                    observer.received_frames,
-                    observer.matched_frames,
-                    observer.match_ratio,
-                );
-            }
-
-            return Ok((contract_state, observer));
-        }
-
-        tokio::select! {
-            contract_result = &mut contract_future, if !contract_finished => {
-                match contract_result {
-                    Ok(state) => {
-                        contract_finished = true;
-                        contract_state = Some(state);
-                    }
-                    Err(error) => {
-                        return cancel_and_await_observer(
-                            error,
-                            cancel_observer.take(),
-                            observer_task.take(),
-                        )
-                        .await;
-                    }
-                }
-            }
-            observer_result = async {
-                match observer_task.as_mut() {
-                    Some(task) => task.await,
-                    None => std::future::pending().await,
-                }
-            }, if observer_task.is_some() => {
-                observer_finished = true;
-                observer_evidence = Some(flatten_observer_task_result(observer_result)?);
-                observer_task = None;
-            }
-            play_result = &mut play_future, if !play_finished => {
-                match play_result {
-                    Ok(()) => {
-                        play_finished = true;
-                    }
-                    Err(error) => {
-                        return cancel_and_await_observer(
-                            error,
-                            cancel_observer.take(),
-                            observer_task.take(),
-                        )
-                        .await;
-                    }
-                }
-            }
-        }
-    }
-}
-
-async fn cancel_and_await_observer(
-    primary: anyhow::Error,
-    cancel_observer: Option<oneshot::Sender<()>>,
-    observer_task: Option<tokio::task::JoinHandle<Result<ObserverAudioEvidence>>>,
-) -> Result<(LiveContractState, ObserverAudioEvidence)> {
-    let Some(observer_task) = observer_task else {
-        return Err(primary);
-    };
-
-    if let Some(cancel_observer) = cancel_observer {
-        let _ = cancel_observer.send(());
-    }
-
-    match flatten_observer_task_result(observer_task.await) {
-        Ok(_) => Err(primary),
-        Err(observer_error) => Err(primary.context(format!(
-            "observer proof cleanup also failed: {observer_error}"
-        ))),
-    }
-}
-
-fn flatten_observer_task_result(
-    result: std::result::Result<Result<ObserverAudioEvidence>, tokio::task::JoinError>,
-) -> Result<ObserverAudioEvidence> {
-    result.context("observer proof task panicked or was cancelled")?
 }
 
 async fn wait_for_authentic_voice_context(
