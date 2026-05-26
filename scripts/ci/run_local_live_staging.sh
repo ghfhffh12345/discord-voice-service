@@ -65,14 +65,15 @@ cargo run -p discord-voice-service >"${service_log}" 2>&1 &
 service_pid=$!
 trap 'kill "${service_pid}" >/dev/null 2>&1 || true' EXIT
 
-for _ in $(seq 1 30); do
+attempt=0
+while [[ "${attempt}" -lt 30 ]]; do
   if ! kill -0 "${service_pid}" >/dev/null 2>&1; then
     echo "discord-voice-service exited before readiness" >&2
-    tail -n 200 "${service_log}" >&2 || true
+    "${runtime_env[@]}" tail -n 200 "${service_log}" >&2 || true
     exit 1
   fi
 
-  if bash -lc "</dev/tcp/${probe_host}/${probe_port}" >/dev/null 2>&1; then
+  if "${runtime_env[@]}" bash -lc "</dev/tcp/${probe_host}/${probe_port}" >/dev/null 2>&1; then
     "${runtime_env[@]}" \
     APPLICATION_ID="${application_id}" \
     BOT_TOKEN="${bot_token}" \
@@ -84,9 +85,10 @@ for _ in $(seq 1 30); do
     cargo run -p discord-voice-service-live-validation --bin staging_live_check
     exit 0
   fi
-  sleep 1
+  attempt=$((attempt + 1))
+  "${runtime_env[@]}" sleep 1
 done
 
 echo "Timed out waiting for local discord-voice-service on ${probe_host}:${probe_port}" >&2
-tail -n 200 "${service_log}" >&2 || true
+"${runtime_env[@]}" tail -n 200 "${service_log}" >&2 || true
 exit 1

@@ -100,6 +100,10 @@ fn live_staging_workflow_uses_github_hosted_runner_and_secret_browser_json() {
     assert!(local_helper.contains("Unsupported DISCORD_VOICE_SERVICE_URI"));
     assert!(local_helper.contains("kill -0 \"${service_pid}\""));
     assert!(local_helper.contains("discord-voice-service exited before readiness"));
+    assert!(local_helper.contains("attempt=0"));
+    assert!(local_helper.contains("while [[ \"${attempt}\" -lt 30 ]]"));
+    assert!(!local_helper.contains("seq 1 30"));
+    assert!(local_helper.contains("\"${runtime_env[@]}\" bash -lc"));
 }
 
 #[test]
