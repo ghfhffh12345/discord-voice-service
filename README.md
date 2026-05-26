@@ -150,9 +150,11 @@ The live validation controller contract is:
 | `DISCORD_VOICE_SERVICE_BIND_ADDR` | In-container bind address used by the `discord-voice-service` container during live staging | `0.0.0.0:55051` |
 | `DISCORD_VOICE_SERVICE_YTMUSIC_ADDR` | Base gRPC endpoint reserved for the service/controller contract with `ytmusic-service` | `http://127.0.0.1:50051` |
 
+For local real-Discord live staging, load secrets from `.env`, load `BROWSER_JSON` from `./browser.json`, start a source-built `discord-voice-service`, and then run `scripts/ci/run_local_live_staging.sh`.
+
 Inside the live workflow, `DISCORD_VOICE_SERVICE_BIND_ADDR` remains `0.0.0.0:55051`, while `DISCORD_VOICE_SERVICE_URI` remains `http://127.0.0.1:55051`.
 
-For a manual or local staging run, the operator command is:
+For manual controller-only invocation against already-running dependencies with the required environment already prepared, run:
 
 ```bash
 cargo run -p discord-voice-service-live-validation --bin staging_live_check
@@ -161,8 +163,6 @@ cargo run -p discord-voice-service-live-validation --bin staging_live_check
 For manual `workflow_dispatch` live-staging runs, provide `discord_voice_service_image_ref`. The workflow also accepts an optional `ytmusic_service_image_ref` input and an optional environment variable `YTMUSIC_SERVICE_IMAGE_REF`; otherwise it falls back to `ghcr.io/ghfhffh12345/ytmusic-service:latest`.
 
 For reproducible staging, pin `YTMUSIC_SERVICE_IMAGE_REF` to an immutable tag or digest instead of relying on `:latest`.
-
-For local real-Discord live staging, load secrets from `.env`, load `BROWSER_JSON` from `./browser.json`, start a source-built `discord-voice-service`, and then run `scripts/ci/run_local_live_staging.sh`.
 
 During live staging, human listeners may remain in the channel while the staging bot validates playback against the short dedicated validation track.
 Live-staging success waits for the natural end of the validation track before the run is treated as release-ready.
