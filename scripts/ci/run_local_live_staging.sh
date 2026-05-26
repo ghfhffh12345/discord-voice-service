@@ -36,6 +36,17 @@ service_ytmusic_addr="${DISCORD_VOICE_SERVICE_YTMUSIC_ADDR:?DISCORD_VOICE_SERVIC
 unset APPLICATION_ID BOT_TOKEN TEST_GUILD_ID TEST_VOICE_CHANNEL_ID TEST_VIDEO_ID
 unset DISCORD_VOICE_SERVICE_BIND_ADDR DISCORD_VOICE_SERVICE_URI DISCORD_VOICE_SERVICE_YTMUSIC_ADDR
 
+runtime_env=(env -i PATH="${PATH}")
+if [[ -n "${HOME:-}" ]]; then
+  runtime_env+=(HOME="${HOME}")
+fi
+if [[ -n "${CARGO_HOME:-}" ]]; then
+  runtime_env+=(CARGO_HOME="${CARGO_HOME}")
+fi
+if [[ -n "${RUSTUP_HOME:-}" ]]; then
+  runtime_env+=(RUSTUP_HOME="${RUSTUP_HOME}")
+fi
+
 if [[ ! "${service_uri}" =~ ^http://([A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?):([0-9]+)$ ]]; then
   echo "Unsupported DISCORD_VOICE_SERVICE_URI: ${service_uri}. Expected http://host:port" >&2
   exit 1
@@ -47,6 +58,7 @@ probe_port="${BASH_REMATCH[2]}"
 cargo build -p discord-voice-service --bin discord-voice-service
 cargo build -p discord-voice-service-live-validation --bin staging_live_check
 
+"${runtime_env[@]}" \
 DISCORD_VOICE_SERVICE_BIND_ADDR="${service_bind_addr}" \
 DISCORD_VOICE_SERVICE_YTMUSIC_ADDR="${service_ytmusic_addr}" \
 cargo run -p discord-voice-service >"${service_log}" 2>&1 &
@@ -54,7 +66,14 @@ service_pid=$!
 trap 'kill "${service_pid}" >/dev/null 2>&1 || true' EXIT
 
 for _ in $(seq 1 30); do
+  if ! kill -0 "${service_pid}" >/dev/null 2>&1; then
+    echo "discord-voice-service exited before readiness" >&2
+    tail -n 200 "${service_log}" >&2 || true
+    exit 1
+  fi
+
   if bash -lc "</dev/tcp/${probe_host}/${probe_port}" >/dev/null 2>&1; then
+    "${runtime_env[@]}" \
     APPLICATION_ID="${application_id}" \
     BOT_TOKEN="${bot_token}" \
     TEST_GUILD_ID="${test_guild_id}" \

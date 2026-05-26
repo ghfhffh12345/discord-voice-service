@@ -70,6 +70,8 @@ fn live_staging_workflow_uses_github_hosted_runner_and_secret_browser_json() {
     assert!(local_helper.contains(
         "cargo build -p discord-voice-service-live-validation --bin staging_live_check"
     ));
+    assert!(local_helper.contains("env -i"));
+    assert!(local_helper.contains("PATH=\"${PATH}\""));
     assert!(local_helper.contains("DISCORD_VOICE_SERVICE_BIND_ADDR=\"${service_bind_addr}\""));
     assert!(local_helper.contains(
         "DISCORD_VOICE_SERVICE_YTMUSIC_ADDR=\"${service_ytmusic_addr}\""
@@ -92,6 +94,8 @@ fn live_staging_workflow_uses_github_hosted_runner_and_secret_browser_json() {
     assert!(local_helper.contains("probe_host=\"${BASH_REMATCH[1]}\""));
     assert!(local_helper.contains("probe_port=\"${BASH_REMATCH[2]}\""));
     assert!(local_helper.contains("Unsupported DISCORD_VOICE_SERVICE_URI"));
+    assert!(local_helper.contains("kill -0 \"${service_pid}\""));
+    assert!(local_helper.contains("discord-voice-service exited before readiness"));
 }
 
 #[test]
