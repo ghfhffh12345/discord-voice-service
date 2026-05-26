@@ -17,6 +17,9 @@ if [[ ! -f "${browser_json_file}" ]]; then
 fi
 
 cd "${repo_root}"
+cargo build -p discord-voice-service --bin discord-voice-service
+cargo build -p discord-voice-service-live-validation --bin staging_live_check
+
 source "${env_file}"
 cat "${browser_json_file}" >/dev/null
 if [[ ! -s "${browser_json_file}" ]]; then
@@ -54,9 +57,6 @@ fi
 
 probe_host="${BASH_REMATCH[1]}"
 probe_port="${BASH_REMATCH[2]}"
-
-cargo build -p discord-voice-service --bin discord-voice-service
-cargo build -p discord-voice-service-live-validation --bin staging_live_check
 
 "${runtime_env[@]}" \
 DISCORD_VOICE_SERVICE_BIND_ADDR="${service_bind_addr}" \

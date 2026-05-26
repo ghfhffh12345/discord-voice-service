@@ -19,6 +19,10 @@ fn live_staging_workflow_uses_github_hosted_runner_and_secret_browser_json() {
         .expect("live staging runner script should exist");
     let local_helper = fs::read_to_string("../../scripts/ci/run_local_live_staging.sh")
         .expect("live staging local helper script should exist");
+    let build_service = "cargo build -p discord-voice-service --bin discord-voice-service";
+    let build_validator =
+        "cargo build -p discord-voice-service-live-validation --bin staging_live_check";
+    let source_env = "source \"${env_file}\"";
 
     assert!(workflow.contains("runs-on: ubuntu-24.04"));
     assert!(workflow.contains("environment: live-staging"));
@@ -61,15 +65,15 @@ fn live_staging_workflow_uses_github_hosted_runner_and_secret_browser_json() {
     assert!(!run_script.contains("wait_for_port 50051 \"ytmusic-service public gRPC listener\""));
     assert!(!run_script.contains("podman "));
 
-    assert!(local_helper.contains("source \"${env_file}\""));
+    assert!(local_helper.contains(source_env));
     assert!(!local_helper.contains("set -a"));
     assert!(local_helper.contains("cat \"${browser_json_file}\""));
     assert!(local_helper.contains("cat \"${browser_json_file}\" >/dev/null"));
     assert!(local_helper.contains("[[ ! -s \"${browser_json_file}\" ]]"));
-    assert!(local_helper.contains("cargo build -p discord-voice-service --bin discord-voice-service"));
-    assert!(local_helper.contains(
-        "cargo build -p discord-voice-service-live-validation --bin staging_live_check"
-    ));
+    assert!(local_helper.contains(build_service));
+    assert!(local_helper.contains(build_validator));
+    assert!(local_helper.find(build_service) < local_helper.find(source_env));
+    assert!(local_helper.find(build_validator) < local_helper.find(source_env));
     assert!(local_helper.contains("env -i"));
     assert!(local_helper.contains("PATH=\"${PATH}\""));
     assert!(local_helper.contains("DISCORD_VOICE_SERVICE_BIND_ADDR=\"${service_bind_addr}\""));
