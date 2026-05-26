@@ -14,8 +14,6 @@
 - Secrets:
   - `APPLICATION_ID`
   - `BOT_TOKEN`
-  - `OBSERVER_APPLICATION_ID`
-  - `OBSERVER_BOT_TOKEN`
   - `TEST_GUILD_ID`
   - `TEST_VOICE_CHANNEL_ID`
   - `TEST_VIDEO_ID` for a short dedicated validation track
@@ -24,6 +22,7 @@
   - `YTMUSIC_SERVICE_IMAGE_REF`
 
 No self-hosted runner labels, runner registration, or runner-local browser file path are required.
+For local real-Discord live staging, load secrets from `.env`, load `BROWSER_JSON` from `./browser.json`, start a source-built `discord-voice-service`, and then run `scripts/ci/run_local_live_staging.sh`.
 During live staging, human listeners may remain in the channel while the staging bot validates playback against the short dedicated validation track.
 
 ## Preflight expectations
@@ -32,7 +31,7 @@ During live staging, human listeners may remain in the channel while the staging
 - The controller build command remains `cargo build --locked -p discord-voice-service-live-validation --bin staging_live_check`.
 - The workflow materializes `BROWSER_JSON` into `${GITHUB_WORKSPACE}/browser.json`, mounts it into `ytmusic-service`, and removes it during cleanup.
 - Live-staging success waits for the natural end of the validation track before the run is treated as release-ready.
-- Live-staging success requires the observer bot to verify that Discord-delivered audio matched the dedicated validation track.
+- Live-staging success is based on Discord-supported send-side proof: authentic voice context, VoiceReady, Playing, natural TrackEnded, and no reconnect/interruption/fatal error during validation.
 - A preflight failure is a configuration problem, not a flaky success condition.
 
 ## Failure diagnosis
