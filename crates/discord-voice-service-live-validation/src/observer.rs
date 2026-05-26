@@ -49,7 +49,7 @@ pub(crate) async fn verify_observer_audio_with_ready(
     mut cancel_rx: oneshot::Receiver<()>,
 ) -> Result<ObserverAudioEvidence> {
     let proof_started = Instant::now();
-    let http = HttpClient::new(config.observer_bot_token.clone());
+    let http = HttpClient::new(config.bot_token.clone());
     let current_user = tokio::select! {
         result = timeout(remaining_observer_budget(proof_started)?, fetch_observer_user(&http)) => {
             result
@@ -63,7 +63,7 @@ pub(crate) async fn verify_observer_audio_with_ready(
 
     let mut shard = Shard::new(
         ShardId::ONE,
-        config.observer_bot_token.clone(),
+        config.bot_token.clone(),
         Intents::GUILD_VOICE_STATES,
     );
     let sender = shard.sender();

@@ -54,7 +54,6 @@ pub async fn run(config: StagingConfig) -> Result<()> {
 
     info!(
         application_id = %config.application_id,
-        observer_application_id = %config.observer_application_id,
         guild_id = %config.test_guild_id,
         channel_id = %config.test_voice_channel_id,
         service_uri = %config.discord_voice_service_uri,
@@ -114,17 +113,13 @@ pub async fn run(config: StagingConfig) -> Result<()> {
     finalize_success_evidence(
         flow.result,
         cleanup,
-        |(state, observer)| LiveValidationEvidence {
+        |(state, _observer)| LiveValidationEvidence {
             outcome: "success".to_owned(),
             service_uri: config.discord_voice_service_uri.clone(),
             ytmusic_addr: config.discord_voice_service_ytmusic_addr.clone(),
             saw_voice_ready: state.saw_voice_ready,
             saw_playing: state.saw_playing,
             saw_track_ended: true,
-            observer_verified: observer.verified,
-            observer_received_frames: observer.received_frames,
-            observer_matched_frames: observer.matched_frames,
-            observer_match_ratio: observer.match_ratio,
             failure_reason: None,
         },
         emit_validation_evidence,

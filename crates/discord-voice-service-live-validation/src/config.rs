@@ -24,8 +24,8 @@ impl StagingConfig {
 
     pub fn from_env_map(env: HashMap<String, String>) -> Result<Self> {
         Ok(Self {
-            application_id: required_env(&env, "APPLICATION_ID")?,
             bot_token: required_env(&env, "BOT_TOKEN")?,
+            application_id: required_env(&env, "APPLICATION_ID")?,
             test_guild_id: required_env(&env, "TEST_GUILD_ID")?,
             test_voice_channel_id: required_env(&env, "TEST_VOICE_CHANNEL_ID")?,
             test_video_id: required_env(&env, "TEST_VIDEO_ID")?,
