@@ -46,6 +46,7 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
   APPLICATION_ID: ${{ secrets.APPLICATION_ID }}
   BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+  OBSERVER_BOT_TOKEN: ${{ secrets.OBSERVER_BOT_TOKEN }}
   TEST_GUILD_ID: ${{ secrets.TEST_GUILD_ID }}
   TEST_VOICE_CHANNEL_ID: ${{ secrets.TEST_VOICE_CHANNEL_ID }}
   TEST_VIDEO_ID: ${{ secrets.TEST_VIDEO_ID }}
@@ -61,6 +62,7 @@ env:
   YTMUSIC_SERVICE_PUBLIC_ADDR: 0.0.0.0:50051
   YTMUSIC_SERVICE_ADMIN_ADDR: 0.0.0.0:50052
   YTMUSIC_SERVICE_BROWSER_JSON: /run/secrets/browser.json
+  LIVE_VALIDATION_EVIDENCE_PATH: ${{ github.workspace }}/live-validation-evidence.json
 
 concurrency:
   group: live-staging-${{ inputs.source_sha || github.sha }}
@@ -159,6 +161,14 @@ jobs:
         shell: bash
         run: ./scripts/ci/run_live_staging.sh
 
+      - name: Upload structured observer evidence artifact
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-validation-evidence
+          path: ${{ env.LIVE_VALIDATION_EVIDENCE_PATH }}
+          if-no-files-found: error
+
       - name: Summarize staging validation mode
         if: ${{ always() }}
         shell: bash
@@ -177,5 +187,6 @@ jobs:
             echo "- Source commit: \`${{ steps.source.outputs.source_sha }}\`"
             echo "- ytmusic-service image ref: \`${YTMUSIC_SERVICE_IMAGE_REF:-not resolved}\`"
             echo "- browser.json source: \`BROWSER_JSON\` secret materialized for the run"
-            echo "- Validation mode: Discord-supported send-side live contract"
+            echo "- Validation mode: observer receive-side live contract"
+            echo "- Structured observer evidence artifact: \`${LIVE_VALIDATION_EVIDENCE_PATH}\`"
           } >> "${GITHUB_STEP_SUMMARY}"

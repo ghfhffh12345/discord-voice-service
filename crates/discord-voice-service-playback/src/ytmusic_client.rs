@@ -1,22 +1,22 @@
 use crate::error::PlaybackError;
 use crate::selector::select_song_stream_format;
 use crate::source::ResolvedPlaybackSource;
-use ytmusic_service_proto::ytmusic::v1::yt_music_public_client::YtMusicPublicClient;
-use ytmusic_service_proto::ytmusic::v1::{DecipherRequest, GetSongRequest};
+use ytmusic_service_client::v2::{DecipherRequest, GetSongRequest};
+use ytmusic_service_client::{ClientError, YtMusicServiceClient};
 
 #[derive(Debug)]
 pub struct YtMusicClient {
-    inner: YtMusicPublicClient<tonic::transport::Channel>,
+    inner: YtMusicServiceClient,
 }
 
 impl YtMusicClient {
     pub async fn connect(endpoint: String) -> Result<Self, PlaybackError> {
-        let channel = tonic::transport::Endpoint::from_shared(endpoint)?
-            .connect()
-            .await?;
-        Ok(Self {
-            inner: YtMusicPublicClient::new(channel),
-        })
+        let inner = YtMusicServiceClient::connect(endpoint)
+            .await
+            .map_err(|error| match error {
+                ClientError::Transport(error) => PlaybackError::Transport(error),
+            })?;
+        Ok(Self { inner })
     }
 
     pub async fn resolve_playback_source(
@@ -25,6 +25,8 @@ impl YtMusicClient {
     ) -> Result<ResolvedPlaybackSource, PlaybackError> {
         let song = self
             .inner
+            .music()
+            .inner_mut()
             .get_song(GetSongRequest {
                 video_id: video_id.into(),
             })
@@ -36,6 +38,8 @@ impl YtMusicClient {
         let selected = select_song_stream_format(&streaming_data.adaptive_formats)?;
         let deciphered = self
             .inner
+            .cipher()
+            .inner_mut()
             .decipher(DecipherRequest {
                 signature_cipher: selected.signature_cipher.clone(),
             })

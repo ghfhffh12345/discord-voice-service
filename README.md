@@ -127,6 +127,7 @@ The staging environment must provide:
 
 - `APPLICATION_ID`
 - `BOT_TOKEN`
+- `OBSERVER_BOT_TOKEN`
 - `TEST_GUILD_ID`
 - `TEST_VOICE_CHANNEL_ID`
 - `TEST_VIDEO_ID`
@@ -142,6 +143,7 @@ The live validation controller contract is:
 | --- | --- | --- |
 | `APPLICATION_ID` | Discord application ID for the dedicated staging bot | `123456789012345678` |
 | `BOT_TOKEN` | Bot token for the dedicated staging bot | `discord-bot-token` |
+| `OBSERVER_BOT_TOKEN` | Bot token for the muted, non-deafened observer identity that validates receive-side audio | `discord-observer-token` |
 | `TEST_GUILD_ID` | Dedicated staging guild ID | `234567890123456789` |
 | `TEST_VOICE_CHANNEL_ID` | Dedicated non-stage voice channel ID inside that guild | `345678901234567890` |
 | `TEST_VIDEO_ID` | YouTube video ID for the short dedicated validation track used by live staging | `dQw4w9WgXcQ` |
@@ -151,6 +153,8 @@ The live validation controller contract is:
 | `DISCORD_VOICE_SERVICE_YTMUSIC_ADDR` | Base gRPC endpoint reserved for the service/controller contract with `ytmusic-service` | `http://127.0.0.1:50051` |
 
 For local real-Discord live staging, load secrets from `.env`, load `BROWSER_JSON` from `./browser.json`, start a source-built `discord-voice-service`, and then run `scripts/ci/run_local_live_staging.sh`.
+
+Protected live staging requires `OBSERVER_BOT_TOKEN` for the muted, non-deafened observer identity that validates receive-side audio.
 
 Inside the live workflow, `DISCORD_VOICE_SERVICE_BIND_ADDR` remains `0.0.0.0:55051`, while `DISCORD_VOICE_SERVICE_URI` remains `http://127.0.0.1:55051`.
 
@@ -166,7 +170,8 @@ For reproducible staging, pin `YTMUSIC_SERVICE_IMAGE_REF` to an immutable tag or
 
 During live staging, human listeners may remain in the channel while the staging bot validates playback against the short dedicated validation track.
 Live-staging success waits for the natural end of the validation track before the run is treated as release-ready.
-Live-staging success is based on Discord-supported send-side proof: authentic voice context, VoiceReady, Playing, natural TrackEnded, and no reconnect/interruption/fatal error during validation.
+Live-staging success requires observer receive-side proof: authentic voice context, VoiceReady, Playing, natural TrackEnded, at least 120 observed packets, at least 3000 ms decoded audio, at least 1000 ms non-silent audio, and no reconnect/interruption/fatal error during validation.
+Live-staging always uploads a structured observer evidence artifact summarizing observed packets, decoded audio, non-silent audio, and failure_reason.
 
 The workflow intentionally starts the live dependencies itself instead of assuming external staging processes:
 
@@ -186,6 +191,7 @@ Every successful live staging validation should record this evidence in the impl
 - candidate manifest digest
 - whether authentic voice context was acquired
 - whether `VoiceReady`, `Playing`, and `TrackEnded` were observed through the natural end of the validation track
+- observed packet count, decoded audio duration, and non-silent audio duration from the uploaded observer artifact
 - whether cleanup succeeded
 
 ## Rollback

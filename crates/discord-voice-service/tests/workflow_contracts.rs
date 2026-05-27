@@ -3,11 +3,18 @@ use std::fs;
 const OCCUPIED_LISTENER_CONTRACT: &str = "During live staging, human listeners may remain in the channel while the staging bot validates playback against the short dedicated validation track.";
 const NATURAL_END_SUCCESS_CONTRACT: &str = "Live-staging success waits for the natural end of the validation track before the run is treated as release-ready.";
 const LOCAL_LIVE_STAGING_CONTRACT: &str = "For local real-Discord live staging, load secrets from `.env`, load `BROWSER_JSON` from `./browser.json`, start a source-built `discord-voice-service`, and then run `scripts/ci/run_local_live_staging.sh`.";
-const SEND_SIDE_SUCCESS_CONTRACT: &str = "Live-staging success is based on Discord-supported send-side proof: authentic voice context, VoiceReady, Playing, natural TrackEnded, and no reconnect/interruption/fatal error during validation.";
+const OBSERVER_SECRET_CONTRACT: &str = "Protected live staging requires `OBSERVER_BOT_TOKEN` for the muted, non-deafened observer identity that validates receive-side audio.";
+const RECEIVE_SIDE_SUCCESS_CONTRACT: &str = "Live-staging success requires observer receive-side proof: authentic voice context, VoiceReady, Playing, natural TrackEnded, at least 120 observed packets, at least 3000 ms decoded audio, at least 1000 ms non-silent audio, and no reconnect/interruption/fatal error during validation.";
+const EVIDENCE_ARTIFACT_CONTRACT: &str = "Live-staging always uploads a structured observer evidence artifact summarizing observed packets, decoded audio, non-silent audio, and failure_reason.";
 
 #[test]
 fn live_staging_workflow_uses_github_hosted_runner_and_secret_browser_json() {
-    let _ = (LOCAL_LIVE_STAGING_CONTRACT, SEND_SIDE_SUCCESS_CONTRACT);
+    let _ = (
+        LOCAL_LIVE_STAGING_CONTRACT,
+        OBSERVER_SECRET_CONTRACT,
+        RECEIVE_SIDE_SUCCESS_CONTRACT,
+        EVIDENCE_ARTIFACT_CONTRACT,
+    );
     let workflow = fs::read_to_string("../../.github/workflows/live-staging.yml")
         .expect("live-staging workflow should exist");
     let preflight = fs::read_to_string("../../scripts/ci/live_staging_preflight.sh")
@@ -24,14 +31,16 @@ fn live_staging_workflow_uses_github_hosted_runner_and_secret_browser_json() {
     assert!(workflow.contains("runs-on: ubuntu-24.04"));
     assert!(workflow.contains("environment: live-staging"));
     assert!(workflow.contains("BROWSER_JSON: ${{ secrets.BROWSER_JSON }}"));
+    assert!(workflow.contains("OBSERVER_BOT_TOKEN: ${{ secrets.OBSERVER_BOT_TOKEN }}"));
     assert!(!workflow.contains("OBSERVER_APPLICATION_ID"));
-    assert!(!workflow.contains("OBSERVER_BOT_TOKEN"));
     assert!(workflow.contains("scripts/ci/live_staging_preflight.sh"));
     assert!(workflow.contains("scripts/ci/run_live_staging.sh"));
     assert!(workflow.contains("DISCORD_VOICE_SERVICE_RESOLVED_IMAGE_REF"));
     assert!(workflow.contains("${DISCORD_VOICE_SERVICE_IMAGE_REF:-not resolved}"));
     assert!(workflow.contains("${YTMUSIC_SERVICE_IMAGE_REF:-not resolved}"));
-    assert!(workflow.contains("Validation mode: Discord-supported send-side live contract"));
+    assert!(workflow.contains("Validation mode: observer receive-side live contract"));
+    assert!(workflow.contains("structured observer evidence artifact"));
+    assert!(workflow.contains("actions/upload-artifact"));
     assert!(workflow.contains("packages: read"));
     assert!(workflow.contains("docker/login-action@v3"));
     assert!(!workflow.contains("self-hosted"));
@@ -40,9 +49,9 @@ fn live_staging_workflow_uses_github_hosted_runner_and_secret_browser_json() {
 
     assert!(preflight.contains("APPLICATION_ID"));
     assert!(preflight.contains("BOT_TOKEN"));
+    assert!(preflight.contains("OBSERVER_BOT_TOKEN"));
     assert!(preflight.contains("BROWSER_JSON"));
     assert!(!preflight.contains("OBSERVER_APPLICATION_ID"));
-    assert!(!preflight.contains("OBSERVER_BOT_TOKEN"));
     assert!(!preflight.contains("STAGING_BROWSER_JSON_SOURCE_PATH"));
 
     assert!(run_script.contains("printf '%s' \"${BROWSER_JSON}\""));
@@ -81,6 +90,7 @@ fn live_staging_workflow_uses_github_hosted_runner_and_secret_browser_json() {
     assert!(local_helper.contains("service_pid=$!"));
     assert!(local_helper.contains("APPLICATION_ID=\"${application_id}\""));
     assert!(local_helper.contains("BOT_TOKEN=\"${bot_token}\""));
+    assert!(local_helper.contains("OBSERVER_BOT_TOKEN=\"${observer_bot_token}\""));
     assert!(local_helper.contains("TEST_GUILD_ID=\"${test_guild_id}\""));
     assert!(local_helper.contains("TEST_VOICE_CHANNEL_ID=\"${test_voice_channel_id}\""));
     assert!(local_helper.contains("TEST_VIDEO_ID=\"${test_video_id}\""));
@@ -163,9 +173,9 @@ fn live_staging_runner_doc_matches_the_live_validation_contract() {
     assert!(doc.contains(OCCUPIED_LISTENER_CONTRACT));
     assert!(doc.contains(NATURAL_END_SUCCESS_CONTRACT));
     assert!(doc.contains(LOCAL_LIVE_STAGING_CONTRACT));
-    assert!(doc.contains(SEND_SIDE_SUCCESS_CONTRACT));
+    assert!(doc.contains(OBSERVER_SECRET_CONTRACT));
+    assert!(doc.contains(RECEIVE_SIDE_SUCCESS_CONTRACT));
+    assert!(doc.contains(EVIDENCE_ARTIFACT_CONTRACT));
     assert!(!doc.contains("5-second live interval"));
     assert!(!doc.contains("OBSERVER_APPLICATION_ID"));
-    assert!(!doc.contains("OBSERVER_BOT_TOKEN"));
-    assert!(!doc.contains("observer bot"));
 }

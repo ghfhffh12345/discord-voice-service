@@ -1,9 +1,10 @@
 use anyhow::{Context, Result};
 use serde::Serialize;
+use std::fs;
 
 use discord_voice_service_proto::discordvoice::v1::{SessionEvent, SessionEventKind};
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct LiveContractState {
     pub saw_voice_ready: bool,
     pub saw_playing: bool,
@@ -17,14 +18,22 @@ pub struct LiveValidationEvidence {
     pub saw_voice_ready: bool,
     pub saw_playing: bool,
     pub saw_track_ended: bool,
+    pub observed_packet_count: u64,
+    pub decoded_audio_ms: u64,
+    pub non_silent_audio_ms: u64,
     pub failure_reason: Option<String>,
 }
 
 pub fn emit_validation_evidence(evidence: &LiveValidationEvidence) -> Result<()> {
-    println!(
-        "{}",
-        serde_json::to_string(evidence).context("serialize live validation evidence")?
-    );
+    let json = serde_json::to_string(evidence).context("serialize live validation evidence")?;
+    if let Some(path) = std::env::var_os("LIVE_VALIDATION_EVIDENCE_PATH")
+        && !path.is_empty()
+    {
+        fs::write(path, format!("{json}\n")).context("write live validation evidence file")?;
+        return Ok(());
+    }
+
+    println!("{json}");
     Ok(())
 }
 

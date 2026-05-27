@@ -5,6 +5,7 @@ network_name="discord-voice-live-staging"
 ytmusic_container_name="ytmusic-service-live-staging"
 service_container_name="discord-voice-service-live-staging"
 controller_log="${RUNNER_TEMP}/staging-live-check.log"
+validation_evidence_path="${LIVE_VALIDATION_EVIDENCE_PATH:-${RUNNER_TEMP}/live-validation-evidence.json}"
 controller_binary="${GITHUB_WORKSPACE}/target/debug/staging_live_check"
 ytmusic_probe_binary="${GITHUB_WORKSPACE}/target/debug/ytmusic_ready_check"
 staged_browser_json="${GITHUB_WORKSPACE}/browser.json"
@@ -63,6 +64,14 @@ cleanup() {
     fi
     echo "::endgroup::"
 
+    echo "::group::staging_live_check evidence"
+    if [[ -f "${validation_evidence_path}" ]]; then
+      cat "${validation_evidence_path}" || true
+    else
+      echo "validation evidence artifact was not created"
+    fi
+    echo "::endgroup::"
+
     echo "::group::ytmusic-service container log"
     docker logs "${ytmusic_container_name}" || true
     echo "::endgroup::"
@@ -78,6 +87,9 @@ trap cleanup EXIT
 
 install -m 644 /dev/null "${staged_browser_json}"
 printf '%s' "${BROWSER_JSON}" > "${staged_browser_json}"
+cat > "${validation_evidence_path}" <<EOF
+{"outcome":"failure","service_uri":"${DISCORD_VOICE_SERVICE_URI}","ytmusic_addr":"${DISCORD_VOICE_SERVICE_YTMUSIC_ADDR}","saw_voice_ready":false,"saw_playing":false,"saw_track_ended":false,"observed_packet_count":0,"decoded_audio_ms":0,"non_silent_audio_ms":0,"failure_reason":"controller_not_started"}
+EOF
 
 cargo build --locked -p discord-voice-service-live-validation --bin staging_live_check --bin ytmusic_ready_check
 
@@ -116,4 +128,9 @@ docker run -d \
 wait_for_port 55051 "discord-voice-service gRPC listener"
 sleep 5
 
-"${controller_binary}" >"${controller_log}" 2>&1
+"${controller_binary}" > /dev/null 2>"${controller_log}"
+
+if [[ ! -s "${validation_evidence_path}" ]]; then
+  echo "::error::Live validation evidence artifact was empty"
+  exit 1
+fi

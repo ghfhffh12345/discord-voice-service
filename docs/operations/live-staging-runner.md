@@ -14,6 +14,7 @@
 - Secrets:
   - `APPLICATION_ID`
   - `BOT_TOKEN`
+  - `OBSERVER_BOT_TOKEN`
   - `TEST_GUILD_ID`
   - `TEST_VOICE_CHANNEL_ID`
   - `TEST_VIDEO_ID` for a short dedicated validation track
@@ -24,6 +25,7 @@
 No self-hosted runner labels, runner registration, or runner-local browser file path are required.
 For local real-Discord live staging, load secrets from `.env`, load `BROWSER_JSON` from `./browser.json`, start a source-built `discord-voice-service`, and then run `scripts/ci/run_local_live_staging.sh`.
 During live staging, human listeners may remain in the channel while the staging bot validates playback against the short dedicated validation track.
+Protected live staging requires `OBSERVER_BOT_TOKEN` for the muted, non-deafened observer identity that validates receive-side audio.
 
 ## Preflight expectations
 
@@ -31,7 +33,8 @@ During live staging, human listeners may remain in the channel while the staging
 - The controller build command remains `cargo build --locked -p discord-voice-service-live-validation --bin staging_live_check`.
 - The workflow materializes `BROWSER_JSON` into `${GITHUB_WORKSPACE}/browser.json`, mounts it into `ytmusic-service`, and removes it during cleanup.
 - Live-staging success waits for the natural end of the validation track before the run is treated as release-ready.
-- Live-staging success is based on Discord-supported send-side proof: authentic voice context, VoiceReady, Playing, natural TrackEnded, and no reconnect/interruption/fatal error during validation.
+- Live-staging success requires observer receive-side proof: authentic voice context, VoiceReady, Playing, natural TrackEnded, at least 120 observed packets, at least 3000 ms decoded audio, at least 1000 ms non-silent audio, and no reconnect/interruption/fatal error during validation.
+- Live-staging always uploads a structured observer evidence artifact summarizing observed packets, decoded audio, non-silent audio, and failure_reason.
 - A preflight failure is a configuration problem, not a flaky success condition.
 
 ## Failure diagnosis

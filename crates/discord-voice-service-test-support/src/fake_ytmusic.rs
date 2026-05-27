@@ -8,21 +8,16 @@ use tokio::time::{Duration, sleep};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
-use ytmusic_service_proto::ytmusic::v1::yt_music_public_server::{
-    YtMusicPublic, YtMusicPublicServer,
-};
-use ytmusic_service_proto::ytmusic::v1::{
-    AccountInfoResponse, DecipherRequest, DecipherResponse, Empty,
-    GetLibraryAlbumsContinuationRequest, GetLibraryArtistsContinuationRequest,
-    GetLibraryChannelsContinuationRequest, GetLibraryPlaylistsContinuationRequest,
-    GetLibraryPodcastsContinuationRequest, GetLibrarySongsContinuationRequest,
-    GetLibrarySubscriptionsContinuationRequest, GetLikedSongsContinuationRequest,
-    GetSavedEpisodesContinuationRequest, GetSongRequest, GetSongResponse,
+use ytmusic_service_client::v2::yt_cipher_server::{YtCipher, YtCipherServer};
+use ytmusic_service_client::v2::yt_music_server::{YtMusic, YtMusicServer};
+use ytmusic_service_client::v2::{
+    AccountInfoResponse, ContinuationRequest, DecipherRequest, DecipherResponse, Empty,
+    GetSignatureTimestampResponse, GetSongRequest, GetSongResponse,
     GetWatchPlaylistContinuationRequest, GetWatchPlaylistRequest, LibraryAlbumsResponse,
     LibraryArtistsResponse, LibraryChannelsResponse, LibraryPlaylistsResponse,
     LibraryPodcastsResponse, LibrarySongsResponse, LibrarySubscriptionsResponse,
-    LikedSongsResponse, SavedEpisodesResponse, SearchContinuationRequest, SearchRequest,
-    SearchResponse, SongStreamFormat, SongStreamingData, WatchPlaylistResponse,
+    LikedSongsResponse, RefreshCipherResponse, SavedEpisodesResponse, SearchContinuationRequest,
+    SearchRequest, SearchResponse, SongStreamFormat, SongStreamingData, WatchPlaylistResponse,
 };
 
 pub struct FakeYtMusic {
@@ -51,7 +46,8 @@ impl FakeYtMusic {
 
         let server = tokio::spawn(async move {
             Server::builder()
-                .add_service(YtMusicPublicServer::new(service))
+                .add_service(YtMusicServer::new(service.clone()))
+                .add_service(YtCipherServer::new(service))
                 .serve_with_incoming(TcpListenerStream::new(listener))
                 .await
                 .unwrap();
@@ -88,6 +84,7 @@ impl FakeYtMusic {
     }
 }
 
+#[derive(Clone)]
 struct FakeYtMusicService {
     calls: Arc<Mutex<Vec<String>>>,
     playable_url: Arc<Mutex<String>>,
@@ -106,7 +103,7 @@ fn unimplemented(name: &str) -> Status {
 }
 
 #[tonic::async_trait]
-impl YtMusicPublic for FakeYtMusicService {
+impl YtMusic for FakeYtMusicService {
     async fn search(
         &self,
         _request: Request<SearchRequest>,
@@ -141,19 +138,12 @@ impl YtMusicPublic for FakeYtMusicService {
     ) -> Result<Response<GetSongResponse>, Status> {
         self.record("GetSong");
         let video_id = request.into_inner().video_id;
-        let adaptive_formats = if video_id == "missing-lower" {
-            vec![SongStreamFormat {
-                itag: 251,
-                mime_type: "audio/webm; codecs=\"opus\"".to_owned(),
-                bitrate: 160_000,
-                audio_sample_rate: Some(48_000),
-                audio_channels: Some(2),
-                signature_cipher: format!("cipher-{video_id}-251"),
-                ..Default::default()
-            }]
+
+        let streaming_data = if video_id == "missing-streaming-data" {
+            None
         } else {
-            vec![
-                SongStreamFormat {
+            let adaptive_formats = if video_id == "missing-lower" {
+                vec![SongStreamFormat {
                     itag: 251,
                     mime_type: "audio/webm; codecs=\"opus\"".to_owned(),
                     bitrate: 160_000,
@@ -161,25 +151,40 @@ impl YtMusicPublic for FakeYtMusicService {
                     audio_channels: Some(2),
                     signature_cipher: format!("cipher-{video_id}-251"),
                     ..Default::default()
-                },
-                SongStreamFormat {
-                    itag: 250,
-                    mime_type: "audio/webm; codecs=\"opus\"".to_owned(),
-                    bitrate: 70_000,
-                    audio_sample_rate: Some(48_000),
-                    audio_channels: Some(2),
-                    signature_cipher: format!("cipher-{video_id}-250"),
-                    ..Default::default()
-                },
-            ]
+                }]
+            } else {
+                vec![
+                    SongStreamFormat {
+                        itag: 251,
+                        mime_type: "audio/webm; codecs=\"opus\"".to_owned(),
+                        bitrate: 160_000,
+                        audio_sample_rate: Some(48_000),
+                        audio_channels: Some(2),
+                        signature_cipher: format!("cipher-{video_id}-251"),
+                        ..Default::default()
+                    },
+                    SongStreamFormat {
+                        itag: 250,
+                        mime_type: "audio/webm; codecs=\"opus\"".to_owned(),
+                        bitrate: 70_000,
+                        audio_sample_rate: Some(48_000),
+                        audio_channels: Some(2),
+                        signature_cipher: format!("cipher-{video_id}-250"),
+                        ..Default::default()
+                    },
+                ]
+            };
+
+            Some(SongStreamingData {
+                adaptive_formats,
+                ..Default::default()
+            })
         };
+
         let response = GetSongResponse {
             video_details: Some(Default::default()),
             playability_status: Some(Default::default()),
-            streaming_data: Some(SongStreamingData {
-                adaptive_formats,
-                ..Default::default()
-            }),
+            streaming_data,
             microformat: Some(Default::default()),
         };
 
@@ -195,7 +200,7 @@ impl YtMusicPublic for FakeYtMusicService {
 
     async fn get_library_playlists_continuation(
         &self,
-        _request: Request<GetLibraryPlaylistsContinuationRequest>,
+        _request: Request<ContinuationRequest>,
     ) -> Result<Response<LibraryPlaylistsResponse>, Status> {
         Err(unimplemented("get_library_playlists_continuation"))
     }
@@ -216,7 +221,7 @@ impl YtMusicPublic for FakeYtMusicService {
 
     async fn get_library_artists_continuation(
         &self,
-        _request: Request<GetLibraryArtistsContinuationRequest>,
+        _request: Request<ContinuationRequest>,
     ) -> Result<Response<LibraryArtistsResponse>, Status> {
         Err(unimplemented("get_library_artists_continuation"))
     }
@@ -230,7 +235,7 @@ impl YtMusicPublic for FakeYtMusicService {
 
     async fn get_library_albums_continuation(
         &self,
-        _request: Request<GetLibraryAlbumsContinuationRequest>,
+        _request: Request<ContinuationRequest>,
     ) -> Result<Response<LibraryAlbumsResponse>, Status> {
         Err(unimplemented("get_library_albums_continuation"))
     }
@@ -244,7 +249,7 @@ impl YtMusicPublic for FakeYtMusicService {
 
     async fn get_library_subscriptions_continuation(
         &self,
-        _request: Request<GetLibrarySubscriptionsContinuationRequest>,
+        _request: Request<ContinuationRequest>,
     ) -> Result<Response<LibrarySubscriptionsResponse>, Status> {
         Err(unimplemented("get_library_subscriptions_continuation"))
     }
@@ -258,7 +263,7 @@ impl YtMusicPublic for FakeYtMusicService {
 
     async fn get_library_channels_continuation(
         &self,
-        _request: Request<GetLibraryChannelsContinuationRequest>,
+        _request: Request<ContinuationRequest>,
     ) -> Result<Response<LibraryChannelsResponse>, Status> {
         Err(unimplemented("get_library_channels_continuation"))
     }
@@ -272,7 +277,7 @@ impl YtMusicPublic for FakeYtMusicService {
 
     async fn get_library_podcasts_continuation(
         &self,
-        _request: Request<GetLibraryPodcastsContinuationRequest>,
+        _request: Request<ContinuationRequest>,
     ) -> Result<Response<LibraryPodcastsResponse>, Status> {
         Err(unimplemented("get_library_podcasts_continuation"))
     }
@@ -286,7 +291,7 @@ impl YtMusicPublic for FakeYtMusicService {
 
     async fn get_library_songs_continuation(
         &self,
-        _request: Request<GetLibrarySongsContinuationRequest>,
+        _request: Request<ContinuationRequest>,
     ) -> Result<Response<LibrarySongsResponse>, Status> {
         Err(unimplemented("get_library_songs_continuation"))
     }
@@ -300,7 +305,7 @@ impl YtMusicPublic for FakeYtMusicService {
 
     async fn get_liked_songs_continuation(
         &self,
-        _request: Request<GetLikedSongsContinuationRequest>,
+        _request: Request<ContinuationRequest>,
     ) -> Result<Response<LikedSongsResponse>, Status> {
         Err(unimplemented("get_liked_songs_continuation"))
     }
@@ -314,9 +319,26 @@ impl YtMusicPublic for FakeYtMusicService {
 
     async fn get_saved_episodes_continuation(
         &self,
-        _request: Request<GetSavedEpisodesContinuationRequest>,
+        _request: Request<ContinuationRequest>,
     ) -> Result<Response<SavedEpisodesResponse>, Status> {
         Err(unimplemented("get_saved_episodes_continuation"))
+    }
+}
+
+#[tonic::async_trait]
+impl YtCipher for FakeYtMusicService {
+    async fn get_signature_timestamp(
+        &self,
+        _request: Request<Empty>,
+    ) -> Result<Response<GetSignatureTimestampResponse>, Status> {
+        Err(unimplemented("get_signature_timestamp"))
+    }
+
+    async fn refresh(
+        &self,
+        _request: Request<Empty>,
+    ) -> Result<Response<RefreshCipherResponse>, Status> {
+        Err(unimplemented("refresh"))
     }
 
     async fn decipher(

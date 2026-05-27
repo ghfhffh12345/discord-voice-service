@@ -504,8 +504,12 @@ name = "discord-voice-service-live-validation"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "discord-voice-service-playback",
  "discord-voice-service-proto",
+ "discord-voice-service-test-support",
+ "discord-voice-service-voice",
  "futures",
+ "opus-rs",
  "rustls",
  "serde",
  "serde_json",
@@ -534,7 +538,7 @@ dependencies = [
  "tonic",
  "tracing",
  "webm-iterable",
- "ytmusic-service-proto",
+ "ytmusic-service-client",
 ]
 
 [[package]]
@@ -576,7 +580,7 @@ dependencies = [
  "tokio-stream",
  "tokio-tungstenite",
  "tonic",
- "ytmusic-service-proto",
+ "ytmusic-service-client",
 ]
 
 [[package]]
@@ -2010,6 +2014,12 @@ name = "openssl-probe"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
+
+[[package]]
+name = "opus-rs"
+version = "0.1.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4db188a3786f2c9704ec3bac4db8a221a69acab649980b371a8f00f1d0519150"
 
 [[package]]
 name = "ordered-float"
@@ -4280,9 +4290,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ytmusic-service-client"
+version = "0.2.0"
+source = "git+https://github.com/ghfhffh12345/ytmusic-service?tag=v0.2.0#c89f302e4e3a0876ab61518892d2732d84c8bc87"
+dependencies = [
+ "thiserror 2.0.18",
+ "tonic",
+ "ytmusic-service-proto",
+]
+
+[[package]]
 name = "ytmusic-service-proto"
-version = "0.1.0"
-source = "git+https://github.com/ghfhffh12345/ytmusic-service?tag=v0.1.0#4d971fc087b38e5e15e3810fdefb41f506b65a80"
+version = "0.2.0"
+source = "git+https://github.com/ghfhffh12345/ytmusic-service?tag=v0.2.0#c89f302e4e3a0876ab61518892d2732d84c8bc87"
 dependencies = [
  "prost",
  "protoc-bin-vendored",

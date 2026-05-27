@@ -30,3 +30,20 @@ async fn resolve_playback_source_rejects_unsupported_formats() {
     ));
     assert_eq!(fake.calls(), vec!["GetSong"]);
 }
+
+#[tokio::test]
+async fn resolve_playback_source_rejects_missing_streaming_data() {
+    let fake = FakeYtMusic::spawn().await;
+    let mut client = YtMusicClient::connect(fake.endpoint()).await.unwrap();
+
+    let error = client
+        .resolve_playback_source("missing-streaming-data")
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        discord_voice_service_playback::PlaybackError::UnsupportedFormat
+    ));
+    assert_eq!(fake.calls(), vec!["GetSong"]);
+}

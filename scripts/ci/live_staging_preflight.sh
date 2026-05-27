@@ -4,6 +4,7 @@ set -euo pipefail
 required_vars=(
   APPLICATION_ID
   BOT_TOKEN
+  OBSERVER_BOT_TOKEN
   TEST_GUILD_ID
   TEST_VOICE_CHANNEL_ID
   TEST_VIDEO_ID

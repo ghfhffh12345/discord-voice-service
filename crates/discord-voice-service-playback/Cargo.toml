@@ -12,7 +12,7 @@ tokio.workspace = true
 tonic.workspace = true
 tracing.workspace = true
 webm-iterable.workspace = true
-ytmusic-service-proto.workspace = true
+ytmusic-service-client.workspace = true
 
 [dev-dependencies]
 discord-voice-service-test-support = { workspace = true }

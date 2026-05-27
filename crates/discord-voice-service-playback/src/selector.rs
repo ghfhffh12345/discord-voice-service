@@ -1,7 +1,7 @@
 use std::cmp::Reverse;
 
 use crate::error::PlaybackError;
-use ytmusic_service_proto::ytmusic::v1::SongStreamFormat;
+use ytmusic_service_client::v2::SongStreamFormat;
 
 pub fn select_song_stream_format(
     formats: &[SongStreamFormat],
@@ -35,7 +35,7 @@ fn priority_for_itag(itag: u32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::select_song_stream_format;
-    use ytmusic_service_proto::ytmusic::v1::SongStreamFormat;
+    use ytmusic_service_client::v2::SongStreamFormat;
 
     fn stream_format(
         itag: u32,

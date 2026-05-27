@@ -6,10 +6,11 @@ use twilight_model::id::{
     marker::{ChannelMarker, GuildMarker},
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct StagingConfig {
     pub application_id: String,
     pub bot_token: String,
+    pub observer_bot_token: String,
     pub test_guild_id: String,
     pub test_voice_channel_id: String,
     pub test_video_id: String,
@@ -24,6 +25,7 @@ impl StagingConfig {
 
     pub fn from_env_map(env: HashMap<String, String>) -> Result<Self> {
         Ok(Self {
+            observer_bot_token: required_env(&env, "OBSERVER_BOT_TOKEN")?,
             bot_token: required_env(&env, "BOT_TOKEN")?,
             application_id: required_env(&env, "APPLICATION_ID")?,
             test_guild_id: required_env(&env, "TEST_GUILD_ID")?,
@@ -43,6 +45,24 @@ impl StagingConfig {
 
     pub fn channel_id(&self) -> Result<Id<ChannelMarker>> {
         parse_id(&self.test_voice_channel_id, "TEST_VOICE_CHANNEL_ID")
+    }
+}
+
+impl std::fmt::Debug for StagingConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StagingConfig")
+            .field("application_id", &self.application_id)
+            .field("bot_token", &"[REDACTED]")
+            .field("observer_bot_token", &"[REDACTED]")
+            .field("test_guild_id", &self.test_guild_id)
+            .field("test_voice_channel_id", &self.test_voice_channel_id)
+            .field("test_video_id", &self.test_video_id)
+            .field("discord_voice_service_uri", &self.discord_voice_service_uri)
+            .field(
+                "discord_voice_service_ytmusic_addr",
+                &self.discord_voice_service_ytmusic_addr,
+            )
+            .finish()
     }
 }
 
