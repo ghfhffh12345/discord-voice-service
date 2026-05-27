@@ -17,8 +17,9 @@ if [[ ! -f "${browser_json_file}" ]]; then
 fi
 
 cd "${repo_root}"
+ytmusic_probe_binary="${CARGO_TARGET_DIR:-${repo_root}/target}/debug/ytmusic_ready_check"
 cargo build -p discord-voice-service --bin discord-voice-service
-cargo build -p discord-voice-service-live-validation --bin staging_live_check
+cargo build -p discord-voice-service-live-validation --bin staging_live_check --bin ytmusic_ready_check
 
 source "${env_file}"
 cat "${browser_json_file}" >/dev/null
@@ -51,6 +52,23 @@ if [[ -n "${RUSTUP_HOME:-}" ]]; then
   runtime_env+=(RUSTUP_HOME="${RUSTUP_HOME}")
 fi
 
+wait_for_ytmusic_grpc() {
+  local endpoint="$1"
+  local attempts="${2:-30}"
+  local attempt=0
+
+  while [[ "${attempt}" -lt "${attempts}" ]]; do
+    if "${runtime_env[@]}" "${ytmusic_probe_binary}" "${endpoint}" >/dev/null 2>&1; then
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    "${runtime_env[@]}" sleep 1
+  done
+
+  echo "Timed out waiting for ytmusic-service gRPC readiness from DISCORD_VOICE_SERVICE_YTMUSIC_ADDR; ensure ytmusic-service is running before local live staging." >&2
+  return 1
+}
+
 if [[ ! "${service_uri}" =~ ^http://([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9]):([0-9]+)$ ]]; then
   echo "Unsupported DISCORD_VOICE_SERVICE_URI: ${service_uri}. Expected http://host:port" >&2
   exit 1
@@ -58,6 +76,8 @@ fi
 
 probe_host="${BASH_REMATCH[1]}"
 probe_port="${BASH_REMATCH[2]}"
+
+wait_for_ytmusic_grpc "${service_ytmusic_addr}"
 
 "${runtime_env[@]}" \
 DISCORD_VOICE_SERVICE_BIND_ADDR="${service_bind_addr}" \

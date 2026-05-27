@@ -2,7 +2,7 @@ use std::fs;
 
 const OCCUPIED_LISTENER_CONTRACT: &str = "During live staging, human listeners may remain in the channel while the staging bot validates playback against the short dedicated validation track.";
 const NATURAL_END_SUCCESS_CONTRACT: &str = "Live-staging success waits for the natural end of the validation track before the run is treated as release-ready.";
-const LOCAL_LIVE_STAGING_CONTRACT: &str = "For local real-Discord live staging, load secrets from `.env`, load `BROWSER_JSON` from `./browser.json`, start a source-built `discord-voice-service`, and then run `scripts/ci/run_local_live_staging.sh`.";
+const LOCAL_LIVE_STAGING_CONTRACT: &str = "For local real-Discord live staging, run `scripts/ci/run_local_live_staging.sh`; the helper loads secrets from `.env`, loads `BROWSER_JSON` from `./browser.json`, verifies the already-running `ytmusic-service` endpoint from `DISCORD_VOICE_SERVICE_YTMUSIC_ADDR`, then starts a source-built `discord-voice-service`.";
 const OBSERVER_SECRET_CONTRACT: &str = "Protected live staging requires `OBSERVER_BOT_TOKEN` for the muted, non-deafened observer identity that validates receive-side audio.";
 const RECEIVE_SIDE_SUCCESS_CONTRACT: &str = "Live-staging success requires observer receive-side proof: authentic voice context, VoiceReady, Playing, natural TrackEnded, at least 120 observed packets, at least 3000 ms decoded audio, at least 1000 ms non-silent audio, and no reconnect/interruption/fatal error during validation.";
 const EVIDENCE_ARTIFACT_CONTRACT: &str = "Live-staging always uploads a structured observer evidence artifact summarizing observed packets, decoded audio, non-silent audio, and failure_reason.";
@@ -24,9 +24,11 @@ fn live_staging_workflow_uses_github_hosted_runner_and_secret_browser_json() {
     let local_helper = fs::read_to_string("../../scripts/ci/run_local_live_staging.sh")
         .expect("live staging local helper script should exist");
     let build_service = "cargo build -p discord-voice-service --bin discord-voice-service";
-    let build_validator =
-        "cargo build -p discord-voice-service-live-validation --bin staging_live_check";
+    let build_validator = "cargo build -p discord-voice-service-live-validation --bin staging_live_check --bin ytmusic_ready_check";
     let source_env = "source \"${env_file}\"";
+    let local_ytmusic_probe = "ytmusic_probe_binary=\"${CARGO_TARGET_DIR:-${repo_root}/target}/debug/ytmusic_ready_check\"";
+    let local_wait_for_ytmusic = "wait_for_ytmusic_grpc \"${service_ytmusic_addr}\"";
+    let local_service_start = "cargo run -p discord-voice-service >\"${service_log}\" 2>&1 &";
 
     assert!(workflow.contains("runs-on: ubuntu-24.04"));
     assert!(workflow.contains("environment: live-staging"));
@@ -78,15 +80,34 @@ fn live_staging_workflow_uses_github_hosted_runner_and_secret_browser_json() {
     assert!(local_helper.contains("[[ ! -s \"${browser_json_file}\" ]]"));
     assert!(local_helper.contains(build_service));
     assert!(local_helper.contains(build_validator));
+    assert!(local_helper.contains(local_ytmusic_probe));
     assert!(local_helper.find(build_service) < local_helper.find(source_env));
     assert!(local_helper.find(build_validator) < local_helper.find(source_env));
+    assert!(local_helper.find(local_ytmusic_probe) < local_helper.find(source_env));
     assert!(local_helper.contains("env -i"));
     assert!(local_helper.contains("PATH=\"${PATH}\""));
+    assert!(local_helper.contains("wait_for_ytmusic_grpc()"));
+    assert!(local_helper.contains(
+        "\"${runtime_env[@]}\" \"${ytmusic_probe_binary}\" \"${endpoint}\" >/dev/null 2>&1"
+    ));
+    assert!(local_helper.contains(
+        "Timed out waiting for ytmusic-service gRPC readiness from DISCORD_VOICE_SERVICE_YTMUSIC_ADDR"
+    ));
+    assert!(
+        !local_helper
+            .contains("Timed out waiting for ytmusic-service gRPC readiness at ${endpoint}")
+    );
+    assert!(!local_helper.contains(
+        "Timed out waiting for ytmusic-service gRPC readiness at ${service_ytmusic_addr}"
+    ));
     assert!(local_helper.contains("DISCORD_VOICE_SERVICE_BIND_ADDR=\"${service_bind_addr}\""));
     assert!(
         local_helper.contains("DISCORD_VOICE_SERVICE_YTMUSIC_ADDR=\"${service_ytmusic_addr}\"")
     );
     assert!(local_helper.contains("cargo run -p discord-voice-service"));
+    assert!(local_helper.contains(local_wait_for_ytmusic));
+    assert!(local_helper.contains(local_service_start));
+    assert!(local_helper.find(local_wait_for_ytmusic) < local_helper.find(local_service_start));
     assert!(local_helper.contains("service_pid=$!"));
     assert!(local_helper.contains("APPLICATION_ID=\"${application_id}\""));
     assert!(local_helper.contains("BOT_TOKEN=\"${bot_token}\""));
