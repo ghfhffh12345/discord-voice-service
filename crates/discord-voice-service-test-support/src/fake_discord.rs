@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use discord_voice_service_voice::VoiceContext;
 use discord_voice_service_voice::VoiceError;
 use discord_voice_service_voice::crypto::{EncryptionMode, PREFERRED_MODE, REQUIRED_MODE};
-use discord_voice_service_voice::dave::{DaveExternalSender, DaveSession};
+use discord_voice_service_voice::dave::{DaveExternalSender, DaveMediaType, DaveSession};
 use discord_voice_service_voice::test_support::{
     ProtectionContext, RtpPacketBuilder, split_dave_mls_commit_welcome_payload,
 };
@@ -26,6 +26,7 @@ const DAVE_EXISTING_MEMBER_USER_ID: &str = "8888888888888888";
 const DAVE_PROTOCOL_VERSION: u16 = 1;
 const DAVE_INIT_TRANSITION_ID: u16 = 0;
 const DAVE_TRANSITION_ID: u16 = 1;
+const DAVE_LATE_TRANSITION_ID: u16 = 2;
 const DAVE_UNMATCHED_TRANSITION_ID: u16 = 9;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -56,6 +57,27 @@ enum FakeDiscordControl {
         frame: Vec<u8>,
         response: oneshot::Sender<Result<Vec<u8>, VoiceError>>,
     },
+    DecryptDaveAudioFrameFromCreator {
+        sender_user_id: String,
+        frame: Vec<u8>,
+        response: oneshot::Sender<Result<Vec<u8>, VoiceError>>,
+    },
+    DecryptDaveAudioFrameFromLateListener {
+        sender_user_id: String,
+        frame: Vec<u8>,
+        response: oneshot::Sender<Result<Vec<u8>, VoiceError>>,
+    },
+    InjectLateDaveListenerTransition {
+        late_user_id: String,
+        prelude_speaking_events: usize,
+        response: oneshot::Sender<Result<(), VoiceError>>,
+    },
+    InjectLateDavePrepareEpochOnly {
+        response: oneshot::Sender<Result<(), VoiceError>>,
+    },
+    InjectInvalidLateDavePrepareCommit {
+        response: oneshot::Sender<Result<(), VoiceError>>,
+    },
 }
 
 pub struct FakeDiscordPeer {
@@ -68,6 +90,7 @@ pub struct FakeDiscordPeer {
     encryption_mode: Arc<StdMutex<Option<EncryptionMode>>>,
     secret_key: Arc<StdMutex<Option<Vec<u8>>>>,
     last_udp_peer: Arc<StdMutex<Option<SocketAddr>>>,
+    last_audio_packet: Arc<Mutex<Option<Vec<u8>>>>,
     discovery_count: Arc<Mutex<usize>>,
     speaking_observed: Arc<Notify>,
     audio_frame_count: Arc<Mutex<usize>>,
@@ -88,6 +111,7 @@ pub struct FakeDiscordPeer {
     saw_dave_init_transition_ready: Arc<Mutex<bool>>,
     saw_dave_init_transition_ready_before_prepare_commit_transition: Arc<Mutex<bool>>,
     sent_dave_prepare_commit_transition: Arc<Mutex<bool>>,
+    saw_late_dave_transition_ready: Arc<Mutex<bool>>,
 }
 
 impl FakeDiscordPeer {
@@ -344,6 +368,7 @@ impl FakeDiscordPeer {
         let encryption_mode = Arc::new(StdMutex::new(None));
         let secret_key = Arc::new(StdMutex::new(None));
         let last_udp_peer = Arc::new(StdMutex::new(None));
+        let last_audio_packet = Arc::new(Mutex::new(None::<Vec<u8>>));
         let discovery_count = Arc::new(Mutex::new(0usize));
         let speaking_observed = Arc::new(Notify::new());
         let audio_frame_count = Arc::new(Mutex::new(0usize));
@@ -365,11 +390,13 @@ impl FakeDiscordPeer {
         let saw_dave_init_transition_ready_before_prepare_commit_transition =
             Arc::new(Mutex::new(false));
         let sent_dave_prepare_commit_transition = Arc::new(Mutex::new(false));
+        let saw_late_dave_transition_ready = Arc::new(Mutex::new(false));
         let identified_user_id = Arc::new(Mutex::new(None::<String>));
 
         let discovery_count_state = Arc::clone(&discovery_count);
         let audio_frame_count_state = Arc::clone(&audio_frame_count);
         let audio_frame_times_state = Arc::clone(&audio_frame_times);
+        let last_audio_packet_state = Arc::clone(&last_audio_packet);
         let last_udp_peer_state = Arc::clone(&last_udp_peer);
         let udp_socket_state = Arc::clone(&udp_socket);
         tokio::spawn(async move {
@@ -396,6 +423,7 @@ impl FakeDiscordPeer {
                 if len >= 12 {
                     *audio_frame_count_state.lock().await += 1;
                     audio_frame_times_state.lock().await.push(Instant::now());
+                    *last_audio_packet_state.lock().await = Some(buf[..len].to_vec());
                 }
             }
         });
@@ -424,6 +452,7 @@ impl FakeDiscordPeer {
             Arc::clone(&saw_dave_init_transition_ready_before_prepare_commit_transition);
         let sent_dave_prepare_commit_transition_state =
             Arc::clone(&sent_dave_prepare_commit_transition);
+        let saw_late_dave_transition_ready_state = Arc::clone(&saw_late_dave_transition_ready);
         let identified_user_id_state = Arc::clone(&identified_user_id);
         let dave_group_id_state = Arc::clone(&dave_group_id);
         let encryption_mode_state = Arc::clone(&encryption_mode);
@@ -438,6 +467,9 @@ impl FakeDiscordPeer {
             let mut queued_stray_welcome = None::<Vec<u8>>;
             let mut queued_init_prepare_commit_transition = None::<Vec<u8>>;
             let mut sent_initial_external_sender = false;
+            let mut pending_late_member = None::<DaveSession>;
+            let mut pending_late_user_id = None::<String>;
+            let mut late_dave_listener = None::<DaveSession>;
             let mut dave_key_package_count = 0usize;
             let mut delayed_prepare_epoch_after_proposals =
                 matches!(
@@ -485,6 +517,202 @@ impl FakeDiscordPeer {
                                             .encrypt_audio_frame(&frame)
                                             .map_err(|_| VoiceError::InvalidState("fake dave encrypt failed"))
                                     });
+                                let _ = response.send(result);
+                            }
+                            FakeDiscordControl::DecryptDaveAudioFrameFromCreator {
+                                sender_user_id,
+                                frame,
+                                response,
+                            } => {
+                                let result = dave_creator
+                                    .as_mut()
+                                    .ok_or(VoiceError::InvalidState("fake dave creator unavailable"))
+                                    .and_then(|creator| {
+                                        creator
+                                            .decrypt_audio_frame_from(
+                                                &sender_user_id,
+                                                DaveMediaType::Audio,
+                                                &frame,
+                                            )
+                                            .map_err(|_| VoiceError::InvalidState("fake dave decrypt failed"))
+                                    });
+                                let _ = response.send(result);
+                            }
+                            FakeDiscordControl::DecryptDaveAudioFrameFromLateListener {
+                                sender_user_id,
+                                frame,
+                                response,
+                            } => {
+                                let result = late_dave_listener
+                                    .as_mut()
+                                    .ok_or(VoiceError::InvalidState("fake late dave listener unavailable"))
+                                    .and_then(|listener| {
+                                        listener
+                                            .decrypt_audio_frame_from(
+                                                &sender_user_id,
+                                                DaveMediaType::Audio,
+                                                &frame,
+                                            )
+                                            .map_err(|_| VoiceError::InvalidState("fake late dave decrypt failed"))
+                                    });
+                                let _ = response.send(result);
+                            }
+                            FakeDiscordControl::InjectLateDaveListenerTransition {
+                                late_user_id,
+                                prelude_speaking_events,
+                                response,
+                            } => {
+                                let result = async {
+                                    let external_sender = dave_external_sender
+                                        .as_ref()
+                                        .ok_or(VoiceError::InvalidState("fake dave external sender unavailable"))?;
+                                    let external_sender_bytes = external_sender
+                                        .marshalled_external_sender()
+                                        .map_err(|_| VoiceError::InvalidState("fake dave external sender marshal failed"))?;
+                                    if dave_creator.is_none() {
+                                        return Err(VoiceError::InvalidState(
+                                            "fake dave creator unavailable",
+                                        ));
+                                    }
+                                    let runtime_user_id = identified_user_id_state
+                                        .lock()
+                                        .await
+                                        .clone()
+                                        .ok_or(VoiceError::InvalidState("fake runtime user id unavailable"))?;
+                                    let group_id = group_id_from_user_context(
+                                        &runtime_user_id,
+                                        &dave_group_id_state,
+                                    );
+                                    let mut late_member =
+                                        DaveSession::new(None).map_err(|_| VoiceError::InvalidState("fake late dave session create failed"))?;
+                                    late_member
+                                        .set_external_sender(&external_sender_bytes)
+                                        .map_err(|_| VoiceError::InvalidState("fake late dave external sender invalid"))?;
+                                    late_member
+                                        .init(
+                                            DAVE_PROTOCOL_VERSION,
+                                            group_id,
+                                            &late_user_id,
+                                        )
+                                        .map_err(|_| VoiceError::InvalidState("fake late dave session init failed"))?;
+                                    let late_key_package = late_member
+                                        .key_package()
+                                        .map_err(|_| VoiceError::InvalidState("fake late dave key package failed"))?;
+                                    let proposal = external_sender
+                                        .propose_add(2, &late_key_package)
+                                        .map_err(|_| VoiceError::InvalidState("fake late dave proposal failed"))?;
+                                    pending_late_member = Some(late_member);
+                                    pending_late_user_id = Some(late_user_id.clone());
+                                    for index in 0..prelude_speaking_events {
+                                        ws.send(Message::Text(
+                                            json!({
+                                                "op": 5,
+                                                "seq": 10 + index,
+                                                "d": {
+                                                    "speaking": 1,
+                                                    "delay": 0,
+                                                    "ssrc": 42,
+                                                    "user_id": DAVE_EXISTING_MEMBER_USER_ID,
+                                                }
+                                            })
+                                            .to_string()
+                                            .into(),
+                                        ))
+                                        .await
+                                        .map_err(|_| VoiceError::InvalidState("fake gateway send failed"))?;
+                                    }
+                                    ws.send(Message::Text(
+                                        json!({
+                                            "op": 11,
+                                            "seq": 10,
+                                            "d": {
+                                                "user_ids": [late_user_id],
+                                            }
+                                        })
+                                        .to_string()
+                                        .into(),
+                                    ))
+                                    .await
+                                    .map_err(|_| VoiceError::InvalidState("fake gateway send failed"))?;
+                                    ws.send(Message::Text(
+                                        json!({
+                                            "op": 24,
+                                            "seq": 11,
+                                            "d": {
+                                                "transition_id": DAVE_LATE_TRANSITION_ID,
+                                                "epoch": "2",
+                                                "protocol_version": DAVE_PROTOCOL_VERSION,
+                                            }
+                                        })
+                                        .to_string()
+                                        .into(),
+                                    ))
+                                    .await
+                                    .map_err(|_| VoiceError::InvalidState("fake gateway send failed"))?;
+                                    ws.send(Message::Binary(Bytes::from(
+                                        dave_proposals_message(
+                                            12,
+                                            &proposal,
+                                        ),
+                                    )))
+                                    .await
+                                    .map_err(|_| VoiceError::InvalidState("fake gateway send failed"))?;
+                                    Ok(())
+                                }
+                                .await;
+                                let _ = response.send(result);
+                            }
+                            FakeDiscordControl::InjectLateDavePrepareEpochOnly { response } => {
+                                let result = async {
+                                    ws.send(Message::Text(
+                                        json!({
+                                            "op": 24,
+                                            "seq": 11,
+                                            "d": {
+                                                "transition_id": DAVE_LATE_TRANSITION_ID,
+                                                "epoch": "2",
+                                                "protocol_version": DAVE_PROTOCOL_VERSION,
+                                            }
+                                        })
+                                        .to_string()
+                                        .into(),
+                                    ))
+                                    .await
+                                    .map_err(|_| VoiceError::InvalidState("fake gateway send failed"))?;
+                                    Ok(())
+                                }
+                                .await;
+                                let _ = response.send(result);
+                            }
+                            FakeDiscordControl::InjectInvalidLateDavePrepareCommit { response } => {
+                                let result = async {
+                                    ws.send(Message::Text(
+                                        json!({
+                                            "op": 24,
+                                            "seq": 11,
+                                            "d": {
+                                                "transition_id": DAVE_LATE_TRANSITION_ID,
+                                                "epoch": "2",
+                                                "protocol_version": DAVE_PROTOCOL_VERSION,
+                                            }
+                                        })
+                                        .to_string()
+                                        .into(),
+                                    ))
+                                    .await
+                                    .map_err(|_| VoiceError::InvalidState("fake gateway send failed"))?;
+                                    ws.send(Message::Binary(Bytes::from(
+                                        dave_prepare_commit_transition_message(
+                                            12,
+                                            DAVE_LATE_TRANSITION_ID,
+                                            &[0xff, 0x00, 0x01],
+                                        ),
+                                    )))
+                                    .await
+                                    .map_err(|_| VoiceError::InvalidState("fake gateway send failed"))?;
+                                    Ok(())
+                                }
+                                .await;
                                 let _ = response.send(result);
                             }
                         }
@@ -823,6 +1051,21 @@ impl FakeDiscordPeer {
                                 ))
                                 .await
                                 .unwrap();
+                            } else if transition_id == DAVE_LATE_TRANSITION_ID {
+                                *saw_late_dave_transition_ready_state.lock().await = true;
+                                ws.send(Message::Text(
+                                    json!({
+                                        "op": 22,
+                                        "seq": 13,
+                                        "d": {
+                                            "transition_id": DAVE_LATE_TRANSITION_ID,
+                                        }
+                                    })
+                                    .to_string()
+                                    .into(),
+                                ))
+                                .await
+                                .unwrap();
                             }
                         }
                         Some(5) => speaking_observed_state.notify_one(),
@@ -1103,6 +1346,37 @@ impl FakeDiscordPeer {
                                 delayed_prepare_epoch_after_commit = false;
                             }
                         }
+                        Some(28)
+                            if dave_scenario == DaveScenario::EstablishedGroupJoin
+                                && pending_late_member.is_some() =>
+                        {
+                            *saw_dave_commit_welcome_state.lock().await = true;
+                            let user_id = identified_user_id_state
+                                .lock()
+                                .await
+                                .clone()
+                                .unwrap_or_else(|| "1111111111111111".to_owned());
+                            let late_user_id = pending_late_user_id
+                                .take()
+                                .expect("late user id missing");
+                            let mut late_member = pending_late_member
+                                .take()
+                                .expect("late member missing");
+                            let (_commit, welcome) =
+                                split_dave_mls_commit_welcome_payload(&bytes[1..])
+                                    .expect("split late commit/welcome");
+                            let welcome = welcome.expect("late commit/welcome includes welcome");
+                            let recognized_user_ids = [
+                                DAVE_CREATOR_USER_ID,
+                                DAVE_EXISTING_MEMBER_USER_ID,
+                                user_id.as_str(),
+                                late_user_id.as_str(),
+                            ];
+                            late_member
+                                .process_welcome(&welcome, &recognized_user_ids)
+                                .expect("late member welcome");
+                            late_dave_listener = Some(late_member);
+                        }
                         _ => {}
                     }
                 }
@@ -1119,6 +1393,7 @@ impl FakeDiscordPeer {
             encryption_mode,
             secret_key,
             last_udp_peer,
+            last_audio_packet,
             discovery_count,
             speaking_observed,
             audio_frame_count,
@@ -1139,6 +1414,7 @@ impl FakeDiscordPeer {
             saw_dave_init_transition_ready,
             saw_dave_init_transition_ready_before_prepare_commit_transition,
             sent_dave_prepare_commit_transition,
+            saw_late_dave_transition_ready,
         }
     }
 
@@ -1216,6 +1492,120 @@ impl FakeDiscordPeer {
             .map_err(|_| VoiceError::InvalidState("fake dave control closed"))?
     }
 
+    pub async fn last_unprotected_audio_payload(&self) -> Result<Vec<u8>, VoiceError> {
+        let packet = wait_for_value(&self.last_audio_packet, Option::is_some)
+            .await
+            .ok_or(VoiceError::InvalidState(
+                "fake protected audio packet unavailable",
+            ))?;
+        let mode = self
+            .encryption_mode()
+            .await
+            .ok_or(VoiceError::InvalidState("fake encryption mode unavailable"))?;
+        let secret_key = self
+            .secret_key()
+            .await
+            .ok_or(VoiceError::InvalidState("fake secret key unavailable"))?;
+        let protection = ProtectionContext::new(mode, secret_key)?;
+        let (_header, payload) = protection.unprotect_packet(&packet)?;
+        Ok(payload.to_vec())
+    }
+
+    pub async fn decrypt_last_dave_audio_frame_from_creator(
+        &self,
+        sender_user_id: &str,
+    ) -> Result<Vec<u8>, VoiceError> {
+        let frame = self.last_unprotected_audio_payload().await?;
+        let (response_tx, response_rx) = oneshot::channel();
+        self.control_messages
+            .send(FakeDiscordControl::DecryptDaveAudioFrameFromCreator {
+                sender_user_id: sender_user_id.to_owned(),
+                frame,
+                response: response_tx,
+            })
+            .map_err(|_| VoiceError::InvalidState("fake dave control send failed"))?;
+        response_rx
+            .await
+            .map_err(|_| VoiceError::InvalidState("fake dave control closed"))?
+    }
+
+    pub async fn decrypt_last_dave_audio_frame_from_late_listener(
+        &self,
+        sender_user_id: &str,
+    ) -> Result<Vec<u8>, VoiceError> {
+        let frame = self.last_unprotected_audio_payload().await?;
+        let (response_tx, response_rx) = oneshot::channel();
+        self.control_messages
+            .send(FakeDiscordControl::DecryptDaveAudioFrameFromLateListener {
+                sender_user_id: sender_user_id.to_owned(),
+                frame,
+                response: response_tx,
+            })
+            .map_err(|_| VoiceError::InvalidState("fake dave control send failed"))?;
+        response_rx
+            .await
+            .map_err(|_| VoiceError::InvalidState("fake dave control closed"))?
+    }
+
+    pub async fn inject_late_dave_listener_transition(
+        &self,
+        late_user_id: &str,
+    ) -> Result<(), VoiceError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.control_messages
+            .send(FakeDiscordControl::InjectLateDaveListenerTransition {
+                late_user_id: late_user_id.to_owned(),
+                prelude_speaking_events: 0,
+                response: response_tx,
+            })
+            .map_err(|_| VoiceError::InvalidState("fake dave control send failed"))?;
+        response_rx
+            .await
+            .map_err(|_| VoiceError::InvalidState("fake dave control closed"))?
+    }
+
+    pub async fn inject_late_dave_listener_transition_after_gateway_noise(
+        &self,
+        late_user_id: &str,
+        prelude_speaking_events: usize,
+    ) -> Result<(), VoiceError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.control_messages
+            .send(FakeDiscordControl::InjectLateDaveListenerTransition {
+                late_user_id: late_user_id.to_owned(),
+                prelude_speaking_events,
+                response: response_tx,
+            })
+            .map_err(|_| VoiceError::InvalidState("fake dave control send failed"))?;
+        response_rx
+            .await
+            .map_err(|_| VoiceError::InvalidState("fake dave control closed"))?
+    }
+
+    pub async fn inject_late_dave_prepare_epoch_only(&self) -> Result<(), VoiceError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.control_messages
+            .send(FakeDiscordControl::InjectLateDavePrepareEpochOnly {
+                response: response_tx,
+            })
+            .map_err(|_| VoiceError::InvalidState("fake dave control send failed"))?;
+        response_rx
+            .await
+            .map_err(|_| VoiceError::InvalidState("fake dave control closed"))?
+    }
+
+    pub async fn inject_invalid_late_dave_prepare_commit(&self) -> Result<(), VoiceError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.control_messages
+            .send(FakeDiscordControl::InjectInvalidLateDavePrepareCommit {
+                response: response_tx,
+            })
+            .map_err(|_| VoiceError::InvalidState("fake dave control send failed"))?;
+        response_rx
+            .await
+            .map_err(|_| VoiceError::InvalidState("fake dave control closed"))?
+    }
+
     pub async fn send_protected_audio_packet(
         &self,
         ssrc: u32,
@@ -1250,6 +1640,10 @@ impl FakeDiscordPeer {
 
     pub async fn audio_frame_count_at_least(&self, minimum: usize) -> usize {
         wait_for_value(&self.audio_frame_count, |count| *count >= minimum).await
+    }
+
+    pub async fn audio_frame_count(&self) -> usize {
+        *self.audio_frame_count.lock().await
     }
 
     pub async fn audio_frame_span_for_first(&self, frame_count: usize) -> Duration {
@@ -1360,6 +1754,13 @@ impl FakeDiscordPeer {
             timeout,
             |ready| *ready,
         )
+        .await
+    }
+
+    pub async fn saw_late_dave_transition_ready_within(&self, timeout: Duration) -> bool {
+        wait_for_value_with_timeout(&self.saw_late_dave_transition_ready, timeout, |ready| {
+            *ready
+        })
         .await
     }
 }

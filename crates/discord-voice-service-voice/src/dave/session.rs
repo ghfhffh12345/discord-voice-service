@@ -285,6 +285,54 @@ impl DaveRuntimeContext {
             .map_err(|err| DaveError::operation("decrypt audio frame", err))
     }
 
+    pub(crate) fn process_commit(&mut self, commit: &[u8]) -> Result<DaveCommitResult, DaveError> {
+        self.session
+            .process_commit(commit)
+            .map_err(|err| DaveError::operation("process commit", err))?;
+        let roster_member_ids = self.session.get_user_ids().unwrap_or_default();
+        Ok(DaveCommitResult {
+            failed: false,
+            ignored: false,
+            roster_member_ids,
+        })
+    }
+
+    pub(crate) fn process_welcome(
+        &mut self,
+        welcome: &[u8],
+        _recognized_user_ids: &[&str],
+    ) -> Result<DaveWelcomeResult, DaveError> {
+        self.session
+            .process_welcome(welcome)
+            .map_err(|err| DaveError::operation("process welcome", err))?;
+        let roster_member_ids = self.session.get_user_ids().unwrap_or_default();
+        Ok(DaveWelcomeResult { roster_member_ids })
+    }
+
+    pub(crate) fn process_proposals_with_operation(
+        &mut self,
+        operation: DaveMlsProposalsOperation,
+        proposals: &[u8],
+        recognized_user_ids: &[&str],
+    ) -> Result<Option<Vec<u8>>, DaveError> {
+        let recognized_user_ids = parse_user_ids(recognized_user_ids)?;
+        let commit_welcome = self
+            .session
+            .process_proposals(operation.into(), proposals, Some(&recognized_user_ids))
+            .map_err(|err| DaveError::operation("process proposals", err))?;
+        match (operation, commit_welcome) {
+            (DaveMlsProposalsOperation::Revoke, None) => Ok(None),
+            (_, Some(commit_welcome)) => Ok(Some(pack_commit_welcome(
+                &commit_welcome.commit,
+                commit_welcome.welcome.as_deref(),
+            ))),
+            (DaveMlsProposalsOperation::Append, None) => Err(DaveError::operation(
+                "process proposals",
+                "append proposals returned no commit/welcome",
+            )),
+        }
+    }
+
     fn encrypt(&mut self, media_type: DaveMediaType, frame: &[u8]) -> Result<Vec<u8>, DaveError> {
         let codec = match media_type {
             DaveMediaType::Audio => Codec::OPUS,

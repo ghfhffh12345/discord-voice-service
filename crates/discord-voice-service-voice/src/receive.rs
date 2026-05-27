@@ -66,7 +66,7 @@ impl ObservedVoiceSession {
             gateway: Some(gateway),
             transport: Some(transport),
             protection: Some(ProtectionContext::from_session(&session_description)?),
-            dave,
+            dave: dave.map(|state| state.runtime),
             heartbeat_shutdown: Some(heartbeat_shutdown),
             speaker_ssrcs: HashMap::new(),
         })

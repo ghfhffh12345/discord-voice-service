@@ -27,7 +27,14 @@ pub struct VoiceHandshakeResult {
     pub ssrc: u32,
     pub heartbeat_shutdown: oneshot::Sender<()>,
     pub session_description: SessionDescription,
-    pub dave: Option<DaveRuntimeContext>,
+    pub dave: Option<InitialDaveState>,
+}
+
+pub struct InitialDaveState {
+    pub runtime: DaveRuntimeContext,
+    pub group_id: u64,
+    pub external_sender: DaveExternalSender,
+    pub recognized_user_ids: BTreeSet<String>,
 }
 
 pub async fn connect(voice: &VoiceContext) -> Result<Option<VoiceHandshakeResult>, VoiceError> {
@@ -278,7 +285,7 @@ async fn complete_initial_dave_transition(
     ssrc: u32,
     protocol_version: u16,
     timeout_duration: Duration,
-) -> Result<DaveRuntimeContext, VoiceError> {
+) -> Result<InitialDaveState, VoiceError> {
     let group_id = voice
         .channel_id
         .parse::<u64>()
@@ -341,7 +348,13 @@ async fn complete_initial_dave_transition(
                     *transition_id == *expected_transition_id
                 })
             {
-                return Ok(pending_transition.take().expect("pending transition").1);
+                let runtime = pending_transition.take().expect("pending transition").1;
+                return Ok(initial_dave_state(
+                    runtime,
+                    group_id,
+                    local_external_sender,
+                    recognized_user_ids,
+                ));
             }
             continue;
         }
@@ -400,13 +413,19 @@ async fn complete_initial_dave_transition(
                             VoiceError::InvalidState("voice dave commit welcome invalid")
                         })?;
                     let session = take_dave_session(&mut session)?;
-                    return complete_local_initial_creator_transition(
+                    let runtime = complete_local_initial_creator_transition(
                         gateway,
                         session,
                         &commit_welcome,
                         &commit,
                     )
-                    .await;
+                    .await?;
+                    return Ok(initial_dave_state(
+                        runtime,
+                        group_id,
+                        local_external_sender,
+                        recognized_user_ids,
+                    ));
                 }
             }
             VoiceGatewayEvent::DavePrepareEpoch(DavePrepareEpoch {
@@ -477,13 +496,19 @@ async fn complete_initial_dave_transition(
                     .split_commit_welcome(&commit_welcome)
                     .map_err(|_| VoiceError::InvalidState("voice dave commit welcome invalid"))?;
                 let session = take_dave_session(&mut session)?;
-                return complete_local_initial_creator_transition(
+                let runtime = complete_local_initial_creator_transition(
                     gateway,
                     session,
                     &commit_welcome,
                     &commit,
                 )
-                .await;
+                .await?;
+                return Ok(initial_dave_state(
+                    runtime,
+                    group_id,
+                    local_external_sender,
+                    recognized_user_ids,
+                ));
             }
             VoiceGatewayEvent::DaveMlsPrepareCommitTransition(DaveMlsPrepareCommitTransition {
                 transition_id,
@@ -539,7 +564,12 @@ async fn complete_initial_dave_transition(
                         "voice dave handshake sending transition-ready for init transition"
                     );
                     gateway.send_dave_transition_ready(transition_id).await?;
-                    return Ok(runtime);
+                    return Ok(initial_dave_state(
+                        runtime,
+                        group_id,
+                        local_external_sender,
+                        recognized_user_ids,
+                    ));
                 }
                 tracing::debug!(
                     transition_id,
@@ -587,7 +617,12 @@ async fn complete_initial_dave_transition(
                         "voice dave handshake sending transition-ready for init transition"
                     );
                     gateway.send_dave_transition_ready(transition_id).await?;
-                    return Ok(runtime);
+                    return Ok(initial_dave_state(
+                        runtime,
+                        group_id,
+                        local_external_sender,
+                        recognized_user_ids,
+                    ));
                 }
                 tracing::debug!(
                     transition_id,
@@ -598,6 +633,20 @@ async fn complete_initial_dave_transition(
             }
             _ => {}
         }
+    }
+}
+
+fn initial_dave_state(
+    runtime: DaveRuntimeContext,
+    group_id: u64,
+    external_sender: DaveExternalSender,
+    recognized_user_ids: BTreeSet<String>,
+) -> InitialDaveState {
+    InitialDaveState {
+        runtime,
+        group_id,
+        external_sender,
+        recognized_user_ids,
     }
 }
 
