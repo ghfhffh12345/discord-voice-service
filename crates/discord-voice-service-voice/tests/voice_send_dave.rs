@@ -191,12 +191,14 @@ async fn connected_voice_session_ignores_replayed_established_join_commit_after_
     let first = hex::decode("0dc5aedd5bdc3f20be5697e54dd1f437").unwrap();
     session.send_audio_frame(Bytes::from(first)).await.unwrap();
 
+    // This regression stays red until Task 2 teaches the session to ignore the replay.
     fake.replay_established_join_commit_transition()
         .await
         .unwrap();
-    sleep(Duration::from_millis(25)).await;
 
     let second = hex::decode("f8b4011b2e11df489afb841af48c").unwrap();
+    // send_audio_frame drains pending gateway events before sending media, so queueing the
+    // replay immediately before this call deterministically exercises the failure.
     session
         .send_audio_frame(Bytes::from(second.clone()))
         .await
