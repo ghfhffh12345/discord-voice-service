@@ -22,6 +22,18 @@ const POST_HELLO_TIMEOUT_FLOOR: Duration = Duration::from_secs(30);
 const DAVE_PROTOCOL_INIT_TRANSITION_ID: u16 = 0;
 const SELF_ONLY_INITIAL_GROUP_GRACE: Duration = Duration::from_millis(250);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingHandshakeTransitionSource {
+    CommitBacked,
+    WelcomeBacked,
+}
+
+struct PendingHandshakeTransition {
+    transition_id: u16,
+    runtime: DaveRuntimeContext,
+    source: PendingHandshakeTransitionSource,
+}
+
 pub struct VoiceHandshakeResult {
     pub gateway: VoiceGatewayClient,
     pub transport: VoiceUdpTransport,
@@ -36,7 +48,7 @@ pub struct InitialDaveState {
     pub group_id: u64,
     pub external_sender: DaveExternalSender,
     pub recognized_user_ids: BTreeSet<String>,
-    pub completed_transition_ids: BTreeSet<u16>,
+    pub completed_welcome_backed_transition_ids: BTreeSet<u16>,
 }
 
 pub async fn connect(voice: &VoiceContext) -> Result<Option<VoiceHandshakeResult>, VoiceError> {
@@ -311,9 +323,9 @@ async fn complete_initial_dave_transition(
         "voice dave handshake initialized session"
     );
     let mut pending_prepared_transitions = BTreeMap::<u16, u16>::new();
-    let mut pending_transition = None::<(u16, DaveRuntimeContext)>;
+    let mut pending_transition = None::<PendingHandshakeTransition>;
     let mut pending_key_package = false;
-    let mut completed_transition_ids = BTreeSet::new();
+    let mut completed_welcome_backed_transition_ids = BTreeSet::new();
     let mut self_only_group_deadline = None::<Instant>;
     send_pending_join_key_package(
         gateway,
@@ -346,7 +358,7 @@ async fn complete_initial_dave_transition(
                     group_id,
                     local_external_sender,
                     recognized_user_ids,
-                    completed_transition_ids,
+                    completed_welcome_backed_transition_ids,
                 ));
             }
             Err(_) => return Err(VoiceError::InvalidState("voice handshake timed out")),
@@ -368,26 +380,31 @@ async fn complete_initial_dave_transition(
                 matched_pending_transition =
                     pending_transition
                         .as_ref()
-                        .is_some_and(
-                            |(expected_transition_id, _)| *transition_id == *expected_transition_id
-                        ),
+                        .is_some_and(|pending_transition| {
+                            *transition_id == pending_transition.transition_id
+                        }),
                 "voice dave handshake processing execute transition"
             );
             if pending_transition
                 .as_ref()
-                .is_some_and(|(expected_transition_id, _)| {
-                    *transition_id == *expected_transition_id
+                .is_some_and(|pending_transition| {
+                    *transition_id == pending_transition.transition_id
                 })
             {
-                let (completed_transition_id, runtime) =
-                    pending_transition.take().expect("pending transition");
-                completed_transition_ids.insert(completed_transition_id);
+                let PendingHandshakeTransition {
+                    transition_id: completed_transition_id,
+                    runtime,
+                    source,
+                } = pending_transition.take().expect("pending transition");
+                if source == PendingHandshakeTransitionSource::WelcomeBacked {
+                    completed_welcome_backed_transition_ids.insert(completed_transition_id);
+                }
                 return Ok(initial_dave_state(
                     runtime,
                     group_id,
                     local_external_sender,
                     recognized_user_ids,
-                    completed_transition_ids,
+                    completed_welcome_backed_transition_ids,
                 ));
             }
             continue;
@@ -503,7 +520,7 @@ async fn complete_initial_dave_transition(
                     group_id,
                     local_external_sender,
                     recognized_user_ids,
-                    completed_transition_ids,
+                    completed_welcome_backed_transition_ids,
                 ));
             }
             VoiceGatewayEvent::DaveMlsPrepareCommitTransition(DaveMlsPrepareCommitTransition {
@@ -566,7 +583,7 @@ async fn complete_initial_dave_transition(
                         group_id,
                         local_external_sender,
                         recognized_user_ids,
-                        completed_transition_ids,
+                        completed_welcome_backed_transition_ids,
                     ));
                 }
                 tracing::debug!(
@@ -574,7 +591,11 @@ async fn complete_initial_dave_transition(
                     "voice dave handshake sending transition-ready after commit transition"
                 );
                 gateway.send_dave_transition_ready(transition_id).await?;
-                pending_transition = Some((transition_id, runtime));
+                pending_transition = Some(PendingHandshakeTransition {
+                    transition_id,
+                    runtime,
+                    source: PendingHandshakeTransitionSource::CommitBacked,
+                });
             }
             VoiceGatewayEvent::DaveMlsWelcome(DaveMlsWelcome {
                 transition_id,
@@ -621,7 +642,7 @@ async fn complete_initial_dave_transition(
                         group_id,
                         local_external_sender,
                         recognized_user_ids,
-                        completed_transition_ids,
+                        completed_welcome_backed_transition_ids,
                     ));
                 }
                 tracing::debug!(
@@ -629,7 +650,11 @@ async fn complete_initial_dave_transition(
                     "voice dave handshake sending transition-ready after welcome"
                 );
                 gateway.send_dave_transition_ready(transition_id).await?;
-                pending_transition = Some((transition_id, runtime));
+                pending_transition = Some(PendingHandshakeTransition {
+                    transition_id,
+                    runtime,
+                    source: PendingHandshakeTransitionSource::WelcomeBacked,
+                });
             }
             _ => {}
         }
@@ -641,14 +666,14 @@ fn initial_dave_state(
     group_id: u64,
     external_sender: DaveExternalSender,
     recognized_user_ids: BTreeSet<String>,
-    completed_transition_ids: BTreeSet<u16>,
+    completed_welcome_backed_transition_ids: BTreeSet<u16>,
 ) -> InitialDaveState {
     InitialDaveState {
         runtime,
         group_id,
         external_sender,
         recognized_user_ids,
-        completed_transition_ids,
+        completed_welcome_backed_transition_ids,
     }
 }
 

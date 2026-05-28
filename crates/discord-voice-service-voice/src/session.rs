@@ -21,6 +21,18 @@ const DAVE_GATEWAY_EVENT_DRAIN_LIMIT: usize = 256;
 const DAVE_GATEWAY_IDLE_POLL: Duration = Duration::from_millis(1);
 const DAVE_GATEWAY_TRANSITION_POLL: Duration = Duration::from_millis(50);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingDaveTransitionSource {
+    CommitBacked,
+    WelcomeBacked,
+}
+
+struct PendingDaveTransition {
+    transition_id: u16,
+    runtime: DaveRuntimeContext,
+    source: PendingDaveTransitionSource,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VoiceContext {
     pub guild_id: String,
@@ -42,10 +54,10 @@ pub struct ConnectedVoiceSession {
     dave_group_id: Option<u64>,
     dave_external_sender: Option<DaveExternalSender>,
     dave_recognized_user_ids: BTreeSet<String>,
-    completed_dave_transition_ids: BTreeSet<u16>,
+    completed_welcome_backed_dave_transition_ids: BTreeSet<u16>,
     pending_dave_prepared_transitions: BTreeMap<u16, u16>,
     pending_dave_local_commit_transition: Option<DaveRuntimeContext>,
-    pending_dave_transition: Option<(u16, DaveRuntimeContext)>,
+    pending_dave_transition: Option<PendingDaveTransition>,
     dave_failed_closed: bool,
     heartbeat_shutdown: Option<oneshot::Sender<()>>,
     speaking_started: bool,
@@ -65,7 +77,7 @@ impl ConnectedVoiceSession {
             dave_group_id: None,
             dave_external_sender: None,
             dave_recognized_user_ids: BTreeSet::from([user_id]),
-            completed_dave_transition_ids: BTreeSet::new(),
+            completed_welcome_backed_dave_transition_ids: BTreeSet::new(),
             pending_dave_prepared_transitions: BTreeMap::new(),
             pending_dave_local_commit_transition: None,
             pending_dave_transition: None,
@@ -94,7 +106,7 @@ impl ConnectedVoiceSession {
             dave_group_id,
             dave_external_sender,
             dave_recognized_user_ids,
-            completed_dave_transition_ids,
+            completed_welcome_backed_dave_transition_ids,
         ) =
             if let Some(dave) = dave {
                 (
@@ -102,7 +114,7 @@ impl ConnectedVoiceSession {
                     Some(dave.group_id),
                     Some(dave.external_sender),
                     dave.recognized_user_ids,
-                    dave.completed_transition_ids,
+                    dave.completed_welcome_backed_transition_ids,
                 )
             } else {
                 (
@@ -125,7 +137,7 @@ impl ConnectedVoiceSession {
             dave_group_id,
             dave_external_sender,
             dave_recognized_user_ids,
-            completed_dave_transition_ids,
+            completed_welcome_backed_dave_transition_ids,
             pending_dave_prepared_transitions: BTreeMap::new(),
             pending_dave_local_commit_transition: None,
             pending_dave_transition: None,
@@ -328,8 +340,13 @@ impl ConnectedVoiceSession {
                         protocol_version,
                         "voice dave session prepared deferred local transition epoch"
                     );
-                    self.ready_pending_transition(gateway, transition_id, runtime)
-                        .await?;
+                    self.ready_pending_transition(
+                        gateway,
+                        transition_id,
+                        runtime,
+                        PendingDaveTransitionSource::CommitBacked,
+                    )
+                    .await?;
                 } else {
                     self.pending_dave_prepared_transitions
                         .insert(transition_id, protocol_version);
@@ -365,18 +382,20 @@ impl ConnectedVoiceSession {
             }
             VoiceGatewayEvent::DaveExecuteTransition(DaveExecuteTransition { transition_id }) => {
                 match self.pending_dave_transition.take() {
-                    Some((expected_transition_id, runtime))
-                        if expected_transition_id == transition_id =>
-                    {
-                        self.completed_dave_transition_ids.insert(transition_id);
+                    Some(PendingDaveTransition {
+                        transition_id: expected_transition_id,
+                        runtime,
+                        source,
+                    }) if expected_transition_id == transition_id => {
+                        self.mark_completed_transition(transition_id, source);
                         self.dave = Some(runtime);
                         tracing::debug!(
                             transition_id,
                             "voice dave session executed pending transition"
                         );
                     }
-                    Some((expected_transition_id, runtime)) => {
-                        self.pending_dave_transition = Some((expected_transition_id, runtime));
+                    Some(pending_transition) => {
+                        self.pending_dave_transition = Some(pending_transition);
                         return Err(VoiceError::InvalidState(
                             "voice dave execute transition id mismatch",
                         ));
@@ -405,8 +424,12 @@ impl ConnectedVoiceSession {
         transition_id: u16,
         commit: &[u8],
     ) -> Result<(), VoiceError> {
-        if self.completed_dave_transition_ids.contains(&transition_id)
-            && self.pending_dave_prepared_transitions.is_empty()
+        if self
+            .completed_welcome_backed_dave_transition_ids
+            .contains(&transition_id)
+            && !self
+                .pending_dave_prepared_transitions
+                .contains_key(&transition_id)
         {
             tracing::debug!(
                 transition_id,
@@ -431,7 +454,12 @@ impl ConnectedVoiceSession {
                 "voice dave commit transition did not keep group",
             ));
         }
-        self.ready_pending_transition(gateway, transition_id, runtime)
+        self.ready_pending_transition(
+            gateway,
+            transition_id,
+            runtime,
+            PendingDaveTransitionSource::CommitBacked,
+        )
             .await
     }
 
@@ -459,7 +487,12 @@ impl ConnectedVoiceSession {
                 "voice dave welcome transition did not keep group",
             ));
         }
-        self.ready_pending_transition(gateway, transition_id, runtime)
+        self.ready_pending_transition(
+            gateway,
+            transition_id,
+            runtime,
+            PendingDaveTransitionSource::WelcomeBacked,
+        )
             .await
     }
 
@@ -511,8 +544,13 @@ impl ConnectedVoiceSession {
         }
         if let Some(transition_id) = transition_id {
             self.consume_prepared_transition(transition_id)?;
-            self.ready_pending_transition(gateway, transition_id, runtime)
-                .await
+            self.ready_pending_transition(
+                gateway,
+                transition_id,
+                runtime,
+                PendingDaveTransitionSource::CommitBacked,
+            )
+            .await
         } else {
             self.pending_dave_local_commit_transition = Some(runtime);
             Ok(())
@@ -524,8 +562,13 @@ impl ConnectedVoiceSession {
         gateway: &VoiceGatewayClient,
         transition_id: u16,
         runtime: DaveRuntimeContext,
+        source: PendingDaveTransitionSource,
     ) -> Result<(), VoiceError> {
-        self.pending_dave_transition = Some((transition_id, runtime));
+        self.pending_dave_transition = Some(PendingDaveTransition {
+            transition_id,
+            runtime,
+            source,
+        });
         if let Err(err) = gateway.send_dave_transition_ready(transition_id).await {
             return Err(self.fail_dave_closed(err));
         }
@@ -570,7 +613,7 @@ impl ConnectedVoiceSession {
             .or_else(|| {
                 self.pending_dave_transition
                     .as_ref()
-                    .map(|(_, runtime)| runtime.protocol_version)
+                    .map(|pending_transition| pending_transition.runtime.protocol_version)
             })
             .or_else(|| {
                 self.pending_dave_local_commit_transition
@@ -578,6 +621,17 @@ impl ConnectedVoiceSession {
                     .map(|runtime| runtime.protocol_version)
             })
             .ok_or(VoiceError::InvalidState("voice dave runtime unavailable"))
+    }
+
+    fn mark_completed_transition(
+        &mut self,
+        transition_id: u16,
+        source: PendingDaveTransitionSource,
+    ) {
+        if source == PendingDaveTransitionSource::WelcomeBacked {
+            self.completed_welcome_backed_dave_transition_ids
+                .insert(transition_id);
+        }
     }
 
     pub async fn stop_audio(&mut self) -> Result<(), VoiceError> {
@@ -774,6 +828,46 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn remote_commit_replay_after_commit_backed_completion_still_requires_prepared_epoch() {
+        let gateway = FakeVoiceGateway::spawn().await;
+        let udp = FakeUdpPeer::spawn().await;
+        let mut session = test_connected_session(gateway.url(), udp.addr()).await;
+        let gateway_client = session.gateway.as_ref().expect("gateway").clone();
+        session.mark_completed_transition(7, PendingDaveTransitionSource::CommitBacked);
+
+        let err = session
+            .prepare_remote_commit_transition(&gateway_client, 7, &[1, 2, 3])
+            .await
+            .expect_err("commit-backed completion must not suppress replayed commit");
+
+        assert_eq!(
+            invalid_state_reason(err),
+            "voice dave transition missing prepared epoch"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_commit_replay_after_welcome_backed_completion_ignores_unrelated_pending_epoch() {
+        let gateway = FakeVoiceGateway::spawn().await;
+        let udp = FakeUdpPeer::spawn().await;
+        let mut session = test_connected_session(gateway.url(), udp.addr()).await;
+        let gateway_client = session.gateway.as_ref().expect("gateway").clone();
+        session.mark_completed_transition(7, PendingDaveTransitionSource::WelcomeBacked);
+        session.pending_dave_prepared_transitions.insert(8, 1);
+
+        session
+            .prepare_remote_commit_transition(&gateway_client, 7, &[1, 2, 3])
+            .await
+            .expect("welcome-backed replay should ignore stale commit even with unrelated pending epoch");
+
+        assert_eq!(
+            session.pending_dave_prepared_transitions.get(&8),
+            Some(&1),
+            "unrelated pending epochs must remain intact"
+        );
+    }
+
     async fn test_connected_session(url: &str, udp_addr: SocketAddr) -> ConnectedVoiceSession {
         ConnectedVoiceSession {
             voice: VoiceContext {
@@ -797,7 +891,7 @@ mod tests {
             dave_group_id: None,
             dave_external_sender: None,
             dave_recognized_user_ids: BTreeSet::from(["user-1".to_owned()]),
-            completed_dave_transition_ids: BTreeSet::new(),
+            completed_welcome_backed_dave_transition_ids: BTreeSet::new(),
             pending_dave_prepared_transitions: BTreeMap::new(),
             pending_dave_local_commit_transition: None,
             pending_dave_transition: None,
