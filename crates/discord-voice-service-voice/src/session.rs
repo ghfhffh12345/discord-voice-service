@@ -414,18 +414,7 @@ impl ConnectedVoiceSession {
             );
             return Ok(());
         }
-        match self.consume_prepared_transition(transition_id) {
-            Ok(_) => {}
-            Err(VoiceError::InvalidState("voice dave transition missing prepared epoch"))
-                if self.pending_dave_prepared_transitions.is_empty() =>
-            {
-                tracing::debug!(
-                    transition_id,
-                    "voice dave session accepting prepare commit transition without cached prepare epoch"
-                );
-            }
-            Err(err) => return Err(err),
-        }
+        self.consume_prepared_transition(transition_id)?;
         let mut runtime = self
             .dave
             .take()
@@ -767,6 +756,24 @@ mod tests {
         assert_eq!(udp.silence_frame_count().await, 5);
     }
 
+    #[tokio::test]
+    async fn remote_commit_without_prepared_epoch_fails_before_runtime_lookup() {
+        let gateway = FakeVoiceGateway::spawn().await;
+        let udp = FakeUdpPeer::spawn().await;
+        let mut session = test_connected_session(gateway.url(), udp.addr()).await;
+        let gateway_client = session.gateway.as_ref().expect("gateway").clone();
+
+        let err = session
+            .prepare_remote_commit_transition(&gateway_client, 42, &[1, 2, 3])
+            .await
+            .expect_err("unknown transition without prepared epoch must fail closed");
+
+        assert_eq!(
+            invalid_state_reason(err),
+            "voice dave transition missing prepared epoch"
+        );
+    }
+
     async fn test_connected_session(url: &str, udp_addr: SocketAddr) -> ConnectedVoiceSession {
         ConnectedVoiceSession {
             voice: VoiceContext {
@@ -812,6 +819,13 @@ mod tests {
                 return value;
             }
             sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn invalid_state_reason(err: VoiceError) -> &'static str {
+        match err {
+            VoiceError::InvalidState(reason) => reason,
+            other => panic!("expected invalid state error, got {other:?}"),
         }
     }
 }
