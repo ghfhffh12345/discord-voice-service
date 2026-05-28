@@ -33,6 +33,8 @@ fn live_staging_workflow_uses_github_hosted_runner_and_secret_browser_json() {
     let local_ytmusic_pull = "docker pull \"${ytmusic_image_ref}\"";
     let local_network_create = "docker network create \"${network_name}\"";
     let local_evidence_default = "validation_evidence_path=\"${LIVE_VALIDATION_EVIDENCE_PATH:-${RUNNER_TEMP:-/tmp}/live-validation-evidence-local.json}\"";
+    let local_wait_for_ytmusic = "wait_for_ytmusic_grpc \"${host_ytmusic_endpoint}\"";
+    let local_service_start = "cargo run -p discord-voice-service >\"${service_log}\" 2>&1 &";
 
     assert!(workflow.contains("runs-on: ubuntu-24.04"));
     assert!(workflow.contains("environment: live-staging"));
@@ -94,7 +96,13 @@ fn live_staging_workflow_uses_github_hosted_runner_and_secret_browser_json() {
     assert!(local_helper.contains(local_network_create));
     assert!(local_helper.contains(local_ytmusic_pull));
     assert!(local_helper.contains(local_ytmusic_run));
-    assert!(local_helper.contains("wait_for_ytmusic_grpc \"${host_ytmusic_endpoint}\""));
+    assert!(local_helper.contains("wait_for_ytmusic_grpc()"));
+    assert!(local_helper.contains("\"${runtime_env[@]}\" \"${ytmusic_probe_binary}\" \"${endpoint}\" >/dev/null 2>&1"));
+    assert!(local_helper.contains("Timed out waiting for ytmusic-service gRPC readiness from DISCORD_VOICE_SERVICE_YTMUSIC_ADDR"));
+    assert!(local_helper.contains(local_wait_for_ytmusic));
+    assert!(local_helper.find(local_wait_for_ytmusic) < local_helper.find(local_service_start));
+    assert!(local_helper.contains(local_service_start));
+    assert!(local_helper.contains("service_pid=$!"));
     assert!(local_helper.contains("DISCORD_VOICE_SERVICE_YTMUSIC_ADDR=\"${service_ytmusic_addr}\""));
     assert!(local_helper.contains(local_evidence_default));
     assert!(local_helper.contains("docker logs \"${ytmusic_container_name}\" || true"));
