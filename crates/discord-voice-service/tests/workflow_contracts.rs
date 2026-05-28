@@ -2,7 +2,7 @@ use std::fs;
 
 const OCCUPIED_LISTENER_CONTRACT: &str = "During live staging, human listeners may remain in the channel while the staging bot validates playback against the short dedicated validation track.";
 const NATURAL_END_SUCCESS_CONTRACT: &str = "Live-staging success waits for the natural end of the validation track before the run is treated as release-ready.";
-const LOCAL_LIVE_STAGING_CONTRACT: &str = "For local real-Discord live staging, run `scripts/ci/run_local_live_staging.sh`; the helper loads secrets from `.env`, loads `BROWSER_JSON` from `./browser.json`, verifies the already-running `ytmusic-service` endpoint from `DISCORD_VOICE_SERVICE_YTMUSIC_ADDR`, then starts a source-built `discord-voice-service`.";
+const LOCAL_LIVE_STAGING_CONTRACT: &str = "For local real-Discord live staging, run `scripts/ci/run_local_live_staging.sh`; the helper loads secrets from `.env`, loads `BROWSER_JSON` from `./browser.json`, starts a disposable local `ytmusic-service` container, waits for its gRPC readiness, then starts a source-built `discord-voice-service` before running observer validation.";
 const OBSERVER_SECRET_CONTRACT: &str = "Protected live staging requires `OBSERVER_BOT_TOKEN` for the muted, non-deafened observer identity that validates receive-side audio.";
 const RECEIVE_SIDE_SUCCESS_CONTRACT: &str = "Live-staging success requires observer receive-side proof: authentic voice context, VoiceReady, Playing, natural TrackEnded, at least 120 observed packets, at least 3000 ms decoded audio, at least 1000 ms non-silent audio, and no reconnect/interruption/fatal error during validation.";
 const EVIDENCE_ARTIFACT_CONTRACT: &str = "Live-staging always uploads a structured observer evidence artifact summarizing observed packets, decoded audio, non-silent audio, and failure_reason.";
@@ -200,6 +200,7 @@ fn live_staging_runner_doc_matches_the_live_validation_contract() {
     assert!(doc.contains(OBSERVER_SECRET_CONTRACT));
     assert!(doc.contains(RECEIVE_SIDE_SUCCESS_CONTRACT));
     assert!(doc.contains(EVIDENCE_ARTIFACT_CONTRACT));
+    assert!(!doc.contains("verifies the already-running `ytmusic-service` endpoint"));
     assert!(!doc.contains("5-second live interval"));
     assert!(!doc.contains("OBSERVER_APPLICATION_ID"));
 }

@@ -152,7 +152,9 @@ The live validation controller contract is:
 | `DISCORD_VOICE_SERVICE_BIND_ADDR` | In-container bind address used by the `discord-voice-service` container during live staging | `0.0.0.0:55051` |
 | `DISCORD_VOICE_SERVICE_YTMUSIC_ADDR` | Base gRPC endpoint reserved for the service/controller contract with `ytmusic-service` | `http://127.0.0.1:50051` |
 
-For local real-Discord live staging, run `scripts/ci/run_local_live_staging.sh`; the helper loads secrets from `.env`, loads `BROWSER_JSON` from `./browser.json`, verifies the already-running `ytmusic-service` endpoint from `DISCORD_VOICE_SERVICE_YTMUSIC_ADDR`, then starts a source-built `discord-voice-service`.
+For local real-Discord live staging, run `scripts/ci/run_local_live_staging.sh`; the helper loads secrets from `.env`, loads `BROWSER_JSON` from `./browser.json`, starts a disposable local `ytmusic-service` container, waits for its gRPC readiness, then starts a source-built `discord-voice-service` before running observer validation.
+
+For reproducible local live staging, optionally set `YTMUSIC_SERVICE_IMAGE_REF`; otherwise the helper defaults to `ghcr.io/ghfhffh12345/ytmusic-service:latest`.
 
 Protected live staging requires `OBSERVER_BOT_TOKEN` for the muted, non-deafened observer identity that validates receive-side audio.
 

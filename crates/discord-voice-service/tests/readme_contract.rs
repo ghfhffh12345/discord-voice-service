@@ -1,6 +1,6 @@
 use std::fs;
 
-const LOCAL_LIVE_STAGING_CONTRACT: &str = "For local real-Discord live staging, run `scripts/ci/run_local_live_staging.sh`; the helper loads secrets from `.env`, loads `BROWSER_JSON` from `./browser.json`, verifies the already-running `ytmusic-service` endpoint from `DISCORD_VOICE_SERVICE_YTMUSIC_ADDR`, then starts a source-built `discord-voice-service`.";
+const LOCAL_LIVE_STAGING_CONTRACT: &str = "For local real-Discord live staging, run `scripts/ci/run_local_live_staging.sh`; the helper loads secrets from `.env`, loads `BROWSER_JSON` from `./browser.json`, starts a disposable local `ytmusic-service` container, waits for its gRPC readiness, then starts a source-built `discord-voice-service` before running observer validation.";
 const OBSERVER_SECRET_CONTRACT: &str = "Protected live staging requires `OBSERVER_BOT_TOKEN` for the muted, non-deafened observer identity that validates receive-side audio.";
 const RECEIVE_SIDE_SUCCESS_CONTRACT: &str = "Live-staging success requires observer receive-side proof: authentic voice context, VoiceReady, Playing, natural TrackEnded, at least 120 observed packets, at least 3000 ms decoded audio, at least 1000 ms non-silent audio, and no reconnect/interruption/fatal error during validation.";
 const EVIDENCE_ARTIFACT_CONTRACT: &str = "Live-staging always uploads a structured observer evidence artifact summarizing observed packets, decoded audio, non-silent audio, and failure_reason.";
@@ -16,6 +16,8 @@ fn readme_publishes_the_hosted_live_staging_contract() {
     assert!(readme.contains("BROWSER_JSON"));
     assert!(readme.contains("OBSERVER_BOT_TOKEN"));
     assert!(readme.contains(LOCAL_LIVE_STAGING_CONTRACT));
+    assert!(readme.contains("YTMUSIC_SERVICE_IMAGE_REF"));
+    assert!(readme.contains("ghcr.io/ghfhffh12345/ytmusic-service:latest"));
     assert!(readme.contains(OBSERVER_SECRET_CONTRACT));
     assert!(readme.contains(RECEIVE_SIDE_SUCCESS_CONTRACT));
     assert!(readme.contains(EVIDENCE_ARTIFACT_CONTRACT));
