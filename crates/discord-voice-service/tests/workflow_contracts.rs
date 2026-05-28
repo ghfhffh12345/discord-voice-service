@@ -90,6 +90,7 @@ fn live_staging_workflow_uses_github_hosted_runner_and_secret_browser_json() {
     assert!(local_helper.find(build_service) < local_helper.find(source_env));
     assert!(local_helper.find(build_validator) < local_helper.find(source_env));
     assert!(local_helper.find(local_ytmusic_probe) < local_helper.find(source_env));
+    assert!(local_helper.find(source_env) < local_helper.find(local_ytmusic_image));
     assert!(local_helper.contains("env -i"));
     assert!(local_helper.contains("PATH=\"${PATH}\""));
     assert!(local_helper.contains(local_ytmusic_image));

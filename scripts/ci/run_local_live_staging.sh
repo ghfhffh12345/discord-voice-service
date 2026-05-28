@@ -7,7 +7,6 @@ browser_json_file="${repo_root}/browser.json"
 service_log="${RUNNER_TEMP:-/tmp}/discord-voice-service-local.log"
 network_name="${LOCAL_LIVE_STAGING_NETWORK_NAME:-discord-voice-local-live-staging}"
 ytmusic_container_name="${LOCAL_YTMUSIC_CONTAINER_NAME:-ytmusic-service-local-live-staging}"
-ytmusic_image_ref="${YTMUSIC_SERVICE_IMAGE_REF:-ghcr.io/ghfhffh12345/ytmusic-service:latest}"
 ytmusic_public_port="${LOCAL_YTMUSIC_SERVICE_PUBLIC_PORT:-50051}"
 ytmusic_admin_port="${LOCAL_YTMUSIC_SERVICE_ADMIN_PORT:-50052}"
 ytmusic_public_addr="${YTMUSIC_SERVICE_PUBLIC_ADDR:-0.0.0.0:50051}"
@@ -34,6 +33,7 @@ cargo build -p discord-voice-service --bin discord-voice-service
 cargo build -p discord-voice-service-live-validation --bin staging_live_check --bin ytmusic_ready_check
 
 source "${env_file}"
+ytmusic_image_ref="${YTMUSIC_SERVICE_IMAGE_REF:-ghcr.io/ghfhffh12345/ytmusic-service:latest}"
 cat "${browser_json_file}" >/dev/null
 if [[ ! -s "${browser_json_file}" ]]; then
   echo "browser.json at ${browser_json_file} was empty" >&2
