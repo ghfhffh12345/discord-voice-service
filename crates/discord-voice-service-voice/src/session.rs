@@ -42,7 +42,9 @@ pub struct ConnectedVoiceSession {
     dave_group_id: Option<u64>,
     dave_external_sender: Option<DaveExternalSender>,
     dave_recognized_user_ids: BTreeSet<String>,
+    completed_dave_transition_ids: BTreeSet<u16>,
     pending_dave_prepared_transitions: BTreeMap<u16, u16>,
+    pending_dave_local_commit_transition: Option<DaveRuntimeContext>,
     pending_dave_transition: Option<(u16, DaveRuntimeContext)>,
     dave_failed_closed: bool,
     heartbeat_shutdown: Option<oneshot::Sender<()>>,
@@ -63,7 +65,9 @@ impl ConnectedVoiceSession {
             dave_group_id: None,
             dave_external_sender: None,
             dave_recognized_user_ids: BTreeSet::from([user_id]),
+            completed_dave_transition_ids: BTreeSet::new(),
             pending_dave_prepared_transitions: BTreeMap::new(),
+            pending_dave_local_commit_transition: None,
             pending_dave_transition: None,
             dave_failed_closed: false,
             heartbeat_shutdown: None,
@@ -85,16 +89,29 @@ impl ConnectedVoiceSession {
         } = result;
         let transport =
             transport.with_protection(ProtectionContext::from_session(&session_description)?);
-        let (dave, dave_group_id, dave_external_sender, dave_recognized_user_ids) =
+        let (
+            dave,
+            dave_group_id,
+            dave_external_sender,
+            dave_recognized_user_ids,
+            completed_dave_transition_ids,
+        ) =
             if let Some(dave) = dave {
                 (
                     Some(dave.runtime),
                     Some(dave.group_id),
                     Some(dave.external_sender),
                     dave.recognized_user_ids,
+                    dave.completed_transition_ids,
                 )
             } else {
-                (None, None, None, BTreeSet::from([voice.user_id.clone()]))
+                (
+                    None,
+                    None,
+                    None,
+                    BTreeSet::from([voice.user_id.clone()]),
+                    BTreeSet::new(),
+                )
             };
 
         Ok(Self {
@@ -108,7 +125,9 @@ impl ConnectedVoiceSession {
             dave_group_id,
             dave_external_sender,
             dave_recognized_user_ids,
+            completed_dave_transition_ids,
             pending_dave_prepared_transitions: BTreeMap::new(),
+            pending_dave_local_commit_transition: None,
             pending_dave_transition: None,
             dave_failed_closed: false,
             heartbeat_shutdown: Some(heartbeat_shutdown),
@@ -130,6 +149,7 @@ impl ConnectedVoiceSession {
     pub fn dave_enabled(&self) -> bool {
         self.dave.is_some()
             || self.pending_dave_transition.is_some()
+            || self.pending_dave_local_commit_transition.is_some()
             || !self.pending_dave_prepared_transitions.is_empty()
             || self.dave_failed_closed
     }
@@ -178,11 +198,25 @@ impl ConnectedVoiceSession {
     }
 
     async fn process_pending_gateway_events(&mut self) -> Result<(), VoiceError> {
+        self.process_pending_gateway_events_with_initial_poll(DAVE_GATEWAY_IDLE_POLL)
+            .await
+    }
+
+    pub async fn wait_for_initial_dave_settle(&mut self) -> Result<(), VoiceError> {
+        self.process_pending_gateway_events_with_initial_poll(DAVE_GATEWAY_TRANSITION_POLL)
+            .await
+    }
+
+    async fn process_pending_gateway_events_with_initial_poll(
+        &mut self,
+        initial_wait: Duration,
+    ) -> Result<(), VoiceError> {
         if self.dave_failed_closed {
             return Err(VoiceError::InvalidState("voice dave session failed closed"));
         }
         if self.dave.is_none()
             && self.pending_dave_transition.is_none()
+            && self.pending_dave_local_commit_transition.is_none()
             && self.pending_dave_prepared_transitions.is_empty()
         {
             return Ok(());
@@ -196,12 +230,13 @@ impl ConnectedVoiceSession {
         let mut reached_drain_limit = true;
         for _ in 0..DAVE_GATEWAY_EVENT_DRAIN_LIMIT {
             let wait = if self.pending_dave_transition.is_some()
+                || self.pending_dave_local_commit_transition.is_some()
                 || !self.pending_dave_prepared_transitions.is_empty()
                 || drained_any_event
             {
                 DAVE_GATEWAY_TRANSITION_POLL
             } else {
-                DAVE_GATEWAY_IDLE_POLL
+                initial_wait
             };
             let payload = match timeout(wait, gateway.receive_event()).await {
                 Ok(Ok(payload)) => payload,
@@ -212,10 +247,17 @@ impl ConnectedVoiceSession {
                 }
             };
             drained_any_event = true;
-            if let Err(err) = self
-                .process_gateway_event_for_dave(&gateway, payload.into_event())
-                .await
-            {
+            let event = payload.into_event();
+            tracing::debug!(
+                event = dave_session_event_name(&event),
+                pending_prepared_transitions = self.pending_dave_prepared_transitions.len(),
+                has_pending_transition = self.pending_dave_transition.is_some(),
+                has_pending_local_commit_transition =
+                    self.pending_dave_local_commit_transition.is_some(),
+                recognized_user_ids = self.dave_recognized_user_ids.len(),
+                "voice dave session draining gateway event"
+            );
+            if let Err(err) = self.process_gateway_event_for_dave(&gateway, event).await {
                 return Err(self.fail_dave_closed(err));
             }
         }
@@ -227,6 +269,11 @@ impl ConnectedVoiceSession {
         }
         if self.pending_dave_transition.is_some() {
             return Err(VoiceError::InvalidState("voice dave transition pending"));
+        }
+        if self.pending_dave_local_commit_transition.is_some() {
+            return Err(VoiceError::InvalidState(
+                "voice dave local commit transition pending",
+            ));
         }
         if !self.pending_dave_prepared_transitions.is_empty() {
             return Err(VoiceError::InvalidState(
@@ -273,15 +320,27 @@ impl ConnectedVoiceSession {
                         "voice dave prepare epoch protocol version mismatch",
                     ));
                 }
-                self.pending_dave_prepared_transitions
-                    .insert(transition_id, protocol_version);
-                tracing::debug!(
-                    transition_id,
-                    group_id = ?self.dave_group_id,
-                    epoch = %epoch,
-                    protocol_version,
-                    "voice dave session prepared transition epoch"
-                );
+                if let Some(runtime) = self.pending_dave_local_commit_transition.take() {
+                    tracing::debug!(
+                        transition_id,
+                        group_id = ?self.dave_group_id,
+                        epoch = %epoch,
+                        protocol_version,
+                        "voice dave session prepared deferred local transition epoch"
+                    );
+                    self.ready_pending_transition(gateway, transition_id, runtime)
+                        .await?;
+                } else {
+                    self.pending_dave_prepared_transitions
+                        .insert(transition_id, protocol_version);
+                    tracing::debug!(
+                        transition_id,
+                        group_id = ?self.dave_group_id,
+                        epoch = %epoch,
+                        protocol_version,
+                        "voice dave session prepared transition epoch"
+                    );
+                }
             }
             VoiceGatewayEvent::DaveMlsPrepareCommitTransition(DaveMlsPrepareCommitTransition {
                 transition_id,
@@ -309,6 +368,7 @@ impl ConnectedVoiceSession {
                     Some((expected_transition_id, runtime))
                         if expected_transition_id == transition_id =>
                     {
+                        self.completed_dave_transition_ids.insert(transition_id);
                         self.dave = Some(runtime);
                         tracing::debug!(
                             transition_id,
@@ -345,7 +405,27 @@ impl ConnectedVoiceSession {
         transition_id: u16,
         commit: &[u8],
     ) -> Result<(), VoiceError> {
-        self.consume_prepared_transition(transition_id)?;
+        if self.completed_dave_transition_ids.contains(&transition_id)
+            && self.pending_dave_prepared_transitions.is_empty()
+        {
+            tracing::debug!(
+                transition_id,
+                "voice dave session ignoring duplicate commit transition already applied via welcome"
+            );
+            return Ok(());
+        }
+        match self.consume_prepared_transition(transition_id) {
+            Ok(_) => {}
+            Err(VoiceError::InvalidState("voice dave transition missing prepared epoch"))
+                if self.pending_dave_prepared_transitions.is_empty() =>
+            {
+                tracing::debug!(
+                    transition_id,
+                    "voice dave session accepting prepare commit transition without cached prepare epoch"
+                );
+            }
+            Err(err) => return Err(err),
+        }
         let mut runtime = self
             .dave
             .take()
@@ -400,7 +480,7 @@ impl ConnectedVoiceSession {
         operation: crate::dave::DaveMlsProposalsOperation,
         proposals: &[u8],
     ) -> Result<(), VoiceError> {
-        let transition_id = self.next_prepared_transition_id()?;
+        let transition_id = self.next_prepared_transition_id().ok();
         let mut runtime = self
             .dave
             .take()
@@ -440,9 +520,14 @@ impl ConnectedVoiceSession {
                 "voice dave local commit transition did not keep group",
             ));
         }
-        self.consume_prepared_transition(transition_id)?;
-        self.ready_pending_transition(gateway, transition_id, runtime)
-            .await
+        if let Some(transition_id) = transition_id {
+            self.consume_prepared_transition(transition_id)?;
+            self.ready_pending_transition(gateway, transition_id, runtime)
+                .await
+        } else {
+            self.pending_dave_local_commit_transition = Some(runtime);
+            Ok(())
+        }
     }
 
     async fn ready_pending_transition(
@@ -465,6 +550,7 @@ impl ConnectedVoiceSession {
         );
         self.dave = None;
         self.pending_dave_transition = None;
+        self.pending_dave_local_commit_transition = None;
         self.pending_dave_prepared_transitions.clear();
         self.dave_failed_closed = true;
         err
@@ -497,6 +583,11 @@ impl ConnectedVoiceSession {
                     .as_ref()
                     .map(|(_, runtime)| runtime.protocol_version)
             })
+            .or_else(|| {
+                self.pending_dave_local_commit_transition
+                    .as_ref()
+                    .map(|runtime| runtime.protocol_version)
+            })
             .ok_or(VoiceError::InvalidState("voice dave runtime unavailable"))
     }
 
@@ -516,6 +607,30 @@ impl ConnectedVoiceSession {
         }
         self.speaking_started = false;
         Ok(())
+    }
+}
+
+fn dave_session_event_name(event: &VoiceGatewayEvent) -> &'static str {
+    match event {
+        VoiceGatewayEvent::ClientsConnect(_) => "clients_connect",
+        VoiceGatewayEvent::ClientDisconnect(_) => "client_disconnect",
+        VoiceGatewayEvent::DavePrepareEpoch(_) => "dave_prepare_epoch",
+        VoiceGatewayEvent::DaveMlsPrepareCommitTransition(_) => "dave_mls_prepare_commit_transition",
+        VoiceGatewayEvent::DaveMlsWelcome(_) => "dave_mls_welcome",
+        VoiceGatewayEvent::DaveMlsProposals(_) => "dave_mls_proposals",
+        VoiceGatewayEvent::DaveExecuteTransition(_) => "dave_execute_transition",
+        VoiceGatewayEvent::Speaking(_) => "speaking",
+        VoiceGatewayEvent::HeartbeatAck(_) => "heartbeat_ack",
+        VoiceGatewayEvent::SessionDescription(_) => "session_description",
+        VoiceGatewayEvent::MediaSinkWants => "media_sink_wants",
+        VoiceGatewayEvent::ClientFlags(_) => "client_flags",
+        VoiceGatewayEvent::ClientPlatform(_) => "client_platform",
+        VoiceGatewayEvent::DavePrepareTransition(_) => "dave_prepare_transition",
+        VoiceGatewayEvent::Video(_) => "video",
+        VoiceGatewayEvent::Ready(_) => "ready",
+        VoiceGatewayEvent::Resumed => "resumed",
+        VoiceGatewayEvent::Hello(_) => "hello",
+        VoiceGatewayEvent::DaveMlsExternalSenderPackage(_) => "dave_mls_external_sender_package",
     }
 }
 
@@ -675,7 +790,9 @@ mod tests {
             dave_group_id: None,
             dave_external_sender: None,
             dave_recognized_user_ids: BTreeSet::from(["user-1".to_owned()]),
+            completed_dave_transition_ids: BTreeSet::new(),
             pending_dave_prepared_transitions: BTreeMap::new(),
+            pending_dave_local_commit_transition: None,
             pending_dave_transition: None,
             dave_failed_closed: false,
             heartbeat_shutdown: None,
