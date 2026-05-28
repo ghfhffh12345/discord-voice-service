@@ -3,5 +3,3 @@
 Use Serena for project context and Context7 for library/docs context.
 Treat `browser.json` and `.env` as a secret. It is ignored by git and must not appear with real values in examples, logs, fixtures, or commits.
 Use $conventional-commit for all Git commit messages.
-Do not change the Git commit author when committing; use the existing Git author configuration.
-Do not begin implementation automatically after `$deep-interview` ends.
