@@ -33,7 +33,6 @@ const DAVE_UNMATCHED_TRANSITION_ID: u16 = 9;
 enum DaveScenario {
     Disabled,
     NewGroup,
-    NewGroupWithoutPreAnnouncedCreator,
     NewGroupWithNoOpRevokeBeforeProposals,
     NewGroupSelfOnlyNoProposals,
     NewGroupRequiresInitTransitionReadyBeforePrepareCommitTransition,
@@ -73,10 +72,6 @@ enum FakeDiscordControl {
         prelude_speaking_events: usize,
         response: oneshot::Sender<Result<(), VoiceError>>,
     },
-    InjectLateDaveListenerTransitionWithDelayedPrepareEpoch {
-        late_user_id: String,
-        response: oneshot::Sender<Result<(), VoiceError>>,
-    },
     InjectLateDavePrepareEpochOnly {
         response: oneshot::Sender<Result<(), VoiceError>>,
     },
@@ -84,10 +79,6 @@ enum FakeDiscordControl {
         response: oneshot::Sender<Result<(), VoiceError>>,
     },
     ReplayEstablishedJoinCommitTransition {
-        response: oneshot::Sender<Result<(), VoiceError>>,
-    },
-    InjectValidLateDavePrepareCommitWithoutPrepareEpoch {
-        late_user_id: String,
         response: oneshot::Sender<Result<(), VoiceError>>,
     },
 }
@@ -229,18 +220,6 @@ impl FakeDiscordPeer {
         Self::spawn_with_options_and_ready_delay(
             1_000,
             DaveScenario::NewGroup,
-            Duration::ZERO,
-            Duration::ZERO,
-            vec![],
-        )
-        .await
-    }
-
-    #[allow(clippy::result_large_err)]
-    pub async fn spawn_with_dave_without_pre_announced_creator() -> Self {
-        Self::spawn_with_options_and_ready_delay(
-            1_000,
-            DaveScenario::NewGroupWithoutPreAnnouncedCreator,
             Duration::ZERO,
             Duration::ZERO,
             vec![],
@@ -689,89 +668,6 @@ impl FakeDiscordPeer {
                                 .await;
                                 let _ = response.send(result);
                             }
-                            FakeDiscordControl::InjectLateDaveListenerTransitionWithDelayedPrepareEpoch {
-                                late_user_id,
-                                response,
-                            } => {
-                                let result = async {
-                                    let external_sender = dave_external_sender
-                                        .as_ref()
-                                        .ok_or(VoiceError::InvalidState("fake dave external sender unavailable"))?;
-                                    let external_sender_bytes = external_sender
-                                        .marshalled_external_sender()
-                                        .map_err(|_| VoiceError::InvalidState("fake dave external sender marshal failed"))?;
-                                    if dave_creator.is_none() {
-                                        return Err(VoiceError::InvalidState(
-                                            "fake dave creator unavailable",
-                                        ));
-                                    }
-                                    let runtime_user_id = identified_user_id_state
-                                        .lock()
-                                        .await
-                                        .clone()
-                                        .ok_or(VoiceError::InvalidState("fake runtime user id unavailable"))?;
-                                    let group_id = group_id_from_user_context(
-                                        &runtime_user_id,
-                                        &dave_group_id_state,
-                                    );
-                                    let mut late_member =
-                                        DaveSession::new(None).map_err(|_| VoiceError::InvalidState("fake late dave session create failed"))?;
-                                    late_member
-                                        .set_external_sender(&external_sender_bytes)
-                                        .map_err(|_| VoiceError::InvalidState("fake late dave external sender invalid"))?;
-                                    late_member
-                                        .init(
-                                            DAVE_PROTOCOL_VERSION,
-                                            group_id,
-                                            &late_user_id,
-                                        )
-                                        .map_err(|_| VoiceError::InvalidState("fake late dave session init failed"))?;
-                                    let late_key_package = late_member
-                                        .key_package()
-                                        .map_err(|_| VoiceError::InvalidState("fake late dave key package failed"))?;
-                                    let proposal = external_sender
-                                        .propose_add(2, &late_key_package)
-                                        .map_err(|_| VoiceError::InvalidState("fake late dave proposal failed"))?;
-                                    pending_late_member = Some(late_member);
-                                    pending_late_user_id = Some(late_user_id.clone());
-                                    ws.send(Message::Text(
-                                        json!({
-                                            "op": 11,
-                                            "seq": 10,
-                                            "d": {
-                                                "user_ids": [late_user_id],
-                                            }
-                                        })
-                                        .to_string()
-                                        .into(),
-                                    ))
-                                    .await
-                                    .map_err(|_| VoiceError::InvalidState("fake gateway send failed"))?;
-                                    ws.send(Message::Binary(Bytes::from(
-                                        dave_proposals_message(12, &proposal),
-                                    )))
-                                    .await
-                                    .map_err(|_| VoiceError::InvalidState("fake gateway send failed"))?;
-                                    ws.send(Message::Text(
-                                        json!({
-                                            "op": 24,
-                                            "seq": 11,
-                                            "d": {
-                                                "transition_id": DAVE_LATE_TRANSITION_ID,
-                                                "epoch": "2",
-                                                "protocol_version": DAVE_PROTOCOL_VERSION,
-                                            }
-                                        })
-                                        .to_string()
-                                        .into(),
-                                    ))
-                                    .await
-                                    .map_err(|_| VoiceError::InvalidState("fake gateway send failed"))?;
-                                    Ok(())
-                                }
-                                .await;
-                                let _ = response.send(result);
-                            }
                             FakeDiscordControl::InjectLateDavePrepareEpochOnly { response } => {
                                 let result = async {
                                     ws.send(Message::Text(
@@ -840,69 +736,6 @@ impl FakeDiscordPeer {
                                         dave_prepare_commit_transition_message(
                                             12,
                                             DAVE_TRANSITION_ID,
-                                            &commit,
-                                        ),
-                                    )))
-                                    .await
-                                    .map_err(|_| VoiceError::InvalidState("fake gateway send failed"))?;
-                                    Ok(())
-                                }
-                                .await;
-                                let _ = response.send(result);
-                            }
-                            FakeDiscordControl::InjectValidLateDavePrepareCommitWithoutPrepareEpoch {
-                                late_user_id,
-                                response,
-                            } => {
-                                let result = async {
-                                    let external_sender = dave_external_sender
-                                        .as_ref()
-                                        .ok_or(VoiceError::InvalidState("fake dave external sender unavailable"))?;
-                                    let creator = dave_creator
-                                        .as_mut()
-                                        .ok_or(VoiceError::InvalidState("fake dave creator session missing"))?;
-                                    let runtime_user_id = identified_user_id_state
-                                        .lock()
-                                        .await
-                                        .clone()
-                                        .ok_or(VoiceError::InvalidState("fake runtime user id unavailable"))?;
-                                    let group_id = group_id_from_user_context(
-                                        &runtime_user_id,
-                                        &dave_group_id_state,
-                                    );
-                                    let external_sender_bytes = external_sender
-                                        .marshalled_external_sender()
-                                        .map_err(|_| VoiceError::InvalidState("fake dave external sender marshal failed"))?;
-                                    let mut late_member = DaveSession::new(None)
-                                        .map_err(|_| VoiceError::InvalidState("fake late dave session create failed"))?;
-                                    late_member
-                                        .set_external_sender(&external_sender_bytes)
-                                        .map_err(|_| VoiceError::InvalidState("fake late dave external sender invalid"))?;
-                                    late_member
-                                        .init(DAVE_PROTOCOL_VERSION, group_id, &late_user_id)
-                                        .map_err(|_| VoiceError::InvalidState("fake late dave session init failed"))?;
-                                    let late_key_package = late_member
-                                        .key_package()
-                                        .map_err(|_| VoiceError::InvalidState("fake late dave key package failed"))?;
-                                    let proposal = external_sender
-                                        .propose_add(2, &late_key_package)
-                                        .map_err(|_| VoiceError::InvalidState("fake late dave proposal failed"))?;
-                                    let recognized_user_ids = [
-                                        DAVE_CREATOR_USER_ID,
-                                        DAVE_EXISTING_MEMBER_USER_ID,
-                                        runtime_user_id.as_str(),
-                                        late_user_id.as_str(),
-                                    ];
-                                    let commit_welcome = creator
-                                        .process_proposals(&proposal, &recognized_user_ids)
-                                        .map_err(|_| VoiceError::InvalidState("fake creator process proposals failed"))?;
-                                    let (commit, _welcome) = external_sender
-                                        .split_commit_welcome(&commit_welcome)
-                                        .map_err(|_| VoiceError::InvalidState("fake split commit/welcome failed"))?;
-                                    ws.send(Message::Binary(Bytes::from(
-                                        dave_prepare_commit_transition_message(
-                                            12,
-                                            DAVE_LATE_TRANSITION_ID,
                                             &commit,
                                         ),
                                     )))
@@ -1055,7 +888,6 @@ impl FakeDiscordPeer {
                                 let announced_user_ids = match dave_scenario {
                                     DaveScenario::Disabled => Vec::new(),
                                     DaveScenario::NewGroupSelfOnlyNoProposals => Vec::new(),
-                                    DaveScenario::NewGroupWithoutPreAnnouncedCreator => Vec::new(),
                                     DaveScenario::NewGroup
                                     | DaveScenario::NewGroupWithNoOpRevokeBeforeProposals
                                     | DaveScenario::NewGroupRequiresInitTransitionReadyBeforePrepareCommitTransition
@@ -1153,7 +985,6 @@ impl FakeDiscordPeer {
                                     && !matches!(
                                         dave_scenario,
                                         DaveScenario::NewGroup
-                                            | DaveScenario::NewGroupWithoutPreAnnouncedCreator
                                             | DaveScenario::NewGroupWithNoOpRevokeBeforeProposals
                                             | DaveScenario::NewGroupSelfOnlyNoProposals
                                             | DaveScenario::NewGroupRequiresInitTransitionReadyBeforePrepareCommitTransition
@@ -1162,7 +993,6 @@ impl FakeDiscordPeer {
                                     let transition_id = if matches!(
                                         dave_scenario,
                                         DaveScenario::NewGroup
-                                            | DaveScenario::NewGroupWithoutPreAnnouncedCreator
                                             | DaveScenario::NewGroupWithNoOpRevokeBeforeProposals
                                             | DaveScenario::NewGroupRequiresInitTransitionReadyBeforePrepareCommitTransition
                                     ) {
@@ -1340,7 +1170,6 @@ impl FakeDiscordPeer {
                                 && matches!(
                                     dave_scenario,
                                     DaveScenario::NewGroup
-                                        | DaveScenario::NewGroupWithoutPreAnnouncedCreator
                                         | DaveScenario::NewGroupSelfOnlyNoProposals
                                         | DaveScenario::NewGroupWithNoOpRevokeBeforeProposals
                                         | DaveScenario::NewGroupRequiresInitTransitionReadyBeforePrepareCommitTransition
@@ -1398,7 +1227,6 @@ impl FakeDiscordPeer {
 
                             let transition_id = match dave_scenario {
                                 DaveScenario::NewGroup
-                                | DaveScenario::NewGroupWithoutPreAnnouncedCreator
                                 | DaveScenario::NewGroupSelfOnlyNoProposals
                                 | DaveScenario::NewGroupWithNoOpRevokeBeforeProposals
                                 | DaveScenario::NewGroupRequiresInitTransitionReadyBeforePrepareCommitTransition
@@ -1416,7 +1244,6 @@ impl FakeDiscordPeer {
                             } else if matches!(
                                 dave_scenario,
                                 DaveScenario::NewGroup
-                                    | DaveScenario::NewGroupWithoutPreAnnouncedCreator
                                     | DaveScenario::NewGroupWithNoOpRevokeBeforeProposals
                                     | DaveScenario::NewGroupRequiresInitTransitionReadyBeforePrepareCommitTransition
                                     | DaveScenario::NewGroupCommitBeforePrepareEpoch
@@ -1444,23 +1271,6 @@ impl FakeDiscordPeer {
                                 ws.send(Message::Binary(Bytes::from(proposal_message)))
                                     .await
                                     .unwrap();
-                                if dave_scenario
-                                    == DaveScenario::NewGroupWithoutPreAnnouncedCreator
-                                {
-                                    ws.send(Message::Text(
-                                        json!({
-                                            "op": 11,
-                                            "seq": 5,
-                                            "d": {
-                                                "user_ids": [DAVE_CREATOR_USER_ID],
-                                            }
-                                        })
-                                        .to_string()
-                                        .into(),
-                                    ))
-                                    .await
-                                    .unwrap();
-                                }
                                 if delayed_prepare_epoch_after_proposals {
                                     ws.send(Message::Text(
                                         json!({
@@ -1819,48 +1629,12 @@ impl FakeDiscordPeer {
             .map_err(|_| VoiceError::InvalidState("fake dave control closed"))?
     }
 
-    pub async fn inject_late_dave_listener_transition_with_delayed_prepare_epoch(
-        &self,
-        late_user_id: &str,
-    ) -> Result<(), VoiceError> {
-        let (response_tx, response_rx) = oneshot::channel();
-        self.control_messages
-            .send(
-                FakeDiscordControl::InjectLateDaveListenerTransitionWithDelayedPrepareEpoch {
-                    late_user_id: late_user_id.to_owned(),
-                    response: response_tx,
-                },
-            )
-            .map_err(|_| VoiceError::InvalidState("fake dave control send failed"))?;
-        response_rx
-            .await
-            .map_err(|_| VoiceError::InvalidState("fake dave control closed"))?
-    }
-
     pub async fn inject_invalid_late_dave_prepare_commit(&self) -> Result<(), VoiceError> {
         let (response_tx, response_rx) = oneshot::channel();
         self.control_messages
             .send(FakeDiscordControl::InjectInvalidLateDavePrepareCommit {
                 response: response_tx,
             })
-            .map_err(|_| VoiceError::InvalidState("fake dave control send failed"))?;
-        response_rx
-            .await
-            .map_err(|_| VoiceError::InvalidState("fake dave control closed"))?
-    }
-
-    pub async fn inject_valid_late_dave_prepare_commit_without_prepare_epoch(
-        &self,
-        late_user_id: &str,
-    ) -> Result<(), VoiceError> {
-        let (response_tx, response_rx) = oneshot::channel();
-        self.control_messages
-            .send(
-                FakeDiscordControl::InjectValidLateDavePrepareCommitWithoutPrepareEpoch {
-                    late_user_id: late_user_id.to_owned(),
-                    response: response_tx,
-                },
-            )
             .map_err(|_| VoiceError::InvalidState("fake dave control send failed"))?;
         response_rx
             .await
@@ -2097,7 +1871,6 @@ fn dave_welcome_message(
     let proposal_epoch = match dave_scenario {
         DaveScenario::Disabled => unreachable!("disabled DAVE scenario cannot emit welcome"),
         DaveScenario::NewGroup
-        | DaveScenario::NewGroupWithoutPreAnnouncedCreator
         | DaveScenario::NewGroupWithNoOpRevokeBeforeProposals
         | DaveScenario::NewGroupSelfOnlyNoProposals
         | DaveScenario::NewGroupRequiresInitTransitionReadyBeforePrepareCommitTransition
@@ -2114,7 +1887,6 @@ fn dave_welcome_message(
     let recognized_user_ids = match dave_scenario {
         DaveScenario::Disabled => unreachable!("disabled DAVE scenario cannot emit welcome"),
         DaveScenario::NewGroup
-        | DaveScenario::NewGroupWithoutPreAnnouncedCreator
         | DaveScenario::NewGroupWithNoOpRevokeBeforeProposals
         | DaveScenario::NewGroupSelfOnlyNoProposals
         | DaveScenario::NewGroupRequiresInitTransitionReadyBeforePrepareCommitTransition
