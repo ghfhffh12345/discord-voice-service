@@ -98,7 +98,7 @@ fn live_staging_workflow_uses_github_hosted_runner_and_secret_browser_json() {
     assert!(local_helper.contains(local_ytmusic_run));
     assert!(local_helper.contains("wait_for_ytmusic_grpc()"));
     assert!(local_helper.contains("\"${runtime_env[@]}\" \"${ytmusic_probe_binary}\" \"${endpoint}\" >/dev/null 2>&1"));
-    assert!(local_helper.contains("Timed out waiting for ytmusic-service gRPC readiness from DISCORD_VOICE_SERVICE_YTMUSIC_ADDR"));
+    assert!(local_helper.contains("Timed out waiting for helper-managed ytmusic-service gRPC readiness at ${endpoint}"));
     assert!(local_helper.contains(local_wait_for_ytmusic));
     assert!(local_helper.find(local_wait_for_ytmusic) < local_helper.find(local_service_start));
     assert!(local_helper.contains(local_service_start));
