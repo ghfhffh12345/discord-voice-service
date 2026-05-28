@@ -118,6 +118,7 @@ fn live_staging_workflow_uses_github_hosted_runner_and_secret_browser_json() {
     assert!(local_helper.contains("TEST_VOICE_CHANNEL_ID=\"${test_voice_channel_id}\""));
     assert!(local_helper.contains("TEST_VIDEO_ID=\"${test_video_id}\""));
     assert!(local_helper.contains("DISCORD_VOICE_SERVICE_URI=\"${service_uri}\""));
+    assert!(local_helper.contains("LIVE_VALIDATION_EVIDENCE_PATH=\"${validation_evidence_path}\""));
     assert!(
         local_helper.contains(
             "cargo run -p discord-voice-service-live-validation --bin staging_live_check"

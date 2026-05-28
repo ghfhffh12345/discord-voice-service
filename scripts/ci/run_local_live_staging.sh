@@ -163,6 +163,7 @@ while [[ "${attempt}" -lt 30 ]]; do
     TEST_VIDEO_ID="${test_video_id}" \
     DISCORD_VOICE_SERVICE_URI="${service_uri}" \
     DISCORD_VOICE_SERVICE_YTMUSIC_ADDR="${service_ytmusic_addr}" \
+    LIVE_VALIDATION_EVIDENCE_PATH="${validation_evidence_path}" \
     cargo run -p discord-voice-service-live-validation --bin staging_live_check > /dev/null 2>"${controller_log}"
     exit 0
   fi
