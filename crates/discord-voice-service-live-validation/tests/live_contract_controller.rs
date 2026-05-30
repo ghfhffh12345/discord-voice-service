@@ -290,28 +290,32 @@ fn success_evidence_waits_for_cleanup_success() {
 
 #[tokio::test]
 async fn orchestration_returns_when_play_and_live_contract_succeed() {
-    let (play_tx, play_rx) = oneshot::channel::<Result<()>>();
     let (contract_tx, contract_rx) = oneshot::channel::<Result<LiveContractState>>();
 
-    let mut orchestration = tokio::spawn(wait_for_play_and_live_contract(
+    let orchestration = tokio::spawn(wait_for_play_and_live_contract(
         async move { contract_rx.await.expect("contract sender should complete") },
-        async move { play_rx.await.expect("play sender should complete") },
+        async move {
+            tokio::time::sleep(TokioDuration::from_secs(1)).await;
+            Ok(())
+        },
     ));
 
     contract_tx
-        .send(Ok(LiveContractState::default()))
+        .send(Ok(LiveContractState {
+            saw_voice_ready: true,
+            saw_playing: true,
+            saw_track_ended: false,
+        }))
         .expect("contract result should be sent");
 
-    assert!(
-        timeout(TokioDuration::from_millis(25), &mut orchestration)
-            .await
-            .is_err(),
-        "orchestration should keep waiting for play completion",
-    );
-
-    play_tx.send(Ok(())).expect("play result should be sent");
-
-    orchestration.await.unwrap().unwrap();
+    let state = timeout(TokioDuration::from_millis(25), orchestration)
+        .await
+        .expect("orchestration should now return once proof succeeds")
+        .unwrap()
+        .unwrap();
+    assert!(state.saw_voice_ready);
+    assert!(state.saw_playing);
+    assert!(!state.saw_track_ended);
 }
 
 #[tokio::test]

@@ -2,6 +2,7 @@ target
 .git
 .env
 .env.*
+browser.json
 .worktrees
 .serena
 .idea

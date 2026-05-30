@@ -129,10 +129,14 @@ impl DaveSession {
         proposals: &[u8],
         recognized_user_ids: &[&str],
     ) -> Result<Option<Vec<u8>>, DaveError> {
-        let recognized_user_ids = parse_user_ids(recognized_user_ids)?;
+        let expected_user_ids = if recognized_user_ids.len() <= 1 {
+            None
+        } else {
+            Some(parse_user_ids(recognized_user_ids)?)
+        };
         let commit_welcome = self
             .inner_mut()?
-            .process_proposals(operation.into(), proposals, Some(&recognized_user_ids))
+            .process_proposals(operation.into(), proposals, expected_user_ids.as_deref())
             .map_err(|err| DaveError::operation("process proposals", err))?;
         match (operation, commit_welcome) {
             (DaveMlsProposalsOperation::Revoke, None) => Ok(None),
@@ -315,10 +319,14 @@ impl DaveRuntimeContext {
         proposals: &[u8],
         recognized_user_ids: &[&str],
     ) -> Result<Option<Vec<u8>>, DaveError> {
-        let recognized_user_ids = parse_user_ids(recognized_user_ids)?;
+        let expected_user_ids = if recognized_user_ids.len() <= 1 {
+            None
+        } else {
+            Some(parse_user_ids(recognized_user_ids)?)
+        };
         let commit_welcome = self
             .session
-            .process_proposals(operation.into(), proposals, Some(&recognized_user_ids))
+            .process_proposals(operation.into(), proposals, expected_user_ids.as_deref())
             .map_err(|err| DaveError::operation("process proposals", err))?;
         match (operation, commit_welcome) {
             (DaveMlsProposalsOperation::Revoke, None) => Ok(None),

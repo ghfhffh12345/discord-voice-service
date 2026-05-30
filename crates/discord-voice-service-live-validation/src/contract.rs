@@ -8,6 +8,7 @@ use discord_voice_service_proto::discordvoice::v1::{SessionEvent, SessionEventKi
 pub struct LiveContractState {
     pub saw_voice_ready: bool,
     pub saw_playing: bool,
+    pub saw_track_ended: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -83,6 +84,7 @@ impl LiveContractState {
                     anyhow::bail!("TrackEnded observed before Playing");
                 }
                 validate_expected_video_id(&event, expected_video_id, kind)?;
+                self.saw_track_ended = true;
 
                 return Ok(true);
             }

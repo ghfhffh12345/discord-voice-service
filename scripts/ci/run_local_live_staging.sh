@@ -66,6 +66,12 @@ fi
 if [[ -n "${RUSTUP_HOME:-}" ]]; then
   runtime_env+=(RUSTUP_HOME="${RUSTUP_HOME}")
 fi
+if [[ -n "${RUST_LOG:-}" ]]; then
+  runtime_env+=(RUST_LOG="${RUST_LOG}")
+fi
+if [[ -n "${RUST_BACKTRACE:-}" ]]; then
+  runtime_env+=(RUST_BACKTRACE="${RUST_BACKTRACE}")
+fi
 
 wait_for_ytmusic_grpc() {
   local endpoint="$1"
@@ -164,7 +170,7 @@ while [[ "${attempt}" -lt 30 ]]; do
     DISCORD_VOICE_SERVICE_URI="${service_uri}" \
     DISCORD_VOICE_SERVICE_YTMUSIC_ADDR="${service_ytmusic_addr}" \
     LIVE_VALIDATION_EVIDENCE_PATH="${validation_evidence_path}" \
-    cargo run -p discord-voice-service-live-validation --bin staging_live_check > /dev/null 2>"${controller_log}"
+    cargo run -p discord-voice-service-live-validation --bin staging_live_check >"${controller_log}" 2>&1
     exit 0
   fi
   attempt=$((attempt + 1))

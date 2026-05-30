@@ -98,6 +98,74 @@ fn dave_session_surfaces_mls_failure_callback_diagnostics() {
 }
 
 #[test]
+fn dave_self_only_group_accepts_late_member_append_proposal() {
+    const GROUP_ID: u64 = 1_234_567_890;
+    const PROTOCOL_VERSION: u16 = 1;
+    const CREATOR_USER_ID: &str = "1234123412341234";
+    const LATE_USER_ID: &str = "5678567856785678";
+
+    let external_sender = DaveExternalSender::new(GROUP_ID).expect("external sender");
+    let external_sender_bytes = external_sender
+        .marshalled_external_sender()
+        .expect("external sender bytes");
+
+    let mut creator = DaveSession::new(None).expect("creator session");
+    creator
+        .set_external_sender(&external_sender_bytes)
+        .expect("creator external sender");
+    creator
+        .init(PROTOCOL_VERSION, GROUP_ID, CREATOR_USER_ID)
+        .expect("creator init");
+
+    let self_only_commit_welcome = creator
+        .process_proposals(&[0], &[CREATOR_USER_ID])
+        .expect("self-only proposals");
+    let (self_only_commit, _self_only_welcome) = external_sender
+        .split_commit_welcome(&self_only_commit_welcome)
+        .expect("split self-only commit/welcome");
+    creator
+        .process_commit(&self_only_commit)
+        .expect("process self-only commit");
+
+    let mut late_member = DaveSession::new(None).expect("late member session");
+    late_member
+        .set_external_sender(&external_sender_bytes)
+        .expect("late external sender");
+    late_member
+        .init(PROTOCOL_VERSION, GROUP_ID, LATE_USER_ID)
+        .expect("late init");
+    let key_package = late_member.key_package().expect("late key package");
+    let proposal = external_sender
+        .propose_add(0, &key_package)
+        .expect("late add proposal");
+    let recognized_user_ids = [CREATOR_USER_ID, LATE_USER_ID];
+    let mut gateway_epoch_creator = DaveSession::new(None).expect("gateway epoch creator session");
+    gateway_epoch_creator
+        .set_external_sender(&external_sender_bytes)
+        .expect("gateway epoch creator external sender");
+    gateway_epoch_creator
+        .init(PROTOCOL_VERSION, GROUP_ID, CREATOR_USER_ID)
+        .expect("gateway epoch creator init");
+    let commit_welcome = gateway_epoch_creator
+        .process_proposals(&proposal, &recognized_user_ids)
+        .expect("creator process late proposal");
+    let (commit, welcome) = external_sender
+        .split_commit_welcome(&commit_welcome)
+        .expect("split late commit/welcome");
+    let commit_result = gateway_epoch_creator
+        .process_commit(&commit)
+        .expect("creator commit late");
+    let welcome_result = late_member
+        .process_welcome(&welcome, &recognized_user_ids)
+        .expect("late welcome");
+
+    assert_eq!(
+        commit_result.roster_member_ids(),
+        welcome_result.roster_member_ids()
+    );
+}
+
+#[test]
 fn dave_runtime_context_builds_send_side_encrypt_state_from_welcomed_session() {
     const GROUP_ID: u64 = 1_234_567_890;
     const PROTOCOL_VERSION: u16 = 1;

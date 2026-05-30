@@ -57,8 +57,8 @@ fn env_example_mentions_required_addresses() {
     let env_file = std::fs::read_to_string("../../.env.example").expect("env example");
     assert!(env_file.contains("DISCORD_VOICE_SERVICE_BIND_ADDR="));
     assert!(env_file.contains("DISCORD_VOICE_SERVICE_YTMUSIC_ADDR="));
-    assert!(env_file.contains(
-        "YTMUSIC_SERVICE_IMAGE_REF=ghcr.io/ghfhffh12345/ytmusic-service:latest"
-    ));
+    assert!(
+        env_file.contains("YTMUSIC_SERVICE_IMAGE_REF=ghcr.io/ghfhffh12345/ytmusic-service:latest")
+    );
     assert!(!env_file.contains("DISCORD_VOICE_SERVICE_ADDR="));
 }

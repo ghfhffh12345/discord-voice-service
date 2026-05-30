@@ -6,13 +6,13 @@ use tokio::net::lookup_host;
 use tokio::sync::oneshot;
 use tokio::time::{Duration, Instant, sleep, timeout};
 
-use crate::dave::{DaveExternalSender, DaveRuntimeContext, DaveSession};
+use crate::dave::{DaveExternalSender, DaveRuntimeContext, DaveSession, unpack_commit_welcome};
 use crate::error::VoiceError;
 use crate::gateway::VoiceGatewayClient;
 use crate::protocol::{
-    self, ClientsConnect, DaveExecuteTransition, DaveMlsExternalSenderPackage,
+    self, ClientDisconnect, ClientsConnect, DaveExecuteTransition, DaveMlsExternalSenderPackage,
     DaveMlsPrepareCommitTransition, DaveMlsProposals, DaveMlsWelcome, DavePrepareEpoch, Hello,
-    Ready, SessionDescription, VoiceGatewayEvent,
+    Ready, SessionDescription, Speaking, VoiceGatewayEvent,
 };
 use crate::session::VoiceContext;
 use crate::udp::{DiscoveredUdpAddress, VoiceUdpTransport};
@@ -20,7 +20,7 @@ use crate::udp::{DiscoveredUdpAddress, VoiceUdpTransport};
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const POST_HELLO_TIMEOUT_FLOOR: Duration = Duration::from_secs(30);
 const DAVE_PROTOCOL_INIT_TRANSITION_ID: u16 = 0;
-const SELF_ONLY_INITIAL_GROUP_GRACE: Duration = Duration::from_millis(250);
+const SELF_ONLY_INITIAL_GROUP_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PendingHandshakeTransitionSource {
@@ -34,6 +34,17 @@ struct PendingHandshakeTransition {
     source: PendingHandshakeTransitionSource,
 }
 
+struct VoiceBootstrap {
+    gateway: VoiceGatewayClient,
+    transport: VoiceUdpTransport,
+    ssrc: u32,
+    heartbeat_shutdown: oneshot::Sender<()>,
+    session_description: SessionDescription,
+    pre_session_recognized_user_ids: BTreeSet<String>,
+    pre_session_saw_existing_speaker: bool,
+    dave_timeout: Duration,
+}
+
 pub struct VoiceHandshakeResult {
     pub gateway: VoiceGatewayClient,
     pub transport: VoiceUdpTransport,
@@ -43,15 +54,143 @@ pub struct VoiceHandshakeResult {
     pub dave: Option<InitialDaveState>,
 }
 
-pub struct InitialDaveState {
+pub struct PendingObserverHandshakeResult {
+    pub gateway: VoiceGatewayClient,
+    pub transport: VoiceUdpTransport,
+    pub ssrc: u32,
+    pub heartbeat_shutdown: oneshot::Sender<()>,
+    pub session_description: SessionDescription,
+    pub dave_timeout: Duration,
+    pub dave: Option<PendingObserverDaveState>,
+}
+
+pub struct PendingObserverDaveState {
+    pub session: Option<DaveSession>,
+    pub recognized_user_ids: BTreeSet<String>,
+    pub pending_prepared_transitions: BTreeMap<u16, u16>,
+    pub pending_key_package: bool,
+    pending_gateway_winner_after_local_proposals_commit: bool,
+    pending_proposals_replay_start: usize,
+    pending_proposals: Vec<(crate::dave::DaveMlsProposalsOperation, Vec<u8>)>,
+    gateway_updates: Vec<PendingObserverGatewayUpdate>,
+    saw_existing_speaker: bool,
+}
+
+pub(crate) enum PendingObserverGatewayUpdate {
+    Speaking { user_id: String, ssrc: u32 },
+    ClientDisconnect { user_id: String },
+}
+
+pub(crate) struct PendingObserverReadyResult {
     pub runtime: DaveRuntimeContext,
+    pub gateway_updates: Vec<PendingObserverGatewayUpdate>,
+    pub recognized_user_ids: BTreeSet<String>,
+}
+
+pub struct InitialDaveState {
+    pub runtime: Option<DaveRuntimeContext>,
+    pub pending_initial_session: Option<DaveSession>,
     pub group_id: u64,
+    pub protocol_version: u16,
     pub external_sender: DaveExternalSender,
+    pub external_sender_bytes: Vec<u8>,
     pub recognized_user_ids: BTreeSet<String>,
     pub completed_welcome_backed_transition_ids: BTreeSet<u16>,
+    pub completed_local_init_commit_transition_ids: BTreeSet<u16>,
 }
 
 pub async fn connect(voice: &VoiceContext) -> Result<Option<VoiceHandshakeResult>, VoiceError> {
+    connect_active_participant(voice).await
+}
+
+pub async fn connect_active_participant(
+    voice: &VoiceContext,
+) -> Result<Option<VoiceHandshakeResult>, VoiceError> {
+    let Some(bootstrap) = bootstrap_voice_connection(voice).await? else {
+        return Ok(None);
+    };
+    let VoiceBootstrap {
+        gateway,
+        transport,
+        ssrc,
+        heartbeat_shutdown,
+        session_description,
+        pre_session_recognized_user_ids,
+        pre_session_saw_existing_speaker: _,
+        dave_timeout,
+    } = bootstrap;
+    let dave = if let Some(protocol_version) = session_description.dave_protocol_version {
+        Some(
+            complete_active_dave_transition(
+                &gateway,
+                voice,
+                ssrc,
+                protocol_version,
+                dave_timeout,
+                pre_session_recognized_user_ids,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
+    Ok(Some(VoiceHandshakeResult {
+        gateway,
+        transport,
+        ssrc,
+        heartbeat_shutdown,
+        session_description,
+        dave,
+    }))
+}
+
+pub async fn connect_observer_participant(
+    voice: &VoiceContext,
+) -> Result<Option<PendingObserverHandshakeResult>, VoiceError> {
+    let Some(bootstrap) = bootstrap_voice_connection(voice).await? else {
+        return Ok(None);
+    };
+    let VoiceBootstrap {
+        gateway,
+        transport,
+        ssrc,
+        heartbeat_shutdown,
+        session_description,
+        pre_session_recognized_user_ids,
+        pre_session_saw_existing_speaker,
+        dave_timeout,
+    } = bootstrap;
+    let dave = if let Some(protocol_version) = session_description.dave_protocol_version {
+        Some(
+            start_pending_observer_dave_join(
+                &gateway,
+                voice,
+                ssrc,
+                protocol_version,
+                pre_session_recognized_user_ids,
+                pre_session_saw_existing_speaker,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
+    Ok(Some(PendingObserverHandshakeResult {
+        gateway,
+        transport,
+        ssrc,
+        heartbeat_shutdown,
+        session_description,
+        dave_timeout,
+        dave,
+    }))
+}
+
+async fn bootstrap_voice_connection(
+    voice: &VoiceContext,
+) -> Result<Option<VoiceBootstrap>, VoiceError> {
     let Some(gateway_url) = gateway_url(&voice.endpoint)? else {
         return Ok(None);
     };
@@ -64,13 +203,13 @@ pub async fn connect(voice: &VoiceContext) -> Result<Option<VoiceHandshakeResult
         heartbeat_interval_ms = hello.heartbeat_interval_ms,
         "voice handshake received hello"
     );
-    let post_hello_timeout = post_hello_timeout(hello.heartbeat_interval_ms);
+    let dave_timeout = post_hello_timeout(hello.heartbeat_interval_ms);
     let heartbeat_shutdown = spawn_heartbeat_task(gateway.clone(), hello.heartbeat_interval_ms);
 
-    let connect_result = async {
+    let bootstrap_result = async {
         gateway.send_identify(voice).await?;
 
-        let ready = expect_ready(&gateway, post_hello_timeout).await?;
+        let ready = expect_ready(&gateway, dave_timeout).await?;
         let mode = protocol::choose_encryption_mode(&ready)?.to_owned();
         let udp_target = resolve_udp_target(&ready).await?;
         let transport = VoiceUdpTransport::connect(udp_target, ready.ssrc).await?;
@@ -80,43 +219,44 @@ pub async fn connect(voice: &VoiceContext) -> Result<Option<VoiceHandshakeResult
         };
 
         gateway.send_select_protocol(&discovered, &mode).await?;
-        let session_description =
-            expect_session_description(&gateway, post_hello_timeout, &voice.user_id).await?;
-        let dave = if let Some(protocol_version) = session_description.dave_protocol_version {
-            Some(
-                complete_initial_dave_transition(
-                    &gateway,
-                    voice,
-                    ready.ssrc,
-                    protocol_version,
-                    post_hello_timeout,
-                )
-                .await?,
-            )
-        } else {
-            None
-        };
+        let (
+            session_description,
+            pre_session_recognized_user_ids,
+            pre_session_saw_existing_speaker,
+        ) = expect_session_description(&gateway, dave_timeout, &voice.user_id).await?;
 
-        Ok::<_, VoiceError>((transport, ready.ssrc, session_description, dave))
+        Ok::<_, VoiceError>((
+            transport,
+            ready.ssrc,
+            session_description,
+            pre_session_recognized_user_ids,
+            pre_session_saw_existing_speaker,
+        ))
     }
     .await;
 
-    let (transport, ssrc, session_description, dave) = match connect_result {
-        Ok(result) => result,
+    match bootstrap_result {
+        Ok((
+            transport,
+            ssrc,
+            session_description,
+            pre_session_recognized_user_ids,
+            pre_session_saw_existing_speaker,
+        )) => Ok(Some(VoiceBootstrap {
+            gateway,
+            transport,
+            ssrc,
+            heartbeat_shutdown,
+            session_description,
+            pre_session_recognized_user_ids,
+            pre_session_saw_existing_speaker,
+            dave_timeout,
+        })),
         Err(err) => {
             let _ = heartbeat_shutdown.send(());
-            return Err(err);
+            Err(err)
         }
-    };
-
-    Ok(Some(VoiceHandshakeResult {
-        gateway,
-        transport,
-        ssrc,
-        heartbeat_shutdown,
-        session_description,
-        dave,
-    }))
+    }
 }
 
 pub async fn resume(voice: &VoiceContext, seq_ack: Option<u64>) -> Result<(), VoiceError> {
@@ -252,8 +392,10 @@ async fn expect_session_description(
     gateway: &VoiceGatewayClient,
     timeout_duration: Duration,
     self_user_id: &str,
-) -> Result<SessionDescription, VoiceError> {
+) -> Result<(SessionDescription, BTreeSet<String>, bool), VoiceError> {
     let deadline = tokio::time::Instant::now() + timeout_duration;
+    let mut recognized_user_ids = BTreeSet::from([self_user_id.to_owned()]);
+    let mut saw_existing_speaker = false;
 
     loop {
         let remaining = deadline
@@ -261,7 +403,38 @@ async fn expect_session_description(
             .ok_or(VoiceError::InvalidState("voice handshake timed out"))?;
 
         match next_event(gateway, remaining).await?.into_event() {
-            VoiceGatewayEvent::SessionDescription(description) => return Ok(description),
+            VoiceGatewayEvent::SessionDescription(description) => {
+                return Ok((description, recognized_user_ids, saw_existing_speaker));
+            }
+            VoiceGatewayEvent::ClientsConnect(ClientsConnect { user_ids }) => {
+                let user_count = user_ids.len();
+                recognized_user_ids.extend(user_ids);
+                tracing::debug!(
+                    user_count,
+                    recognized_user_ids = recognized_user_ids.len(),
+                    "voice handshake recorded pre-session connected users"
+                );
+            }
+            VoiceGatewayEvent::ClientDisconnect(ClientDisconnect { user_id })
+                if user_id != self_user_id =>
+            {
+                recognized_user_ids.remove(&user_id);
+                tracing::debug!(
+                    %user_id,
+                    recognized_user_ids = recognized_user_ids.len(),
+                    "voice handshake recorded pre-session disconnect"
+                );
+            }
+            VoiceGatewayEvent::Speaking(Speaking {
+                user_id: Some(user_id),
+                ..
+            }) if user_id != self_user_id => {
+                saw_existing_speaker = true;
+                tracing::debug!(
+                    %user_id,
+                    "voice handshake recorded pre-session existing speaker"
+                );
+            }
             event if is_benign_pre_session_description_event(&event, self_user_id) => {
                 tracing::debug!(
                     event = dave_handshake_event_name(&event),
@@ -293,12 +466,13 @@ fn is_benign_pre_session_description_event(event: &VoiceGatewayEvent, self_user_
     )
 }
 
-async fn complete_initial_dave_transition(
+async fn complete_active_dave_transition(
     gateway: &VoiceGatewayClient,
     voice: &VoiceContext,
     ssrc: u32,
     protocol_version: u16,
     timeout_duration: Duration,
+    mut recognized_user_ids: BTreeSet<String>,
 ) -> Result<InitialDaveState, VoiceError> {
     let handshake_deadline = Instant::now() + timeout_duration;
     let group_id = voice
@@ -307,7 +481,7 @@ async fn complete_initial_dave_transition(
         .map_err(|_| VoiceError::InvalidState("voice dave group id invalid"))?;
     let local_external_sender = DaveExternalSender::new(group_id)
         .map_err(|_| VoiceError::InvalidState("voice dave external sender create failed"))?;
-    let mut recognized_user_ids = BTreeSet::from([voice.user_id.clone()]);
+    recognized_user_ids.insert(voice.user_id.clone());
     let mut session = Some(
         DaveSession::new(None)
             .map_err(|_| VoiceError::InvalidState("voice dave session create failed"))?,
@@ -327,13 +501,14 @@ async fn complete_initial_dave_transition(
     let mut pending_key_package = false;
     let mut completed_welcome_backed_transition_ids = BTreeSet::new();
     let mut self_only_group_deadline = None::<Instant>;
+    let mut pending_local_init_transition = None::<(DaveRuntimeContext, Vec<u8>)>;
+    let mut gateway_external_sender = None::<Vec<u8>>;
     send_pending_join_key_package(
         gateway,
         dave_session_mut(&mut session)?,
         &mut pending_key_package,
     )
     .await?;
-    let mut sent_key_package_before_external_sender = true;
 
     loop {
         let now = Instant::now();
@@ -346,16 +521,19 @@ async fn complete_initial_dave_transition(
         let event = match timeout(wait_duration, gateway.receive_event()).await {
             Ok(result) => result?.into_event(),
             Err(_) if self_only_group_deadline.is_some() => {
-                let runtime = complete_self_only_initial_group(
-                    gateway,
-                    voice,
-                    session,
-                    &local_external_sender,
-                )
-                .await?;
-                return Ok(initial_dave_state(
-                    runtime,
+                tracing::debug!(
+                    recognized_user_ids = recognized_user_ids.len(),
+                    "voice dave handshake keeping initial session pending after grace window"
+                );
+                let pending_session = take_dave_session(&mut session)?;
+                return Ok(pending_initial_dave_state(
+                    pending_session,
                     group_id,
+                    protocol_version,
+                    current_external_sender_bytes(
+                        &gateway_external_sender,
+                        &local_external_sender,
+                    )?,
                     local_external_sender,
                     recognized_user_ids,
                     completed_welcome_backed_transition_ids,
@@ -399,12 +577,26 @@ async fn complete_initial_dave_transition(
                 if source == PendingHandshakeTransitionSource::WelcomeBacked {
                     completed_welcome_backed_transition_ids.insert(completed_transition_id);
                 }
+                let completed_local_init_commit_transition_ids = if completed_transition_id
+                    == DAVE_PROTOCOL_INIT_TRANSITION_ID
+                    && source == PendingHandshakeTransitionSource::CommitBacked
+                {
+                    BTreeSet::from([completed_transition_id])
+                } else {
+                    BTreeSet::new()
+                };
                 return Ok(initial_dave_state(
                     runtime,
                     group_id,
+                    protocol_version,
+                    current_external_sender_bytes(
+                        &gateway_external_sender,
+                        &local_external_sender,
+                    )?,
                     local_external_sender,
                     recognized_user_ids,
                     completed_welcome_backed_transition_ids,
+                    completed_local_init_commit_transition_ids,
                 ));
             }
             continue;
@@ -418,9 +610,6 @@ async fn complete_initial_dave_transition(
             VoiceGatewayEvent::ClientsConnect(ClientsConnect { user_ids }) => {
                 let user_count = user_ids.len();
                 recognized_user_ids.extend(user_ids);
-                if !has_only_self_recognized_user(&recognized_user_ids, &voice.user_id) {
-                    self_only_group_deadline = None;
-                }
                 tracing::debug!(
                     user_count,
                     recognized_user_ids = recognized_user_ids.len(),
@@ -437,27 +626,13 @@ async fn complete_initial_dave_transition(
                 dave_session_mut(&mut session)?
                     .set_external_sender(&sender)
                     .map_err(|_| VoiceError::InvalidState("voice dave external sender invalid"))?;
-                if sent_key_package_before_external_sender {
-                    tracing::debug!(
-                        "voice dave handshake refreshing key package after external sender"
-                    );
-                    pending_key_package = false;
-                    send_pending_join_key_package(
-                        gateway,
-                        dave_session_mut(&mut session)?,
-                        &mut pending_key_package,
-                    )
-                    .await?;
-                    sent_key_package_before_external_sender = false;
-                }
-                if has_only_self_recognized_user(&recognized_user_ids, &voice.user_id) {
-                    tracing::debug!(
-                        grace_ms = SELF_ONLY_INITIAL_GROUP_GRACE.as_millis(),
-                        "voice dave handshake deferring self-only initial group until no peer DAVE events arrive"
-                    );
-                    self_only_group_deadline =
-                        Some(Instant::now() + SELF_ONLY_INITIAL_GROUP_GRACE);
-                }
+                gateway_external_sender = Some(sender);
+                tracing::debug!(
+                    grace_ms = SELF_ONLY_INITIAL_GROUP_GRACE.as_millis(),
+                    recognized_user_ids = recognized_user_ids.len(),
+                    "voice dave handshake deferring initial group until no peer DAVE events arrive"
+                );
+                self_only_group_deadline = Some(Instant::now() + SELF_ONLY_INITIAL_GROUP_GRACE);
             }
             VoiceGatewayEvent::DavePrepareEpoch(DavePrepareEpoch {
                 transition_id,
@@ -478,6 +653,13 @@ async fn complete_initial_dave_transition(
                     prepare_protocol_version,
                     "voice dave handshake processing prepare epoch"
                 );
+                if pending_local_init_transition.is_some() {
+                    if let Some(transition_id) = transition_id {
+                        pending_prepared_transitions
+                            .insert(transition_id, prepare_protocol_version);
+                    }
+                    continue;
+                }
                 self_only_group_deadline = None;
                 send_pending_join_key_package(
                     gateway,
@@ -485,7 +667,9 @@ async fn complete_initial_dave_transition(
                     &mut pending_key_package,
                 )
                 .await?;
-                pending_prepared_transitions.insert(transition_id, prepare_protocol_version);
+                if let Some(transition_id) = transition_id {
+                    pending_prepared_transitions.insert(transition_id, prepare_protocol_version);
+                }
             }
             VoiceGatewayEvent::DaveMlsProposals(DaveMlsProposals {
                 operation,
@@ -496,7 +680,6 @@ async fn complete_initial_dave_transition(
                         "voice dave proposals missing pending group creation",
                     ));
                 }
-                self_only_group_deadline = None;
                 let recognized = recognized_user_ids
                     .iter()
                     .map(String::as_str)
@@ -506,27 +689,81 @@ async fn complete_initial_dave_transition(
                     recognized_user_ids = recognized.len(),
                     "voice dave handshake processing proposals"
                 );
+                if pending_local_init_transition.is_some() {
+                    tracing::debug!(
+                        proposals_len = proposals.len(),
+                        recognized_user_ids = recognized.len(),
+                        "voice dave handshake ignoring follow-up proposals while waiting for gateway local init commit"
+                    );
+                    continue;
+                }
                 let runtime = complete_initial_proposals_transition(
                     gateway,
-                    session,
+                    &mut session,
                     &local_external_sender,
                     operation,
                     &proposals,
                     &recognized_user_ids,
                 )
                 .await?;
+                let Some(runtime) = runtime else {
+                    tracing::debug!(
+                        operation = ?ProposalsOperationType::from(operation),
+                        "voice dave handshake ignoring no-op proposals update"
+                    );
+                    continue;
+                };
+                tracing::debug!(
+                    transition_id = DAVE_PROTOCOL_INIT_TRANSITION_ID,
+                    "voice dave handshake completed local init creator commit"
+                );
+                let (runtime, _local_commit) = runtime;
                 return Ok(initial_dave_state(
                     runtime,
                     group_id,
+                    protocol_version,
+                    current_external_sender_bytes(
+                        &gateway_external_sender,
+                        &local_external_sender,
+                    )?,
                     local_external_sender,
                     recognized_user_ids,
                     completed_welcome_backed_transition_ids,
+                    BTreeSet::from([DAVE_PROTOCOL_INIT_TRANSITION_ID]),
                 ));
             }
             VoiceGatewayEvent::DaveMlsPrepareCommitTransition(DaveMlsPrepareCommitTransition {
                 transition_id,
                 commit,
             }) => {
+                if transition_id == DAVE_PROTOCOL_INIT_TRANSITION_ID
+                    && let Some((runtime, local_commit)) = pending_local_init_transition.take()
+                {
+                    if commit != local_commit {
+                        return Err(VoiceError::InvalidState(
+                            "voice dave local init gateway commit mismatch",
+                        ));
+                    }
+                    tracing::debug!(
+                        transition_id,
+                        commit_len = commit.len(),
+                        "voice dave handshake confirmed gateway local init commit"
+                    );
+                    pending_prepared_transitions.clear();
+                    return Ok(initial_dave_state(
+                        runtime,
+                        group_id,
+                        protocol_version,
+                        current_external_sender_bytes(
+                            &gateway_external_sender,
+                            &local_external_sender,
+                        )?,
+                        local_external_sender,
+                        recognized_user_ids,
+                        completed_welcome_backed_transition_ids,
+                        BTreeSet::from([transition_id]),
+                    ));
+                }
                 let runtime_protocol_version = if let Some(runtime_protocol_version) =
                     pending_prepared_transitions.remove(&transition_id)
                 {
@@ -575,15 +812,20 @@ async fn complete_initial_dave_transition(
                 if transition_id == DAVE_PROTOCOL_INIT_TRANSITION_ID {
                     tracing::debug!(
                         transition_id,
-                        "voice dave handshake sending transition-ready for init transition"
+                        "voice dave handshake completed init commit transition"
                     );
-                    gateway.send_dave_transition_ready(transition_id).await?;
                     return Ok(initial_dave_state(
                         runtime,
                         group_id,
+                        protocol_version,
+                        current_external_sender_bytes(
+                            &gateway_external_sender,
+                            &local_external_sender,
+                        )?,
                         local_external_sender,
                         recognized_user_ids,
                         completed_welcome_backed_transition_ids,
+                        BTreeSet::new(),
                     ));
                 }
                 tracing::debug!(
@@ -634,15 +876,20 @@ async fn complete_initial_dave_transition(
                 if transition_id == DAVE_PROTOCOL_INIT_TRANSITION_ID {
                     tracing::debug!(
                         transition_id,
-                        "voice dave handshake sending transition-ready for init transition"
+                        "voice dave handshake completed init welcome transition"
                     );
-                    gateway.send_dave_transition_ready(transition_id).await?;
                     return Ok(initial_dave_state(
                         runtime,
                         group_id,
+                        protocol_version,
+                        current_external_sender_bytes(
+                            &gateway_external_sender,
+                            &local_external_sender,
+                        )?,
                         local_external_sender,
                         recognized_user_ids,
                         completed_welcome_backed_transition_ids,
+                        BTreeSet::new(),
                     ));
                 }
                 tracing::debug!(
@@ -661,88 +908,550 @@ async fn complete_initial_dave_transition(
     }
 }
 
+async fn start_pending_observer_dave_join(
+    gateway: &VoiceGatewayClient,
+    voice: &VoiceContext,
+    ssrc: u32,
+    protocol_version: u16,
+    mut recognized_user_ids: BTreeSet<String>,
+    pre_session_saw_existing_speaker: bool,
+) -> Result<PendingObserverDaveState, VoiceError> {
+    let group_id = voice
+        .channel_id
+        .parse::<u64>()
+        .map_err(|_| VoiceError::InvalidState("voice dave group id invalid"))?;
+    recognized_user_ids.insert(voice.user_id.clone());
+    let mut pending = PendingObserverDaveState {
+        session: Some(
+            DaveSession::new(None)
+                .map_err(|_| VoiceError::InvalidState("voice dave session create failed"))?,
+        ),
+        recognized_user_ids,
+        pending_prepared_transitions: BTreeMap::new(),
+        pending_key_package: false,
+        pending_gateway_winner_after_local_proposals_commit: false,
+        pending_proposals_replay_start: 0,
+        pending_proposals: Vec::new(),
+        gateway_updates: Vec::new(),
+        saw_existing_speaker: pre_session_saw_existing_speaker,
+    };
+    dave_session_mut(&mut pending.session)?
+        .init(protocol_version, group_id, &voice.user_id)
+        .map_err(|_| VoiceError::InvalidState("voice dave session init failed"))?;
+    tracing::debug!(
+        group_id,
+        protocol_version,
+        user_id = %voice.user_id,
+        ssrc,
+        "voice observer dave handshake initialized session"
+    );
+    send_pending_join_key_package(
+        gateway,
+        dave_session_mut(&mut pending.session)?,
+        &mut pending.pending_key_package,
+    )
+    .await?;
+    seed_pending_observer_dave_state(gateway, &mut pending).await?;
+    Ok(pending)
+}
+
+async fn seed_pending_observer_dave_state(
+    gateway: &VoiceGatewayClient,
+    pending: &mut PendingObserverDaveState,
+) -> Result<(), VoiceError> {
+    let protocol_version = observer_dave_protocol_version(pending)?;
+    loop {
+        let event = match timeout(Duration::ZERO, gateway.receive_event()).await {
+            Ok(Ok(payload)) => payload.into_event(),
+            Ok(Err(err)) => return Err(err),
+            Err(_) => return Ok(()),
+        };
+        tracing::debug!(
+            event = dave_handshake_event_name(&event),
+            recognized_user_ids = pending.recognized_user_ids.len(),
+            pending_prepared_transitions = pending.pending_prepared_transitions.len(),
+            "voice observer dave handshake draining seed event"
+        );
+
+        match event {
+            VoiceGatewayEvent::Speaking(Speaking {
+                user_id: Some(user_id),
+                ssrc,
+                ..
+            }) => {
+                pending.saw_existing_speaker = true;
+                pending
+                    .gateway_updates
+                    .push(PendingObserverGatewayUpdate::Speaking { user_id, ssrc });
+            }
+            VoiceGatewayEvent::ClientDisconnect(ClientDisconnect { user_id }) => {
+                pending
+                    .gateway_updates
+                    .push(PendingObserverGatewayUpdate::ClientDisconnect { user_id });
+            }
+            VoiceGatewayEvent::ClientsConnect(ClientsConnect { user_ids }) => {
+                pending.recognized_user_ids.extend(user_ids);
+            }
+            VoiceGatewayEvent::DaveMlsExternalSenderPackage(DaveMlsExternalSenderPackage {
+                external_sender: sender,
+            }) => {
+                tracing::debug!(
+                    external_sender_len = sender.len(),
+                    "voice observer dave handshake seeding external sender"
+                );
+                dave_session_mut(&mut pending.session)?
+                    .set_external_sender(&sender)
+                    .map_err(|_| VoiceError::InvalidState("voice dave external sender invalid"))?;
+            }
+            VoiceGatewayEvent::DavePrepareEpoch(DavePrepareEpoch {
+                transition_id,
+                epoch,
+                protocol_version: prepare_protocol_version,
+            }) => {
+                if prepare_protocol_version != protocol_version {
+                    return Err(VoiceError::InvalidState(
+                        "voice dave prepare epoch protocol version mismatch",
+                    ));
+                }
+                if epoch.is_empty() {
+                    return Err(VoiceError::InvalidState("voice dave prepare epoch missing"));
+                }
+                tracing::debug!(
+                    transition_id,
+                    epoch = %epoch,
+                    prepare_protocol_version,
+                    "voice observer dave handshake seeding prepare epoch"
+                );
+                if let Some(transition_id) = transition_id {
+                    pending
+                        .pending_prepared_transitions
+                        .insert(transition_id, prepare_protocol_version);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+pub(crate) async fn complete_pending_observer_dave_join(
+    gateway: &VoiceGatewayClient,
+    mut pending: PendingObserverDaveState,
+    timeout_duration: Duration,
+) -> Result<PendingObserverReadyResult, VoiceError> {
+    let handshake_deadline = Instant::now() + timeout_duration;
+    let mut gateway_updates = std::mem::take(&mut pending.gateway_updates);
+
+    loop {
+        let remaining = handshake_deadline
+            .checked_duration_since(Instant::now())
+            .ok_or(VoiceError::InvalidState(
+                "voice observer dave join timed out",
+            ))?;
+        let event = timeout(remaining, gateway.receive_event())
+            .await
+            .map_err(|_| VoiceError::InvalidState("voice observer dave join timed out"))??
+            .into_event();
+        tracing::debug!(
+            event = dave_handshake_event_name(&event),
+            pending_key_package = pending.pending_key_package,
+            pending_prepared_transitions = pending.pending_prepared_transitions.len(),
+            recognized_user_ids = pending.recognized_user_ids.len(),
+            "voice observer dave handshake received gateway event"
+        );
+
+        match event {
+            VoiceGatewayEvent::Speaking(Speaking {
+                user_id: Some(user_id),
+                ssrc,
+                ..
+            }) => {
+                pending.saw_existing_speaker = true;
+                gateway_updates.push(PendingObserverGatewayUpdate::Speaking { user_id, ssrc });
+            }
+            VoiceGatewayEvent::ClientDisconnect(ClientDisconnect { user_id }) => {
+                gateway_updates.push(PendingObserverGatewayUpdate::ClientDisconnect { user_id });
+            }
+            VoiceGatewayEvent::ClientsConnect(ClientsConnect { user_ids }) => {
+                pending.recognized_user_ids.extend(user_ids);
+            }
+            VoiceGatewayEvent::DaveMlsExternalSenderPackage(DaveMlsExternalSenderPackage {
+                external_sender: sender,
+            }) => {
+                tracing::debug!(
+                    external_sender_len = sender.len(),
+                    "voice observer dave handshake received external sender"
+                );
+                dave_session_mut(&mut pending.session)?
+                    .set_external_sender(&sender)
+                    .map_err(|_| VoiceError::InvalidState("voice dave external sender invalid"))?;
+            }
+            VoiceGatewayEvent::DavePrepareEpoch(DavePrepareEpoch {
+                transition_id,
+                epoch,
+                protocol_version: prepare_protocol_version,
+            }) => {
+                let protocol_version = observer_dave_protocol_version(&pending)?;
+                if prepare_protocol_version != protocol_version {
+                    return Err(VoiceError::InvalidState(
+                        "voice dave prepare epoch protocol version mismatch",
+                    ));
+                }
+                if epoch.is_empty() {
+                    return Err(VoiceError::InvalidState("voice dave prepare epoch missing"));
+                }
+                tracing::debug!(
+                    transition_id,
+                    epoch = %epoch,
+                    prepare_protocol_version,
+                    "voice observer dave handshake processing prepare epoch"
+                );
+                if let Some(transition_id) = transition_id {
+                    pending
+                        .pending_prepared_transitions
+                        .insert(transition_id, prepare_protocol_version);
+                }
+                send_pending_join_key_package(
+                    gateway,
+                    dave_session_mut(&mut pending.session)?,
+                    &mut pending.pending_key_package,
+                )
+                .await?;
+            }
+            VoiceGatewayEvent::DaveMlsProposals(DaveMlsProposals {
+                operation,
+                proposals,
+            }) => {
+                if !pending.pending_key_package {
+                    return Err(VoiceError::InvalidState(
+                        "voice dave proposals missing pending group creation",
+                    ));
+                }
+                tracing::debug!(
+                    proposals_len = proposals.len(),
+                    recognized_user_ids = pending.recognized_user_ids.len(),
+                    operation = ?ProposalsOperationType::from(operation),
+                    pending_gateway_winner_after_local_proposals_commit =
+                        pending.pending_gateway_winner_after_local_proposals_commit,
+                    "voice observer dave handshake processing proposals"
+                );
+                pending
+                    .pending_proposals
+                    .push((operation, proposals.clone()));
+                if pending.saw_existing_speaker
+                    && !pending.pending_gateway_winner_after_local_proposals_commit
+                {
+                    pending.pending_gateway_winner_after_local_proposals_commit = true;
+                    pending.pending_proposals_replay_start = pending.pending_proposals.len();
+                    tracing::debug!(
+                        proposals_len = proposals.len(),
+                        recognized_user_ids = pending.recognized_user_ids.len(),
+                        operation = ?ProposalsOperationType::from(operation),
+                        "voice observer dave handshake waiting for sender-authored transition after seeing active speaker"
+                    );
+                }
+                if pending.pending_gateway_winner_after_local_proposals_commit {
+                    tracing::debug!(
+                        proposals_len = proposals.len(),
+                        recognized_user_ids = pending.recognized_user_ids.len(),
+                        operation = ?ProposalsOperationType::from(operation),
+                        "voice observer dave handshake buffering follow-up proposals while waiting for gateway winner"
+                    );
+                    continue;
+                }
+                let commit_welcome = process_initial_proposals(
+                    &mut pending.session,
+                    operation,
+                    &proposals,
+                    &pending.recognized_user_ids,
+                )?;
+                let Some(commit_welcome) = commit_welcome else {
+                    tracing::debug!(
+                        operation = ?ProposalsOperationType::from(operation),
+                        "voice observer dave handshake ignoring no-op proposals update"
+                    );
+                    continue;
+                };
+                let (commit, _welcome) = unpack_commit_welcome(&commit_welcome)
+                    .map_err(|_| VoiceError::InvalidState("voice dave commit welcome invalid"))?;
+                let session = take_dave_session(&mut pending.session)?;
+                let runtime = complete_local_initial_creator_transition(
+                    gateway,
+                    session,
+                    &commit_welcome,
+                    &commit,
+                    false,
+                )
+                .await?;
+                pending.pending_gateway_winner_after_local_proposals_commit = true;
+                pending.pending_proposals_replay_start = pending.pending_proposals.len();
+                tracing::debug!(
+                    recognized_user_ids = pending.recognized_user_ids.len(),
+                    "voice observer dave handshake completed local proposals commit"
+                );
+                return Ok(PendingObserverReadyResult {
+                    runtime,
+                    gateway_updates,
+                    recognized_user_ids: pending.recognized_user_ids,
+                });
+            }
+            VoiceGatewayEvent::DaveMlsPrepareCommitTransition(DaveMlsPrepareCommitTransition {
+                transition_id,
+                commit,
+            }) => {
+                let protocol_version = observer_dave_protocol_version(&pending)?;
+                let runtime_protocol_version = if let Some(runtime_protocol_version) =
+                    pending.pending_prepared_transitions.remove(&transition_id)
+                {
+                    runtime_protocol_version
+                } else if pending.pending_key_package
+                    && pending.pending_prepared_transitions.is_empty()
+                {
+                    protocol_version
+                } else {
+                    return Err(VoiceError::InvalidState(
+                        "voice observer dave commit transition missing pending join",
+                    ));
+                };
+                let commit_result = dave_session_mut(&mut pending.session)?
+                    .process_commit(&commit)
+                    .map_err(|_| VoiceError::InvalidState("voice dave commit invalid"))?;
+                tracing::debug!(
+                    transition_id,
+                    commit_len = commit.len(),
+                    commit_failed = commit_result.is_failed(),
+                    commit_ignored = commit_result.is_ignored(),
+                    roster_member_ids = commit_result.roster_member_ids().len(),
+                    runtime_protocol_version,
+                    "voice observer dave handshake processed commit transition"
+                );
+                if commit_result.is_failed()
+                    || commit_result.is_ignored()
+                    || commit_result.roster_member_ids().is_empty()
+                {
+                    return Err(VoiceError::InvalidState(
+                        "voice observer dave commit transition did not join group",
+                    ));
+                }
+                let mut runtime =
+                    DaveRuntimeContext::from_session(take_dave_session(&mut pending.session)?)
+                        .map_err(|_| {
+                            VoiceError::InvalidState("voice dave runtime create failed")
+                        })?;
+                stage_pending_observer_proposals(
+                    &mut runtime,
+                    &pending,
+                    pending.pending_proposals_replay_start,
+                )?;
+                if transition_id != DAVE_PROTOCOL_INIT_TRANSITION_ID {
+                    gateway.send_dave_transition_ready(transition_id).await?;
+                }
+                return Ok(PendingObserverReadyResult {
+                    runtime,
+                    gateway_updates,
+                    recognized_user_ids: pending.recognized_user_ids,
+                });
+            }
+            VoiceGatewayEvent::DaveMlsWelcome(DaveMlsWelcome {
+                transition_id,
+                welcome,
+            }) => {
+                let protocol_version = observer_dave_protocol_version(&pending)?;
+                let runtime_protocol_version = if let Some(runtime_protocol_version) =
+                    pending.pending_prepared_transitions.remove(&transition_id)
+                {
+                    runtime_protocol_version
+                } else if pending.pending_key_package
+                    && pending.pending_prepared_transitions.is_empty()
+                {
+                    protocol_version
+                } else {
+                    return Err(VoiceError::InvalidState(
+                        "voice observer dave welcome transition missing pending join",
+                    ));
+                };
+                let recognized = pending
+                    .recognized_user_ids
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>();
+                tracing::debug!(
+                    transition_id,
+                    welcome_len = welcome.len(),
+                    recognized_user_ids = recognized.len(),
+                    runtime_protocol_version,
+                    "voice observer dave handshake processing welcome"
+                );
+                dave_session_mut(&mut pending.session)?
+                    .process_welcome(&welcome, &recognized)
+                    .map_err(|_| VoiceError::InvalidState("voice dave welcome invalid"))?;
+                let mut runtime =
+                    DaveRuntimeContext::from_session(take_dave_session(&mut pending.session)?)
+                        .map_err(|_| {
+                            VoiceError::InvalidState("voice dave runtime create failed")
+                        })?;
+                stage_pending_observer_proposals(
+                    &mut runtime,
+                    &pending,
+                    pending.pending_proposals_replay_start,
+                )?;
+                if transition_id != DAVE_PROTOCOL_INIT_TRANSITION_ID {
+                    gateway.send_dave_transition_ready(transition_id).await?;
+                }
+                return Ok(PendingObserverReadyResult {
+                    runtime,
+                    gateway_updates,
+                    recognized_user_ids: pending.recognized_user_ids,
+                });
+            }
+            _ => {}
+        }
+    }
+}
+
 fn initial_dave_state(
     runtime: DaveRuntimeContext,
     group_id: u64,
+    protocol_version: u16,
+    external_sender_bytes: Vec<u8>,
+    external_sender: DaveExternalSender,
+    recognized_user_ids: BTreeSet<String>,
+    completed_welcome_backed_transition_ids: BTreeSet<u16>,
+    completed_local_init_commit_transition_ids: BTreeSet<u16>,
+) -> InitialDaveState {
+    InitialDaveState {
+        runtime: Some(runtime),
+        pending_initial_session: None,
+        group_id,
+        protocol_version,
+        external_sender,
+        external_sender_bytes,
+        recognized_user_ids,
+        completed_welcome_backed_transition_ids,
+        completed_local_init_commit_transition_ids,
+    }
+}
+
+fn pending_initial_dave_state(
+    session: DaveSession,
+    group_id: u64,
+    protocol_version: u16,
+    external_sender_bytes: Vec<u8>,
     external_sender: DaveExternalSender,
     recognized_user_ids: BTreeSet<String>,
     completed_welcome_backed_transition_ids: BTreeSet<u16>,
 ) -> InitialDaveState {
     InitialDaveState {
-        runtime,
+        runtime: None,
+        pending_initial_session: Some(session),
         group_id,
+        protocol_version,
         external_sender,
+        external_sender_bytes,
         recognized_user_ids,
         completed_welcome_backed_transition_ids,
+        completed_local_init_commit_transition_ids: BTreeSet::new(),
     }
 }
 
-async fn complete_self_only_initial_group(
-    gateway: &VoiceGatewayClient,
-    voice: &VoiceContext,
-    mut session: Option<DaveSession>,
+fn current_external_sender_bytes(
+    gateway_external_sender: &Option<Vec<u8>>,
     local_external_sender: &DaveExternalSender,
-) -> Result<DaveRuntimeContext, VoiceError> {
-    let recognized = [voice.user_id.as_str()];
-    tracing::debug!(
-        recognized_user_ids = recognized.len(),
-        "voice dave handshake creating self-only initial group after grace window"
-    );
-    let commit_welcome = dave_session_mut(&mut session)?
-        .process_proposals(&empty_mls_proposals(), &recognized)
-        .map_err(|_| VoiceError::InvalidState("voice dave self-only proposals invalid"))?;
-    let (commit, _welcome) = local_external_sender
-        .split_commit_welcome(&commit_welcome)
-        .map_err(|_| VoiceError::InvalidState("voice dave commit welcome invalid"))?;
-    let session = take_dave_session(&mut session)?;
-    complete_local_initial_creator_transition(gateway, session, &commit_welcome, &commit).await
+) -> Result<Vec<u8>, VoiceError> {
+    match gateway_external_sender {
+        Some(sender) => Ok(sender.clone()),
+        None => local_external_sender
+            .marshalled_external_sender()
+            .map_err(|_| VoiceError::InvalidState("voice dave external sender unavailable")),
+    }
 }
 
 async fn complete_initial_proposals_transition(
     gateway: &VoiceGatewayClient,
-    mut session: Option<DaveSession>,
+    session: &mut Option<DaveSession>,
     local_external_sender: &DaveExternalSender,
     operation: crate::dave::DaveMlsProposalsOperation,
     proposals: &[u8],
     recognized_user_ids: &BTreeSet<String>,
-) -> Result<DaveRuntimeContext, VoiceError> {
-    let recognized = recognized_user_ids
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>();
-    let commit_welcome = dave_session_mut(&mut session)?
-        .process_proposals_with_operation(operation, proposals, &recognized)
-        .map_err(|_| VoiceError::InvalidState("voice dave proposals invalid"))?;
+) -> Result<Option<(DaveRuntimeContext, Vec<u8>)>, VoiceError> {
+    let commit_welcome =
+        process_initial_proposals(session, operation, proposals, recognized_user_ids)?;
     let commit_welcome = match commit_welcome {
         Some(commit_welcome) => commit_welcome,
-        None if ProposalsOperationType::from(operation) == ProposalsOperationType::REVOKE => {
-            return Err(VoiceError::InvalidState(
-                "voice dave proposal result missing commit for initial transition",
-            ));
-        }
-        None => {
-            return Err(VoiceError::InvalidState(
-                "voice dave append proposals produced no commit",
-            ));
-        }
+        None => return Ok(None),
     };
     let (commit, _welcome) = local_external_sender
         .split_commit_welcome(&commit_welcome)
         .map_err(|_| VoiceError::InvalidState("voice dave commit welcome invalid"))?;
-    let session = take_dave_session(&mut session)?;
-    complete_local_initial_creator_transition(gateway, session, &commit_welcome, &commit).await
+    let session = take_dave_session(session)?;
+    let runtime = complete_local_initial_creator_transition(
+        gateway,
+        session,
+        &commit_welcome,
+        &commit,
+        false,
+    )
+    .await?;
+    Ok(Some((runtime, commit)))
 }
 
-fn has_only_self_recognized_user(
+fn stage_pending_observer_proposals(
+    runtime: &mut DaveRuntimeContext,
+    pending: &PendingObserverDaveState,
+    replay_start: usize,
+) -> Result<(), VoiceError> {
+    let recognized = pending
+        .recognized_user_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    for (operation, proposals) in pending.pending_proposals.iter().skip(replay_start) {
+        let commit_welcome = runtime
+            .process_proposals_with_operation(*operation, proposals, &recognized)
+            .map_err(|_| VoiceError::InvalidState("voice observer dave proposals invalid"))?;
+        tracing::debug!(
+            proposals_len = proposals.len(),
+            recognized_user_ids = recognized.len(),
+            operation = ?ProposalsOperationType::from(*operation),
+            produced_commit_welcome = commit_welcome.is_some(),
+            "voice observer dave handshake staged buffered proposals after welcome"
+        );
+    }
+    Ok(())
+}
+
+fn process_initial_proposals(
+    session: &mut Option<DaveSession>,
+    operation: crate::dave::DaveMlsProposalsOperation,
+    proposals: &[u8],
     recognized_user_ids: &BTreeSet<String>,
-    self_user_id: &str,
-) -> bool {
-    recognized_user_ids.len() == 1 && recognized_user_ids.contains(self_user_id)
+) -> Result<Option<Vec<u8>>, VoiceError> {
+    let recognized = recognized_user_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let commit_welcome = dave_session_mut(session)?
+        .process_proposals_with_operation(operation, proposals, &recognized)
+        .map_err(|_| VoiceError::InvalidState("voice dave proposals invalid"))?;
+    match commit_welcome {
+        Some(commit_welcome) => Ok(Some(commit_welcome)),
+        None if ProposalsOperationType::from(operation) == ProposalsOperationType::REVOKE => {
+            Ok(None)
+        }
+        None => Err(VoiceError::InvalidState(
+            "voice dave append proposals produced no commit",
+        )),
+    }
 }
 
-fn empty_mls_proposals() -> [u8; 1] {
-    // davey expects a TLS-encoded empty VLBytes payload for APPEND proposals.
-    [0]
+fn observer_dave_protocol_version(pending: &PendingObserverDaveState) -> Result<u16, VoiceError> {
+    pending
+        .session
+        .as_ref()
+        .map(DaveSession::protocol_version)
+        .filter(|protocol_version| *protocol_version != 0)
+        .ok_or(VoiceError::InvalidState(
+            "voice dave session already moved to runtime",
+        ))
 }
 
 fn dave_session_mut(session: &mut Option<DaveSession>) -> Result<&mut DaveSession, VoiceError> {
@@ -762,14 +1471,9 @@ async fn complete_local_initial_creator_transition(
     mut session: DaveSession,
     commit_welcome: &[u8],
     commit: &[u8],
+    send_transition_ready: bool,
 ) -> Result<DaveRuntimeContext, VoiceError> {
-    tracing::debug!(
-        commit_welcome_len = commit_welcome.len(),
-        "voice dave handshake sending commit welcome"
-    );
-    gateway
-        .send_binary(protocol::dave_mls_commit_welcome_payload(commit_welcome))
-        .await?;
+    send_local_initial_creator_commit_welcome(gateway, commit_welcome).await?;
     let commit_joined_group = {
         let commit_result = session
             .process_commit(commit)
@@ -785,15 +1489,30 @@ async fn complete_local_initial_creator_transition(
     }
     let runtime = DaveRuntimeContext::from_session(session)
         .map_err(|_| VoiceError::InvalidState("voice dave runtime create failed"))?;
+    if send_transition_ready {
+        tracing::debug!(
+            transition_id = DAVE_PROTOCOL_INIT_TRANSITION_ID,
+            commit_len = commit.len(),
+            "voice dave handshake sending transition-ready after local init creator commit"
+        );
+        gateway
+            .send_dave_transition_ready(DAVE_PROTOCOL_INIT_TRANSITION_ID)
+            .await?;
+    }
+    Ok(runtime)
+}
+
+async fn send_local_initial_creator_commit_welcome(
+    gateway: &VoiceGatewayClient,
+    commit_welcome: &[u8],
+) -> Result<(), VoiceError> {
     tracing::debug!(
-        transition_id = DAVE_PROTOCOL_INIT_TRANSITION_ID,
-        commit_len = commit.len(),
-        "voice dave handshake sending transition-ready after local init creator commit"
+        commit_welcome_len = commit_welcome.len(),
+        "voice dave handshake sending commit welcome"
     );
     gateway
-        .send_dave_transition_ready(DAVE_PROTOCOL_INIT_TRANSITION_ID)
-        .await?;
-    Ok(runtime)
+        .send_binary(protocol::dave_mls_commit_welcome_payload(commit_welcome))
+        .await
 }
 
 async fn send_pending_join_key_package(

@@ -72,6 +72,7 @@ pub struct ClientPlatform {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DavePrepareTransition {
     pub transition_id: u16,
+    pub protocol_version: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,7 +82,7 @@ pub struct DaveExecuteTransition {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DavePrepareEpoch {
-    pub transition_id: u16,
+    pub transition_id: Option<u16>,
     pub epoch: String,
     pub protocol_version: u16,
 }
@@ -319,18 +320,26 @@ pub fn parse_gateway_message(text: &str) -> Result<VoiceGatewayPayload, VoiceErr
                 .ok_or(VoiceError::InvalidState(
                     "voice dave prepare transition id invalid",
                 ))?,
-        }),
-        24 => VoiceGatewayEvent::DavePrepareEpoch(DavePrepareEpoch {
-            transition_id: data
-                .get("transition_id")
+            protocol_version: data
+                .get("protocol_version")
                 .and_then(Value::as_u64)
                 .and_then(|value| u16::try_from(value).ok())
                 .ok_or(VoiceError::InvalidState(
-                    "voice dave prepare epoch transition id invalid",
+                    "voice dave prepare transition protocol version invalid",
                 ))?,
+        }),
+        24 => VoiceGatewayEvent::DavePrepareEpoch(DavePrepareEpoch {
+            transition_id: parse_optional_u16(
+                data.get("transition_id"),
+                "voice dave prepare epoch transition id invalid",
+            )?,
             epoch: data
                 .get("epoch")
-                .and_then(Value::as_str)
+                .and_then(|value| match value {
+                    Value::String(epoch) => Some(epoch.clone()),
+                    Value::Number(epoch) => epoch.as_u64().map(|epoch| epoch.to_string()),
+                    _ => None,
+                })
                 .ok_or(VoiceError::InvalidState("voice dave prepare epoch missing"))?
                 .to_owned(),
             protocol_version: data
@@ -744,7 +753,32 @@ mod tests {
         assert_eq!(payload.seq(), Some(9));
         match payload.into_event() {
             VoiceGatewayEvent::DavePrepareEpoch(epoch) => {
-                assert_eq!(epoch.transition_id, 11);
+                assert_eq!(epoch.transition_id, Some(11));
+                assert_eq!(epoch.epoch, "1");
+                assert_eq!(epoch.protocol_version, 1);
+            }
+            other => panic!("expected dave prepare epoch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_gateway_message_supports_dave_prepare_epoch_without_transition_id() {
+        let payload = parse_gateway_message(
+            r#"{
+                "op": 24,
+                "seq": 12,
+                "d": {
+                    "epoch": 1,
+                    "protocol_version": 1
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(payload.seq(), Some(12));
+        match payload.into_event() {
+            VoiceGatewayEvent::DavePrepareEpoch(epoch) => {
+                assert_eq!(epoch.transition_id, None);
                 assert_eq!(epoch.epoch, "1");
                 assert_eq!(epoch.protocol_version, 1);
             }
@@ -853,7 +887,8 @@ mod tests {
             r#"{
                 "op": 21,
                 "d": {
-                    "transition_id": 12
+                    "transition_id": 12,
+                    "protocol_version": 1
                 }
             }"#,
         )
@@ -861,6 +896,7 @@ mod tests {
         match prepare_transition.into_event() {
             VoiceGatewayEvent::DavePrepareTransition(transition) => {
                 assert_eq!(transition.transition_id, 12);
+                assert_eq!(transition.protocol_version, 1);
             }
             other => panic!("expected dave prepare transition event, got {other:?}"),
         }

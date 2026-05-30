@@ -85,7 +85,8 @@ impl VoiceSessionRuntime {
             ensure_joinable_session(&state)?;
         }
 
-        let session = ConnectedVoiceSession::connect(voice).await?;
+        let mut session = ConnectedVoiceSession::connect(voice).await?;
+        session.wait_for_initial_dave_settle().await?;
         let event = {
             let mut state = self.state.write().await;
             apply_voice_context(&mut state, session.voice_context());
@@ -153,6 +154,7 @@ impl VoiceSessionRuntime {
             state.state = SessionState::ResolvingTrack;
             SessionEventRecord::from_snapshot(SessionEventKind::TrackResolving, &state)
         };
+        tracing::debug!(%video_id, playback_epoch, "runtime emitting TrackResolving");
         self.events.emit(resolving_event);
 
         let Some(playback) = &self.playback else {
@@ -196,6 +198,14 @@ impl VoiceSessionRuntime {
             state.state = SessionState::Buffering;
             SessionEventRecord::from_snapshot(SessionEventKind::Buffering, &state)
         };
+        tracing::debug!(
+            %video_id,
+            playback_epoch,
+            selected_itag,
+            queue_depth = queue.len(),
+            resume_position_ms,
+            "runtime emitting Buffering"
+        );
         self.events.emit(buffering_event);
 
         let playing_event = {
@@ -209,6 +219,14 @@ impl VoiceSessionRuntime {
             state.state = SessionState::Playing;
             SessionEventRecord::from_snapshot(SessionEventKind::Playing, &state)
         };
+        tracing::debug!(
+            %video_id,
+            playback_epoch,
+            selected_itag,
+            queue_depth = queue.len(),
+            resume_position_ms,
+            "runtime emitting Playing"
+        );
         self.events.emit(playing_event);
 
         let mut pacer = AudioPacer::new();
@@ -275,6 +293,13 @@ impl VoiceSessionRuntime {
                     "play requires active voice session",
                 ))?;
                 let frame_duration_ms = frame.duration_ms;
+                tracing::debug!(
+                    %video_id,
+                    playback_epoch,
+                    position_ms,
+                    frame_duration_ms,
+                    "runtime sending audio frame"
+                );
                 if let Err(err) = session.send_audio_frame(frame.data).await {
                     tracing::debug!(
                         %video_id,
@@ -286,6 +311,13 @@ impl VoiceSessionRuntime {
                     );
                     return Err(err.into());
                 }
+                tracing::debug!(
+                    %video_id,
+                    playback_epoch,
+                    position_ms,
+                    frame_duration_ms,
+                    "runtime sent audio frame"
+                );
             }
             source.record_sent_packet(frame.duration_ms);
             position_ms += frame.duration_ms;

@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use tokio::time::{Instant, timeout};
 use tracing::{info, warn};
 use twilight_gateway::error::ReceiveMessageErrorType;
@@ -24,7 +24,8 @@ use discord_voice_service_proto::discordvoice::v1::{
     JoinVoiceRequest, LeaveVoiceRequest, PlayRequest, SessionEvent, SubscribeEventsRequest,
 };
 use discord_voice_service_voice::{
-    ObservedAudioFrame, ObservedVoiceSession, VoiceContext as ObserverVoiceContext,
+    ObservedAudioFrame, ObservedVoiceSession, PendingObservedVoiceSession,
+    VoiceContext as ObserverVoiceContext,
 };
 
 use crate::audio::{AudioValidationStats, ObservedOpusPacket, analyze_opus_packets};
@@ -92,6 +93,25 @@ struct ServiceFlowOutcome {
     result: Result<ValidatedLiveOutcome>,
     failure_snapshot: FailureEvidenceSnapshot,
     service_joined: bool,
+}
+
+async fn await_observer_dave_ready<T, E, F>(ready: F) -> Result<T>
+where
+    F: Future<Output = std::result::Result<T, E>>,
+    E: Into<anyhow::Error>,
+{
+    ready
+        .await
+        .map_err(Into::into)
+        .context("await observer dave readiness")
+}
+
+fn post_play_live_contract_state(initial: &LiveContractState) -> LiveContractState {
+    LiveContractState {
+        saw_voice_ready: initial.saw_voice_ready,
+        saw_playing: false,
+        saw_track_ended: false,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -186,7 +206,9 @@ pub async fn run(config: StagingConfig) -> Result<()> {
         }
     };
 
-    let observer_voice = match join_gateway_voice(
+    let flow = run_service_flow(
+        &config,
+        service_voice,
         &observer_sender,
         &mut observer_shard,
         GatewayJoinTarget {
@@ -194,79 +216,12 @@ pub async fn run(config: StagingConfig) -> Result<()> {
             guild_id,
             channel_id,
             user_id: observer_user.id,
-            self_mute: true,
+            self_mute: false,
             self_deaf: false,
         },
-    )
-    .await
-    {
-        Ok(context) => context,
-        Err(error) => {
-            let service_cleanup = cleanup_gateway_voice(
-                &service_http,
-                &service_sender,
-                &mut service_shard,
-                guild_id,
-                service_user.id,
-            )
-            .await;
-            let observer_cleanup = cleanup_gateway_voice(
-                &observer_http,
-                &observer_sender,
-                &mut observer_shard,
-                guild_id,
-                observer_user.id,
-            )
-            .await;
-            return finish_with_failure(
-                &config,
-                Err(error),
-                combine_results(service_cleanup, observer_cleanup),
-                None,
-            );
-        }
-    };
-
-    let mut observer_session =
-        match ObservedVoiceSession::connect(observer_voice.to_observer_voice_context())
-            .await
-            .context("connect observer voice session")
-        {
-            Ok(session) => session,
-            Err(error) => {
-                let service_cleanup = cleanup_gateway_voice(
-                    &service_http,
-                    &service_sender,
-                    &mut service_shard,
-                    guild_id,
-                    service_user.id,
-                )
-                .await;
-                let observer_cleanup = cleanup_gateway_voice(
-                    &observer_http,
-                    &observer_sender,
-                    &mut observer_shard,
-                    guild_id,
-                    observer_user.id,
-                )
-                .await;
-                return finish_with_failure(
-                    &config,
-                    Err(error),
-                    combine_results(service_cleanup, observer_cleanup),
-                    None,
-                );
-            }
-        };
-
-    let flow = run_service_flow(
-        &config,
-        service_voice,
-        &mut observer_session,
         service_user.id.to_string(),
     )
     .await;
-    drop(observer_session);
 
     let cleanup = cleanup_after_flow(
         &config.discord_voice_service_uri,
@@ -310,7 +265,9 @@ pub async fn run(config: StagingConfig) -> Result<()> {
 async fn run_service_flow(
     config: &StagingConfig,
     forwarded_voice: ForwardedVoiceContext,
-    observer_session: &mut ObservedVoiceSession,
+    observer_sender: &twilight_gateway::MessageSender,
+    observer_shard: &mut Shard,
+    observer_join: GatewayJoinTarget<'_>,
     service_user_id: String,
 ) -> ServiceFlowOutcome {
     let mut failure_snapshot = FailureEvidenceSnapshot::default();
@@ -356,7 +313,6 @@ async fn run_service_flow(
         }
     };
     let mut events = response.into_inner();
-
     let join_result = join_client
         .join_voice(JoinVoiceRequest {
             voice: Some(forwarded_voice.to_proto_voice_context()),
@@ -371,6 +327,35 @@ async fn run_service_flow(
         };
     }
 
+    let initial_live_contract = match timeout(
+        LIVE_CONTRACT_TIMEOUT,
+        wait_for_initial_voice_ready(&mut events, &config.test_video_id),
+    )
+    .await
+    {
+        Ok(Ok(state)) => state,
+        Ok(Err(error)) => {
+            return ServiceFlowOutcome {
+                result: Err(error.context("wait for service VoiceReady before Play")),
+                failure_snapshot,
+                service_joined: true,
+            };
+        }
+        Err(_) => {
+            return ServiceFlowOutcome {
+                result: Err(anyhow!(
+                    "timed out waiting for service VoiceReady before Play after {} seconds",
+                    LIVE_CONTRACT_TIMEOUT.as_secs()
+                )),
+                failure_snapshot,
+                service_joined: true,
+            };
+        }
+    };
+    let post_play_live_contract = post_play_live_contract_state(&initial_live_contract);
+    let live_contract_snapshot = Arc::new(Mutex::new(post_play_live_contract.clone()));
+    failure_snapshot.live_contract = Some(post_play_live_contract.clone());
+
     let observer_audio_snapshot = Arc::new(Mutex::new(None::<AudioValidationStats>));
     let play_rpc = async {
         join_client
@@ -382,25 +367,50 @@ async fn run_service_flow(
             .map(|_| ())
     };
 
-    let service_contract = async {
-        match timeout(
-            LIVE_CONTRACT_TIMEOUT,
-            assert_live_success_contract(&mut events, &config.test_video_id),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => Err(anyhow!(
-                "live contract timed out after {} seconds",
-                LIVE_CONTRACT_TIMEOUT.as_secs()
-            )),
+    let service_contract = {
+        let live_contract_snapshot = Arc::clone(&live_contract_snapshot);
+        async {
+            match timeout(
+                LIVE_CONTRACT_TIMEOUT,
+                wait_for_play_started_contract_with_snapshot(
+                    &mut events,
+                    &config.test_video_id,
+                    post_play_live_contract,
+                    Some(live_contract_snapshot),
+                ),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(anyhow!(
+                    "play-start contract timed out after {} seconds",
+                    LIVE_CONTRACT_TIMEOUT.as_secs()
+                )),
+            }
         }
     };
-    let observer_proof = async {
-        let snapshot = Arc::clone(&observer_audio_snapshot);
-        match timeout(
+    let observer_audio_snapshot_for_proof = Arc::clone(&observer_audio_snapshot);
+    let combined_validation = async move {
+        let live_contract = service_contract.await?;
+        info!("service play contract satisfied; joining observer voice session");
+        let observer_voice = join_gateway_voice(observer_sender, observer_shard, observer_join)
+            .await
+            .context("join observer gateway voice after service started")?;
+        info!("observer gateway voice joined; connecting observer voice session");
+        let pending_observer =
+            PendingObservedVoiceSession::connect(observer_voice.to_observer_voice_context())
+                .await
+                .context("connect pending observer voice session")?;
+        let mut observer_session =
+            await_observer_dave_ready(pending_observer.await_dave_ready(LIVE_CONTRACT_TIMEOUT))
+                .await?;
+        let audio_stats = match timeout(
             LIVE_CONTRACT_TIMEOUT,
-            observe_audio_proof(observer_session, &service_user_id, snapshot),
+            observe_audio_proof(
+                &mut observer_session,
+                &service_user_id,
+                observer_audio_snapshot_for_proof,
+            ),
         )
         .await
         {
@@ -409,10 +419,7 @@ async fn run_service_flow(
                 "observer audio proof timed out after {} seconds",
                 LIVE_CONTRACT_TIMEOUT.as_secs()
             )),
-        }
-    };
-    let combined_validation = async {
-        let (live_contract, audio_stats) = tokio::try_join!(service_contract, observer_proof)?;
+        }?;
         Ok(ValidatedLiveOutcome {
             live_contract,
             audio_stats,
@@ -420,6 +427,7 @@ async fn run_service_flow(
     };
 
     let result = wait_for_play_and_live_contract(combined_validation, play_rpc).await;
+    failure_snapshot.live_contract = Some(live_contract_snapshot.lock().unwrap().clone());
     failure_snapshot.audio_stats = observer_audio_snapshot.lock().unwrap().clone();
 
     ServiceFlowOutcome {
@@ -437,29 +445,14 @@ where
     ContractFuture: Future<Output = Result<State>>,
     PlayFuture: Future<Output = Result<()>>,
 {
-    let mut contract_finished = false;
-    let mut play_finished = false;
-    let mut contract_state: Option<State> = None;
-
     tokio::pin!(contract_future);
     tokio::pin!(play_future);
 
-    loop {
-        if contract_finished && play_finished {
-            return contract_state.ok_or_else(|| {
-                anyhow!("internal controller error: live contract completed without state")
-            });
-        }
-
-        tokio::select! {
-            contract_result = &mut contract_future, if !contract_finished => {
-                contract_finished = true;
-                contract_state = Some(contract_result?);
-            }
-            play_result = &mut play_future, if !play_finished => {
-                play_finished = true;
-                play_result?;
-            }
+    tokio::select! {
+        contract_result = &mut contract_future => contract_result,
+        play_result = &mut play_future => {
+            play_result?;
+            contract_future.await
         }
     }
 }
@@ -636,8 +629,36 @@ fn observer_threshold_error(stats: Option<&AudioValidationStats>) -> anyhow::Err
     }
 }
 
-async fn assert_live_success_contract(
-    events: &mut tonic::Streaming<SessionEvent>,
+#[cfg(test)]
+async fn wait_for_play_started_contract(
+    events: &mut (impl Stream<Item = Result<SessionEvent, tonic::Status>> + Unpin),
+    expected_video_id: &str,
+    state: LiveContractState,
+) -> Result<LiveContractState> {
+    wait_for_play_started_contract_with_snapshot(events, expected_video_id, state, None).await
+}
+
+async fn wait_for_play_started_contract_with_snapshot(
+    events: &mut (impl Stream<Item = Result<SessionEvent, tonic::Status>> + Unpin),
+    expected_video_id: &str,
+    mut state: LiveContractState,
+    snapshot: Option<Arc<Mutex<LiveContractState>>>,
+) -> Result<LiveContractState> {
+    loop {
+        let maybe_event = events.next().await;
+        let event = next_session_event(maybe_event)?;
+        state.observe_event(event, expected_video_id)?;
+        if let Some(snapshot) = &snapshot {
+            *snapshot.lock().unwrap() = state.clone();
+        }
+        if state.saw_playing {
+            return Ok(state);
+        }
+    }
+}
+
+async fn wait_for_initial_voice_ready(
+    events: &mut (impl Stream<Item = Result<SessionEvent, tonic::Status>> + Unpin),
     expected_video_id: &str,
 ) -> Result<LiveContractState> {
     let mut state = LiveContractState::default();
@@ -645,7 +666,8 @@ async fn assert_live_success_contract(
     loop {
         let maybe_event = events.next().await;
         let event = next_session_event(maybe_event)?;
-        if state.observe_event(event, expected_video_id)? {
+        state.observe_event(event, expected_video_id)?;
+        if state.saw_voice_ready {
             return Ok(state);
         }
     }
@@ -865,7 +887,7 @@ fn build_success_evidence(
         ytmusic_addr: config.discord_voice_service_ytmusic_addr.clone(),
         saw_voice_ready: validated.live_contract.saw_voice_ready,
         saw_playing: validated.live_contract.saw_playing,
-        saw_track_ended: true,
+        saw_track_ended: validated.live_contract.saw_track_ended,
         observed_packet_count: validated.audio_stats.observed_packet_count,
         decoded_audio_ms: validated.audio_stats.decoded_audio_ms,
         non_silent_audio_ms: validated.audio_stats.non_silent_audio_ms,
@@ -887,7 +909,7 @@ fn build_failure_evidence(
         ytmusic_addr: config.discord_voice_service_ytmusic_addr.clone(),
         saw_voice_ready: live_contract.is_some_and(|state| state.saw_voice_ready),
         saw_playing: live_contract.is_some_and(|state| state.saw_playing),
-        saw_track_ended: false,
+        saw_track_ended: live_contract.is_some_and(|state| state.saw_track_ended),
         observed_packet_count: audio_stats.map_or(0, |stats| stats.observed_packet_count),
         decoded_audio_ms: audio_stats.map_or(0, |stats| stats.decoded_audio_ms),
         non_silent_audio_ms: audio_stats.map_or(0, |stats| stats.non_silent_audio_ms),
@@ -951,4 +973,192 @@ pub(crate) fn is_fatal_gateway_receive_error(
     error: &twilight_gateway::error::ReceiveMessageError,
 ) -> bool {
     matches!(error.kind(), ReceiveMessageErrorType::Reconnect)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use discord_voice_service_proto::discordvoice::v1::SessionEventKind;
+    use futures::stream;
+    use std::collections::HashMap;
+
+    fn event(kind: SessionEventKind, current_video_id: Option<&str>) -> SessionEvent {
+        SessionEvent {
+            kind: kind as i32,
+            current_video_id: current_video_id.unwrap_or_default().to_owned(),
+            message: String::new(),
+            ..SessionEvent::default()
+        }
+    }
+
+    fn valid_test_config() -> StagingConfig {
+        StagingConfig::from_env_map(HashMap::from([
+            ("BOT_TOKEN".to_owned(), "token".to_owned()),
+            ("OBSERVER_BOT_TOKEN".to_owned(), "observer-token".to_owned()),
+            ("APPLICATION_ID".to_owned(), "1".to_owned()),
+            ("TEST_GUILD_ID".to_owned(), "2".to_owned()),
+            ("TEST_VOICE_CHANNEL_ID".to_owned(), "3".to_owned()),
+            ("TEST_VIDEO_ID".to_owned(), "video".to_owned()),
+            (
+                "DISCORD_VOICE_SERVICE_URI".to_owned(),
+                "http://127.0.0.1:55051".to_owned(),
+            ),
+            (
+                "DISCORD_VOICE_SERVICE_YTMUSIC_ADDR".to_owned(),
+                "http://127.0.0.1:50051".to_owned(),
+            ),
+        ]))
+        .expect("config should parse")
+    }
+
+    #[tokio::test]
+    async fn waits_for_voice_ready_before_continuing_live_contract() {
+        let mut events = stream::iter(vec![
+            Ok(event(SessionEventKind::VoiceConnecting, None)),
+            Ok(event(SessionEventKind::VoiceReady, None)),
+            Ok(event(SessionEventKind::Playing, Some("video"))),
+            Ok(event(SessionEventKind::TrackEnded, Some("video"))),
+        ]);
+
+        let initial = wait_for_initial_voice_ready(&mut events, "video")
+            .await
+            .expect("voice ready should be observed before play");
+        assert!(initial.saw_voice_ready);
+        assert!(!initial.saw_playing);
+
+        let final_state = wait_for_play_started_contract(&mut events, "video", initial)
+            .await
+            .expect("remaining events should satisfy the play-start contract");
+        assert!(final_state.saw_voice_ready);
+        assert!(final_state.saw_playing);
+        assert!(!final_state.saw_track_ended);
+    }
+
+    #[tokio::test]
+    async fn play_started_contract_requires_post_play_playing_after_pre_play_playing() {
+        let mut events = stream::iter(vec![
+            Ok(event(SessionEventKind::Playing, Some("video"))),
+            Ok(event(SessionEventKind::VoiceReady, None)),
+            Ok(event(SessionEventKind::Playing, Some("video"))),
+        ]);
+
+        let initial = wait_for_initial_voice_ready(&mut events, "video")
+            .await
+            .expect("voice ready should preserve earlier playing progress");
+        assert!(initial.saw_voice_ready);
+        assert!(initial.saw_playing);
+
+        let post_play_state = post_play_live_contract_state(&initial);
+        assert!(post_play_state.saw_voice_ready);
+        assert!(
+            !post_play_state.saw_playing,
+            "pre-Play Playing must not satisfy the post-Play contract",
+        );
+        assert!(!post_play_state.saw_track_ended);
+
+        let final_state = wait_for_play_started_contract(&mut events, "video", post_play_state)
+            .await
+            .expect("a post-Play Playing event should satisfy the play-start contract");
+        assert!(final_state.saw_voice_ready);
+        assert!(final_state.saw_playing);
+        assert!(!final_state.saw_track_ended);
+    }
+
+    #[tokio::test]
+    async fn play_completion_does_not_block_success_after_contract_finishes() {
+        let contract = async {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            Ok::<_, anyhow::Error>(LiveContractState {
+                saw_voice_ready: true,
+                saw_playing: true,
+                saw_track_ended: false,
+            })
+        };
+        let play = async {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            Ok::<_, anyhow::Error>(())
+        };
+
+        let state = wait_for_play_and_live_contract(contract, play)
+            .await
+            .expect("contract success should return before long-lived play RPC completes");
+        assert!(state.saw_voice_ready);
+        assert!(state.saw_playing);
+    }
+
+    #[test]
+    fn failure_evidence_preserves_live_contract_snapshot_fields() {
+        let snapshot = FailureEvidenceSnapshot {
+            live_contract: Some(LiveContractState {
+                saw_voice_ready: true,
+                saw_playing: true,
+                saw_track_ended: true,
+            }),
+            audio_stats: None,
+        };
+
+        let evidence = build_failure_evidence(
+            &valid_test_config(),
+            &anyhow!("observer audio proof timed out"),
+            Some(&snapshot),
+        );
+
+        assert!(evidence.saw_voice_ready);
+        assert!(evidence.saw_playing);
+        assert!(evidence.saw_track_ended);
+    }
+
+    #[tokio::test]
+    async fn failure_evidence_keeps_play_progress_from_snapshot_updates() {
+        let initial = LiveContractState {
+            saw_voice_ready: true,
+            saw_playing: false,
+            saw_track_ended: false,
+        };
+        let snapshot = Arc::new(Mutex::new(initial.clone()));
+        let mut events = stream::iter(vec![Ok(event(SessionEventKind::Playing, Some("video")))]);
+
+        let state = wait_for_play_started_contract_with_snapshot(
+            &mut events,
+            "video",
+            initial,
+            Some(Arc::clone(&snapshot)),
+        )
+        .await
+        .expect("playing should satisfy the play-start contract");
+        assert!(state.saw_playing);
+        let failure_snapshot = FailureEvidenceSnapshot {
+            live_contract: Some(snapshot.lock().unwrap().clone()),
+            audio_stats: None,
+        };
+        let error = anyhow!("observer audio proof timed out");
+
+        let evidence =
+            build_failure_evidence(&valid_test_config(), &error, Some(&failure_snapshot));
+
+        assert!(evidence.saw_voice_ready);
+        assert!(evidence.saw_playing);
+        assert!(!evidence.saw_track_ended);
+    }
+
+    #[tokio::test]
+    async fn observer_dave_readiness_returns_ready_session_value() {
+        let ready = await_observer_dave_ready(async { Ok::<_, anyhow::Error>(41usize) })
+            .await
+            .expect("ready observer session should pass through");
+
+        assert_eq!(ready, 41);
+    }
+
+    #[tokio::test]
+    async fn observer_dave_readiness_adds_context_on_failure() {
+        let error =
+            await_observer_dave_ready(async { Err::<(), _>(anyhow!("dave handshake failed")) })
+                .await
+                .expect_err("readiness failure should surface with context");
+
+        let message = format!("{error:#}");
+        assert!(message.contains("await observer dave readiness"));
+        assert!(message.contains("dave handshake failed"));
+    }
 }

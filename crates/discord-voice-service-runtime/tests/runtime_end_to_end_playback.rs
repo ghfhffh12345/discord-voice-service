@@ -12,6 +12,7 @@ use futures::StreamExt;
 use tokio::time::{Duration, Instant};
 use tonic::Request;
 
+const SERVICE_USER_ID: &str = "1111111111111111";
 #[tokio::test]
 async fn join_voice_then_play_reaches_connected_runtime_playback_path() {
     let fake_yt = FakeYtMusic::spawn().await;
@@ -73,6 +74,109 @@ async fn join_voice_then_play_reaches_connected_runtime_playback_path() {
     assert_eq!(snapshot.selected_itag, None);
     assert_eq!(snapshot.queue_depth, 0);
     assert_eq!(snapshot.position_ms, 0);
+}
+
+#[tokio::test]
+async fn play_handles_queued_replayed_established_join_welcome_before_first_audio_frame() {
+    let fake_yt = FakeYtMusic::spawn().await;
+    let http = spawn_stream_server("audio-itag250.webm").await;
+    fake_yt.set_playable_url(http.url()).await;
+    let fake_voice = FakeDiscordPeer::spawn_with_established_dave_group().await;
+    let speaking_observed = fake_voice.speaking_observed();
+    let supervisor = Supervisor::with_ytmusic_endpoint(fake_yt.endpoint())
+        .await
+        .unwrap();
+    let mut stream = subscribe_events(supervisor.clone()).await;
+
+    supervisor
+        .send(Command::JoinVoice {
+            voice: fake_voice.voice_context("1", "2", SERVICE_USER_ID, "session-1", "token-1"),
+        })
+        .await
+        .unwrap();
+
+    let startup_events = collect_events(&mut stream, 1).await;
+    assert_eq!(startup_events[0].kind, SessionEventKind::VoiceReady as i32);
+
+    fake_voice
+        .replay_established_join_welcome_transition()
+        .await
+        .unwrap();
+
+    supervisor
+        .send(Command::Play {
+            video_id: "video-1".into(),
+        })
+        .await
+        .unwrap();
+
+    let playback_events = collect_events(&mut stream, 3).await;
+    assert_eq!(
+        playback_events[0].kind,
+        SessionEventKind::TrackResolving as i32
+    );
+    assert_eq!(playback_events[1].kind, SessionEventKind::Buffering as i32);
+    assert_eq!(playback_events[2].kind, SessionEventKind::Playing as i32);
+
+    tokio::time::timeout(Duration::from_secs(2), speaking_observed.notified())
+        .await
+        .expect("speaking should be observed");
+    assert!(fake_voice.audio_frame_count_at_least(2).await >= 2);
+
+    let ending_events = collect_events(&mut stream, 1).await;
+    assert_eq!(ending_events[0].kind, SessionEventKind::TrackEnded as i32);
+}
+
+#[tokio::test]
+async fn play_handles_queued_replayed_local_init_creator_commit_before_first_audio_frame() {
+    let fake_yt = FakeYtMusic::spawn().await;
+    let http = spawn_stream_server("audio-itag250.webm").await;
+    fake_yt.set_playable_url(http.url()).await;
+    let fake_voice =
+        FakeDiscordPeer::spawn_with_dave_queued_init_prepare_commit_until_control().await;
+    let speaking_observed = fake_voice.speaking_observed();
+    let supervisor = Supervisor::with_ytmusic_endpoint(fake_yt.endpoint())
+        .await
+        .unwrap();
+    let mut stream = subscribe_events(supervisor.clone()).await;
+
+    supervisor
+        .send(Command::JoinVoice {
+            voice: fake_voice.voice_context("1", "2", SERVICE_USER_ID, "session-1", "token-1"),
+        })
+        .await
+        .unwrap();
+
+    let startup_events = collect_events(&mut stream, 1).await;
+    assert_eq!(startup_events[0].kind, SessionEventKind::VoiceReady as i32);
+
+    fake_voice
+        .replay_local_init_creator_commit_transition()
+        .await
+        .unwrap();
+
+    supervisor
+        .send(Command::Play {
+            video_id: "video-1".into(),
+        })
+        .await
+        .unwrap();
+
+    let playback_events = collect_events(&mut stream, 3).await;
+    assert_eq!(
+        playback_events[0].kind,
+        SessionEventKind::TrackResolving as i32
+    );
+    assert_eq!(playback_events[1].kind, SessionEventKind::Buffering as i32);
+    assert_eq!(playback_events[2].kind, SessionEventKind::Playing as i32);
+
+    tokio::time::timeout(Duration::from_secs(2), speaking_observed.notified())
+        .await
+        .expect("speaking should be observed");
+    assert!(fake_voice.audio_frame_count_at_least(2).await >= 2);
+
+    let ending_events = collect_events(&mut stream, 1).await;
+    assert_eq!(ending_events[0].kind, SessionEventKind::TrackEnded as i32);
 }
 
 #[tokio::test]

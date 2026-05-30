@@ -128,7 +128,7 @@ docker run -d \
 wait_for_port 55051 "discord-voice-service gRPC listener"
 sleep 5
 
-"${controller_binary}" > /dev/null 2>"${controller_log}"
+"${controller_binary}" >"${controller_log}" 2>&1
 
 if [[ ! -s "${validation_evidence_path}" ]]; then
   echo "::error::Live validation evidence artifact was empty"
