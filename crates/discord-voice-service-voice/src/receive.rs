@@ -41,6 +41,7 @@ pub struct PendingObservedVoiceSession {
     completed_dave_transition_ids: BTreeSet<u16>,
     dave_timeout: Option<Duration>,
     heartbeat_shutdown: Option<oneshot::Sender<()>>,
+    author_dave_proposals: bool,
     speaker_ssrcs: HashMap<u32, String>,
     remote_speaker_candidates: BTreeSet<String>,
     pending_packets: HashMap<u32, PendingPacket>,
@@ -87,6 +88,7 @@ impl PendingObservedVoiceSession {
             completed_dave_transition_ids: BTreeSet::new(),
             dave_timeout: None,
             heartbeat_shutdown: None,
+            author_dave_proposals: true,
             speaker_ssrcs: HashMap::new(),
             remote_speaker_candidates: BTreeSet::new(),
             pending_packets: HashMap::new(),
@@ -118,10 +120,15 @@ impl PendingObservedVoiceSession {
             completed_dave_transition_ids: BTreeSet::new(),
             dave_timeout: Some(dave_timeout),
             heartbeat_shutdown: Some(heartbeat_shutdown),
+            author_dave_proposals: true,
             speaker_ssrcs: HashMap::new(),
             remote_speaker_candidates: BTreeSet::new(),
             pending_packets: HashMap::new(),
         })
+    }
+
+    pub fn set_dave_proposal_authoring(&mut self, enabled: bool) {
+        self.author_dave_proposals = enabled;
     }
 
     pub async fn await_dave_ready(
@@ -138,6 +145,7 @@ impl PendingObservedVoiceSession {
                     gateway,
                     pending,
                     timeout_duration,
+                    self.author_dave_proposals,
                 )
                 .await?;
                 self.dave_material = Some(ready.material);
@@ -162,7 +170,7 @@ impl PendingObservedVoiceSession {
             transport: self.transport.take(),
             protection: self.protection.take(),
             dave,
-            author_dave_proposals: true,
+            author_dave_proposals: self.author_dave_proposals,
             dave_material: self.dave_material.take(),
             dave_recognized_user_ids: std::mem::take(&mut self.dave_recognized_user_ids),
             completed_dave_transition_ids: std::mem::take(&mut self.completed_dave_transition_ids),
@@ -314,6 +322,17 @@ impl ObservedVoiceSession {
                         return Ok(Some(frame));
                     }
                     Err(DecodeAudioPacketError::NotReady) => {}
+                    Err(DecodeAudioPacketError::Fatal(err))
+                        if err.is_packet_unprotect_failure() =>
+                    {
+                        debug!(
+                            expected_user_id,
+                            ssrc = header.ssrc,
+                            error = %err,
+                            "voice receive ignored unprotectable packet for unknown ssrc"
+                        );
+                        return Ok(None);
+                    }
                     Err(DecodeAudioPacketError::Fatal(err)) => return Err(err),
                 }
             }
@@ -638,9 +657,13 @@ impl ObservedVoiceSession {
         )
         .await?;
         self.dave = None;
-        let ready =
-            handshake::complete_pending_observer_dave_join(gateway, pending, timeout_duration)
-                .await?;
+        let ready = handshake::complete_pending_observer_dave_join(
+            gateway,
+            pending,
+            timeout_duration,
+            self.author_dave_proposals,
+        )
+        .await?;
         self.apply_observer_dave_ready(ready);
         Ok(())
     }

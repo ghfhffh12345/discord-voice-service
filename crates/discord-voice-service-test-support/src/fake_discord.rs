@@ -2234,6 +2234,15 @@ impl FakeDiscordPeer {
         Ok(())
     }
 
+    pub async fn send_raw_udp_packet(&self, packet: &[u8]) -> Result<(), VoiceError> {
+        let peer = self
+            .last_udp_peer()
+            .await
+            .ok_or(VoiceError::InvalidState("fake udp peer unavailable"))?;
+        self.udp_socket.send_to(packet, peer).await?;
+        Ok(())
+    }
+
     pub async fn discovery_count(&self) -> usize {
         wait_for_value(&self.discovery_count, |count| *count >= 1).await
     }

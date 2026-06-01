@@ -87,7 +87,7 @@ impl VoiceSessionRuntime {
         }
 
         let mut session = ConnectedVoiceSession::connect(voice).await?;
-        session.wait_for_initial_dave_settle().await?;
+        session.settle_initial_dave_for_join().await?;
         let event = {
             let mut state = self.state.write().await;
             apply_voice_context(&mut state, session.voice_context());

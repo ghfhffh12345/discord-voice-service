@@ -6,6 +6,7 @@ use discord_voice_service_test_support::fake_discord::FakeDiscordPeer;
 use discord_voice_service_voice::dave::{
     DaveExternalSender, DaveMediaType, DaveRuntimeContext, DaveSession,
 };
+use discord_voice_service_voice::test_support::RtpPacketBuilder;
 use discord_voice_service_voice::{ObservedVoiceSession, PendingObservedVoiceSession};
 use tokio::net::UdpSocket;
 use tokio::time::{Duration, Instant, sleep};
@@ -161,6 +162,58 @@ async fn observed_voice_session_resolves_unknown_ssrc_by_expected_dave_speaker_d
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn observed_voice_session_ignores_unprotectable_unknown_ssrc_before_target_dave_audio() {
+    let fake = FakeDiscordPeer::spawn_with_established_dave_group().await;
+    let voice = fake.voice_context("1", "2", OBSERVER_USER_ID, "session-1", "token-1");
+
+    let pending = PendingObservedVoiceSession::connect(voice).await.unwrap();
+    let mut session = pending.await_dave_ready(DAVE_READY_TIMEOUT).await.unwrap();
+    assert!(fake.saw_dave_transition().await);
+
+    let malformed = RtpPacketBuilder::new(77).build(0, 0, b"not-a-valid-protected-packet");
+    fake.send_raw_udp_packet(&malformed).await.unwrap();
+
+    let opus = hex::decode("0dc5aedd5bdc3f20be5697e54dd1f437").unwrap();
+    let encrypted = fake
+        .encrypt_dave_audio_frame_from_creator(&opus)
+        .await
+        .unwrap();
+    fake.send_protected_audio_packet(42, &encrypted)
+        .await
+        .unwrap();
+
+    let frame = session
+        .receive_audio_frame_from(FAKE_DAVE_CREATOR_USER_ID, Duration::from_secs(1))
+        .await
+        .unwrap();
+
+    assert_eq!(frame.user_id, FAKE_DAVE_CREATOR_USER_ID);
+    assert_eq!(frame.ssrc, 42);
+    assert_eq!(frame.payload, Bytes::from(opus));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn observed_voice_session_keeps_unprotectable_mapped_target_packet_fatal() {
+    let fake = FakeDiscordPeer::spawn_with_established_dave_group().await;
+    let voice = fake.voice_context("1", "2", OBSERVER_USER_ID, "session-1", "token-1");
+
+    let pending = PendingObservedVoiceSession::connect(voice).await.unwrap();
+    let mut session = pending.await_dave_ready(DAVE_READY_TIMEOUT).await.unwrap();
+    assert!(fake.saw_dave_transition().await);
+
+    session.record_speaker_ssrc(FAKE_DAVE_CREATOR_USER_ID, 77);
+    let malformed = RtpPacketBuilder::new(77).build(0, 0, b"not-a-valid-protected-packet");
+    fake.send_raw_udp_packet(&malformed).await.unwrap();
+
+    let error = session
+        .receive_audio_frame_from(FAKE_DAVE_CREATOR_USER_ID, Duration::from_secs(1))
+        .await
+        .unwrap_err();
+
+    assert!(error.is_packet_unprotect_failure());
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn observed_voice_session_ignores_foreign_dave_speaker_before_target_audio() {
     let fake = FakeDiscordPeer::spawn_with_established_dave_group().await;
     let voice = fake.voice_context("1", "2", OBSERVER_USER_ID, "session-1", "token-1");
@@ -304,6 +357,57 @@ async fn observed_voice_session_can_leave_post_join_proposals_to_active_sender()
         .unwrap();
 
     let frame = receive_task.await.unwrap().unwrap();
+    assert_eq!(frame.user_id, FAKE_DAVE_CREATOR_USER_ID);
+    assert_eq!(frame.payload, Bytes::from(opus));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn pending_observed_voice_session_can_leave_initial_proposals_to_active_sender() {
+    let fake =
+        FakeDiscordPeer::spawn_with_delayed_established_dave_group_join_after_proposals().await;
+    let voice = fake.voice_context("1", "2", OBSERVER_USER_ID, "session-1", "token-1");
+
+    let mut pending = PendingObservedVoiceSession::connect(voice).await.unwrap();
+    pending.set_dave_proposal_authoring(false);
+    let ready = pending.await_dave_ready(DAVE_READY_TIMEOUT);
+    tokio::pin!(ready);
+
+    assert!(fake.saw_dave_key_package_after_external_sender().await);
+    sleep(Duration::from_millis(100)).await;
+    assert!(
+        !fake
+            .saw_dave_commit_welcome_within(Duration::from_millis(50))
+            .await,
+        "passive pending observer must not author initial DAVE proposal commits"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut ready)
+            .await
+            .is_err(),
+        "observer join should wait for the sender-authored initial transition"
+    );
+
+    fake.release_delayed_established_join_material()
+        .await
+        .unwrap();
+    let mut session = ready.await.unwrap();
+
+    let opus = hex::decode("0dc5aedd5bdc3f20be5697e54dd1f437").unwrap();
+    let encrypted = fake
+        .encrypt_dave_audio_frame_from_creator(&opus)
+        .await
+        .unwrap();
+    fake.send_speaking(FAKE_DAVE_CREATOR_USER_ID, 42)
+        .await
+        .unwrap();
+    fake.send_protected_audio_packet(42, &encrypted)
+        .await
+        .unwrap();
+
+    let frame = session
+        .receive_audio_frame_from(FAKE_DAVE_CREATOR_USER_ID, Duration::from_secs(1))
+        .await
+        .unwrap();
     assert_eq!(frame.user_id, FAKE_DAVE_CREATOR_USER_ID);
     assert_eq!(frame.payload, Bytes::from(opus));
 }

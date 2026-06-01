@@ -1142,6 +1142,7 @@ pub(crate) async fn complete_pending_observer_dave_join(
     gateway: &VoiceGatewayClient,
     mut pending: PendingObserverDaveState,
     timeout_duration: Duration,
+    author_proposals: bool,
 ) -> Result<PendingObserverReadyResult, VoiceError> {
     let handshake_deadline = Instant::now() + timeout_duration;
     let mut gateway_updates = std::mem::take(&mut pending.gateway_updates);
@@ -1252,11 +1253,23 @@ pub(crate) async fn complete_pending_observer_dave_join(
                     operation = ?ProposalsOperationType::from(operation),
                     pending_gateway_winner_after_local_proposals_commit =
                         pending.pending_gateway_winner_after_local_proposals_commit,
+                    author_proposals,
                     "voice observer dave handshake processing proposals"
                 );
                 pending
                     .pending_proposals
                     .push((operation, proposals.clone()));
+                if !author_proposals && !pending.pending_gateway_winner_after_local_proposals_commit
+                {
+                    pending.pending_gateway_winner_after_local_proposals_commit = true;
+                    pending.pending_proposals_replay_start = pending.pending_proposals.len();
+                    tracing::debug!(
+                        proposals_len = proposals.len(),
+                        recognized_user_ids = pending.recognized_user_ids.len(),
+                        operation = ?ProposalsOperationType::from(operation),
+                        "voice observer dave handshake waiting for sender-authored transition because local proposal authoring is disabled"
+                    );
+                }
                 if pending.saw_existing_speaker
                     && !pending.pending_gateway_winner_after_local_proposals_commit
                 {

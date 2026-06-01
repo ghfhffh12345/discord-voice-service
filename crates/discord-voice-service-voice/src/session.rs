@@ -307,9 +307,26 @@ impl ConnectedVoiceSession {
             .await
     }
 
+    pub async fn settle_initial_dave_for_join(&mut self) -> Result<(), VoiceError> {
+        self.process_pending_gateway_events_with_initial_poll_policy(
+            DAVE_GATEWAY_TRANSITION_POLL,
+            true,
+        )
+        .await
+    }
+
     async fn process_pending_gateway_events_with_initial_poll(
         &mut self,
         initial_wait: Duration,
+    ) -> Result<(), VoiceError> {
+        self.process_pending_gateway_events_with_initial_poll_policy(initial_wait, false)
+            .await
+    }
+
+    async fn process_pending_gateway_events_with_initial_poll_policy(
+        &mut self,
+        initial_wait: Duration,
+        allow_pending_initial_dave: bool,
     ) -> Result<(), VoiceError> {
         if self.dave_failed_closed {
             return Err(VoiceError::InvalidState("voice dave session failed closed"));
@@ -387,7 +404,7 @@ impl ConnectedVoiceSession {
                 "voice dave local commit transition pending",
             ));
         }
-        if self.pending_initial_dave.is_some() {
+        if self.pending_initial_dave.is_some() && !allow_pending_initial_dave {
             return Err(VoiceError::InvalidState(
                 "voice dave initial session pending",
             ));

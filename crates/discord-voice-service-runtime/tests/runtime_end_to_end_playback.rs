@@ -77,6 +77,30 @@ async fn join_voice_then_play_reaches_connected_runtime_playback_path() {
 }
 
 #[tokio::test]
+async fn join_voice_accepts_self_only_pending_initial_dave_session() {
+    let fake_voice = FakeDiscordPeer::spawn_with_dave_self_only_no_proposals().await;
+    let supervisor = Supervisor::new();
+    let mut stream = subscribe_events(supervisor.clone()).await;
+
+    supervisor
+        .send(Command::JoinVoice {
+            voice: fake_voice.voice_context("1", "2", SERVICE_USER_ID, "session-1", "token-1"),
+        })
+        .await
+        .unwrap();
+
+    let startup_events = collect_events(&mut stream, 1).await;
+    assert_eq!(startup_events[0].kind, SessionEventKind::VoiceReady as i32);
+    assert_eq!(supervisor.snapshot().await.state, SessionState::VoiceReady);
+    assert!(fake_voice.saw_dave_key_package_before_prepare_epoch().await);
+    assert!(
+        !fake_voice
+            .saw_dave_commit_welcome_within(Duration::from_millis(100))
+            .await
+    );
+}
+
+#[tokio::test]
 async fn play_handles_queued_replayed_established_join_welcome_before_first_audio_frame() {
     let fake_yt = FakeYtMusic::spawn().await;
     let http = spawn_stream_server("audio-itag250.webm").await;

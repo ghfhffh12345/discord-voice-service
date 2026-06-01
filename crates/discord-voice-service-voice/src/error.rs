@@ -25,4 +25,16 @@ impl VoiceError {
             Self::InvalidState("voice gateway closed during receive")
         )
     }
+
+    pub fn is_packet_unprotect_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::InvalidState(
+                "voice protected packet truncated"
+                    | "voice protected packet body too short"
+                    | "voice packet unprotect failed"
+                    | "voice rtp padding invalid"
+            )
+        )
+    }
 }

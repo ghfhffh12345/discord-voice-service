@@ -412,7 +412,7 @@ async fn run_service_flow(
         }
     };
     info!("observer gateway voice joined; connecting observer voice session");
-    let pending_observer =
+    let mut pending_observer =
         match PendingObservedVoiceSession::connect(to_observer_voice_context(&observer_voice))
             .await
             .context("connect pending observer voice session")
@@ -426,6 +426,7 @@ async fn run_service_flow(
                 };
             }
         };
+    pending_observer.set_dave_proposal_authoring(false);
     info!("observer voice session connected; awaiting DAVE readiness during Play");
 
     let observer_audio_snapshot = Arc::new(Mutex::new(None::<AudioValidationStats>));
