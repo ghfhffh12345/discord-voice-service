@@ -4,6 +4,12 @@ on:
   release:
     types:
       - published
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag to publish, for rerunning image publication after a published release
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -13,7 +19,7 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 concurrency:
-  group: release-image-${{ github.event.release.tag_name }}
+  group: release-image-${{ github.event.release.tag_name || inputs.release_tag }}
   cancel-in-progress: false
 
 jobs:
@@ -28,19 +34,18 @@ jobs:
       final_tags: ${{ steps.meta.outputs.final_tags }}
       version_tag: ${{ steps.meta.outputs.version_tag }}
       oci_labels: ${{ steps.meta.outputs.oci_labels }}
-      image_annotations: ${{ steps.meta.outputs.image_annotations }}
       oci_annotations: ${{ steps.meta.outputs.oci_annotations }}
     steps:
       - name: Check out release tag
         uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ github.event.release.tag_name || inputs.release_tag }}
 
       - name: Validate release tag and derive metadata
         id: meta
         shell: bash
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
           REPOSITORY_OWNER: ${{ github.repository_owner }}
         run: |
           set -euo pipefail
@@ -75,14 +80,6 @@ jobs:
             printf '%s\n' "${final_tags}"
             echo "EOF"
             echo "oci_labels<<EOF"
-            echo "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}"
-            echo "org.opencontainers.image.title=discord-voice-service"
-            echo "org.opencontainers.image.description=Rust microservice for direct Discord Voice playback from YouTube Music streams"
-            echo "org.opencontainers.image.documentation=https://github.com/${GITHUB_REPOSITORY}#readme"
-            echo "org.opencontainers.image.revision=${release_sha}"
-            echo "org.opencontainers.image.version=${version_tag}"
-            echo "EOF"
-            echo "image_annotations<<EOF"
             echo "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}"
             echo "org.opencontainers.image.title=discord-voice-service"
             echo "org.opencontainers.image.description=Rust microservice for direct Discord Voice playback from YouTube Music streams"
@@ -142,8 +139,6 @@ jobs:
     name: Build amd64 Image
     needs: [prepare, verify-fake-peer-ci]
     runs-on: ubuntu-24.04
-    outputs:
-      digest: ${{ steps.build.outputs.digest }}
     steps:
       - name: Check out release tag
         uses: actions/checkout@v5
@@ -153,31 +148,29 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v4
 
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-
-      - name: Build amd64 image by digest
-        id: build
+      - name: Build amd64 image archive
         uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Containerfile
           platforms: linux/amd64
           provenance: false
-          outputs: type=image,name=${{ needs.prepare.outputs.image_ref }},push-by-digest=true,name-canonical=true,push=true
+          outputs: type=docker,dest=${{ runner.temp }}/discord-voice-service-amd64.tar
           labels: ${{ needs.prepare.outputs.oci_labels }}
-          annotations: ${{ needs.prepare.outputs.image_annotations }}
+
+      - name: Upload amd64 image archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: discord-voice-service-amd64-image
+          path: ${{ runner.temp }}/discord-voice-service-amd64.tar
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
 
   build-arm64:
     name: Build arm64 Image
     needs: [prepare, verify-fake-peer-ci]
     runs-on: ubuntu-24.04-arm
-    outputs:
-      digest: ${{ steps.build.outputs.digest }}
     steps:
       - name: Check out release tag
         uses: actions/checkout@v5
@@ -187,24 +180,24 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v4
 
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-
-      - name: Build arm64 image by digest
-        id: build
+      - name: Build arm64 image archive
         uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Containerfile
           platforms: linux/arm64
           provenance: false
-          outputs: type=image,name=${{ needs.prepare.outputs.image_ref }},push-by-digest=true,name-canonical=true,push=true
+          outputs: type=docker,dest=${{ runner.temp }}/discord-voice-service-arm64.tar
           labels: ${{ needs.prepare.outputs.oci_labels }}
-          annotations: ${{ needs.prepare.outputs.image_annotations }}
+
+      - name: Upload arm64 image archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: discord-voice-service-arm64-image
+          path: ${{ runner.temp }}/discord-voice-service-arm64.tar
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
 
   publish-candidate-manifest:
     name: Publish Candidate Manifest
@@ -216,6 +209,13 @@ jobs:
     steps:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v4
+
+      - name: Download image archives
+        uses: actions/download-artifact@v8
+        with:
+          pattern: discord-voice-service-*-image
+          path: ${{ runner.temp }}/images
+          merge-multiple: true
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -238,10 +238,16 @@ jobs:
           IMAGE_REF: ${{ needs.prepare.outputs.image_ref }}
           CANDIDATE_TAG: ${{ needs.prepare.outputs.candidate_tag }}
           OCI_ANNOTATIONS: ${{ needs.prepare.outputs.oci_annotations }}
-          AMD64_DIGEST: ${{ needs.build-amd64.outputs.digest }}
-          ARM64_DIGEST: ${{ needs.build-arm64.outputs.digest }}
+          AMD64_ARCHIVE: ${{ runner.temp }}/images/discord-voice-service-amd64.tar
+          ARM64_ARCHIVE: ${{ runner.temp }}/images/discord-voice-service-arm64.tar
         run: |
           set -euo pipefail
+
+          amd64_ref="${IMAGE_REF}:${CANDIDATE_TAG}-amd64"
+          arm64_ref="${IMAGE_REF}:${CANDIDATE_TAG}-arm64"
+
+          skopeo copy "docker-archive:${AMD64_ARCHIVE}" "docker://${amd64_ref}"
+          skopeo copy "docker-archive:${ARM64_ARCHIVE}" "docker://${arm64_ref}"
 
           create_args=(
             --tag "${IMAGE_REF}:${CANDIDATE_TAG}"
@@ -254,8 +260,8 @@ jobs:
           done <<< "${OCI_ANNOTATIONS}"
 
           create_args+=(
-            "${IMAGE_REF}@${AMD64_DIGEST}"
-            "${IMAGE_REF}@${ARM64_DIGEST}"
+            "${amd64_ref}"
+            "${arm64_ref}"
           )
 
           docker buildx imagetools create "${create_args[@]}"

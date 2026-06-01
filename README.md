@@ -115,7 +115,7 @@ cargo run -p discord-voice-service
 
 Real Discord validation runs in GitHub-hosted CI. [`.github/workflows/live-staging.yml`](.github/workflows/live-staging.yml) is the protected live gate, and [`.github/workflows/release-image.yml`](.github/workflows/release-image.yml) does not continue release publication until the candidate manifest digest has passed fake-peer CI and protected live staging.
 
-The live gate validates the exact container artifact that will be promoted. Release publication builds native `linux/amd64` and `linux/arm64` images, assembles a candidate GHCR manifest from those digests, passes that candidate manifest digest into the protected live workflow, and applies the public tags only after the same digest succeeds in staging.
+The live gate validates the exact container artifact that will be promoted. Release publication builds native `linux/amd64` and `linux/arm64` image archives, publishes those archives from the manifest job, assembles a candidate GHCR manifest, passes that candidate manifest digest into the protected live workflow, and applies the public tags only after the same digest succeeds in staging.
 
 The release-ready contract is:
 

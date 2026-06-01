@@ -180,12 +180,36 @@ fn release_workflow_builds_native_arch_images_before_live_validation() {
     assert!(workflow.contains("build-arm64:"));
     assert!(workflow.contains("publish-candidate-manifest:"));
     assert!(workflow.contains("publish-release-tags:"));
+    assert!(workflow.contains("workflow_dispatch:"));
+    assert!(workflow.contains("release_tag:"));
+    assert!(workflow.contains("${{ github.event.release.tag_name || inputs.release_tag }}"));
     assert!(workflow.contains("runs-on: ubuntu-24.04-arm"));
     assert!(workflow.contains("docker/setup-buildx-action@v4"));
     assert!(workflow.contains("docker/build-push-action@v7"));
+    assert!(workflow.contains("actions/upload-artifact@v7"));
+    assert!(workflow.contains("actions/download-artifact@v8"));
+    assert!(
+        workflow.contains(
+            "outputs: type=docker,dest=${{ runner.temp }}/discord-voice-service-amd64.tar"
+        )
+    );
+    assert!(
+        workflow.contains(
+            "outputs: type=docker,dest=${{ runner.temp }}/discord-voice-service-arm64.tar"
+        )
+    );
+    assert!(
+        workflow
+            .contains(r#"skopeo copy "docker-archive:${AMD64_ARCHIVE}" "docker://${amd64_ref}""#)
+    );
+    assert!(
+        workflow
+            .contains(r#"skopeo copy "docker-archive:${ARM64_ARCHIVE}" "docker://${arm64_ref}""#)
+    );
     assert!(workflow.contains("docker buildx imagetools create"));
     assert!(workflow.contains("discord_voice_service_image_ref: ${{ needs.publish-candidate-manifest.outputs.candidate_ref }}"));
     assert!(workflow.contains("discord_voice_service_image_digest: ${{ needs.publish-candidate-manifest.outputs.candidate_digest }}"));
+    assert!(!workflow.contains("push-by-digest=true"));
     assert!(!workflow.contains("redhat-actions/buildah-build@v2"));
 }
 
