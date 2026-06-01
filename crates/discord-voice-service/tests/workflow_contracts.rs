@@ -155,6 +155,7 @@ fn fake_peer_ci_runs_a_single_mock_gate() {
     assert!(
         workflow.contains("cargo clippy --workspace --all-targets --all-features -- -D warnings")
     );
+    assert!(workflow.contains("RUST_TEST_THREADS: \"1\""));
     assert_eq!(workflow.matches("cargo test --workspace -v").count(), 1);
     assert!(!workflow.contains("Run fake-peer critical subset"));
 }

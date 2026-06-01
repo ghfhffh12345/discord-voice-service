@@ -45,4 +45,6 @@ jobs:
 
       - name: Run full cargo test suite
         shell: bash
+        env:
+          RUST_TEST_THREADS: "1"
         run: cargo test --workspace -v
