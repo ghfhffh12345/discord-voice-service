@@ -202,6 +202,8 @@ A rollback means promoting a previously validated GHCR digest back to the public
 
 ## Verify and use the service
 
+Twilight bots should prefer the workspace client adapter in [`crates/discord-voice-service-twilight`](crates/discord-voice-service-twilight). It wraps the gRPC control API with Twilight `Id<GuildMarker>`, `Id<ChannelMarker>`, and `Id<UserMarker>` types, provides join/leave `UpdateVoiceState` helpers, and tracks `VoiceStateUpdate` plus `VoiceServerUpdate` events into the authenticated voice context expected by `JoinVoice` and `UpdateVoiceContext`. The live staging controller dogfoods this adapter, so protected validation exercises the same seam intended for Twilight-based bot integrations.
+
 This service does not currently register gRPC reflection, so `grpcurl` examples should point at the bundled proto file.
 
 Check service health:
@@ -234,6 +236,7 @@ grpcurl -plaintext \
     "voice": {
       "guildId": "123456789012345678",
       "channelId": "234567890123456789",
+      "userId": "345678901234567890",
       "sessionId": "voice-session-id",
       "endpoint": "us-east123.discord.media:443",
       "token": "voice-token"

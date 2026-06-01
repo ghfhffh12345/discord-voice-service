@@ -12,7 +12,6 @@ use tracing::{info, warn};
 use twilight_gateway::error::ReceiveMessageErrorType;
 use twilight_gateway::{Event, EventTypeFlags, Intents, Shard, ShardId, StreamExt as _};
 use twilight_http::{Client as HttpClient, error::ErrorType as HttpErrorType};
-use twilight_model::gateway::payload::outgoing::UpdateVoiceState;
 use twilight_model::id::{
     Id,
     marker::{ChannelMarker, GuildMarker, UserMarker},
@@ -20,11 +19,9 @@ use twilight_model::id::{
 use twilight_model::voice::VoiceState;
 
 use discord_voice_service_playback::YtMusicClient;
-use discord_voice_service_proto::discordvoice::v1::discord_voice_control_client::DiscordVoiceControlClient;
-use discord_voice_service_proto::discordvoice::v1::join_voice_request::VoiceContext as ProtoVoiceContext;
-use discord_voice_service_proto::discordvoice::v1::{
-    JoinVoiceRequest, LeaveVoiceRequest, PlayRequest, SessionEvent, SubscribeEventsRequest,
-    UpdateVoiceContextRequest,
+use discord_voice_service_twilight::{
+    Client as VoiceServiceClient, SessionEvent, VoiceContext as ServiceVoiceContext,
+    VoiceContextTracker, join_voice_channel, leave_voice_channel,
 };
 use discord_voice_service_voice::{
     ObservedVoiceSession, PendingObservedVoiceSession, VoiceContext as ObserverVoiceContext,
@@ -46,113 +43,21 @@ const MIN_NON_SILENT_AUDIO_MS: u64 = 1_000;
 const OBSERVER_AUDIO_DURATION_TOLERANCE_MS: u64 = 2_000;
 const OBSERVER_AUDIO_DURATION_MIN_RATIO_PERCENT: u64 = 90;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ForwardedVoiceContext {
-    guild_id: String,
-    channel_id: String,
-    user_id: String,
-    session_id: String,
-    endpoint: String,
-    token: String,
-}
-
-impl ForwardedVoiceContext {
-    fn to_proto_voice_context(&self) -> ProtoVoiceContext {
-        ProtoVoiceContext {
-            guild_id: self.guild_id.clone(),
-            channel_id: self.channel_id.clone(),
-            user_id: self.user_id.clone(),
-            session_id: self.session_id.clone(),
-            endpoint: self.endpoint.clone(),
-            token: self.token.clone(),
-        }
-    }
-
-    fn to_observer_voice_context(&self) -> ObserverVoiceContext {
-        ObserverVoiceContext {
-            guild_id: self.guild_id.clone(),
-            channel_id: self.channel_id.clone(),
-            user_id: self.user_id.clone(),
-            session_id: self.session_id.clone(),
-            endpoint: self.endpoint.clone(),
-            token: self.token.clone(),
-        }
-    }
-}
-
-struct LiveVoiceContextTracker {
-    guild_id: String,
-    channel_id: String,
-    user_id: String,
-    session_id: Option<String>,
-    endpoint: Option<String>,
-    token: Option<String>,
-    current: Option<ForwardedVoiceContext>,
-}
-
-impl LiveVoiceContextTracker {
-    fn new(initial: ForwardedVoiceContext) -> Self {
-        Self {
-            guild_id: initial.guild_id.clone(),
-            channel_id: initial.channel_id.clone(),
-            user_id: initial.user_id.clone(),
-            session_id: Some(initial.session_id.clone()),
-            endpoint: Some(initial.endpoint.clone()),
-            token: Some(initial.token.clone()),
-            current: Some(initial),
-        }
-    }
-
-    fn observe_event(
-        &mut self,
-        event: &Event,
-        guild_id: Id<GuildMarker>,
-        channel_id: Id<ChannelMarker>,
-        user_id: Id<UserMarker>,
-    ) -> Option<ForwardedVoiceContext> {
-        match event {
-            Event::VoiceStateUpdate(update)
-                if update.user_id == user_id
-                    && update.guild_id == Some(guild_id)
-                    && update.channel_id == Some(channel_id) =>
-            {
-                self.session_id = Some(update.session_id.clone());
-            }
-            Event::VoiceServerUpdate(update) if update.guild_id == guild_id => {
-                if let Some(endpoint) = update.endpoint.as_ref().filter(|value| !value.is_empty()) {
-                    self.endpoint = Some(endpoint.clone());
-                }
-                if !update.token.is_empty() {
-                    self.token = Some(update.token.clone());
-                }
-            }
-            _ => {}
-        }
-
-        let context = ForwardedVoiceContext {
-            guild_id: self.guild_id.clone(),
-            channel_id: self.channel_id.clone(),
-            user_id: self.user_id.clone(),
-            session_id: self.session_id.as_ref()?.clone(),
-            endpoint: self.endpoint.as_ref()?.clone(),
-            token: self.token.as_ref()?.clone(),
-        };
-
-        if self.current.as_ref() == Some(&context) {
-            return None;
-        }
-
-        self.current = Some(context.clone());
-        Some(context)
+fn to_observer_voice_context(context: &ServiceVoiceContext) -> ObserverVoiceContext {
+    ObserverVoiceContext {
+        guild_id: context.guild_id.to_string(),
+        channel_id: context.channel_id.to_string(),
+        user_id: context.user_id.to_string(),
+        session_id: context.session_id.clone(),
+        endpoint: context.endpoint.clone(),
+        token: context.token.clone(),
     }
 }
 
 struct LiveGatewayDriverConfig {
     service_addr: String,
-    initial_service_voice: ForwardedVoiceContext,
+    initial_service_voice: ServiceVoiceContext,
     guild_id: Id<GuildMarker>,
-    channel_id: Id<ChannelMarker>,
-    service_user_id: Id<UserMarker>,
     observer_user_id: Id<UserMarker>,
 }
 
@@ -380,7 +285,7 @@ pub async fn run(config: StagingConfig) -> Result<()> {
 
 async fn run_service_flow(
     config: &StagingConfig,
-    forwarded_voice: ForwardedVoiceContext,
+    forwarded_voice: ServiceVoiceContext,
     service_shard: &mut Shard,
     service_user_id: Id<UserMarker>,
     observer_sender: &twilight_gateway::MessageSender,
@@ -388,10 +293,10 @@ async fn run_service_flow(
     observer_join: GatewayJoinTarget<'_>,
 ) -> ServiceFlowOutcome {
     let mut failure_snapshot = FailureEvidenceSnapshot::default();
-    let join_client = DiscordVoiceControlClient::connect(config.discord_voice_service_uri.clone())
+    let control_client = VoiceServiceClient::connect(config.discord_voice_service_uri.clone())
         .await
-        .context("connect JoinVoice gRPC client");
-    let mut join_client = match join_client {
+        .context("connect discord-voice-service Twilight control client");
+    let mut control_client = match control_client {
         Ok(client) => client,
         Err(error) => {
             return ServiceFlowOutcome {
@@ -401,9 +306,9 @@ async fn run_service_flow(
             };
         }
     };
-    let event_client = DiscordVoiceControlClient::connect(config.discord_voice_service_uri.clone())
+    let event_client = VoiceServiceClient::connect(config.discord_voice_service_uri.clone())
         .await
-        .context("connect SubscribeEvents gRPC client");
+        .context("connect discord-voice-service Twilight event client");
     let mut event_client = match event_client {
         Ok(client) => client,
         Err(error) => {
@@ -415,12 +320,12 @@ async fn run_service_flow(
         }
     };
 
-    let response = event_client
-        .subscribe_events(SubscribeEventsRequest {})
+    let events = event_client
+        .events()
         .await
-        .context("subscribe to service events");
-    let response = match response {
-        Ok(response) => response,
+        .context("subscribe to service events through Twilight adapter");
+    let mut events = match events {
+        Ok(events) => events,
         Err(error) => {
             return ServiceFlowOutcome {
                 result: Err(error),
@@ -429,13 +334,10 @@ async fn run_service_flow(
             };
         }
     };
-    let mut events = response.into_inner();
-    let join_result = join_client
-        .join_voice(JoinVoiceRequest {
-            voice: Some(forwarded_voice.to_proto_voice_context()),
-        })
+    let join_result = control_client
+        .join_voice(&forwarded_voice)
         .await
-        .context("forward authentic voice context to JoinVoice");
+        .context("forward authentic voice context to JoinVoice through Twilight adapter");
     if let Err(error) = join_result {
         return ServiceFlowOutcome {
             result: Err(error),
@@ -511,7 +413,7 @@ async fn run_service_flow(
     };
     info!("observer gateway voice joined; connecting observer voice session");
     let pending_observer =
-        match PendingObservedVoiceSession::connect(observer_voice.to_observer_voice_context())
+        match PendingObservedVoiceSession::connect(to_observer_voice_context(&observer_voice))
             .await
             .context("connect pending observer voice session")
         {
@@ -528,13 +430,10 @@ async fn run_service_flow(
 
     let observer_audio_snapshot = Arc::new(Mutex::new(None::<AudioValidationStats>));
     let play_rpc = async {
-        join_client
-            .play(PlayRequest {
-                video_id: config.test_video_id.clone(),
-            })
+        control_client
+            .play(config.test_video_id.clone())
             .await
-            .context("call Play")
-            .map(|_| ())
+            .context("call Play through Twilight adapter")
     };
 
     let (track_ended_tx, track_ended_rx) = oneshot::channel();
@@ -589,8 +488,6 @@ async fn run_service_flow(
         service_addr: config.discord_voice_service_uri.clone(),
         initial_service_voice: forwarded_voice,
         guild_id: observer_join.guild_id,
-        channel_id: observer_join.channel_id,
-        service_user_id,
         observer_user_id: observer_join.user_id,
     };
     let live_gateway_driver =
@@ -631,10 +528,10 @@ async fn drive_live_gateway_shards(
     observer_shard: &mut Shard,
     config: LiveGatewayDriverConfig,
 ) -> Result<()> {
-    let mut update_client = DiscordVoiceControlClient::connect(config.service_addr)
+    let mut update_client = VoiceServiceClient::connect(config.service_addr)
         .await
-        .context("connect UpdateVoiceContext gRPC client for live gateway driver")?;
-    let mut service_voice = LiveVoiceContextTracker::new(config.initial_service_voice);
+        .context("connect Twilight adapter client for live gateway driver")?;
+    let mut service_voice = VoiceContextTracker::from_context(config.initial_service_voice);
 
     loop {
         tokio::select! {
@@ -642,21 +539,12 @@ async fn drive_live_gateway_shards(
                 let Some(event) = next_live_gateway_event("service", item)? else {
                     continue;
                 };
-                if let Some(context) =
-                    service_voice.observe_event(
-                        &event,
-                        config.guild_id,
-                        config.channel_id,
-                        config.service_user_id,
-                    )
-                {
+                if let Some(context) = service_voice.observe(&event) {
                     info!("forwarding refreshed service voice context during live playback");
                     update_client
-                        .update_voice_context(UpdateVoiceContextRequest {
-                            voice: Some(context.to_proto_voice_context()),
-                        })
+                        .update_voice_context(&context)
                         .await
-                        .context("forward refreshed service voice context to UpdateVoiceContext")?;
+                        .context("forward refreshed service voice context through Twilight adapter")?;
                 }
             }
             item = observer_shard.next_event(EventTypeFlags::all()) => {
@@ -704,13 +592,13 @@ async fn join_gateway_voice(
     sender: &twilight_gateway::MessageSender,
     shard: &mut Shard,
     target: GatewayJoinTarget<'_>,
-) -> Result<ForwardedVoiceContext> {
+) -> Result<ServiceVoiceContext> {
     sender
-        .command(&UpdateVoiceState::new(
+        .command(&join_voice_channel(
             target.guild_id,
-            Some(target.channel_id),
-            target.self_mute,
+            target.channel_id,
             target.self_deaf,
+            target.self_mute,
         ))
         .with_context(|| format!("send {} gateway voice join command", target.label))?;
 
@@ -730,26 +618,11 @@ async fn wait_for_authentic_voice_context(
     guild_id: Id<GuildMarker>,
     channel_id: Id<ChannelMarker>,
     user_id: Id<UserMarker>,
-) -> Result<ForwardedVoiceContext> {
-    let mut session_id: Option<String> = None;
-    let mut token: Option<String> = None;
-    let mut endpoint: Option<String> = None;
+) -> Result<ServiceVoiceContext> {
+    let mut tracker = VoiceContextTracker::new(guild_id, channel_id, user_id);
 
     let deadline = Instant::now() + AUTHENTIC_VOICE_EVENT_TIMEOUT;
     loop {
-        if let (Some(session_id), Some(token), Some(endpoint)) =
-            (session_id.as_ref(), token.as_ref(), endpoint.as_ref())
-        {
-            return Ok(ForwardedVoiceContext {
-                guild_id: guild_id.to_string(),
-                channel_id: channel_id.to_string(),
-                user_id: user_id.to_string(),
-                session_id: session_id.clone(),
-                endpoint: endpoint.clone(),
-                token: token.clone(),
-            });
-        }
-
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .ok_or_else(|| {
@@ -778,26 +651,8 @@ async fn wait_for_authentic_voice_context(
             }
         };
 
-        match event {
-            Event::VoiceStateUpdate(update)
-                if update.user_id == user_id
-                    && update.guild_id == Some(guild_id)
-                    && update.channel_id == Some(channel_id) =>
-            {
-                session_id = Some(update.session_id.clone());
-            }
-            Event::VoiceServerUpdate(update) if update.guild_id == guild_id => {
-                if let Some(found_endpoint) =
-                    update.endpoint.as_ref().filter(|value| !value.is_empty())
-                {
-                    endpoint = Some(found_endpoint.clone());
-                }
-
-                if !update.token.is_empty() {
-                    token = Some(update.token.clone());
-                }
-            }
-            _ => {}
+        if let Some(context) = tracker.observe(&event) {
+            return Ok(context);
         }
     }
 }
@@ -985,14 +840,14 @@ async fn cleanup_after_flow(
 }
 
 async fn cleanup_service_voice(service_addr: &str) -> Result<()> {
-    let mut cleanup_client = DiscordVoiceControlClient::connect(service_addr.to_owned())
+    let mut cleanup_client = VoiceServiceClient::connect(service_addr.to_owned())
         .await
-        .context("connect cleanup gRPC client")?;
+        .context("connect cleanup Twilight adapter client")?;
 
     cleanup_client
-        .leave_voice(LeaveVoiceRequest {})
+        .leave_voice()
         .await
-        .context("LeaveVoice cleanup failed")?;
+        .context("LeaveVoice cleanup failed through Twilight adapter")?;
 
     Ok(())
 }
@@ -1005,12 +860,7 @@ pub(crate) async fn cleanup_gateway_voice(
     user_id: Id<UserMarker>,
 ) -> Result<()> {
     sender
-        .command(&UpdateVoiceState::new(
-            guild_id,
-            None::<Id<ChannelMarker>>,
-            false,
-            false,
-        ))
+        .command(&leave_voice_channel(guild_id))
         .context("failed to send gateway leave command")?;
 
     wait_for_gateway_leave(http, shard, guild_id, user_id).await
@@ -1257,15 +1107,14 @@ pub(crate) fn is_fatal_gateway_receive_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use discord_voice_service_proto::discordvoice::v1::SessionEventKind;
+    use discord_voice_service_twilight::SessionEventKind;
     use futures::stream;
     use std::collections::HashMap;
 
     fn event(kind: SessionEventKind, current_video_id: Option<&str>) -> SessionEvent {
         SessionEvent {
-            kind: kind as i32,
-            current_video_id: current_video_id.unwrap_or_default().to_owned(),
-            message: String::new(),
+            kind,
+            current_video_id: current_video_id.map(str::to_owned),
             ..SessionEvent::default()
         }
     }

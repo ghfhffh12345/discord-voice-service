@@ -4,7 +4,7 @@ use discord_voice_service_live_validation::{
     current_user_absent_from_guild_voice, finalize_success_evidence,
     leave_confirmed_by_rest_voice_state, wait_for_play_and_live_contract,
 };
-use discord_voice_service_proto::discordvoice::v1::{SessionEvent, SessionEventKind};
+use discord_voice_service_twilight::{SessionEvent, SessionEventKind};
 use std::collections::HashMap;
 use std::sync::{
     Arc,
@@ -419,8 +419,8 @@ fn valid_env() -> HashMap<String, String> {
 
 fn event(kind: SessionEventKind, current_video_id: Option<&str>) -> SessionEvent {
     SessionEvent {
-        kind: kind as i32,
-        current_video_id: current_video_id.unwrap_or_default().to_owned(),
+        kind,
+        current_video_id: current_video_id.map(str::to_owned),
         ..Default::default()
     }
 }

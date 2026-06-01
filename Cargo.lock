@@ -507,8 +507,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "discord-voice-service-playback",
- "discord-voice-service-proto",
  "discord-voice-service-test-support",
+ "discord-voice-service-twilight",
  "discord-voice-service-voice",
  "futures",
  "opus-rs",
@@ -583,6 +583,19 @@ dependencies = [
  "tokio-tungstenite",
  "tonic",
  "ytmusic-service-client",
+]
+
+[[package]]
+name = "discord-voice-service-twilight"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "prost",
+ "protoc-bin-vendored",
+ "tonic",
+ "tonic-build",
+ "twilight-gateway",
+ "twilight-model",
 ]
 
 [[package]]

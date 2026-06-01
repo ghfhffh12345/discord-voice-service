@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use std::fs;
 
-use discord_voice_service_proto::discordvoice::v1::{SessionEvent, SessionEventKind};
+use discord_voice_service_twilight::{SessionEvent, SessionEventKind};
 
 #[derive(Debug, Clone, Default)]
 pub struct LiveContractState {
@@ -63,7 +63,7 @@ where
 
 impl LiveContractState {
     pub fn observe_event(&mut self, event: SessionEvent, expected_video_id: &str) -> Result<bool> {
-        let kind = SessionEventKind::try_from(event.kind).unwrap_or(SessionEventKind::Unspecified);
+        let kind = event.kind;
 
         match kind {
             SessionEventKind::VoiceReady => {
@@ -127,7 +127,7 @@ fn validate_expected_video_id(
     expected_video_id: &str,
     kind: SessionEventKind,
 ) -> Result<()> {
-    let current_video_id = event.current_video_id.trim();
+    let current_video_id = event.current_video_id.as_deref().unwrap_or("").trim();
     if current_video_id == expected_video_id {
         return Ok(());
     }
@@ -144,9 +144,9 @@ fn validate_expected_video_id(
 }
 
 fn display_event_message(event: &SessionEvent) -> String {
-    if event.message.trim().is_empty() {
+    if event.message.as_deref().unwrap_or("").trim().is_empty() {
         "no message".to_owned()
     } else {
-        event.message.clone()
+        event.message.as_ref().unwrap().clone()
     }
 }

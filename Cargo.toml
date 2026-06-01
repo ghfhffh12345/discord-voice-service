@@ -7,6 +7,7 @@ members = [
     "crates/discord-voice-service-proto",
     "crates/discord-voice-service-runtime",
     "crates/discord-voice-service-test-support",
+    "crates/discord-voice-service-twilight",
     "crates/discord-voice-service-voice",
 ]
 default-members = [
@@ -51,6 +52,7 @@ discord-voice-service-playback = { path = "crates/discord-voice-service-playback
 discord-voice-service-proto = { path = "crates/discord-voice-service-proto" }
 discord-voice-service-runtime = { path = "crates/discord-voice-service-runtime" }
 discord-voice-service-test-support = { path = "crates/discord-voice-service-test-support" }
+discord-voice-service-twilight = { path = "crates/discord-voice-service-twilight" }
 discord-voice-service-voice = { path = "crates/discord-voice-service-voice" }
 openmls = "0.8.1"
 openmls_basic_credential = "0.5.0"
