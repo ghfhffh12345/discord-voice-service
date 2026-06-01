@@ -34,6 +34,10 @@ pub async fn spawn_stream_server_with_initial_delay(path: &str, delay: Duration)
     .await
 }
 
+pub async fn spawn_hanging_server() -> RangeServer {
+    spawn_test_server(ServerBehavior::HangBeforeResponse, Bytes::new()).await
+}
+
 pub async fn spawn_range_server() -> RangeServer {
     let payload = load_fixture_bytes("audio-itag250.webm").repeat(4);
     spawn_test_server(ServerBehavior::HonorRange, payload.into()).await
@@ -126,6 +130,11 @@ async fn spawn_test_server(behavior: ServerBehavior, payload: Bytes) -> RangeSer
                 *request_count += 1;
                 *request_count
             };
+            if let ServerBehavior::HangBeforeResponse = behavior {
+                loop {
+                    thread::park();
+                }
+            }
             let (body, status, content_range, content_length) = match behavior {
                 ServerBehavior::HonorRangeWith416AtEof if start >= payload.len() as u64 => {
                     (&[][..], "HTTP/1.1 416 Range Not Satisfiable", None, 0)
@@ -177,6 +186,7 @@ async fn spawn_test_server(behavior: ServerBehavior, payload: Bytes) -> RangeSer
                     ok_requests,
                     status,
                 } if request_number > ok_requests => (&[][..], status, None, 0),
+                ServerBehavior::HangBeforeResponse => unreachable!("hanging server never responds"),
                 _ => (payload.as_ref(), "HTTP/1.1 200 OK", None, payload.len()),
             };
             let headers = if let Some(content_range) = content_range {
@@ -234,6 +244,7 @@ enum ServerBehavior {
     HonorRangeWithInitialDelay {
         delay: Duration,
     },
+    HangBeforeResponse,
     HonorRangeWith416AtEof,
     PartialBodyThenCloseOnce {
         bytes_before_close: usize,

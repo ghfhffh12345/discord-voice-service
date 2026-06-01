@@ -1,6 +1,7 @@
 use discord_voice_service_test_support::fake_ytmusic::FakeYtMusic;
 use discord_voice_service_test_support::fixtures::{
-    spawn_status_server, spawn_stream_server, spawn_stream_server_with_initial_delay,
+    spawn_hanging_server, spawn_status_server, spawn_stream_server,
+    spawn_stream_server_with_initial_delay,
 };
 
 use std::time::{Duration, Instant};
@@ -168,11 +169,10 @@ async fn recovery_tolerates_a_ci_slow_first_media_chunk() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn recovery_fails_when_the_first_media_chunk_never_arrives_within_policy() {
     let fake = FakeYtMusic::spawn().await;
-    let http =
-        spawn_stream_server_with_initial_delay("audio-itag250.webm", Duration::from_secs(5)).await;
+    let http = spawn_hanging_server().await;
     fake.set_playable_url(http.url()).await;
 
     let mut recovery =

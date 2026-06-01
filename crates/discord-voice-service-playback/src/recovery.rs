@@ -11,7 +11,7 @@ use reqwest::StatusCode;
 use tokio::time::timeout;
 use tracing::warn;
 
-const INITIAL_OPEN_CHUNK_TIMEOUT: Duration = Duration::from_secs(3);
+const INITIAL_OPEN_CHUNK_TIMEOUT: Duration = Duration::from_secs(15);
 const STEADY_STATE_CHUNK_TIMEOUT: Duration = Duration::from_secs(2);
 const OPEN_CHUNK_ATTEMPTS: usize = 2;
 
