@@ -14,7 +14,8 @@ const CREATOR_USER_ID: &str = "1234123412341234";
 const OBSERVER_USER_ID: &str = "5678567856785678";
 const FAKE_DAVE_CREATOR_USER_ID: &str = "9999999999999999";
 const FAKE_DAVE_FOREIGN_USER_ID: &str = "7777777777777777";
-const DAVE_READY_TIMEOUT: Duration = Duration::from_secs(5);
+// Match the production post-HELLO DAVE floor for slower hosted runners.
+const DAVE_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[tokio::test]
 async fn observed_voice_session_receives_protected_audio_and_resolves_speaker_from_gateway() {
