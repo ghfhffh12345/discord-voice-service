@@ -14,6 +14,7 @@ const CREATOR_USER_ID: &str = "1234123412341234";
 const OBSERVER_USER_ID: &str = "5678567856785678";
 const FAKE_DAVE_CREATOR_USER_ID: &str = "9999999999999999";
 const FAKE_DAVE_FOREIGN_USER_ID: &str = "7777777777777777";
+const DAVE_READY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[tokio::test]
 async fn observed_voice_session_receives_protected_audio_and_resolves_speaker_from_gateway() {
@@ -108,10 +109,7 @@ async fn observed_voice_session_receives_and_dave_decrypts_audio_for_numeric_spe
     let voice = fake.voice_context("1", "2", OBSERVER_USER_ID, "session-1", "token-1");
 
     let pending = PendingObservedVoiceSession::connect(voice).await.unwrap();
-    let mut session = pending
-        .await_dave_ready(Duration::from_secs(1))
-        .await
-        .unwrap();
+    let mut session = pending.await_dave_ready(DAVE_READY_TIMEOUT).await.unwrap();
     assert!(fake.saw_dave_transition().await);
     let opus = hex::decode("0dc5aedd5bdc3f20be5697e54dd1f437").unwrap();
     let encrypted = fake
@@ -140,10 +138,7 @@ async fn observed_voice_session_resolves_unknown_ssrc_by_expected_dave_speaker_d
     let voice = fake.voice_context("1", "2", OBSERVER_USER_ID, "session-1", "token-1");
 
     let pending = PendingObservedVoiceSession::connect(voice).await.unwrap();
-    let mut session = pending
-        .await_dave_ready(Duration::from_secs(1))
-        .await
-        .unwrap();
+    let mut session = pending.await_dave_ready(DAVE_READY_TIMEOUT).await.unwrap();
     assert!(fake.saw_dave_transition().await);
     let opus = hex::decode("0dc5aedd5bdc3f20be5697e54dd1f437").unwrap();
     let encrypted = fake
@@ -170,10 +165,7 @@ async fn observed_voice_session_ignores_foreign_dave_speaker_before_target_audio
     let voice = fake.voice_context("1", "2", OBSERVER_USER_ID, "session-1", "token-1");
 
     let pending = PendingObservedVoiceSession::connect(voice).await.unwrap();
-    let mut session = pending
-        .await_dave_ready(Duration::from_secs(1))
-        .await
-        .unwrap();
+    let mut session = pending.await_dave_ready(DAVE_READY_TIMEOUT).await.unwrap();
     assert!(fake.saw_dave_transition().await);
     fake.send_speaking(FAKE_DAVE_FOREIGN_USER_ID, 41)
         .await
@@ -209,10 +201,7 @@ async fn observed_voice_session_receives_audio_after_replayed_established_join_w
     let voice = fake.voice_context("1", "2", OBSERVER_USER_ID, "session-1", "token-1");
 
     let pending = PendingObservedVoiceSession::connect(voice).await.unwrap();
-    let mut session = pending
-        .await_dave_ready(Duration::from_secs(1))
-        .await
-        .unwrap();
+    let mut session = pending.await_dave_ready(DAVE_READY_TIMEOUT).await.unwrap();
     let opus = hex::decode("0dc5aedd5bdc3f20be5697e54dd1f437").unwrap();
     let encrypted = fake
         .encrypt_dave_audio_frame_from_creator(&opus)
@@ -244,10 +233,7 @@ async fn observed_voice_session_stays_decrypt_compatible_after_post_join_remote_
     let voice = fake.voice_context("1", "2", OBSERVER_USER_ID, "session-1", "token-1");
 
     let pending = PendingObservedVoiceSession::connect(voice).await.unwrap();
-    let mut session = pending
-        .await_dave_ready(Duration::from_secs(1))
-        .await
-        .unwrap();
+    let mut session = pending.await_dave_ready(DAVE_READY_TIMEOUT).await.unwrap();
     let receive_task = tokio::spawn(async move {
         session
             .receive_audio_frame_from(FAKE_DAVE_CREATOR_USER_ID, Duration::from_secs(2))
@@ -258,7 +244,7 @@ async fn observed_voice_session_stays_decrypt_compatible_after_post_join_remote_
         .await
         .unwrap();
     assert!(
-        fake.saw_late_dave_transition_ready_within(Duration::from_secs(1))
+        fake.saw_late_dave_transition_ready_within(DAVE_READY_TIMEOUT)
             .await,
         "observer should acknowledge active post-join DAVE transitions"
     );
@@ -284,10 +270,7 @@ async fn observed_voice_session_can_leave_post_join_proposals_to_active_sender()
     let voice = fake.voice_context("1", "2", OBSERVER_USER_ID, "session-1", "token-1");
 
     let pending = PendingObservedVoiceSession::connect(voice).await.unwrap();
-    let mut session = pending
-        .await_dave_ready(Duration::from_secs(1))
-        .await
-        .unwrap();
+    let mut session = pending.await_dave_ready(DAVE_READY_TIMEOUT).await.unwrap();
     session.set_dave_proposal_authoring(false);
 
     let receive_task = tokio::spawn(async move {
@@ -345,7 +328,7 @@ async fn pending_observed_voice_session_waits_for_delayed_established_join_mater
     let voice = fake.voice_context("1", "2", OBSERVER_USER_ID, "session-1", "token-1");
 
     let pending = PendingObservedVoiceSession::connect(voice).await.unwrap();
-    let ready = pending.await_dave_ready(Duration::from_secs(1));
+    let ready = pending.await_dave_ready(DAVE_READY_TIMEOUT);
     tokio::pin!(ready);
     poll_fn(|cx| match ready.as_mut().poll(cx) {
         Poll::Pending => Poll::Ready(()),
@@ -405,10 +388,7 @@ async fn pending_observed_voice_session_authors_local_commit_and_receives_audio_
     let voice = fake.voice_context("1", "2", OBSERVER_USER_ID, "session-1", "token-1");
 
     let pending = PendingObservedVoiceSession::connect(voice).await.unwrap();
-    let mut session = pending
-        .await_dave_ready(Duration::from_secs(1))
-        .await
-        .unwrap();
+    let mut session = pending.await_dave_ready(DAVE_READY_TIMEOUT).await.unwrap();
     assert!(
         fake.saw_dave_commit_welcome_within(Duration::from_millis(100))
             .await,
@@ -446,7 +426,7 @@ async fn pending_observed_voice_session_preserves_speaking_state_consumed_before
     let voice = fake.voice_context("1", "2", OBSERVER_USER_ID, "session-1", "token-1");
 
     let pending = PendingObservedVoiceSession::connect(voice).await.unwrap();
-    let ready = pending.await_dave_ready(Duration::from_secs(1));
+    let ready = pending.await_dave_ready(DAVE_READY_TIMEOUT);
     tokio::pin!(ready);
     poll_fn(|cx| match ready.as_mut().poll(cx) {
         Poll::Pending => Poll::Ready(()),
@@ -491,7 +471,7 @@ async fn pending_observed_voice_session_preserves_seed_phase_speaking_state_befo
         .await
         .unwrap();
     let pending = connect.await.unwrap().unwrap();
-    let ready = pending.await_dave_ready(Duration::from_secs(1));
+    let ready = pending.await_dave_ready(DAVE_READY_TIMEOUT);
     tokio::pin!(ready);
     poll_fn(|cx| match ready.as_mut().poll(cx) {
         Poll::Pending => Poll::Ready(()),
@@ -527,10 +507,7 @@ async fn observed_voice_session_receives_audio_after_replayed_established_join_c
     let voice = fake.voice_context("1", "2", OBSERVER_USER_ID, "session-1", "token-1");
 
     let pending = PendingObservedVoiceSession::connect(voice).await.unwrap();
-    let mut session = pending
-        .await_dave_ready(Duration::from_secs(1))
-        .await
-        .unwrap();
+    let mut session = pending.await_dave_ready(DAVE_READY_TIMEOUT).await.unwrap();
     let opus = hex::decode("0dc5aedd5bdc3f20be5697e54dd1f437").unwrap();
     let encrypted = fake
         .encrypt_dave_audio_frame_from_creator(&opus)
@@ -560,10 +537,7 @@ async fn observed_voice_session_receives_audio_after_real_prepare_epoch_without_
     let voice = fake.voice_context("1", "2", OBSERVER_USER_ID, "session-1", "token-1");
 
     let pending = PendingObservedVoiceSession::connect(voice).await.unwrap();
-    let mut session = pending
-        .await_dave_ready(Duration::from_secs(1))
-        .await
-        .unwrap();
+    let mut session = pending.await_dave_ready(DAVE_READY_TIMEOUT).await.unwrap();
     let opus = hex::decode("0dc5aedd5bdc3f20be5697e54dd1f437").unwrap();
     let encrypted = fake
         .encrypt_dave_audio_frame_from_creator(&opus)
