@@ -5,14 +5,14 @@ use tokio::sync::oneshot;
 use tokio::time::{Duration, Instant};
 use tracing::debug;
 
-use crate::dave::{DaveMediaType, DaveRuntimeContext};
+use crate::dave::{DaveMediaType, DaveMlsProposalsOperation, DaveRuntimeContext};
 use crate::error::VoiceError;
 use crate::gateway::VoiceGatewayClient;
 use crate::handshake;
 use crate::protection::ProtectionContext;
 use crate::protocol::{
-    ClientDisconnect, DaveMlsPrepareCommitTransition, DaveMlsWelcome, Speaking, VoiceGatewayEvent,
-    VoiceGatewayPayload,
+    self, ClientDisconnect, ClientsConnect, DaveMlsPrepareCommitTransition, DaveMlsProposals,
+    DaveMlsWelcome, Speaking, VoiceGatewayEvent, VoiceGatewayPayload,
 };
 use crate::rtp::{RtpHeader, parse_rtp_header};
 use crate::session::VoiceContext;
@@ -36,6 +36,9 @@ pub struct PendingObservedVoiceSession {
     transport: Option<VoiceUdpTransport>,
     protection: Option<ProtectionContext>,
     dave: Option<handshake::PendingObserverDaveState>,
+    dave_material: Option<handshake::ObserverDaveMaterial>,
+    dave_recognized_user_ids: BTreeSet<String>,
+    completed_dave_transition_ids: BTreeSet<u16>,
     dave_timeout: Option<Duration>,
     heartbeat_shutdown: Option<oneshot::Sender<()>>,
     speaker_ssrcs: HashMap<u32, String>,
@@ -49,7 +52,13 @@ pub struct ObservedVoiceSession {
     transport: Option<VoiceUdpTransport>,
     protection: Option<ProtectionContext>,
     dave: Option<DaveRuntimeContext>,
+    author_dave_proposals: bool,
+    dave_material: Option<handshake::ObserverDaveMaterial>,
+    dave_recognized_user_ids: BTreeSet<String>,
+    completed_dave_transition_ids: BTreeSet<u16>,
     heartbeat_shutdown: Option<oneshot::Sender<()>>,
+    gateway_receive_closed: bool,
+    pending_dave_proposals: Vec<(DaveMlsProposalsOperation, Vec<u8>)>,
     speaker_ssrcs: HashMap<u32, String>,
     remote_speaker_candidates: BTreeSet<String>,
     pending_packets: HashMap<u32, PendingPacket>,
@@ -73,6 +82,9 @@ impl PendingObservedVoiceSession {
             transport: None,
             protection: None,
             dave: None,
+            dave_material: None,
+            dave_recognized_user_ids: BTreeSet::new(),
+            completed_dave_transition_ids: BTreeSet::new(),
             dave_timeout: None,
             heartbeat_shutdown: None,
             speaker_ssrcs: HashMap::new(),
@@ -101,6 +113,9 @@ impl PendingObservedVoiceSession {
             transport: Some(transport),
             protection: Some(ProtectionContext::from_session(&session_description)?),
             dave,
+            dave_material: None,
+            dave_recognized_user_ids: BTreeSet::new(),
+            completed_dave_transition_ids: BTreeSet::new(),
             dave_timeout: Some(dave_timeout),
             heartbeat_shutdown: Some(heartbeat_shutdown),
             speaker_ssrcs: HashMap::new(),
@@ -125,11 +140,16 @@ impl PendingObservedVoiceSession {
                     timeout_duration,
                 )
                 .await?;
+                self.dave_material = Some(ready.material);
+                self.dave_recognized_user_ids = ready.recognized_user_ids.clone();
                 self.remote_speaker_candidates = ready
                     .recognized_user_ids
                     .into_iter()
                     .filter(|user_id| user_id != &self.voice.user_id)
                     .collect();
+                if let Some(transition_id) = ready.completed_transition_id {
+                    self.completed_dave_transition_ids.insert(transition_id);
+                }
                 self.apply_pending_gateway_updates(ready.gateway_updates);
                 Some(ready.runtime)
             }
@@ -142,7 +162,13 @@ impl PendingObservedVoiceSession {
             transport: self.transport.take(),
             protection: self.protection.take(),
             dave,
+            author_dave_proposals: true,
+            dave_material: self.dave_material.take(),
+            dave_recognized_user_ids: std::mem::take(&mut self.dave_recognized_user_ids),
+            completed_dave_transition_ids: std::mem::take(&mut self.completed_dave_transition_ids),
             heartbeat_shutdown: self.heartbeat_shutdown.take(),
+            gateway_receive_closed: false,
+            pending_dave_proposals: Vec::new(),
             speaker_ssrcs: std::mem::take(&mut self.speaker_ssrcs),
             remote_speaker_candidates: std::mem::take(&mut self.remote_speaker_candidates),
             pending_packets: std::mem::take(&mut self.pending_packets),
@@ -159,6 +185,10 @@ impl ObservedVoiceSession {
 
     pub fn voice_context(&self) -> &VoiceContext {
         &self.voice
+    }
+
+    pub fn set_dave_proposal_authoring(&mut self, enabled: bool) {
+        self.author_dave_proposals = enabled;
     }
 
     pub fn record_speaker_ssrc(&mut self, user_id: impl Into<String>, ssrc: u32) {
@@ -192,112 +222,185 @@ impl ObservedVoiceSession {
             let remaining = deadline
                 .checked_duration_since(Instant::now())
                 .ok_or(VoiceError::InvalidState("voice receive timed out"))?;
-            let gateway = self
-                .gateway
-                .as_ref()
-                .ok_or(VoiceError::InvalidState("voice gateway unavailable"))?;
+            let gateway = if self.gateway_receive_closed {
+                None
+            } else {
+                Some(
+                    self.gateway
+                        .clone()
+                        .ok_or(VoiceError::InvalidState("voice gateway unavailable"))?,
+                )
+            };
             let transport = self
                 .transport
                 .as_ref()
                 .ok_or(VoiceError::InvalidState("voice transport unavailable"))?;
 
-            tokio::select! {
-                gateway_event = tokio::time::timeout(remaining, gateway.receive_event()) => {
-                    let gateway_event = gateway_event
-                        .map_err(|_| VoiceError::InvalidState("voice receive timed out"))??;
-                    self.apply_gateway_payload(gateway_event)?;
-                    if let Some(frame) = self.try_decode_pending_audio_frame(expected_user_id)? {
-                        debug!(
-                            user_id = %frame.user_id,
-                            ssrc = frame.ssrc,
-                            sequence = frame.sequence,
-                            payload_len = frame.payload.len(),
-                            "voice receive decoded audio frame"
-                        );
-                        return Ok(frame);
+            if let Some(gateway) = gateway {
+                tokio::select! {
+                    gateway_event = tokio::time::timeout(remaining, gateway.receive_event()) => {
+                        let gateway_event = match gateway_event
+                            .map_err(|_| VoiceError::InvalidState("voice receive timed out"))?
+                        {
+                            Ok(gateway_event) => gateway_event,
+                            Err(err) if err.is_gateway_closed_during_receive() => {
+                                self.mark_gateway_receive_closed();
+                                continue;
+                            }
+                            Err(err) => return Err(err),
+                        };
+                        let remaining = deadline
+                            .checked_duration_since(Instant::now())
+                            .ok_or(VoiceError::InvalidState("voice receive timed out"))?;
+                        self.apply_gateway_payload(gateway_event, remaining).await?;
+                        if let Some(frame) = self.try_decode_pending_audio_frame(expected_user_id)? {
+                            debug!(
+                                user_id = %frame.user_id,
+                                ssrc = frame.ssrc,
+                                sequence = frame.sequence,
+                                payload_len = frame.payload.len(),
+                                "voice receive decoded audio frame"
+                            );
+                            return Ok(frame);
+                        }
+                    }
+                    packet = tokio::time::timeout(remaining, transport.receive_packet(MAX_UDP_PACKET_LEN)) => {
+                        let packet = packet
+                            .map_err(|_| VoiceError::InvalidState("voice receive timed out"))??;
+                        if let Some(frame) = self.process_audio_packet(packet, expected_user_id)? {
+                            return Ok(frame);
+                        }
                     }
                 }
-                packet = tokio::time::timeout(remaining, transport.receive_packet(MAX_UDP_PACKET_LEN)) => {
-                    let packet = packet
+            } else {
+                let packet =
+                    tokio::time::timeout(remaining, transport.receive_packet(MAX_UDP_PACKET_LEN))
+                        .await
                         .map_err(|_| VoiceError::InvalidState("voice receive timed out"))??;
-                    if is_rtcp_packet(&packet) {
-                        debug!("voice receive ignored rtcp packet");
-                        continue;
-                    }
-                    let header = parse_rtp_header(&packet)?;
-                    debug!(
-                        ssrc = header.ssrc,
-                        sequence = header.sequence,
-                        timestamp = header.timestamp,
-                        has_mapping = self.speaker_ssrcs.contains_key(&header.ssrc),
-                        "voice receive observed udp packet"
-                    );
-                    if !self.speaker_ssrcs.contains_key(&header.ssrc) {
-                        if let Some(user_id) = self.infer_single_remote_speaker(expected_user_id) {
-                            debug!(
-                                user_id = %user_id,
-                                ssrc = header.ssrc,
-                                "voice receive inferred speaking mapping from single remote dave member"
-                            );
-                            self.record_speaker_ssrc(user_id, header.ssrc);
-                        } else {
-                            debug!(ssrc = header.ssrc, "voice receive buffered packet for unknown ssrc");
-                            self.pending_packets
-                                .insert(header.ssrc, PendingPacket { header, packet });
-                            continue;
-                        }
-                    }
-                    self.pending_packets.remove(&header.ssrc);
-                    let user_id = self
-                        .speaker_ssrcs
-                        .get(&header.ssrc)
-                        .cloned()
-                        .ok_or(VoiceError::InvalidState("voice speaker mapping missing"))?;
-                    if expected_user_id.is_some_and(|expected| user_id != expected) {
-                        debug!(
-                            expected_user_id,
-                            actual_user_id = %user_id,
-                            ssrc = header.ssrc,
-                            "voice receive ignored packet for unexpected user"
-                        );
-                        continue;
-                    }
-                    let frame = match self.decode_audio_packet(&packet, header, user_id) {
-                        Ok(frame) => frame,
-                        Err(DecodeAudioPacketError::NotReady) => {
-                            debug!(
-                                ssrc = header.ssrc,
-                                sequence = header.sequence,
-                                "voice receive buffered packet until dave decrypt material arrives"
-                            );
-                            self.pending_packets
-                                .insert(header.ssrc, PendingPacket { header, packet });
-                            continue;
-                        }
-                        Err(DecodeAudioPacketError::Fatal(err)) => return Err(err),
-                    };
-                    debug!(
-                        user_id = %frame.user_id,
-                        ssrc = frame.ssrc,
-                        sequence = frame.sequence,
-                        payload_len = frame.payload.len(),
-                        "voice receive decoded audio frame"
-                    );
+                if let Some(frame) = self.process_audio_packet(packet, expected_user_id)? {
                     return Ok(frame);
                 }
             }
         }
     }
 
-    fn apply_gateway_payload(&mut self, payload: VoiceGatewayPayload) -> Result<(), VoiceError> {
+    fn process_audio_packet(
+        &mut self,
+        packet: Vec<u8>,
+        expected_user_id: Option<&str>,
+    ) -> Result<Option<ObservedAudioFrame>, VoiceError> {
+        if is_rtcp_packet(&packet) {
+            debug!("voice receive ignored rtcp packet");
+            return Ok(None);
+        }
+        let header = parse_rtp_header(&packet)?;
+        debug!(
+            ssrc = header.ssrc,
+            sequence = header.sequence,
+            timestamp = header.timestamp,
+            has_mapping = self.speaker_ssrcs.contains_key(&header.ssrc),
+            "voice receive observed udp packet"
+        );
+        if !self.speaker_ssrcs.contains_key(&header.ssrc) {
+            if let (Some(expected_user_id), true) = (expected_user_id, self.dave.is_some()) {
+                match self.decode_audio_packet(&packet, header, expected_user_id.to_owned()) {
+                    Ok(frame) => {
+                        debug!(
+                            user_id = %expected_user_id,
+                            ssrc = header.ssrc,
+                            "voice receive inferred speaking mapping by expected user decrypt"
+                        );
+                        self.record_speaker_ssrc(expected_user_id, header.ssrc);
+                        return Ok(Some(frame));
+                    }
+                    Err(DecodeAudioPacketError::NotReady) => {}
+                    Err(DecodeAudioPacketError::Fatal(err)) => return Err(err),
+                }
+            }
+            if let Some(user_id) = self.infer_single_remote_speaker(expected_user_id) {
+                debug!(
+                    user_id = %user_id,
+                    ssrc = header.ssrc,
+                    "voice receive inferred speaking mapping from single remote dave member"
+                );
+                self.record_speaker_ssrc(user_id, header.ssrc);
+            } else {
+                debug!(
+                    ssrc = header.ssrc,
+                    "voice receive buffered packet for unknown ssrc"
+                );
+                self.pending_packets
+                    .insert(header.ssrc, PendingPacket { header, packet });
+                return Ok(None);
+            }
+        }
+        self.pending_packets.remove(&header.ssrc);
+        let user_id = self
+            .speaker_ssrcs
+            .get(&header.ssrc)
+            .cloned()
+            .ok_or(VoiceError::InvalidState("voice speaker mapping missing"))?;
+        if expected_user_id.is_some_and(|expected| user_id != expected) {
+            debug!(
+                expected_user_id,
+                actual_user_id = %user_id,
+                ssrc = header.ssrc,
+                "voice receive ignored packet for unexpected user"
+            );
+            return Ok(None);
+        }
+        let frame = match self.decode_audio_packet(&packet, header, user_id) {
+            Ok(frame) => frame,
+            Err(DecodeAudioPacketError::NotReady) => {
+                debug!(
+                    ssrc = header.ssrc,
+                    sequence = header.sequence,
+                    "voice receive buffered packet until dave decrypt material arrives"
+                );
+                self.pending_packets
+                    .insert(header.ssrc, PendingPacket { header, packet });
+                return Ok(None);
+            }
+            Err(DecodeAudioPacketError::Fatal(err)) => return Err(err),
+        };
+        debug!(
+            user_id = %frame.user_id,
+            ssrc = frame.ssrc,
+            sequence = frame.sequence,
+            payload_len = frame.payload.len(),
+            "voice receive decoded audio frame"
+        );
+        Ok(Some(frame))
+    }
+
+    fn mark_gateway_receive_closed(&mut self) {
+        debug!("voice receive marking gateway receive closed during observation");
+        if let Some(shutdown) = self.heartbeat_shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        self.gateway_receive_closed = true;
+    }
+
+    async fn apply_gateway_payload(
+        &mut self,
+        payload: VoiceGatewayPayload,
+        timeout_duration: Duration,
+    ) -> Result<(), VoiceError> {
         match payload.into_event() {
             VoiceGatewayEvent::Speaking(speaking) => self.apply_speaking(speaking),
+            VoiceGatewayEvent::ClientsConnect(connect) => self.apply_clients_connect(connect),
             VoiceGatewayEvent::ClientDisconnect(disconnect) => {
                 self.apply_client_disconnect(disconnect)
             }
-            VoiceGatewayEvent::DaveMlsWelcome(welcome) => self.apply_dave_welcome(welcome),
+            VoiceGatewayEvent::DaveMlsProposals(proposals) => {
+                self.apply_dave_proposals(proposals).await?
+            }
+            VoiceGatewayEvent::DaveMlsWelcome(welcome) => {
+                self.apply_dave_welcome(welcome, timeout_duration).await?
+            }
             VoiceGatewayEvent::DaveMlsPrepareCommitTransition(commit) => {
-                self.apply_dave_commit_transition(commit)
+                self.apply_dave_commit_transition(commit, timeout_duration)
+                    .await?
             }
             _ => {}
         }
@@ -311,7 +414,17 @@ impl ObservedVoiceSession {
         }
     }
 
+    fn apply_clients_connect(&mut self, connect: ClientsConnect) {
+        for user_id in connect.user_ids {
+            if user_id != self.voice.user_id {
+                self.remote_speaker_candidates.insert(user_id.clone());
+            }
+            self.dave_recognized_user_ids.insert(user_id);
+        }
+    }
+
     fn apply_client_disconnect(&mut self, disconnect: ClientDisconnect) {
+        self.dave_recognized_user_ids.remove(&disconnect.user_id);
         self.remote_speaker_candidates.remove(&disconnect.user_id);
         self.speaker_ssrcs
             .retain(|_, user_id| user_id != &disconnect.user_id);
@@ -336,9 +449,88 @@ impl ObservedVoiceSession {
         }
     }
 
-    fn apply_dave_welcome(&mut self, welcome: DaveMlsWelcome) {
+    async fn apply_dave_proposals(
+        &mut self,
+        proposals: DaveMlsProposals,
+    ) -> Result<(), VoiceError> {
+        if !self.author_dave_proposals {
+            debug!(
+                proposals_len = proposals.proposals.len(),
+                recognized_user_ids = self.dave_recognized_user_ids.len(),
+                "voice receive buffered dave proposals for an active sender"
+            );
+            self.pending_dave_proposals
+                .push((proposals.operation, proposals.proposals));
+            return Ok(());
+        }
         let Some(dave) = self.dave.as_mut() else {
-            return;
+            return Ok(());
+        };
+        let recognized_user_ids = self
+            .dave_recognized_user_ids
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let recognized = recognized_user_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let commit_welcome = match dave.process_proposals_with_operation(
+            proposals.operation,
+            &proposals.proposals,
+            &recognized,
+        ) {
+            Ok(commit_welcome) => commit_welcome,
+            Err(err) => {
+                debug!(
+                    proposals_len = proposals.proposals.len(),
+                    recognized_user_ids = recognized.len(),
+                    error = ?err,
+                    "voice receive ignored dave proposals"
+                );
+                return Ok(());
+            }
+        };
+        let Some(commit_welcome) = commit_welcome else {
+            debug!(
+                proposals_len = proposals.proposals.len(),
+                recognized_user_ids = recognized.len(),
+                "voice receive ignored no-op dave proposals"
+            );
+            return Ok(());
+        };
+        let gateway = self
+            .gateway
+            .as_ref()
+            .ok_or(VoiceError::InvalidState("voice gateway unavailable"))?;
+        debug!(
+            proposals_len = proposals.proposals.len(),
+            recognized_user_ids = recognized.len(),
+            commit_welcome_len = commit_welcome.len(),
+            "voice receive sending dave commit welcome"
+        );
+        gateway
+            .send_binary(protocol::dave_mls_commit_welcome_payload(&commit_welcome))
+            .await
+    }
+
+    async fn apply_dave_welcome(
+        &mut self,
+        welcome: DaveMlsWelcome,
+        timeout_duration: Duration,
+    ) -> Result<(), VoiceError> {
+        if self
+            .completed_dave_transition_ids
+            .contains(&welcome.transition_id)
+        {
+            debug!(
+                transition_id = welcome.transition_id,
+                "voice receive ignored replayed dave welcome transition"
+            );
+            return Ok(());
+        }
+        let Some(dave) = self.dave.as_mut() else {
+            return Ok(());
         };
         if let Err(err) = dave.process_welcome(&welcome.welcome, &[]) {
             debug!(
@@ -346,30 +538,177 @@ impl ObservedVoiceSession {
                 error = ?err,
                 "voice receive ignored dave welcome transition"
             );
-            return;
+            return self
+                .reinitialize_dave_after_invalid_transition(welcome.transition_id, timeout_duration)
+                .await;
         }
         debug!(
             transition_id = welcome.transition_id,
             "voice receive applied dave welcome transition"
         );
+        self.pending_dave_proposals.clear();
+        if welcome.transition_id != 0 {
+            self.gateway
+                .as_ref()
+                .ok_or(VoiceError::InvalidState("voice gateway unavailable"))?
+                .send_dave_transition_ready(welcome.transition_id)
+                .await?;
+        }
+        self.completed_dave_transition_ids
+            .insert(welcome.transition_id);
+        Ok(())
     }
 
-    fn apply_dave_commit_transition(&mut self, commit: DaveMlsPrepareCommitTransition) {
-        let Some(dave) = self.dave.as_mut() else {
-            return;
+    async fn apply_dave_commit_transition(
+        &mut self,
+        commit: DaveMlsPrepareCommitTransition,
+        timeout_duration: Duration,
+    ) -> Result<(), VoiceError> {
+        if self
+            .completed_dave_transition_ids
+            .contains(&commit.transition_id)
+        {
+            debug!(
+                transition_id = commit.transition_id,
+                "voice receive ignored replayed dave commit transition"
+            );
+            return Ok(());
+        }
+        let Some(mut dave) = self.dave.take() else {
+            return Ok(());
         };
+        if let Err(err) = self.stage_pending_dave_proposals(&mut dave) {
+            self.dave = Some(dave);
+            debug!(
+                transition_id = commit.transition_id,
+                error = ?err,
+                "voice receive ignored dave commit transition after proposal staging failed"
+            );
+            return self
+                .reinitialize_dave_after_invalid_transition(commit.transition_id, timeout_duration)
+                .await;
+        }
         if let Err(err) = dave.process_commit(&commit.commit) {
+            self.dave = Some(dave);
             debug!(
                 transition_id = commit.transition_id,
                 error = ?err,
                 "voice receive ignored dave commit transition"
             );
-            return;
+            return self
+                .reinitialize_dave_after_invalid_transition(commit.transition_id, timeout_duration)
+                .await;
         }
         debug!(
             transition_id = commit.transition_id,
             "voice receive applied dave commit transition"
         );
+        self.dave = Some(dave);
+        self.pending_dave_proposals.clear();
+        if commit.transition_id != 0 {
+            self.gateway
+                .as_ref()
+                .ok_or(VoiceError::InvalidState("voice gateway unavailable"))?
+                .send_dave_transition_ready(commit.transition_id)
+                .await?;
+        }
+        self.completed_dave_transition_ids
+            .insert(commit.transition_id);
+        Ok(())
+    }
+
+    async fn reinitialize_dave_after_invalid_transition(
+        &mut self,
+        transition_id: u16,
+        timeout_duration: Duration,
+    ) -> Result<(), VoiceError> {
+        let material = self.dave_material.clone().ok_or(VoiceError::InvalidState(
+            "voice dave reinitialize material unavailable",
+        ))?;
+        let gateway = self
+            .gateway
+            .as_ref()
+            .ok_or(VoiceError::InvalidState("voice gateway unavailable"))?;
+        let pending = handshake::reinitialize_pending_observer_dave_join_after_invalid_transition(
+            gateway,
+            &self.voice,
+            &material,
+            self.dave_recognized_user_ids.clone(),
+            transition_id,
+        )
+        .await?;
+        self.dave = None;
+        let ready =
+            handshake::complete_pending_observer_dave_join(gateway, pending, timeout_duration)
+                .await?;
+        self.apply_observer_dave_ready(ready);
+        Ok(())
+    }
+
+    fn apply_observer_dave_ready(&mut self, ready: handshake::PendingObserverReadyResult) {
+        self.dave_material = Some(ready.material);
+        self.dave_recognized_user_ids = ready.recognized_user_ids.clone();
+        self.remote_speaker_candidates = ready
+            .recognized_user_ids
+            .into_iter()
+            .filter(|user_id| user_id != &self.voice.user_id)
+            .collect();
+        if let Some(transition_id) = ready.completed_transition_id {
+            self.completed_dave_transition_ids.insert(transition_id);
+        }
+        self.apply_pending_gateway_updates(ready.gateway_updates);
+        self.pending_dave_proposals.clear();
+        self.dave = Some(ready.runtime);
+    }
+
+    fn stage_pending_dave_proposals(
+        &mut self,
+        dave: &mut DaveRuntimeContext,
+    ) -> Result<(), VoiceError> {
+        if self.pending_dave_proposals.is_empty() {
+            return Ok(());
+        }
+        let recognized_user_ids = self
+            .dave_recognized_user_ids
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let recognized = recognized_user_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let pending = std::mem::take(&mut self.pending_dave_proposals);
+        for (operation, proposals) in pending {
+            let commit_welcome = dave
+                .process_proposals_with_operation(operation, &proposals, &recognized)
+                .map_err(|_| VoiceError::InvalidState("voice observer dave proposals invalid"))?;
+            debug!(
+                proposals_len = proposals.len(),
+                recognized_user_ids = recognized.len(),
+                produced_commit_welcome = commit_welcome.is_some(),
+                "voice receive staged buffered dave proposals before remote commit"
+            );
+        }
+        Ok(())
+    }
+
+    fn apply_pending_gateway_updates(
+        &mut self,
+        updates: Vec<handshake::PendingObserverGatewayUpdate>,
+    ) {
+        for update in updates {
+            match update {
+                handshake::PendingObserverGatewayUpdate::Speaking { user_id, ssrc } => {
+                    self.record_speaker_ssrc(user_id, ssrc);
+                }
+                handshake::PendingObserverGatewayUpdate::ClientDisconnect { user_id } => {
+                    self.dave_recognized_user_ids.remove(&user_id);
+                    self.remote_speaker_candidates.remove(&user_id);
+                    self.speaker_ssrcs
+                        .retain(|_, mapped_user_id| mapped_user_id != &user_id);
+                }
+            }
+        }
     }
 
     fn try_decode_pending_audio_frame(

@@ -103,6 +103,17 @@ async fn voice_handshake_can_resume_instead_of_identify() {
 }
 
 #[tokio::test]
+async fn voice_handshake_resume_gateway_keeps_heartbeats_running() {
+    let fake = FakeDiscordPeer::spawn_real_shape_with_heartbeat_interval(25).await;
+    let voice = fake.voice_context("1", "2", "user-1", "session-1", "token-1");
+
+    let _resumed = handshake::resume_gateway(&voice, Some(42)).await.unwrap();
+
+    assert!(fake.saw_resume().await);
+    assert!(fake.heartbeat_count_at_least(1).await >= 1);
+}
+
+#[tokio::test]
 async fn connected_voice_session_sends_periodic_heartbeats_after_hello() {
     let fake = FakeDiscordPeer::spawn_real_shape_with_heartbeat_interval(25).await;
     let voice = fake.voice_context("1", "2", "user-1", "session-1", "token-1");

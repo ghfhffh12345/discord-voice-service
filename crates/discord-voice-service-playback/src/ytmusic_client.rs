@@ -36,6 +36,11 @@ impl YtMusicClient {
             .streaming_data
             .ok_or(PlaybackError::UnsupportedFormat)?;
         let selected = select_song_stream_format(&streaming_data.adaptive_formats)?;
+        let approx_duration_ms = selected.approx_duration_ms.or_else(|| {
+            song.video_details.as_ref().and_then(|details| {
+                (details.length_seconds > 0).then_some(u64::from(details.length_seconds) * 1_000)
+            })
+        });
         let deciphered = self
             .inner
             .cipher()
@@ -49,6 +54,7 @@ impl YtMusicClient {
         Ok(ResolvedPlaybackSource::from_parts(
             selected.itag,
             deciphered.playable_url,
+            approx_duration_ms,
         ))
     }
 }

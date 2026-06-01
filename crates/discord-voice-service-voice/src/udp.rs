@@ -88,7 +88,22 @@ impl VoiceUdpTransport {
     }
 
     pub async fn send_audio_frame(&mut self, frame: Bytes) -> Result<(), VoiceError> {
-        let (sequence, timestamp) = self.sequence.advance();
+        self.send_audio_frame_with_duration_samples(frame, 960)
+            .await
+    }
+
+    pub async fn send_audio_frame_with_duration_samples(
+        &mut self,
+        frame: Bytes,
+        duration_samples: u32,
+    ) -> Result<(), VoiceError> {
+        if duration_samples == 0 {
+            return Err(VoiceError::InvalidState(
+                "voice audio frame duration invalid",
+            ));
+        }
+
+        let (sequence, timestamp) = self.sequence.advance_by_samples(duration_samples);
         let rtp_header = self.packet_builder.build_header(sequence, timestamp);
         let packet = match &self.protection {
             Some(protection) => protection.protect_packet(&rtp_header, frame.as_ref())?,

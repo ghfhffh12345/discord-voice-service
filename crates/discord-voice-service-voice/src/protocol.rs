@@ -391,6 +391,15 @@ pub fn dave_transition_ready_payload(transition_id: u16) -> Value {
     })
 }
 
+pub fn dave_mls_invalid_commit_welcome_payload(transition_id: u16) -> Value {
+    json!({
+        "op": 31,
+        "d": {
+            "transition_id": transition_id,
+        }
+    })
+}
+
 pub fn dave_mls_commit_welcome_payload(commit_welcome: &[u8]) -> Vec<u8> {
     let (commit, welcome) =
         unpack_commit_welcome(commit_welcome).expect("internal commit/welcome framing is valid");

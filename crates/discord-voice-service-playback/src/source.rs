@@ -8,13 +8,19 @@ use crate::media::webm_demux::{DemuxedPacket, WebmOpusDemux};
 pub struct ResolvedPlaybackSource {
     pub selected_itag: u32,
     pub playable_url: String,
+    pub approx_duration_ms: Option<u64>,
 }
 
 impl ResolvedPlaybackSource {
-    pub(crate) fn from_parts(selected_itag: u32, playable_url: String) -> Self {
+    pub(crate) fn from_parts(
+        selected_itag: u32,
+        playable_url: String,
+        approx_duration_ms: Option<u64>,
+    ) -> Self {
         Self {
             selected_itag,
             playable_url,
+            approx_duration_ms,
         }
     }
 }

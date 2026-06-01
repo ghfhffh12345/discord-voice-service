@@ -13,6 +13,7 @@ pub struct DemuxedPacket {
     pub data: Bytes,
     pub timestamp_ms: u64,
     pub duration_ms: u64,
+    pub duration_samples: u32,
 }
 
 #[derive(Default)]
@@ -212,7 +213,7 @@ impl WebmDemuxState {
             return Ok(Vec::new());
         }
 
-        let durations = if let Some(durations) = opus_frame_durations_ms(&frames) {
+        let durations = if let Some(durations) = opus_frame_durations(&frames) {
             durations
         } else if let Some(block_duration_ms) = block_duration_ms {
             distribute_duration(block_duration_ms, frames.len())
@@ -225,13 +226,14 @@ impl WebmDemuxState {
         let mut timestamp_ms = self.block_timestamp_ms(relative_timestamp)?;
         let mut packets = Vec::with_capacity(frames.len());
 
-        for (frame, duration_ms) in frames.into_iter().zip(durations) {
+        for (frame, duration) in frames.into_iter().zip(durations) {
             packets.push(DemuxedPacket {
                 data: Bytes::copy_from_slice(frame.data),
                 timestamp_ms,
-                duration_ms,
+                duration_ms: duration.ms,
+                duration_samples: duration.samples,
             });
-            timestamp_ms = timestamp_ms.saturating_add(duration_ms);
+            timestamp_ms = timestamp_ms.saturating_add(duration.ms);
         }
 
         Ok(packets)
@@ -260,14 +262,20 @@ impl WebmDemuxState {
     }
 }
 
-fn opus_frame_durations_ms(frames: &[Frame<'_>]) -> Option<Vec<u64>> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PacketDuration {
+    ms: u64,
+    samples: u32,
+}
+
+fn opus_frame_durations(frames: &[Frame<'_>]) -> Option<Vec<PacketDuration>> {
     frames
         .iter()
-        .map(|frame| opus_packet_duration_ms(frame.data))
+        .map(|frame| opus_packet_duration(frame.data))
         .collect()
 }
 
-fn opus_packet_duration_ms(packet: &[u8]) -> Option<u64> {
+fn opus_packet_duration(packet: &[u8]) -> Option<PacketDuration> {
     let toc = *packet.first()?;
     let samples_per_frame = if (toc & 0x80) != 0 {
         let shift = usize::from((toc >> 3) & 0x03);
@@ -294,10 +302,14 @@ fn opus_packet_duration_ms(packet: &[u8]) -> Option<u64> {
         _ => return None,
     };
 
-    Some(((samples_per_frame * frames) / 48) as u64)
+    let samples = samples_per_frame.checked_mul(frames)?.try_into().ok()?;
+    Some(PacketDuration {
+        ms: u64::from(samples) / 48,
+        samples,
+    })
 }
 
-fn distribute_duration(total_duration_ms: u64, parts: usize) -> Vec<u64> {
+fn distribute_duration(total_duration_ms: u64, parts: usize) -> Vec<PacketDuration> {
     if parts == 0 {
         return Vec::new();
     }
@@ -308,7 +320,11 @@ fn distribute_duration(total_duration_ms: u64, parts: usize) -> Vec<u64> {
 
     for index in 0..parts {
         let extra = u64::from((index as u64) < remainder);
-        durations.push(base + extra);
+        let ms = base + extra;
+        durations.push(PacketDuration {
+            ms,
+            samples: crate::media::opus_queue::samples_from_duration_ms(ms),
+        });
     }
 
     durations

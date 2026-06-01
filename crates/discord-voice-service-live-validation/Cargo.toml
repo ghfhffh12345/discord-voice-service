@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+discord-voice-service-playback = { workspace = true }
 discord-voice-service-proto = { workspace = true }
 futures.workspace = true
 rustls.workspace = true
@@ -26,7 +27,6 @@ opus-rs.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
-discord-voice-service-playback = { workspace = true }
 discord-voice-service-test-support = { workspace = true }
 serde_json.workspace = true
 tokio.workspace = true

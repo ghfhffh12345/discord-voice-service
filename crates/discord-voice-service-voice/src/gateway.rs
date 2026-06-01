@@ -35,6 +35,10 @@ impl VoiceGatewayClient {
         *self.seq_ack.lock().await = Some(seq);
     }
 
+    pub(crate) async fn seq_ack(&self) -> Option<u64> {
+        *self.seq_ack.lock().await
+    }
+
     pub async fn apply_gateway_event(&self, event: &GatewayEvent) {
         if let Some(seq) = event.seq() {
             self.record_seq_ack(seq).await;
@@ -132,6 +136,16 @@ impl VoiceGatewayClient {
     pub async fn send_dave_transition_ready(&self, transition_id: u16) -> Result<(), VoiceError> {
         self.send_json(protocol::dave_transition_ready_payload(transition_id))
             .await
+    }
+
+    pub async fn send_dave_mls_invalid_commit_welcome(
+        &self,
+        transition_id: u16,
+    ) -> Result<(), VoiceError> {
+        self.send_json(protocol::dave_mls_invalid_commit_welcome_payload(
+            transition_id,
+        ))
+        .await
     }
 
     pub async fn send_dave_mls_key_package(&self, key_package: &[u8]) -> Result<(), VoiceError> {

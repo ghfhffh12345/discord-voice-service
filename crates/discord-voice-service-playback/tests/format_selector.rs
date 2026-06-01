@@ -11,6 +11,7 @@ async fn resolve_playback_source_calls_get_song_and_decipher() {
 
     assert_eq!(source.selected_itag, 250);
     assert_eq!(source.playable_url, "https://cdn.example/audio.webm");
+    assert_eq!(source.approx_duration_ms, Some(181_000));
     assert_eq!(fake.calls(), vec!["GetSong", "Decipher"]);
 }
 

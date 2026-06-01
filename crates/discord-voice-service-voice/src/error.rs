@@ -17,3 +17,12 @@ pub enum VoiceError {
     #[error(transparent)]
     WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
 }
+
+impl VoiceError {
+    pub fn is_gateway_closed_during_receive(&self) -> bool {
+        matches!(
+            self,
+            Self::InvalidState("voice gateway closed during receive")
+        )
+    }
+}

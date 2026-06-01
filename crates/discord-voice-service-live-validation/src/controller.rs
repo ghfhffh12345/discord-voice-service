@@ -6,6 +6,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures::{Stream, StreamExt};
+use tokio::sync::oneshot;
 use tokio::time::{Instant, timeout};
 use tracing::{info, warn};
 use twilight_gateway::error::ReceiveMessageErrorType;
@@ -18,17 +19,18 @@ use twilight_model::id::{
 };
 use twilight_model::voice::VoiceState;
 
+use discord_voice_service_playback::YtMusicClient;
 use discord_voice_service_proto::discordvoice::v1::discord_voice_control_client::DiscordVoiceControlClient;
 use discord_voice_service_proto::discordvoice::v1::join_voice_request::VoiceContext as ProtoVoiceContext;
 use discord_voice_service_proto::discordvoice::v1::{
     JoinVoiceRequest, LeaveVoiceRequest, PlayRequest, SessionEvent, SubscribeEventsRequest,
+    UpdateVoiceContextRequest,
 };
 use discord_voice_service_voice::{
-    ObservedAudioFrame, ObservedVoiceSession, PendingObservedVoiceSession,
-    VoiceContext as ObserverVoiceContext,
+    ObservedVoiceSession, PendingObservedVoiceSession, VoiceContext as ObserverVoiceContext,
 };
 
-use crate::audio::{AudioValidationStats, ObservedOpusPacket, analyze_opus_packets};
+use crate::audio::{AudioValidationAccumulator, AudioValidationStats, ObservedOpusPacket};
 use crate::config::StagingConfig;
 use crate::contract::{
     LiveContractState, LiveValidationEvidence, emit_validation_evidence, finalize_success_evidence,
@@ -41,6 +43,8 @@ const LIVE_CONTRACT_TIMEOUT: Duration = Duration::from_secs(240);
 const MIN_OBSERVED_PACKET_COUNT: u64 = 120;
 const MIN_DECODED_AUDIO_MS: u64 = 3_000;
 const MIN_NON_SILENT_AUDIO_MS: u64 = 1_000;
+const OBSERVER_AUDIO_DURATION_TOLERANCE_MS: u64 = 2_000;
+const OBSERVER_AUDIO_DURATION_MIN_RATIO_PERCENT: u64 = 90;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ForwardedVoiceContext {
@@ -74,6 +78,82 @@ impl ForwardedVoiceContext {
             token: self.token.clone(),
         }
     }
+}
+
+struct LiveVoiceContextTracker {
+    guild_id: String,
+    channel_id: String,
+    user_id: String,
+    session_id: Option<String>,
+    endpoint: Option<String>,
+    token: Option<String>,
+    current: Option<ForwardedVoiceContext>,
+}
+
+impl LiveVoiceContextTracker {
+    fn new(initial: ForwardedVoiceContext) -> Self {
+        Self {
+            guild_id: initial.guild_id.clone(),
+            channel_id: initial.channel_id.clone(),
+            user_id: initial.user_id.clone(),
+            session_id: Some(initial.session_id.clone()),
+            endpoint: Some(initial.endpoint.clone()),
+            token: Some(initial.token.clone()),
+            current: Some(initial),
+        }
+    }
+
+    fn observe_event(
+        &mut self,
+        event: &Event,
+        guild_id: Id<GuildMarker>,
+        channel_id: Id<ChannelMarker>,
+        user_id: Id<UserMarker>,
+    ) -> Option<ForwardedVoiceContext> {
+        match event {
+            Event::VoiceStateUpdate(update)
+                if update.user_id == user_id
+                    && update.guild_id == Some(guild_id)
+                    && update.channel_id == Some(channel_id) =>
+            {
+                self.session_id = Some(update.session_id.clone());
+            }
+            Event::VoiceServerUpdate(update) if update.guild_id == guild_id => {
+                if let Some(endpoint) = update.endpoint.as_ref().filter(|value| !value.is_empty()) {
+                    self.endpoint = Some(endpoint.clone());
+                }
+                if !update.token.is_empty() {
+                    self.token = Some(update.token.clone());
+                }
+            }
+            _ => {}
+        }
+
+        let context = ForwardedVoiceContext {
+            guild_id: self.guild_id.clone(),
+            channel_id: self.channel_id.clone(),
+            user_id: self.user_id.clone(),
+            session_id: self.session_id.as_ref()?.clone(),
+            endpoint: self.endpoint.as_ref()?.clone(),
+            token: self.token.as_ref()?.clone(),
+        };
+
+        if self.current.as_ref() == Some(&context) {
+            return None;
+        }
+
+        self.current = Some(context.clone());
+        Some(context)
+    }
+}
+
+struct LiveGatewayDriverConfig {
+    service_addr: String,
+    initial_service_voice: ForwardedVoiceContext,
+    guild_id: Id<GuildMarker>,
+    channel_id: Id<ChannelMarker>,
+    service_user_id: Id<UserMarker>,
+    observer_user_id: Id<UserMarker>,
 }
 
 #[derive(Debug)]
@@ -112,6 +192,41 @@ fn post_play_live_contract_state(initial: &LiveContractState) -> LiveContractSta
         saw_playing: false,
         saw_track_ended: false,
     }
+}
+
+async fn expected_playback_duration_ms(config: &StagingConfig) -> Result<u64> {
+    let mut client = YtMusicClient::connect(config.discord_voice_service_ytmusic_addr.clone())
+        .await
+        .context("connect ytmusic-service to resolve expected playback duration")?;
+    let source = client
+        .resolve_playback_source(&config.test_video_id)
+        .await
+        .with_context(|| {
+            format!(
+                "resolve expected playback duration for TEST_VIDEO_ID={}",
+                config.test_video_id
+            )
+        })?;
+    let duration_ms = source.approx_duration_ms.ok_or_else(|| {
+        anyhow!(
+            "ytmusic-service did not return an expected duration for TEST_VIDEO_ID={}",
+            config.test_video_id
+        )
+    })?;
+    if duration_ms == 0 {
+        bail!(
+            "ytmusic-service returned zero expected duration for TEST_VIDEO_ID={}",
+            config.test_video_id
+        );
+    }
+
+    info!(
+        selected_itag = source.selected_itag,
+        expected_duration_ms = duration_ms,
+        "resolved expected playback duration for live validation",
+    );
+
+    Ok(duration_ms)
 }
 
 #[derive(Clone, Copy)]
@@ -209,6 +324,8 @@ pub async fn run(config: StagingConfig) -> Result<()> {
     let flow = run_service_flow(
         &config,
         service_voice,
+        &mut service_shard,
+        service_user.id,
         &observer_sender,
         &mut observer_shard,
         GatewayJoinTarget {
@@ -219,7 +336,6 @@ pub async fn run(config: StagingConfig) -> Result<()> {
             self_mute: false,
             self_deaf: false,
         },
-        service_user.id.to_string(),
     )
     .await;
 
@@ -265,10 +381,11 @@ pub async fn run(config: StagingConfig) -> Result<()> {
 async fn run_service_flow(
     config: &StagingConfig,
     forwarded_voice: ForwardedVoiceContext,
+    service_shard: &mut Shard,
+    service_user_id: Id<UserMarker>,
     observer_sender: &twilight_gateway::MessageSender,
     observer_shard: &mut Shard,
     observer_join: GatewayJoinTarget<'_>,
-    service_user_id: String,
 ) -> ServiceFlowOutcome {
     let mut failure_snapshot = FailureEvidenceSnapshot::default();
     let join_client = DiscordVoiceControlClient::connect(config.discord_voice_service_uri.clone())
@@ -356,6 +473,59 @@ async fn run_service_flow(
     let live_contract_snapshot = Arc::new(Mutex::new(post_play_live_contract.clone()));
     failure_snapshot.live_contract = Some(post_play_live_contract.clone());
 
+    let expected_duration_ms =
+        match timeout(LIVE_CONTRACT_TIMEOUT, expected_playback_duration_ms(config)).await {
+            Ok(Ok(duration_ms)) => duration_ms,
+            Ok(Err(error)) => {
+                return ServiceFlowOutcome {
+                    result: Err(error),
+                    failure_snapshot,
+                    service_joined: true,
+                };
+            }
+            Err(_) => {
+                return ServiceFlowOutcome {
+                    result: Err(anyhow!(
+                        "timed out resolving expected playback duration after {} seconds",
+                        LIVE_CONTRACT_TIMEOUT.as_secs()
+                    )),
+                    failure_snapshot,
+                    service_joined: true,
+                };
+            }
+        };
+
+    info!("joining observer voice session before Play");
+    let observer_voice = match join_gateway_voice(observer_sender, observer_shard, observer_join)
+        .await
+        .context("join observer gateway voice before Play")
+    {
+        Ok(context) => context,
+        Err(error) => {
+            return ServiceFlowOutcome {
+                result: Err(error),
+                failure_snapshot,
+                service_joined: true,
+            };
+        }
+    };
+    info!("observer gateway voice joined; connecting observer voice session");
+    let pending_observer =
+        match PendingObservedVoiceSession::connect(observer_voice.to_observer_voice_context())
+            .await
+            .context("connect pending observer voice session")
+        {
+            Ok(pending) => pending,
+            Err(error) => {
+                return ServiceFlowOutcome {
+                    result: Err(error),
+                    failure_snapshot,
+                    service_joined: true,
+                };
+            }
+        };
+    info!("observer voice session connected; awaiting DAVE readiness during Play");
+
     let observer_audio_snapshot = Arc::new(Mutex::new(None::<AudioValidationStats>));
     let play_rpc = async {
         join_client
@@ -367,12 +537,13 @@ async fn run_service_flow(
             .map(|_| ())
     };
 
+    let (track_ended_tx, track_ended_rx) = oneshot::channel();
     let service_contract = {
         let live_contract_snapshot = Arc::clone(&live_contract_snapshot);
         async {
-            match timeout(
+            let result = match timeout(
                 LIVE_CONTRACT_TIMEOUT,
-                wait_for_play_started_contract_with_snapshot(
+                wait_for_play_completed_contract_with_snapshot(
                     &mut events,
                     &config.test_video_id,
                     post_play_live_contract,
@@ -383,50 +554,56 @@ async fn run_service_flow(
             {
                 Ok(result) => result,
                 Err(_) => Err(anyhow!(
-                    "play-start contract timed out after {} seconds",
+                    "play-completion contract timed out after {} seconds",
                     LIVE_CONTRACT_TIMEOUT.as_secs()
                 )),
-            }
+            };
+            let state = result?;
+            let _ = track_ended_tx.send(());
+            Ok(state)
         }
     };
     let observer_audio_snapshot_for_proof = Arc::clone(&observer_audio_snapshot);
+    let service_audio_user_id = service_user_id.to_string();
     let combined_validation = async move {
-        let live_contract = service_contract.await?;
-        info!("service play contract satisfied; joining observer voice session");
-        let observer_voice = join_gateway_voice(observer_sender, observer_shard, observer_join)
-            .await
-            .context("join observer gateway voice after service started")?;
-        info!("observer gateway voice joined; connecting observer voice session");
-        let pending_observer =
-            PendingObservedVoiceSession::connect(observer_voice.to_observer_voice_context())
-                .await
-                .context("connect pending observer voice session")?;
         let mut observer_session =
             await_observer_dave_ready(pending_observer.await_dave_ready(LIVE_CONTRACT_TIMEOUT))
                 .await?;
-        let audio_stats = match timeout(
-            LIVE_CONTRACT_TIMEOUT,
-            observe_audio_proof(
-                &mut observer_session,
-                &service_user_id,
-                observer_audio_snapshot_for_proof,
-            ),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => Err(anyhow!(
-                "observer audio proof timed out after {} seconds",
-                LIVE_CONTRACT_TIMEOUT.as_secs()
-            )),
-        }?;
+        observer_session.set_dave_proposal_authoring(false);
+        let observer_audio = observe_audio_until_track_ended(
+            &mut observer_session,
+            &service_audio_user_id,
+            expected_duration_ms,
+            observer_audio_snapshot_for_proof,
+            track_ended_rx,
+        );
+        let (live_contract, audio_stats) = tokio::try_join!(service_contract, observer_audio)?;
         Ok(ValidatedLiveOutcome {
             live_contract,
             audio_stats,
         })
     };
 
-    let result = wait_for_play_and_live_contract(combined_validation, play_rpc).await;
+    let validation_and_play = wait_for_play_and_live_contract(combined_validation, play_rpc);
+    let live_gateway_config = LiveGatewayDriverConfig {
+        service_addr: config.discord_voice_service_uri.clone(),
+        initial_service_voice: forwarded_voice,
+        guild_id: observer_join.guild_id,
+        channel_id: observer_join.channel_id,
+        service_user_id,
+        observer_user_id: observer_join.user_id,
+    };
+    let live_gateway_driver =
+        drive_live_gateway_shards(service_shard, observer_shard, live_gateway_config);
+    let result = tokio::select! {
+        result = validation_and_play => result,
+        result = live_gateway_driver => {
+            match result {
+                Ok(()) => Err(anyhow!("live gateway driver ended before playback completed")),
+                Err(error) => Err(error),
+            }
+        }
+    };
     failure_snapshot.live_contract = Some(live_contract_snapshot.lock().unwrap().clone());
     failure_snapshot.audio_stats = observer_audio_snapshot.lock().unwrap().clone();
 
@@ -445,14 +622,80 @@ where
     ContractFuture: Future<Output = Result<State>>,
     PlayFuture: Future<Output = Result<()>>,
 {
-    tokio::pin!(contract_future);
-    tokio::pin!(play_future);
+    let (state, ()) = tokio::try_join!(contract_future, play_future)?;
+    Ok(state)
+}
 
-    tokio::select! {
-        contract_result = &mut contract_future => contract_result,
-        play_result = &mut play_future => {
-            play_result?;
-            contract_future.await
+async fn drive_live_gateway_shards(
+    service_shard: &mut Shard,
+    observer_shard: &mut Shard,
+    config: LiveGatewayDriverConfig,
+) -> Result<()> {
+    let mut update_client = DiscordVoiceControlClient::connect(config.service_addr)
+        .await
+        .context("connect UpdateVoiceContext gRPC client for live gateway driver")?;
+    let mut service_voice = LiveVoiceContextTracker::new(config.initial_service_voice);
+
+    loop {
+        tokio::select! {
+            item = service_shard.next_event(EventTypeFlags::all()) => {
+                let Some(event) = next_live_gateway_event("service", item)? else {
+                    continue;
+                };
+                if let Some(context) =
+                    service_voice.observe_event(
+                        &event,
+                        config.guild_id,
+                        config.channel_id,
+                        config.service_user_id,
+                    )
+                {
+                    info!("forwarding refreshed service voice context during live playback");
+                    update_client
+                        .update_voice_context(UpdateVoiceContextRequest {
+                            voice: Some(context.to_proto_voice_context()),
+                        })
+                        .await
+                        .context("forward refreshed service voice context to UpdateVoiceContext")?;
+                }
+            }
+            item = observer_shard.next_event(EventTypeFlags::all()) => {
+                let Some(event) = next_live_gateway_event("observer", item)? else {
+                    continue;
+                };
+                if matches!(
+                    event,
+                    Event::VoiceStateUpdate(ref update)
+                        if update.user_id == config.observer_user_id
+                            && update.guild_id == Some(config.guild_id)
+                            && update.channel_id.is_none()
+                ) {
+                    bail!("observer gateway voice state left the target channel during playback");
+                }
+            }
+        }
+    }
+}
+
+fn next_live_gateway_event(
+    label: &str,
+    item: Option<std::result::Result<Event, twilight_gateway::error::ReceiveMessageError>>,
+) -> Result<Option<Event>> {
+    let Some(item) = item else {
+        bail!("gateway shard ended while driving {label} live playback events");
+    };
+
+    match item {
+        Ok(event) => Ok(Some(event)),
+        Err(source) => {
+            if is_fatal_gateway_receive_error(&source) {
+                return Err(anyhow!(
+                    "fatal gateway receive error while driving {label} live playback events: {source}"
+                ));
+            }
+
+            warn!(error = %source, label, "transient gateway receive error during live playback");
+            Ok(None)
         }
     }
 }
@@ -559,86 +802,120 @@ async fn wait_for_authentic_voice_context(
     }
 }
 
-async fn observe_audio_proof(
+async fn observe_audio_until_track_ended(
     observer_session: &mut ObservedVoiceSession,
     expected_user_id: &str,
+    expected_duration_ms: u64,
     snapshot: Arc<Mutex<Option<AudioValidationStats>>>,
+    mut track_ended: oneshot::Receiver<()>,
 ) -> Result<AudioValidationStats> {
     let deadline = Instant::now() + LIVE_CONTRACT_TIMEOUT;
-    let mut observed_frames: Vec<ObservedAudioFrame> = Vec::new();
+    let mut accumulator = AudioValidationAccumulator::new();
     let mut last_stats: Option<AudioValidationStats> = None;
 
     loop {
-        if let Some(stats) = last_stats.as_ref()
-            && observer_thresholds_satisfied(stats)
-        {
-            return Ok(stats.clone());
-        }
-
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            return Err(observer_threshold_error(last_stats.as_ref()));
+            return Err(observer_threshold_error(
+                last_stats.as_ref(),
+                expected_duration_ms,
+            ));
         };
 
-        let frame = match observer_session
-            .receive_audio_frame_from(expected_user_id, remaining)
-            .await
-        {
-            Ok(frame) => frame,
-            Err(error) => {
-                let context = match last_stats.as_ref() {
-                    Some(stats) => format!(
-                        "observer audio proof failed after observed_packet_count={} decoded_audio_ms={} non_silent_audio_ms={}",
-                        stats.observed_packet_count,
-                        stats.decoded_audio_ms,
-                        stats.non_silent_audio_ms
-                    ),
-                    None => {
-                        "observer audio proof failed before any packets were validated".to_owned()
+        tokio::select! {
+            track_ended_result = &mut track_ended => {
+                track_ended_result
+                    .context("service play-completion contract ended before TrackEnded notification")?;
+                let stats = accumulator.into_stats()
+                    .context("observer audio proof completed without validated packets")?;
+                *snapshot.lock().unwrap() = Some(stats.clone());
+                if observer_thresholds_satisfied(&stats, expected_duration_ms) {
+                    return Ok(stats);
+                }
+
+                return Err(observer_threshold_error(Some(&stats), expected_duration_ms));
+            }
+            frame = observer_session.receive_audio_frame_from(expected_user_id, remaining) => {
+                let frame = match frame {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        let context = match last_stats.as_ref() {
+                            Some(stats) => format!(
+                                "observer audio proof failed after observed_packet_count={} decoded_audio_ms={} non_silent_audio_ms={} expected_duration_ms={} required_decoded_audio_ms={}",
+                                stats.observed_packet_count,
+                                stats.decoded_audio_ms,
+                                stats.non_silent_audio_ms,
+                                expected_duration_ms,
+                                required_observer_decoded_audio_ms(expected_duration_ms),
+                            ),
+                            None => {
+                                "observer audio proof failed before any packets were validated".to_owned()
+                            }
+                        };
+                        return Err(error).context(context);
                     }
                 };
-                return Err(error).context(context);
-            }
-        };
 
-        observed_frames.push(frame);
-        let stats = analyze_opus_packets(observed_frames.iter().map(|frame| ObservedOpusPacket {
-            sequence: frame.sequence,
-            payload: frame.payload.as_ref(),
-        }))
-        .context("analyze observer audio packets")?;
-        *snapshot.lock().unwrap() = Some(stats.clone());
-        last_stats = Some(stats);
+                let stats = accumulator
+                    .observe_packet(ObservedOpusPacket {
+                        sequence: frame.sequence,
+                        payload: frame.payload.as_ref(),
+                    })
+                    .context("analyze observer audio packet")?;
+                *snapshot.lock().unwrap() = Some(stats.clone());
+                last_stats = Some(stats);
+            }
+        }
     }
 }
 
-fn observer_thresholds_satisfied(stats: &AudioValidationStats) -> bool {
+fn observer_thresholds_satisfied(stats: &AudioValidationStats, expected_duration_ms: u64) -> bool {
     stats.observed_packet_count >= MIN_OBSERVED_PACKET_COUNT
-        && stats.decoded_audio_ms >= MIN_DECODED_AUDIO_MS
+        && stats.decoded_audio_ms >= required_observer_decoded_audio_ms(expected_duration_ms)
         && stats.non_silent_audio_ms >= MIN_NON_SILENT_AUDIO_MS
 }
 
-fn observer_threshold_error(stats: Option<&AudioValidationStats>) -> anyhow::Error {
+fn required_observer_decoded_audio_ms(expected_duration_ms: u64) -> u64 {
+    let ratio_floor =
+        expected_duration_ms.saturating_mul(OBSERVER_AUDIO_DURATION_MIN_RATIO_PERCENT) / 100;
+    let tolerance_floor = expected_duration_ms.saturating_sub(OBSERVER_AUDIO_DURATION_TOLERANCE_MS);
+    ratio_floor
+        .min(tolerance_floor)
+        .max(MIN_DECODED_AUDIO_MS.min(expected_duration_ms))
+}
+
+fn observer_threshold_error(
+    stats: Option<&AudioValidationStats>,
+    expected_duration_ms: u64,
+) -> anyhow::Error {
+    let required_decoded_audio_ms = required_observer_decoded_audio_ms(expected_duration_ms);
     match stats {
         Some(stats) => anyhow!(
-            "observer audio proof timed out before thresholds (observed_packet_count={} decoded_audio_ms={} non_silent_audio_ms={})",
+            "observer audio proof finished before thresholds (observed_packet_count={} decoded_audio_ms={} required_decoded_audio_ms={} expected_duration_ms={} non_silent_audio_ms={} required_non_silent_audio_ms={})",
             stats.observed_packet_count,
             stats.decoded_audio_ms,
+            required_decoded_audio_ms,
+            expected_duration_ms,
             stats.non_silent_audio_ms,
+            MIN_NON_SILENT_AUDIO_MS,
         ),
-        None => anyhow!("observer audio proof timed out before any packets were received"),
+        None => anyhow!(
+            "observer audio proof timed out before any packets were received (expected_duration_ms={} required_decoded_audio_ms={})",
+            expected_duration_ms,
+            required_decoded_audio_ms,
+        ),
     }
 }
 
 #[cfg(test)]
-async fn wait_for_play_started_contract(
+async fn wait_for_play_completed_contract(
     events: &mut (impl Stream<Item = Result<SessionEvent, tonic::Status>> + Unpin),
     expected_video_id: &str,
     state: LiveContractState,
 ) -> Result<LiveContractState> {
-    wait_for_play_started_contract_with_snapshot(events, expected_video_id, state, None).await
+    wait_for_play_completed_contract_with_snapshot(events, expected_video_id, state, None).await
 }
 
-async fn wait_for_play_started_contract_with_snapshot(
+async fn wait_for_play_completed_contract_with_snapshot(
     events: &mut (impl Stream<Item = Result<SessionEvent, tonic::Status>> + Unpin),
     expected_video_id: &str,
     mut state: LiveContractState,
@@ -651,7 +928,7 @@ async fn wait_for_play_started_contract_with_snapshot(
         if let Some(snapshot) = &snapshot {
             *snapshot.lock().unwrap() = state.clone();
         }
-        if state.saw_playing {
+        if state.saw_track_ended {
             return Ok(state);
         }
     }
@@ -942,6 +1219,8 @@ fn classify_failure_reason(error: &anyhow::Error) -> String {
     let message = error.to_string().to_lowercase();
     if message.contains("observer") && message.contains("timed out") {
         "observer_timeout".to_owned()
+    } else if message.contains("observer audio proof") && message.contains("thresholds") {
+        "observer_audio_incomplete".to_owned()
     } else if message.contains("decode opus packet") || message.contains("analyze observer audio") {
         "observer_decode_failed".to_owned()
     } else if message.contains("speaker mapping") {
@@ -1026,20 +1305,21 @@ mod tests {
         assert!(initial.saw_voice_ready);
         assert!(!initial.saw_playing);
 
-        let final_state = wait_for_play_started_contract(&mut events, "video", initial)
+        let final_state = wait_for_play_completed_contract(&mut events, "video", initial)
             .await
-            .expect("remaining events should satisfy the play-start contract");
+            .expect("remaining events should satisfy the play-completion contract");
         assert!(final_state.saw_voice_ready);
         assert!(final_state.saw_playing);
-        assert!(!final_state.saw_track_ended);
+        assert!(final_state.saw_track_ended);
     }
 
     #[tokio::test]
-    async fn play_started_contract_requires_post_play_playing_after_pre_play_playing() {
+    async fn play_completed_contract_requires_post_play_playing_after_pre_play_playing() {
         let mut events = stream::iter(vec![
             Ok(event(SessionEventKind::Playing, Some("video"))),
             Ok(event(SessionEventKind::VoiceReady, None)),
             Ok(event(SessionEventKind::Playing, Some("video"))),
+            Ok(event(SessionEventKind::TrackEnded, Some("video"))),
         ]);
 
         let initial = wait_for_initial_voice_ready(&mut events, "video")
@@ -1056,34 +1336,71 @@ mod tests {
         );
         assert!(!post_play_state.saw_track_ended);
 
-        let final_state = wait_for_play_started_contract(&mut events, "video", post_play_state)
+        let final_state = wait_for_play_completed_contract(&mut events, "video", post_play_state)
             .await
-            .expect("a post-Play Playing event should satisfy the play-start contract");
+            .expect("a post-Play TrackEnded event should satisfy the play-completion contract");
         assert!(final_state.saw_voice_ready);
         assert!(final_state.saw_playing);
-        assert!(!final_state.saw_track_ended);
+        assert!(final_state.saw_track_ended);
     }
 
     #[tokio::test]
-    async fn play_completion_does_not_block_success_after_contract_finishes() {
+    async fn play_completion_is_required_after_contract_finishes() {
+        let (play_tx, play_rx) = oneshot::channel::<()>();
         let contract = async {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             Ok::<_, anyhow::Error>(LiveContractState {
                 saw_voice_ready: true,
                 saw_playing: true,
-                saw_track_ended: false,
+                saw_track_ended: true,
             })
         };
         let play = async {
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            play_rx.await.expect("play completion should be signaled");
             Ok::<_, anyhow::Error>(())
         };
 
-        let state = wait_for_play_and_live_contract(contract, play)
+        let mut orchestration = Box::pin(wait_for_play_and_live_contract(contract, play));
+        timeout(std::time::Duration::from_millis(25), &mut orchestration)
             .await
-            .expect("contract success should return before long-lived play RPC completes");
+            .expect_err("validation must not finish before Play completes");
+
+        play_tx.send(()).expect("play signal should send");
+        let state = orchestration
+            .await
+            .expect("validation should finish after Play completes");
         assert!(state.saw_voice_ready);
         assert!(state.saw_playing);
+        assert!(state.saw_track_ended);
+    }
+
+    #[test]
+    fn observer_thresholds_require_audio_near_expected_duration() {
+        let expected_duration_ms = 180_000;
+        let required_decoded_audio_ms = required_observer_decoded_audio_ms(expected_duration_ms);
+        assert_eq!(required_decoded_audio_ms, 162_000);
+
+        let short_stats = AudioValidationStats {
+            observed_packet_count: 700,
+            decoded_audio_ms: 14_000,
+            non_silent_audio_ms: 14_000,
+            ..Default::default()
+        };
+        assert!(!observer_thresholds_satisfied(
+            &short_stats,
+            expected_duration_ms,
+        ));
+
+        let full_stats = AudioValidationStats {
+            observed_packet_count: 8_100,
+            decoded_audio_ms: required_decoded_audio_ms,
+            non_silent_audio_ms: 120_000,
+            ..Default::default()
+        };
+        assert!(observer_thresholds_satisfied(
+            &full_stats,
+            expected_duration_ms,
+        ));
     }
 
     #[test]
@@ -1116,17 +1433,20 @@ mod tests {
             saw_track_ended: false,
         };
         let snapshot = Arc::new(Mutex::new(initial.clone()));
-        let mut events = stream::iter(vec![Ok(event(SessionEventKind::Playing, Some("video")))]);
+        let mut events = stream::iter(vec![
+            Ok(event(SessionEventKind::Playing, Some("video"))),
+            Err(tonic::Status::internal("event stream failed after Playing")),
+        ]);
 
-        let state = wait_for_play_started_contract_with_snapshot(
+        let error = wait_for_play_completed_contract_with_snapshot(
             &mut events,
             "video",
             initial,
             Some(Arc::clone(&snapshot)),
         )
         .await
-        .expect("playing should satisfy the play-start contract");
-        assert!(state.saw_playing);
+        .expect_err("event stream failure should prevent completion");
+        assert!(error.to_string().contains("event stream failed"));
         let failure_snapshot = FailureEvidenceSnapshot {
             live_contract: Some(snapshot.lock().unwrap().clone()),
             audio_stats: None,

@@ -61,9 +61,12 @@ impl FakeUdpPeer {
     async fn next_audio_packet(&self) -> Vec<u8> {
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
-            if let Some(packet) = self.audio_packets.lock().await.first().cloned() {
+            let mut audio_packets = self.audio_packets.lock().await;
+            if !audio_packets.is_empty() {
+                let packet = audio_packets.remove(0);
                 return packet;
             }
+            drop(audio_packets);
             if Instant::now() >= deadline {
                 panic!("timed out waiting for audio packet");
             }
@@ -102,6 +105,46 @@ async fn voice_udp_transport_round_trips_aes_gcm_packet_protection() {
     let packet = fake.next_audio_packet().await;
     let (_, plaintext) = aes_gcm_test_context().unprotect_packet(&packet).unwrap();
     assert_eq!(plaintext, payload);
+}
+
+#[tokio::test]
+async fn voice_udp_transport_uses_frame_duration_for_rtp_timestamps() {
+    let fake = FakeUdpPeer::spawn().await;
+    let protection = xchacha_test_context();
+    let mut transport = VoiceUdpTransport::connect_protected(fake.server_addr(), 7, protection)
+        .await
+        .unwrap();
+
+    transport
+        .send_audio_frame_with_duration_samples(Bytes::from_static(b"sixty-ms"), 2_880)
+        .await
+        .unwrap();
+    transport
+        .send_audio_frame_with_duration_samples(Bytes::from_static(b"ten-ms"), 480)
+        .await
+        .unwrap();
+    transport
+        .send_audio_frame_with_duration_samples(Bytes::from_static(b"twenty-ms"), 960)
+        .await
+        .unwrap();
+
+    let first = fake.next_audio_packet().await;
+    let second = fake.next_audio_packet().await;
+    let third = fake.next_audio_packet().await;
+
+    let (first_header, first_payload) = xchacha_test_context().unprotect_packet(&first).unwrap();
+    let (second_header, second_payload) = xchacha_test_context().unprotect_packet(&second).unwrap();
+    let (third_header, third_payload) = xchacha_test_context().unprotect_packet(&third).unwrap();
+
+    assert_eq!(first_payload, Bytes::from_static(b"sixty-ms"));
+    assert_eq!(second_payload, Bytes::from_static(b"ten-ms"));
+    assert_eq!(third_payload, Bytes::from_static(b"twenty-ms"));
+    assert_eq!(first_header.sequence, 0);
+    assert_eq!(second_header.sequence, 1);
+    assert_eq!(third_header.sequence, 2);
+    assert_eq!(first_header.timestamp, 0);
+    assert_eq!(second_header.timestamp, 2_880);
+    assert_eq!(third_header.timestamp, 3_360);
 }
 
 fn xchacha_test_context() -> ProtectionContext {

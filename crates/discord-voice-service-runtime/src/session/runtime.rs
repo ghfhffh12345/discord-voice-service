@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 use discord_voice_service_playback::PlaybackWorker;
 use discord_voice_service_playback::media::opus_queue::OpusFrameQueue;
@@ -208,6 +209,22 @@ impl VoiceSessionRuntime {
         );
         self.events.emit(buffering_event);
 
+        {
+            let mut voice = self.voice.lock().await;
+            if self.playback_interrupted(playback_epoch) {
+                return Ok(());
+            }
+            let session = voice.as_mut().ok_or(RuntimeError::InvalidState(
+                "play requires active voice session",
+            ))?;
+            tracing::debug!(
+                %video_id,
+                playback_epoch,
+                "runtime settling voice session before Playing"
+            );
+            session.wait_for_initial_dave_settle().await?;
+        }
+
         let playing_event = {
             let mut state = self.state.write().await;
             if self.playback_interrupted(playback_epoch) {
@@ -279,19 +296,15 @@ impl VoiceSessionRuntime {
                 continue;
             };
 
-            pacer.wait_next().await;
+            let frame_duration = Duration::from_nanos(
+                u64::from(frame.duration_samples).saturating_mul(1_000_000_000) / 48_000,
+            );
+            pacer.wait_for(frame_duration).await;
             if self.playback_interrupted(playback_epoch) {
                 return Ok(());
             }
 
             {
-                let mut voice = self.voice.lock().await;
-                if self.playback_interrupted(playback_epoch) {
-                    return Ok(());
-                }
-                let session = voice.as_mut().ok_or(RuntimeError::InvalidState(
-                    "play requires active voice session",
-                ))?;
                 let frame_duration_ms = frame.duration_ms;
                 tracing::debug!(
                     %video_id,
@@ -300,16 +313,56 @@ impl VoiceSessionRuntime {
                     frame_duration_ms,
                     "runtime sending audio frame"
                 );
-                if let Err(err) = session.send_audio_frame(frame.data).await {
-                    tracing::debug!(
-                        %video_id,
-                        playback_epoch,
-                        position_ms,
-                        frame_duration_ms,
-                        error = ?err,
-                        "playback send_audio_frame failed"
-                    );
-                    return Err(err.into());
+                let mut retried_after_gateway_reconnect = false;
+                loop {
+                    let mut voice = self.voice.lock().await;
+                    if self.playback_interrupted(playback_epoch) {
+                        return Ok(());
+                    }
+                    let session = voice.as_mut().ok_or(RuntimeError::InvalidState(
+                        "play requires active voice session",
+                    ))?;
+                    let send_result = session
+                        .send_audio_frame_with_duration_samples(
+                            frame.data.clone(),
+                            frame.duration_samples,
+                        )
+                        .await;
+                    drop(voice);
+
+                    match send_result {
+                        Ok(()) => break,
+                        Err(err)
+                            if err.is_gateway_closed_during_receive()
+                                && !retried_after_gateway_reconnect =>
+                        {
+                            tracing::info!(
+                                %video_id,
+                                playback_epoch,
+                                position_ms,
+                                frame_duration_ms,
+                                error = ?err,
+                                "playback reconnecting voice session after gateway close"
+                            );
+                            self.reconnect_voice_session_for_playback(playback_epoch)
+                                .await?;
+                            if self.playback_interrupted(playback_epoch) {
+                                return Ok(());
+                            }
+                            retried_after_gateway_reconnect = true;
+                        }
+                        Err(err) => {
+                            tracing::debug!(
+                                %video_id,
+                                playback_epoch,
+                                position_ms,
+                                frame_duration_ms,
+                                error = ?err,
+                                "playback send_audio_frame failed"
+                            );
+                            return Err(err.into());
+                        }
+                    }
                 }
                 tracing::debug!(
                     %video_id,
@@ -727,6 +780,62 @@ impl VoiceSessionRuntime {
                 .await;
             }
         }
+    }
+
+    async fn reconnect_voice_session_for_playback(
+        &self,
+        playback_epoch: u64,
+    ) -> Result<(), RuntimeError> {
+        let voice_context = {
+            let voice = self.voice.lock().await;
+            voice
+                .as_ref()
+                .map(|session| session.voice_context().clone())
+                .ok_or(RuntimeError::InvalidState(
+                    "play requires active voice session",
+                ))?
+        };
+
+        {
+            let mut voice = self.voice.lock().await;
+            if self.playback_interrupted(playback_epoch) {
+                return Ok(());
+            }
+            let Some(session) = voice.as_mut() else {
+                return Err(RuntimeError::InvalidState(
+                    "play requires active voice session",
+                ));
+            };
+            match session.resume_gateway_after_close().await {
+                Ok(()) => {
+                    tracing::info!(
+                        playback_epoch,
+                        "runtime resumed voice gateway after playback close"
+                    );
+                    return Ok(());
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        playback_epoch,
+                        error = ?err,
+                        "runtime voice gateway resume failed; falling back to full reconnect"
+                    );
+                }
+            }
+        }
+
+        let mut replacement = ConnectedVoiceSession::connect(voice_context).await?;
+        replacement.wait_for_initial_dave_settle().await?;
+        if self.playback_interrupted(playback_epoch) {
+            return Ok(());
+        }
+
+        let mut voice = self.voice.lock().await;
+        if self.playback_interrupted(playback_epoch) {
+            return Ok(());
+        }
+        *voice = Some(replacement);
+        Ok(())
     }
 }
 

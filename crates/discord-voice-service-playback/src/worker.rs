@@ -95,7 +95,11 @@ impl PlaybackWorker {
     ) -> Result<(), PlaybackError> {
         self.position.lock().unwrap().record_buffered(&packet);
         queue
-            .push(OpusFrame::new(packet.data.clone(), packet.duration_ms))
+            .push(OpusFrame::with_duration_samples(
+                packet.data.clone(),
+                packet.duration_ms,
+                packet.duration_samples,
+            ))
             .map_err(|_| PlaybackError::BufferFull)
     }
 }

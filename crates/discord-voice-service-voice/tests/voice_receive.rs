@@ -135,6 +135,36 @@ async fn observed_voice_session_receives_and_dave_decrypts_audio_for_numeric_spe
 }
 
 #[tokio::test]
+async fn observed_voice_session_resolves_unknown_ssrc_by_expected_dave_speaker_decrypt() {
+    let fake = FakeDiscordPeer::spawn_with_established_dave_group().await;
+    let voice = fake.voice_context("1", "2", OBSERVER_USER_ID, "session-1", "token-1");
+
+    let pending = PendingObservedVoiceSession::connect(voice).await.unwrap();
+    let mut session = pending
+        .await_dave_ready(Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert!(fake.saw_dave_transition().await);
+    let opus = hex::decode("0dc5aedd5bdc3f20be5697e54dd1f437").unwrap();
+    let encrypted = fake
+        .encrypt_dave_audio_frame_from_creator(&opus)
+        .await
+        .unwrap();
+    fake.send_protected_audio_packet(42, &encrypted)
+        .await
+        .unwrap();
+
+    let frame = session
+        .receive_audio_frame_from(FAKE_DAVE_CREATOR_USER_ID, Duration::from_secs(1))
+        .await
+        .unwrap();
+
+    assert_eq!(frame.user_id, FAKE_DAVE_CREATOR_USER_ID);
+    assert_eq!(frame.ssrc, 42);
+    assert_eq!(frame.payload, Bytes::from(opus));
+}
+
+#[tokio::test]
 async fn observed_voice_session_ignores_foreign_dave_speaker_before_target_audio() {
     let fake = FakeDiscordPeer::spawn_with_established_dave_group().await;
     let voice = fake.voice_context("1", "2", OBSERVER_USER_ID, "session-1", "token-1");
@@ -218,9 +248,64 @@ async fn observed_voice_session_stays_decrypt_compatible_after_post_join_remote_
         .await_dave_ready(Duration::from_secs(1))
         .await
         .unwrap();
+    let receive_task = tokio::spawn(async move {
+        session
+            .receive_audio_frame_from(FAKE_DAVE_CREATOR_USER_ID, Duration::from_secs(2))
+            .await
+    });
+
     fake.inject_remote_observer_post_join_commit("3333333333333333")
         .await
         .unwrap();
+    assert!(
+        fake.saw_late_dave_transition_ready_within(Duration::from_secs(1))
+            .await,
+        "observer should acknowledge active post-join DAVE transitions"
+    );
+    let opus = hex::decode("0dc5aedd5bdc3f20be5697e54dd1f437").unwrap();
+    let encrypted = fake
+        .encrypt_dave_audio_frame_from_creator(&opus)
+        .await
+        .unwrap();
+    fake.send_speaking(FAKE_DAVE_CREATOR_USER_ID, 42)
+        .await
+        .unwrap();
+    fake.send_protected_audio_packet(42, &encrypted)
+        .await
+        .unwrap();
+
+    let frame = receive_task.await.unwrap().unwrap();
+    assert_eq!(frame.payload, Bytes::from(opus));
+}
+
+#[tokio::test]
+async fn observed_voice_session_can_leave_post_join_proposals_to_active_sender() {
+    let fake = FakeDiscordPeer::spawn_with_established_dave_group().await;
+    let voice = fake.voice_context("1", "2", OBSERVER_USER_ID, "session-1", "token-1");
+
+    let pending = PendingObservedVoiceSession::connect(voice).await.unwrap();
+    let mut session = pending
+        .await_dave_ready(Duration::from_secs(1))
+        .await
+        .unwrap();
+    session.set_dave_proposal_authoring(false);
+
+    let receive_task = tokio::spawn(async move {
+        session
+            .receive_audio_frame_from(FAKE_DAVE_CREATOR_USER_ID, Duration::from_secs(2))
+            .await
+    });
+
+    fake.inject_late_dave_listener_transition("3333333333333333")
+        .await
+        .unwrap();
+    sleep(Duration::from_millis(50)).await;
+    assert!(
+        !fake
+            .saw_dave_commit_welcome_within(Duration::from_millis(50))
+            .await,
+        "passive observer must not author post-join DAVE proposal commits"
+    );
 
     let opus = hex::decode("0dc5aedd5bdc3f20be5697e54dd1f437").unwrap();
     let encrypted = fake
@@ -234,10 +319,8 @@ async fn observed_voice_session_stays_decrypt_compatible_after_post_join_remote_
         .await
         .unwrap();
 
-    let frame = session
-        .receive_audio_frame_from(FAKE_DAVE_CREATOR_USER_ID, Duration::from_secs(1))
-        .await
-        .unwrap();
+    let frame = receive_task.await.unwrap().unwrap();
+    assert_eq!(frame.user_id, FAKE_DAVE_CREATOR_USER_ID);
     assert_eq!(frame.payload, Bytes::from(opus));
 }
 

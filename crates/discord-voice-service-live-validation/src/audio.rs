@@ -23,17 +23,29 @@ pub struct AudioValidationStats {
     pub last_sequence: Option<u16>,
 }
 
-pub fn analyze_opus_packets<'a, I>(packets: I) -> Result<AudioValidationStats>
-where
-    I: IntoIterator<Item = ObservedOpusPacket<'a>>,
-{
-    let mut mono_decoder = None;
-    let mut stereo_decoder = None;
-    let mut stats = AudioValidationStats::default();
-    let mut total_squared_amplitude = 0.0f64;
-    let mut total_samples = 0usize;
+pub struct AudioValidationAccumulator {
+    mono_decoder: Option<OpusDecoder>,
+    stereo_decoder: Option<OpusDecoder>,
+    stats: AudioValidationStats,
+    total_squared_amplitude: f64,
+    total_samples: usize,
+}
 
-    for packet in packets {
+impl AudioValidationAccumulator {
+    pub fn new() -> Self {
+        Self {
+            mono_decoder: None,
+            stereo_decoder: None,
+            stats: AudioValidationStats::default(),
+            total_squared_amplitude: 0.0,
+            total_samples: 0,
+        }
+    }
+
+    pub fn observe_packet(
+        &mut self,
+        packet: ObservedOpusPacket<'_>,
+    ) -> Result<AudioValidationStats> {
         if packet.payload.is_empty() {
             bail!("observed opus payload must not be empty");
         }
@@ -52,12 +64,12 @@ where
         })?;
         let duration_ms = (frame_samples as u64) / 48;
         let decoder = match channels {
-            1 => mono_decoder.get_or_insert(
+            1 => self.mono_decoder.get_or_insert(
                 OpusDecoder::new(SAMPLE_RATE_HZ, 1)
                     .map_err(anyhow::Error::msg)
                     .context("create mono opus decoder")?,
             ),
-            2 => stereo_decoder.get_or_insert(
+            2 => self.stereo_decoder.get_or_insert(
                 OpusDecoder::new(SAMPLE_RATE_HZ, 2)
                     .map_err(anyhow::Error::msg)
                     .context("create stereo opus decoder")?,
@@ -89,30 +101,58 @@ where
             })
             .sum();
 
-        stats.observed_packet_count += 1;
-        stats.decoded_audio_ms += duration_ms;
+        self.stats.observed_packet_count += 1;
+        self.stats.decoded_audio_ms += duration_ms;
         if packet_peak > NON_SILENCE_PEAK_THRESHOLD {
-            stats.non_silent_audio_ms += duration_ms;
+            self.stats.non_silent_audio_ms += duration_ms;
         }
-        stats.max_peak_amplitude = stats.max_peak_amplitude.max(packet_peak);
-        stats.first_sequence.get_or_insert(packet.sequence);
-        stats.last_sequence = Some(packet.sequence);
+        self.stats.max_peak_amplitude = self.stats.max_peak_amplitude.max(packet_peak);
+        self.stats.first_sequence.get_or_insert(packet.sequence);
+        self.stats.last_sequence = Some(packet.sequence);
 
-        total_squared_amplitude += packet_square_sum;
-        total_samples += pcm.len();
+        self.total_squared_amplitude += packet_square_sum;
+        self.total_samples += pcm.len();
+
+        Ok(self.stats())
     }
 
-    if stats.observed_packet_count == 0 {
-        bail!("expected at least one observed opus packet");
+    pub fn stats(&self) -> AudioValidationStats {
+        let mut stats = self.stats.clone();
+        stats.rms_amplitude = if self.total_samples == 0 {
+            0.0
+        } else {
+            ((self.total_squared_amplitude / self.total_samples as f64).sqrt()) as f32
+        };
+        stats
     }
 
-    stats.rms_amplitude = if total_samples == 0 {
-        0.0
-    } else {
-        ((total_squared_amplitude / total_samples as f64).sqrt()) as f32
-    };
+    pub fn into_stats(self) -> Result<AudioValidationStats> {
+        let stats = self.stats();
+        if stats.observed_packet_count == 0 {
+            bail!("expected at least one observed opus packet");
+        }
 
-    Ok(stats)
+        Ok(stats)
+    }
+}
+
+impl Default for AudioValidationAccumulator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub fn analyze_opus_packets<'a, I>(packets: I) -> Result<AudioValidationStats>
+where
+    I: IntoIterator<Item = ObservedOpusPacket<'a>>,
+{
+    let mut accumulator = AudioValidationAccumulator::new();
+
+    for packet in packets {
+        accumulator.observe_packet(packet)?;
+    }
+
+    accumulator.into_stats()
 }
 
 fn opus_packet_frame_samples(packet: &[u8]) -> Option<usize> {
