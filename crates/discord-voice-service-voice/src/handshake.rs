@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 
 use davey::ProposalsOperationType;
@@ -83,6 +83,7 @@ pub struct PendingObserverDaveState {
     pending_gateway_winner_after_local_proposals_commit: bool,
     pending_proposals_replay_start: usize,
     pending_proposals: Vec<(crate::dave::DaveMlsProposalsOperation, Vec<u8>)>,
+    seeded_events: VecDeque<VoiceGatewayEvent>,
     gateway_updates: Vec<PendingObserverGatewayUpdate>,
     saw_existing_speaker: bool,
 }
@@ -1028,6 +1029,7 @@ async fn start_pending_observer_dave_join(
         pending_gateway_winner_after_local_proposals_commit: false,
         pending_proposals_replay_start: 0,
         pending_proposals: Vec::new(),
+        seeded_events: VecDeque::new(),
         gateway_updates: Vec::new(),
         saw_existing_speaker: pre_session_saw_existing_speaker,
     };
@@ -1125,6 +1127,12 @@ async fn seed_pending_observer_dave_state(
                         .insert(transition_id, prepare_protocol_version);
                 }
             }
+            event @ (VoiceGatewayEvent::DaveMlsProposals(_)
+            | VoiceGatewayEvent::DaveMlsPrepareCommitTransition(_)
+            | VoiceGatewayEvent::DaveMlsWelcome(_)) => {
+                pending.seeded_events.push_back(event);
+                return Ok(());
+            }
             _ => {}
         }
     }
@@ -1139,15 +1147,19 @@ pub(crate) async fn complete_pending_observer_dave_join(
     let mut gateway_updates = std::mem::take(&mut pending.gateway_updates);
 
     loop {
-        let remaining = handshake_deadline
-            .checked_duration_since(Instant::now())
-            .ok_or(VoiceError::InvalidState(
-                "voice observer dave join timed out",
-            ))?;
-        let event = timeout(remaining, gateway.receive_event())
-            .await
-            .map_err(|_| VoiceError::InvalidState("voice observer dave join timed out"))??
-            .into_event();
+        let event = if let Some(event) = pending.seeded_events.pop_front() {
+            event
+        } else {
+            let remaining = handshake_deadline
+                .checked_duration_since(Instant::now())
+                .ok_or(VoiceError::InvalidState(
+                    "voice observer dave join timed out",
+                ))?;
+            timeout(remaining, gateway.receive_event())
+                .await
+                .map_err(|_| VoiceError::InvalidState("voice observer dave join timed out"))??
+                .into_event()
+        };
         tracing::debug!(
             event = dave_handshake_event_name(&event),
             transition_id = dave_handshake_event_transition_id(&event),
@@ -1561,6 +1573,7 @@ pub(crate) async fn reinitialize_pending_observer_dave_join_after_invalid_transi
         pending_gateway_winner_after_local_proposals_commit: false,
         pending_proposals_replay_start: 0,
         pending_proposals: Vec::new(),
+        seeded_events: VecDeque::new(),
         gateway_updates: Vec::new(),
         saw_existing_speaker: true,
     };
