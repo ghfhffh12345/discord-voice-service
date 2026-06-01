@@ -17,7 +17,7 @@ const FAKE_DAVE_FOREIGN_USER_ID: &str = "7777777777777777";
 // Match the production post-HELLO DAVE floor for slower hosted runners.
 const DAVE_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn observed_voice_session_receives_protected_audio_and_resolves_speaker_from_gateway() {
     let fake = FakeDiscordPeer::spawn_real_shape().await;
     let voice = fake.voice_context("1", "2", "observer-1", "session-1", "token-1");
@@ -43,7 +43,7 @@ async fn observed_voice_session_receives_protected_audio_and_resolves_speaker_fr
     assert_eq!(frame.payload, Bytes::from_static(b"opus-frame"));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn observed_voice_session_times_out_when_speaker_mapping_never_arrives() {
     let fake = FakeDiscordPeer::spawn_real_shape().await;
     let voice = fake.voice_context("1", "2", "observer-1", "session-1", "token-1");
@@ -73,7 +73,7 @@ async fn observed_voice_session_times_out_when_speaker_mapping_never_arrives() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn observed_voice_session_ignores_unknown_ssrc_packet_before_target_audio() {
     let fake = FakeDiscordPeer::spawn_real_shape().await;
     let voice = fake.voice_context("1", "2", "observer-1", "session-1", "token-1");
@@ -104,7 +104,7 @@ async fn observed_voice_session_ignores_unknown_ssrc_packet_before_target_audio(
     assert_eq!(frame.payload, Bytes::from_static(b"opus-frame"));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn observed_voice_session_receives_and_dave_decrypts_audio_for_numeric_speaker() {
     let fake = FakeDiscordPeer::spawn_with_established_dave_group().await;
     let voice = fake.voice_context("1", "2", OBSERVER_USER_ID, "session-1", "token-1");
@@ -133,7 +133,7 @@ async fn observed_voice_session_receives_and_dave_decrypts_audio_for_numeric_spe
     assert_eq!(frame.payload, Bytes::from(opus));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn observed_voice_session_resolves_unknown_ssrc_by_expected_dave_speaker_decrypt() {
     let fake = FakeDiscordPeer::spawn_with_established_dave_group().await;
     let voice = fake.voice_context("1", "2", OBSERVER_USER_ID, "session-1", "token-1");
@@ -160,7 +160,7 @@ async fn observed_voice_session_resolves_unknown_ssrc_by_expected_dave_speaker_d
     assert_eq!(frame.payload, Bytes::from(opus));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn observed_voice_session_ignores_foreign_dave_speaker_before_target_audio() {
     let fake = FakeDiscordPeer::spawn_with_established_dave_group().await;
     let voice = fake.voice_context("1", "2", OBSERVER_USER_ID, "session-1", "token-1");
@@ -196,7 +196,7 @@ async fn observed_voice_session_ignores_foreign_dave_speaker_before_target_audio
     assert_eq!(frame.payload, Bytes::from(opus));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn observed_voice_session_receives_audio_after_replayed_established_join_welcome() {
     let fake = FakeDiscordPeer::spawn_with_established_dave_group().await;
     let voice = fake.voice_context("1", "2", OBSERVER_USER_ID, "session-1", "token-1");
@@ -228,7 +228,7 @@ async fn observed_voice_session_receives_audio_after_replayed_established_join_w
     assert_eq!(frame.payload, Bytes::from(opus));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn observed_voice_session_stays_decrypt_compatible_after_post_join_remote_commit() {
     let fake = FakeDiscordPeer::spawn_with_established_dave_group().await;
     let voice = fake.voice_context("1", "2", OBSERVER_USER_ID, "session-1", "token-1");
@@ -265,7 +265,7 @@ async fn observed_voice_session_stays_decrypt_compatible_after_post_join_remote_
     assert_eq!(frame.payload, Bytes::from(opus));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn observed_voice_session_can_leave_post_join_proposals_to_active_sender() {
     let fake = FakeDiscordPeer::spawn_with_established_dave_group().await;
     let voice = fake.voice_context("1", "2", OBSERVER_USER_ID, "session-1", "token-1");
@@ -308,7 +308,7 @@ async fn observed_voice_session_can_leave_post_join_proposals_to_active_sender()
     assert_eq!(frame.payload, Bytes::from(opus));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn observed_voice_session_rejects_unmatched_dave_welcome_transition() {
     let fake = FakeDiscordPeer::spawn_with_unmatched_dave_welcome().await;
     let voice = fake.voice_context("1", "2", OBSERVER_USER_ID, "session-1", "token-1");
@@ -323,7 +323,7 @@ async fn observed_voice_session_rejects_unmatched_dave_welcome_transition() {
     assert!(!fake.saw_unmatched_dave_transition().await);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn pending_observed_voice_session_waits_for_delayed_established_join_material_before_ready() {
     let fake = FakeDiscordPeer::spawn_with_delayed_established_dave_group_join().await;
     let voice = fake.voice_context("1", "2", OBSERVER_USER_ID, "session-1", "token-1");
@@ -380,7 +380,7 @@ async fn pending_observed_voice_session_waits_for_delayed_established_join_mater
     assert_eq!(frame.payload, Bytes::from(opus));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn pending_observed_voice_session_authors_local_commit_and_receives_audio_without_gateway_prepare()
  {
     let fake =
@@ -421,7 +421,7 @@ async fn pending_observed_voice_session_authors_local_commit_and_receives_audio_
     assert_eq!(frame.payload, Bytes::from(opus));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn pending_observed_voice_session_preserves_speaking_state_consumed_before_ready() {
     let fake = FakeDiscordPeer::spawn_with_delayed_established_dave_group_join().await;
     let voice = fake.voice_context("1", "2", OBSERVER_USER_ID, "session-1", "token-1");
@@ -460,7 +460,7 @@ async fn pending_observed_voice_session_preserves_speaking_state_consumed_before
     assert_eq!(frame.payload, Bytes::from(opus));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn pending_observed_voice_session_preserves_seed_phase_speaking_state_before_connect_returns()
 {
     let fake = FakeDiscordPeer::spawn_with_delayed_established_dave_group_join().await;
@@ -502,7 +502,7 @@ async fn pending_observed_voice_session_preserves_seed_phase_speaking_state_befo
     assert_eq!(frame.payload, Bytes::from(opus));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn observed_voice_session_receives_audio_after_replayed_established_join_commit() {
     let fake = FakeDiscordPeer::spawn_with_established_dave_group().await;
     let voice = fake.voice_context("1", "2", OBSERVER_USER_ID, "session-1", "token-1");
@@ -532,7 +532,7 @@ async fn observed_voice_session_receives_audio_after_replayed_established_join_c
     assert_eq!(frame.payload, Bytes::from(opus));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn observed_voice_session_receives_audio_after_real_prepare_epoch_without_transition_id() {
     let fake = FakeDiscordPeer::spawn_with_established_dave_group().await;
     let voice = fake.voice_context("1", "2", OBSERVER_USER_ID, "session-1", "token-1");
