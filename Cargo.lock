@@ -488,7 +488,7 @@ dependencies = [
 
 [[package]]
 name = "discord-voice-service"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "discord-voice-service-proto",
@@ -503,7 +503,7 @@ dependencies = [
 
 [[package]]
 name = "discord-voice-service-live-validation"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "discord-voice-service-playback",
@@ -528,7 +528,7 @@ dependencies = [
 
 [[package]]
 name = "discord-voice-service-playback"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "discord-voice-service-test-support",
@@ -545,7 +545,7 @@ dependencies = [
 
 [[package]]
 name = "discord-voice-service-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "prost",
  "protoc-bin-vendored",
@@ -555,7 +555,7 @@ dependencies = [
 
 [[package]]
 name = "discord-voice-service-runtime"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "discord-voice-service-playback",
  "discord-voice-service-proto",
@@ -572,7 +572,7 @@ dependencies = [
 
 [[package]]
 name = "discord-voice-service-test-support"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "discord-voice-service-voice",
@@ -587,7 +587,7 @@ dependencies = [
 
 [[package]]
 name = "discord-voice-service-twilight"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "futures",
  "prost",
@@ -600,7 +600,7 @@ dependencies = [
 
 [[package]]
 name = "discord-voice-service-voice"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes-gcm",
  "bytes",
