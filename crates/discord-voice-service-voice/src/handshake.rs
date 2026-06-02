@@ -1609,6 +1609,58 @@ pub(crate) async fn reinitialize_pending_observer_dave_join_after_invalid_transi
     Ok(pending)
 }
 
+pub(crate) async fn reinitialize_pending_observer_dave_join_after_invalid_proposals(
+    gateway: &VoiceGatewayClient,
+    voice: &VoiceContext,
+    material: &ObserverDaveMaterial,
+    mut recognized_user_ids: BTreeSet<String>,
+) -> Result<PendingObserverDaveState, VoiceError> {
+    recognized_user_ids.insert(voice.user_id.clone());
+    let mut pending = PendingObserverDaveState {
+        session: Some(
+            DaveSession::new(None)
+                .map_err(|_| VoiceError::InvalidState("voice dave session create failed"))?,
+        ),
+        user_id: voice.user_id.clone(),
+        group_id: material.group_id,
+        protocol_version: material.protocol_version,
+        external_sender_bytes: Some(material.external_sender_bytes.clone()),
+        recognized_user_ids,
+        pending_prepared_transitions: BTreeMap::new(),
+        invalidated_transition_ids: BTreeSet::new(),
+        pending_key_package: false,
+        pending_gateway_winner_after_local_proposals_commit: false,
+        pending_proposals_replay_start: 0,
+        pending_proposals: Vec::new(),
+        seeded_events: VecDeque::new(),
+        gateway_updates: Vec::new(),
+        saw_existing_speaker: true,
+    };
+    dave_session_mut(&mut pending.session)?
+        .set_external_sender(&material.external_sender_bytes)
+        .map_err(|_| VoiceError::InvalidState("voice dave external sender invalid"))?;
+    dave_session_mut(&mut pending.session)?
+        .init(material.protocol_version, material.group_id, &voice.user_id)
+        .map_err(|_| VoiceError::InvalidState("voice dave session init failed"))?;
+
+    tracing::debug!(
+        protocol_version = material.protocol_version,
+        group_id = material.group_id,
+        recognized_user_ids = pending.recognized_user_ids.len(),
+        "voice observer dave handshake reinitializing after invalid proposals"
+    );
+    gateway
+        .send_dave_mls_invalid_commit_welcome(DAVE_PROTOCOL_INIT_TRANSITION_ID)
+        .await?;
+    send_pending_join_key_package(
+        gateway,
+        dave_session_mut(&mut pending.session)?,
+        &mut pending.pending_key_package,
+    )
+    .await?;
+    Ok(pending)
+}
+
 async fn restart_pending_observer_dave_join_after_invalid_transition(
     gateway: &VoiceGatewayClient,
     pending: &mut PendingObserverDaveState,

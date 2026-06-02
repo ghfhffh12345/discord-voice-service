@@ -14,7 +14,7 @@ use crate::protocol::{
     DaveMlsProposals, DaveMlsWelcome, DavePrepareEpoch, SessionDescription, VoiceGatewayEvent,
 };
 use crate::rollover::VoiceSessionRollover;
-use crate::speaking::{OPUS_SILENCE_FRAME, send_speaking};
+use crate::speaking::{OPUS_SILENCE_FRAME, send_not_speaking, send_speaking};
 use crate::udp::VoiceUdpTransport;
 
 const DAVE_GATEWAY_EVENT_DRAIN_LIMIT: usize = 256;
@@ -22,6 +22,11 @@ const DAVE_GATEWAY_IDLE_POLL: Duration = Duration::from_millis(1);
 const DAVE_GATEWAY_TRANSITION_POLL: Duration = Duration::from_millis(50);
 const DAVE_GATEWAY_EXECUTE_POLL: Duration = Duration::from_secs(15);
 const DAVE_PROTOCOL_INIT_TRANSITION_ID: u16 = 0;
+const START_SPEAKING_GATEWAY_REPEAT_COUNT: usize = 3;
+const START_SPEAKING_GATEWAY_REPEAT_DELAY: Duration = Duration::from_millis(50);
+const STOP_SPEAKING_GATEWAY_REPEAT_COUNT: usize = 3;
+const STOP_SPEAKING_GATEWAY_REPEAT_DELAY: Duration = Duration::from_millis(100);
+const SUSPEND_STOP_SPEAKING_SETTLE_DELAY: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PendingDaveTransitionSource {
@@ -78,6 +83,7 @@ pub struct ConnectedVoiceSession {
     pending_initial_dave_recovery: bool,
     dave_failed_closed: bool,
     gateway_receive_closed: bool,
+    suspended_gateway_seq_ack: Option<u64>,
     heartbeat_shutdown: Option<oneshot::Sender<()>>,
     speaking_started: bool,
 }
@@ -108,9 +114,14 @@ impl ConnectedVoiceSession {
             pending_initial_dave_recovery: false,
             dave_failed_closed: false,
             gateway_receive_closed: false,
+            suspended_gateway_seq_ack: None,
             heartbeat_shutdown: None,
             speaking_started: false,
         }
+    }
+
+    pub fn disconnected(voice: VoiceContext) -> Self {
+        Self::new(voice)
     }
 
     pub async fn connect(voice: VoiceContext) -> Result<Self, VoiceError> {
@@ -189,6 +200,7 @@ impl ConnectedVoiceSession {
             pending_initial_dave_recovery: false,
             dave_failed_closed: false,
             gateway_receive_closed: false,
+            suspended_gateway_seq_ack: None,
             heartbeat_shutdown: Some(heartbeat_shutdown),
             speaking_started: false,
         })
@@ -198,11 +210,19 @@ impl ConnectedVoiceSession {
         &self.voice
     }
 
+    pub fn replace_voice_context(&mut self, voice: VoiceContext) {
+        self.voice = voice;
+    }
+
     pub fn is_connected(&self) -> bool {
         self.gateway.is_some()
             && self.transport.is_some()
             && self.ssrc.is_some()
             && self.session_description.is_some()
+    }
+
+    pub fn can_resume_gateway_after_close(&self) -> bool {
+        self.transport.is_some() && self.ssrc.is_some() && self.session_description.is_some()
     }
 
     pub fn dave_enabled(&self) -> bool {
@@ -228,12 +248,20 @@ impl ConnectedVoiceSession {
     }
 
     pub async fn resume_gateway_after_close(&mut self) -> Result<(), VoiceError> {
-        let seq_ack = self
-            .gateway
-            .as_ref()
-            .ok_or(VoiceError::InvalidState("voice gateway unavailable"))?
-            .seq_ack()
-            .await;
+        if self.gateway.is_none()
+            && (self.transport.is_none()
+                || self.ssrc.is_none()
+                || self.session_description.is_none())
+        {
+            return Err(VoiceError::InvalidState(
+                "voice media unavailable for gateway resume",
+            ));
+        }
+        let seq_ack = if let Some(gateway) = self.gateway.as_ref() {
+            gateway.seq_ack().await
+        } else {
+            self.suspended_gateway_seq_ack
+        };
         if let Some(shutdown) = self.heartbeat_shutdown.take() {
             let _ = shutdown.send(());
         }
@@ -243,7 +271,35 @@ impl ConnectedVoiceSession {
         self.gateway = Some(resumed.gateway);
         self.heartbeat_shutdown = Some(resumed.heartbeat_shutdown);
         self.gateway_receive_closed = false;
+        self.suspended_gateway_seq_ack = None;
         self.speaking_started = false;
+        Ok(())
+    }
+
+    pub async fn suspend_media(&mut self) -> Result<(), VoiceError> {
+        if self.speaking_started {
+            self.stop_speaking().await?;
+            tokio::time::sleep(SUSPEND_STOP_SPEAKING_SETTLE_DELAY).await;
+        }
+
+        let seq_ack = if let Some(gateway) = self.gateway.as_ref() {
+            gateway.seq_ack().await
+        } else {
+            self.suspended_gateway_seq_ack
+        };
+        if let Some(shutdown) = self.heartbeat_shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(gateway) = self.gateway.take() {
+            self.suspended_gateway_seq_ack = seq_ack;
+            tracing::debug!("voice closing gateway for media suspension");
+            gateway.close().await?;
+        } else {
+            self.suspended_gateway_seq_ack = seq_ack;
+        }
+        self.gateway_receive_closed = true;
+        self.speaking_started = false;
+        tracing::debug!("voice media suspended with gateway closed");
         Ok(())
     }
 
@@ -272,7 +328,7 @@ impl ConnectedVoiceSession {
                 .gateway
                 .as_ref()
                 .ok_or(VoiceError::InvalidState("voice gateway unavailable"))?;
-            send_speaking(gateway, ssrc).await?;
+            send_speaking_repeated(gateway, ssrc).await?;
             self.speaking_started = true;
         }
 
@@ -1362,6 +1418,50 @@ impl ConnectedVoiceSession {
         self.speaking_started = false;
         Ok(())
     }
+
+    pub async fn stop_speaking(&mut self) -> Result<(), VoiceError> {
+        if !self.speaking_started {
+            tracing::debug!("voice stop_speaking skipped because media was not started");
+            return Ok(());
+        }
+
+        let ssrc = self
+            .ssrc
+            .ok_or(VoiceError::InvalidState("voice ssrc unavailable"))?;
+        let gateway = self
+            .gateway
+            .as_ref()
+            .ok_or(VoiceError::InvalidState("voice gateway unavailable"))?;
+        send_not_speaking_repeated(gateway, ssrc).await?;
+        self.speaking_started = false;
+        tracing::debug!(ssrc, "voice cleared Speaking 0");
+        Ok(())
+    }
+}
+
+async fn send_speaking_repeated(gateway: &VoiceGatewayClient, ssrc: u32) -> Result<(), VoiceError> {
+    for attempt in 1..=START_SPEAKING_GATEWAY_REPEAT_COUNT {
+        tracing::debug!(ssrc, attempt, "voice setting Speaking 1");
+        send_speaking(gateway, ssrc).await?;
+        if attempt < START_SPEAKING_GATEWAY_REPEAT_COUNT {
+            tokio::time::sleep(START_SPEAKING_GATEWAY_REPEAT_DELAY).await;
+        }
+    }
+    Ok(())
+}
+
+async fn send_not_speaking_repeated(
+    gateway: &VoiceGatewayClient,
+    ssrc: u32,
+) -> Result<(), VoiceError> {
+    for attempt in 1..=STOP_SPEAKING_GATEWAY_REPEAT_COUNT {
+        tracing::debug!(ssrc, attempt, "voice clearing Speaking 0");
+        send_not_speaking(gateway, ssrc).await?;
+        if attempt < STOP_SPEAKING_GATEWAY_REPEAT_COUNT {
+            tokio::time::sleep(STOP_SPEAKING_GATEWAY_REPEAT_DELAY).await;
+        }
+    }
+    Ok(())
 }
 
 fn dave_session_event_name(event: &VoiceGatewayEvent) -> &'static str {
@@ -1476,11 +1576,16 @@ mod tests {
         async fn silence_frame_count(&self) -> usize {
             wait_for_value(&self.silence_frame_count, |count| *count >= 5).await
         }
+
+        async fn silence_frame_count_now(&self) -> usize {
+            *self.silence_frame_count.lock().await
+        }
     }
 
     struct FakeVoiceGateway {
         url: String,
         speaking_observed: Arc<Notify>,
+        speaking_states: Arc<Mutex<Vec<u64>>>,
         dave_transition_ready_ids: Arc<Mutex<Vec<u16>>>,
         dave_invalid_commit_welcome_ids: Arc<Mutex<Vec<u16>>>,
         dave_key_package_count: Arc<Mutex<usize>>,
@@ -1496,6 +1601,8 @@ mod tests {
             let ws_addr = listener.local_addr().unwrap();
             let speaking_observed = Arc::new(Notify::new());
             let speaking_observed_state = Arc::clone(&speaking_observed);
+            let speaking_states = Arc::new(Mutex::new(Vec::new()));
+            let speaking_states_state = Arc::clone(&speaking_states);
             let dave_transition_ready_ids = Arc::new(Mutex::new(Vec::new()));
             let dave_transition_ready_ids_state = Arc::clone(&dave_transition_ready_ids);
             let dave_invalid_commit_welcome_ids = Arc::new(Mutex::new(Vec::new()));
@@ -1514,7 +1621,16 @@ mod tests {
                         Message::Text(text) => {
                             let payload: Value = serde_json::from_str(text.as_ref()).unwrap();
                             match payload.get("op").and_then(Value::as_u64) {
-                                Some(5) => speaking_observed_state.notify_waiters(),
+                                Some(5) => {
+                                    if let Some(speaking) = payload
+                                        .get("d")
+                                        .and_then(|d| d.get("speaking"))
+                                        .and_then(Value::as_u64)
+                                    {
+                                        speaking_states_state.lock().await.push(speaking);
+                                    }
+                                    speaking_observed_state.notify_waiters();
+                                }
                                 Some(23) => {
                                     if let Some(transition_id) = payload
                                         .get("d")
@@ -1574,6 +1690,7 @@ mod tests {
             Self {
                 url: format!("ws://{ws_addr}/"),
                 speaking_observed,
+                speaking_states,
                 dave_transition_ready_ids,
                 dave_invalid_commit_welcome_ids,
                 dave_key_package_count,
@@ -1586,6 +1703,16 @@ mod tests {
 
         fn speaking_observed(&self) -> Arc<Notify> {
             Arc::clone(&self.speaking_observed)
+        }
+
+        async fn speaking_state_count_at_least(&self, speaking: u64, minimum: usize) -> usize {
+            wait_for_value(&self.speaking_states, |states| {
+                states.iter().filter(|state| **state == speaking).count() >= minimum
+            })
+            .await
+            .iter()
+            .filter(|state| **state == speaking)
+            .count()
         }
 
         async fn saw_dave_transition_ready(&self, transition_id: u16) -> bool {
@@ -1624,6 +1751,47 @@ mod tests {
             .await
             .expect("speaking should be observed");
         assert_eq!(udp.silence_frame_count().await, 5);
+    }
+
+    #[tokio::test]
+    async fn stop_speaking_emits_zero_without_voice_packets() {
+        let gateway = FakeVoiceGateway::spawn().await;
+        let udp = FakeUdpPeer::spawn().await;
+        let mut session = test_connected_session(gateway.url(), udp.addr()).await;
+        session.speaking_started = true;
+
+        session.stop_speaking().await.unwrap();
+
+        assert!(
+            gateway
+                .speaking_state_count_at_least(0, STOP_SPEAKING_GATEWAY_REPEAT_COUNT)
+                .await
+                >= STOP_SPEAKING_GATEWAY_REPEAT_COUNT
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(udp.silence_frame_count_now().await, 0);
+        assert!(!session.media_started());
+    }
+
+    #[tokio::test]
+    async fn suspend_media_clears_speaking_and_disconnects_without_voice_packets() {
+        let gateway = FakeVoiceGateway::spawn().await;
+        let udp = FakeUdpPeer::spawn().await;
+        let mut session = test_connected_session(gateway.url(), udp.addr()).await;
+        session.speaking_started = true;
+
+        session.suspend_media().await.unwrap();
+
+        assert!(
+            gateway
+                .speaking_state_count_at_least(0, STOP_SPEAKING_GATEWAY_REPEAT_COUNT)
+                .await
+                >= STOP_SPEAKING_GATEWAY_REPEAT_COUNT
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(udp.silence_frame_count_now().await, 0);
+        assert!(!session.media_started());
+        assert!(!session.is_connected());
     }
 
     #[tokio::test]
@@ -2057,6 +2225,7 @@ mod tests {
             pending_initial_dave_recovery: false,
             dave_failed_closed: false,
             gateway_receive_closed: false,
+            suspended_gateway_seq_ack: None,
             heartbeat_shutdown: None,
             speaking_started: false,
         }

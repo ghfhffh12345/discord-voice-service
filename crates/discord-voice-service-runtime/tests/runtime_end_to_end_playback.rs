@@ -121,12 +121,13 @@ async fn pause_stops_audio_until_resume_without_bursting() {
     assert_eq!(startup_events[4].kind, SessionEventKind::Playing as i32);
 
     assert!(fake_voice.audio_frame_count_at_least(4).await >= 4);
+    assert!(fake_voice.speaking_state_count_at_least(1, 1).await >= 1);
 
     supervisor.send(Command::Pause).await.unwrap();
     let pause_events = collect_events(&mut stream, 1).await;
     assert_eq!(pause_events[0].kind, SessionEventKind::Paused as i32);
+    assert!(fake_voice.speaking_state_count_at_least(0, 3).await >= 3);
 
-    tokio::time::sleep(Duration::from_millis(40)).await;
     let paused_count = fake_voice.audio_frame_count().await;
     tokio::time::sleep(Duration::from_millis(140)).await;
     assert_eq!(
@@ -135,10 +136,34 @@ async fn pause_stops_audio_until_resume_without_bursting() {
         "audio packets must stop while playback is paused"
     );
 
+    supervisor
+        .send(Command::UpdateVoiceContext {
+            voice: fake_voice.voice_context("1", "2", "user-1", "session-2", "token-2"),
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(140)).await;
+    assert_eq!(
+        fake_voice.audio_frame_count().await,
+        paused_count,
+        "refreshing voice context while paused must not resume audio"
+    );
+    assert_eq!(
+        fake_voice.discovery_count().await,
+        1,
+        "refreshing voice context while paused must not reconnect voice media"
+    );
+
     let resume_started = Instant::now();
     supervisor.send(Command::Resume).await.unwrap();
     let resume_events = collect_events(&mut stream, 1).await;
     assert_eq!(resume_events[0].kind, SessionEventKind::Playing as i32);
+    assert_eq!(
+        fake_voice.discovery_count().await,
+        2,
+        "resume should reconnect voice media after a paused voice context refresh"
+    );
+    assert!(fake_voice.speaking_state_count_at_least(1, 2).await >= 2);
 
     let resumed_target = paused_count + 4;
     assert!(fake_voice.audio_frame_count_at_least(resumed_target).await >= resumed_target);

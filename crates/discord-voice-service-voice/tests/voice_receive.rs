@@ -7,7 +7,9 @@ use discord_voice_service_voice::dave::{
     DaveExternalSender, DaveMediaType, DaveRuntimeContext, DaveSession,
 };
 use discord_voice_service_voice::test_support::RtpPacketBuilder;
-use discord_voice_service_voice::{ObservedVoiceSession, PendingObservedVoiceSession};
+use discord_voice_service_voice::{
+    ObservedVoiceActivity, ObservedVoiceSession, PendingObservedVoiceSession,
+};
 use tokio::net::UdpSocket;
 use tokio::time::{Duration, Instant, sleep};
 
@@ -45,6 +47,137 @@ async fn observed_voice_session_receives_protected_audio_and_resolves_speaker_fr
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn observed_voice_session_resolves_speaking_zero_without_user_id_by_ssrc() {
+    let fake = FakeDiscordPeer::spawn_real_shape().await;
+    let voice = fake.voice_context("1", "2", "observer-1", "session-1", "token-1");
+
+    let mut session = ObservedVoiceSession::connect(voice).await.unwrap();
+    fake.send_speaking("speaker-1", 42).await.unwrap();
+    let started = session
+        .receive_speaking_state_from("speaker-1", 1, Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert_eq!(started.ssrc, 42);
+
+    fake.send_speaking_state_without_user(0, 42).await.unwrap();
+    let stopped = session
+        .receive_speaking_state_from("speaker-1", 0, Duration::from_secs(1))
+        .await
+        .unwrap();
+
+    assert_eq!(stopped.user_id, "speaker-1");
+    assert_eq!(stopped.ssrc, 42);
+    assert_eq!(stopped.speaking, 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn observed_voice_session_treats_no_indicator_state_as_not_microphone_speaking() {
+    let fake = FakeDiscordPeer::spawn_real_shape().await;
+    let voice = fake.voice_context("1", "2", "observer-1", "session-1", "token-1");
+
+    let mut session = ObservedVoiceSession::connect(voice).await.unwrap();
+    fake.send_speaking("speaker-1", 42).await.unwrap();
+    session
+        .receive_speaking_state_from("speaker-1", 1, Duration::from_secs(1))
+        .await
+        .unwrap();
+
+    fake.send_speaking_state_without_user(2, 42).await.unwrap();
+    let stopped = session
+        .receive_non_microphone_speaking_state_from("speaker-1", Duration::from_secs(1))
+        .await
+        .unwrap();
+
+    assert_eq!(stopped.user_id, "speaker-1");
+    assert_eq!(stopped.ssrc, 42);
+    assert_eq!(stopped.speaking, 2);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn observed_voice_session_activity_reports_speaking_and_audio() {
+    let fake = FakeDiscordPeer::spawn_real_shape().await;
+    let voice = fake.voice_context("1", "2", "observer-1", "session-1", "token-1");
+
+    let mut session = ObservedVoiceSession::connect(voice).await.unwrap();
+    fake.send_speaking("speaker-1", 42).await.unwrap();
+
+    let activity = session
+        .receive_activity_from("speaker-1", Duration::from_secs(1))
+        .await
+        .unwrap();
+    match activity {
+        ObservedVoiceActivity::Speaking(state) => {
+            assert_eq!(state.user_id, "speaker-1");
+            assert_eq!(state.ssrc, 42);
+            assert_eq!(state.speaking, 1);
+        }
+        ObservedVoiceActivity::Audio(frame) => {
+            panic!("expected speaking state before audio, got {frame:?}");
+        }
+        ObservedVoiceActivity::RtpPacket(packet) => {
+            panic!("expected speaking state before audio, got RTP packet {packet:?}");
+        }
+        ObservedVoiceActivity::Disconnect(user_id) => {
+            panic!("expected speaking state before audio, got disconnect for {user_id}");
+        }
+    }
+
+    fake.send_protected_audio_packet(42, b"opus-frame")
+        .await
+        .unwrap();
+    let activity = session
+        .receive_activity_from("speaker-1", Duration::from_secs(1))
+        .await
+        .unwrap();
+
+    match activity {
+        ObservedVoiceActivity::Audio(frame) => {
+            assert_eq!(frame.user_id, "speaker-1");
+            assert_eq!(frame.ssrc, 42);
+            assert_eq!(frame.payload, Bytes::from_static(b"opus-frame"));
+        }
+        ObservedVoiceActivity::Speaking(state) => {
+            panic!("expected audio frame after speaking state, got {state:?}");
+        }
+        ObservedVoiceActivity::RtpPacket(packet) => {
+            panic!("expected audio frame after speaking state, got RTP packet {packet:?}");
+        }
+        ObservedVoiceActivity::Disconnect(user_id) => {
+            panic!("expected audio frame after speaking state, got disconnect for {user_id}");
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn observed_voice_session_activity_reports_client_disconnect() {
+    let fake = FakeDiscordPeer::spawn_real_shape().await;
+    let voice = fake.voice_context("1", "2", "observer-1", "session-1", "token-1");
+
+    let mut session = ObservedVoiceSession::connect(voice).await.unwrap();
+    fake.send_client_disconnect("speaker-1").await.unwrap();
+
+    let activity = session
+        .receive_activity_from("speaker-1", Duration::from_secs(1))
+        .await
+        .unwrap();
+
+    match activity {
+        ObservedVoiceActivity::Disconnect(user_id) => {
+            assert_eq!(user_id, "speaker-1");
+        }
+        ObservedVoiceActivity::Audio(frame) => {
+            panic!("expected disconnect, got audio frame {frame:?}");
+        }
+        ObservedVoiceActivity::RtpPacket(packet) => {
+            panic!("expected disconnect, got RTP packet {packet:?}");
+        }
+        ObservedVoiceActivity::Speaking(state) => {
+            panic!("expected disconnect, got speaking state {state:?}");
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn observed_voice_session_times_out_when_speaker_mapping_never_arrives() {
     let fake = FakeDiscordPeer::spawn_real_shape().await;
     let voice = fake.voice_context("1", "2", "observer-1", "session-1", "token-1");
@@ -67,7 +200,10 @@ async fn observed_voice_session_times_out_when_speaker_mapping_never_arrives() {
         .unwrap_err();
     let elapsed = start.elapsed();
 
-    assert!(error.to_string().contains("timed out"));
+    assert!(
+        error.to_string().contains("timed out"),
+        "unexpected error: {error}"
+    );
     assert!(
         elapsed < Duration::from_millis(300),
         "receive exceeded timeout budget: {elapsed:?}"
@@ -302,6 +438,49 @@ async fn observed_voice_session_stays_decrypt_compatible_after_post_join_remote_
             .await,
         "observer should acknowledge active post-join DAVE transitions"
     );
+    let opus = hex::decode("0dc5aedd5bdc3f20be5697e54dd1f437").unwrap();
+    let encrypted = fake
+        .encrypt_dave_audio_frame_from_creator(&opus)
+        .await
+        .unwrap();
+    fake.send_speaking(FAKE_DAVE_CREATOR_USER_ID, 42)
+        .await
+        .unwrap();
+    fake.send_protected_audio_packet(42, &encrypted)
+        .await
+        .unwrap();
+
+    let frame = receive_task.await.unwrap().unwrap();
+    assert_eq!(frame.payload, Bytes::from(opus));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn observed_voice_session_reinitializes_after_stale_authored_proposals() {
+    let fake = FakeDiscordPeer::spawn_with_established_dave_group().await;
+    let voice = fake.voice_context("1", "2", OBSERVER_USER_ID, "session-1", "token-1");
+
+    let pending = PendingObservedVoiceSession::connect(voice).await.unwrap();
+    let mut session = pending.await_dave_ready(DAVE_READY_TIMEOUT).await.unwrap();
+    let receive_task = tokio::spawn(async move {
+        session
+            .receive_audio_frame_from(FAKE_DAVE_CREATOR_USER_ID, Duration::from_secs(3))
+            .await
+    });
+
+    fake.inject_stale_dave_proposal("3333333333333333")
+        .await
+        .unwrap();
+    assert!(
+        fake.saw_dave_invalid_commit_welcome_within(0, DAVE_READY_TIMEOUT)
+            .await,
+        "observer should signal stale DAVE proposal processing"
+    );
+    assert!(
+        fake.saw_dave_key_package_count_at_least(2, DAVE_READY_TIMEOUT)
+            .await,
+        "observer should send a fresh key package after stale proposals"
+    );
+
     let opus = hex::decode("0dc5aedd5bdc3f20be5697e54dd1f437").unwrap();
     let encrypted = fake
         .encrypt_dave_audio_frame_from_creator(&opus)

@@ -23,6 +23,7 @@ pub struct VoiceSessionRuntime {
     state: RwLock<Snapshot>,
     events: EventBus,
     voice: Mutex<Option<ConnectedVoiceSession>>,
+    media_send_gate: Mutex<()>,
     playback: Option<Mutex<PlaybackWorker>>,
     playback_epoch: AtomicU64,
     rollover_epoch: AtomicU64,
@@ -42,6 +43,7 @@ impl VoiceSessionRuntime {
             state: RwLock::new(Snapshot::default()),
             events: EventBus::new(64),
             voice: Mutex::new(None),
+            media_send_gate: Mutex::new(()),
             playback: None,
             playback_epoch: AtomicU64::new(0),
             rollover_epoch: AtomicU64::new(0),
@@ -55,6 +57,7 @@ impl VoiceSessionRuntime {
             state: RwLock::new(Snapshot::default()),
             events: EventBus::new(64),
             voice: Mutex::new(None),
+            media_send_gate: Mutex::new(()),
             playback: Some(Mutex::new(worker)),
             playback_epoch: AtomicU64::new(0),
             rollover_epoch: AtomicU64::new(0),
@@ -136,6 +139,15 @@ impl VoiceSessionRuntime {
         self: &Arc<Self>,
         voice: VoiceContext,
     ) -> Result<(), RuntimeError> {
+        let paused = {
+            let state = self.state.read().await;
+            ensure_active_voice_session(&state, "update_voice_context")?;
+            matches!(state.state, SessionState::Paused)
+        };
+        if paused {
+            return self.refresh_paused_voice_context(voice).await;
+        }
+
         self.rollover_voice_context(voice).await
     }
 
@@ -330,22 +342,33 @@ impl VoiceSessionRuntime {
 
             {
                 let frame_duration_ms = frame.duration_ms;
-                tracing::debug!(
-                    %video_id,
-                    playback_epoch,
-                    position_ms,
-                    frame_duration_ms,
-                    "runtime sending audio frame"
-                );
                 let mut retried_after_gateway_reconnect = false;
                 loop {
+                    let send_gate = self.media_send_gate.lock().await;
                     let mut voice = self.voice.lock().await;
                     if self.playback_interrupted(playback_epoch) {
                         return Ok(());
                     }
+                    if *self.playback_paused.borrow() {
+                        drop(voice);
+                        drop(send_gate);
+                        self.wait_while_paused(playback_epoch, &mut pause_rx, &mut pacer)
+                            .await;
+                        if self.playback_interrupted(playback_epoch) {
+                            return Ok(());
+                        }
+                        continue;
+                    }
                     let session = voice.as_mut().ok_or(RuntimeError::InvalidState(
                         "play requires active voice session",
                     ))?;
+                    tracing::debug!(
+                        %video_id,
+                        playback_epoch,
+                        position_ms,
+                        frame_duration_ms,
+                        "runtime sending audio frame"
+                    );
                     let send_result = session
                         .send_audio_frame_with_duration_samples(
                             frame.data.clone(),
@@ -490,6 +513,24 @@ impl VoiceSessionRuntime {
     }
 
     async fn pause(&self) -> Result<(), RuntimeError> {
+        {
+            let state = self.state.read().await;
+            ensure_pauseable_track(&state)?;
+        }
+        self.playback_paused.send_replace(true);
+        let _send_gate = self.media_send_gate.lock().await;
+        tracing::debug!("runtime pausing playback and stopping speaking state");
+        {
+            let mut voice = self.voice.lock().await;
+            if let Some(session) = voice.as_mut()
+                && session.is_connected()
+            {
+                tracing::debug!("runtime suspending voice media for Pause");
+                session.suspend_media().await?;
+                tracing::debug!("runtime suspended voice media for Pause");
+            }
+        }
+
         let event = {
             let mut state = self.state.write().await;
             ensure_pauseable_track(&state)?;
@@ -497,12 +538,56 @@ impl VoiceSessionRuntime {
             SessionEventRecord::from_snapshot(SessionEventKind::Paused, &state)
         };
 
-        self.playback_paused.send_replace(true);
         self.events.emit(event);
         Ok(())
     }
 
     async fn resume(&self) -> Result<(), RuntimeError> {
+        {
+            let state = self.state.read().await;
+            ensure_resumable_track(&state)?;
+        }
+
+        {
+            let _send_gate = self.media_send_gate.lock().await;
+            let reconnect_voice = {
+                let mut voice = self.voice.lock().await;
+                let session = voice.as_mut().ok_or(RuntimeError::InvalidState(
+                    "resume requires active voice session",
+                ))?;
+                if session.is_connected() {
+                    None
+                } else if session.can_resume_gateway_after_close() {
+                    tracing::debug!("runtime resuming suspended voice gateway for Resume");
+                    session.resume_gateway_after_close().await?;
+                    if !session.is_connected() {
+                        return Err(RuntimeError::InvalidState(
+                            "resume requires connected voice session",
+                        ));
+                    }
+                    tracing::debug!("runtime resumed suspended voice gateway for Resume");
+                    None
+                } else {
+                    Some(session.voice_context().clone())
+                }
+            };
+
+            if let Some(voice_context) = reconnect_voice {
+                tracing::debug!("runtime reconnecting paused voice media for Resume");
+                let mut replacement = ConnectedVoiceSession::connect(voice_context).await?;
+                replacement.settle_initial_dave_for_join().await?;
+                if !replacement.is_connected() {
+                    return Err(RuntimeError::InvalidState(
+                        "resume requires connected voice session",
+                    ));
+                }
+
+                let mut voice = self.voice.lock().await;
+                *voice = Some(replacement);
+                tracing::debug!("runtime reconnected paused voice media for Resume");
+            }
+        }
+
         let event = {
             let mut state = self.state.write().await;
             ensure_resumable_track(&state)?;
@@ -666,6 +751,38 @@ impl VoiceSessionRuntime {
             });
         }
 
+        Ok(())
+    }
+
+    async fn refresh_paused_voice_context(
+        &self,
+        new_voice: VoiceContext,
+    ) -> Result<(), RuntimeError> {
+        tracing::debug!("runtime refreshing paused voice context");
+        {
+            let mut current_voice = self.voice.lock().await;
+            match current_voice.as_mut() {
+                Some(session) => {
+                    if session.is_connected() {
+                        session.suspend_media().await?;
+                    }
+                    *current_voice = Some(ConnectedVoiceSession::disconnected(new_voice.clone()));
+                }
+                None => {
+                    *current_voice = Some(ConnectedVoiceSession::disconnected(new_voice.clone()));
+                }
+            }
+        }
+
+        let mut state = self.state.write().await;
+        if !matches!(state.state, SessionState::Paused) {
+            return Ok(());
+        }
+        apply_voice_context(&mut state, &new_voice);
+        state.recovering = false;
+        state.voice_reconnecting = false;
+        state.last_reason = None;
+        tracing::debug!("runtime refreshed paused voice context");
         Ok(())
     }
 
@@ -887,7 +1004,7 @@ impl VoiceSessionRuntime {
         }
 
         let mut replacement = ConnectedVoiceSession::connect(voice_context).await?;
-        replacement.wait_for_initial_dave_settle().await?;
+        replacement.settle_initial_dave_for_join().await?;
         if self.playback_interrupted(playback_epoch) {
             return Ok(());
         }

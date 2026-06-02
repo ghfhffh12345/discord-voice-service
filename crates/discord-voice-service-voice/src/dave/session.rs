@@ -104,6 +104,13 @@ impl DaveSession {
             .unwrap_or(0)
     }
 
+    #[doc(hidden)]
+    pub fn epoch(&self) -> Option<u64> {
+        self.inner
+            .as_ref()
+            .and_then(|inner| inner.epoch().map(|epoch| epoch.as_u64()))
+    }
+
     pub fn key_package(&mut self) -> Result<Vec<u8>, DaveError> {
         self.inner_mut()?
             .create_key_package()

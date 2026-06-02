@@ -12,6 +12,7 @@
 //! 4. use [`Client::play`], [`Client::pause`], [`Client::resume`], and friends.
 
 use std::{
+    error::Error as StdError,
     fmt,
     pin::Pin,
     task::{Context, Poll},
@@ -22,7 +23,7 @@ use tonic::{
     Code, Status,
     transport::{Channel, Endpoint},
 };
-use twilight_gateway::Event;
+use twilight_gateway::{Event, MessageSender, error::ChannelError};
 use twilight_model::{
     gateway::payload::outgoing::UpdateVoiceState,
     id::{
@@ -56,6 +57,38 @@ pub mod proto {
 /// A Twilight-oriented gRPC client for `discord-voice-service`.
 pub struct Client {
     inner: DiscordVoiceControlClient<Channel>,
+}
+
+/// Error from a playback control RPC paired with a Twilight gateway voice-state command.
+#[derive(Debug)]
+pub enum GatewayVoiceControlError {
+    /// The `discord-voice-service` control RPC failed.
+    Control(Status),
+    /// Sending the Twilight gateway command failed.
+    Gateway(ChannelError),
+}
+
+impl fmt::Display for GatewayVoiceControlError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Control(error) => write!(f, "voice control RPC failed: {error}"),
+            Self::Gateway(error) => write!(f, "gateway voice-state command failed: {error}"),
+        }
+    }
+}
+
+impl StdError for GatewayVoiceControlError {}
+
+impl From<Status> for GatewayVoiceControlError {
+    fn from(value: Status) -> Self {
+        Self::Control(value)
+    }
+}
+
+impl From<ChannelError> for GatewayVoiceControlError {
+    fn from(value: ChannelError) -> Self {
+        Self::Gateway(value)
+    }
 }
 
 impl Client {
@@ -135,9 +168,54 @@ impl Client {
         self.inner.pause(PauseRequest {}).await.map(|_| ())
     }
 
+    /// Pause playback and mark the bot self-muted on the Discord gateway.
+    ///
+    /// The service stops voice media before the gateway mute command is queued, so a successful
+    /// call gives the observer-visible speaking state a Discord voice-state transition while the
+    /// service media sender is already paused.
+    pub async fn pause_and_self_mute(
+        &mut self,
+        sender: &MessageSender,
+        voice: &VoiceContext,
+        self_deaf: bool,
+    ) -> Result<(), GatewayVoiceControlError> {
+        self.pause().await?;
+        set_voice_self_mute(sender, voice, self_deaf, true)?;
+        Ok(())
+    }
+
+    /// Pause playback and leave the Discord voice channel.
+    ///
+    /// The service suspends voice media before the gateway leave command is queued, so observers
+    /// can see the bot disappear from voice while no service RTP is being sent.
+    pub async fn pause_and_leave(
+        &mut self,
+        sender: &MessageSender,
+        voice: &VoiceContext,
+    ) -> Result<(), GatewayVoiceControlError> {
+        self.pause().await?;
+        sender.command(&leave_voice_channel(voice.guild_id))?;
+        Ok(())
+    }
+
     /// Resume playback.
     pub async fn resume(&mut self) -> Result<(), Status> {
         self.inner.resume(ResumeRequest {}).await.map(|_| ())
+    }
+
+    /// Mark the bot self-unmuted on the Discord gateway and resume playback.
+    ///
+    /// The gateway unmute is queued before playback resumes so observers can receive resumed
+    /// service packets after the visible speaking state returns.
+    pub async fn resume_and_self_unmute(
+        &mut self,
+        sender: &MessageSender,
+        voice: &VoiceContext,
+        self_deaf: bool,
+    ) -> Result<(), GatewayVoiceControlError> {
+        set_voice_self_mute(sender, voice, self_deaf, false)?;
+        self.resume().await?;
+        Ok(())
     }
 
     /// Stop playback while keeping the service voice session available.
@@ -253,6 +331,16 @@ pub fn join_voice_channel(
     UpdateVoiceState::new(guild_id, Some(channel_id), self_deaf, self_mute)
 }
 
+/// Queue a Twilight gateway voice-state update that keeps the current channel and toggles self-mute.
+pub fn set_voice_self_mute(
+    sender: &MessageSender,
+    voice: &VoiceContext,
+    self_deaf: bool,
+    self_mute: bool,
+) -> Result<(), ChannelError> {
+    sender.command(&voice.join_command(self_deaf, self_mute))
+}
+
 /// Build the Twilight gateway command for leaving a guild voice channel.
 pub fn leave_voice_channel(guild_id: Id<GuildMarker>) -> UpdateVoiceState {
     UpdateVoiceState::new(guild_id, None, false, false)
@@ -318,12 +406,27 @@ impl VoiceContextTracker {
         self.current.as_ref()
     }
 
+    /// Clear the tracked context after the bot leaves the target voice channel.
+    pub fn reset(&mut self) {
+        self.session_id = None;
+        self.endpoint = None;
+        self.token = None;
+        self.current = None;
+    }
+
     /// Observe one Twilight gateway event.
     ///
     /// Returns `Some` only when the event completes the initial context or changes
     /// the context that should be forwarded to `UpdateVoiceContext`.
     pub fn observe(&mut self, event: &Event) -> Option<VoiceContext> {
         match event {
+            Event::VoiceStateUpdate(update)
+                if update.user_id == self.user_id
+                    && update.guild_id == Some(self.guild_id)
+                    && update.channel_id.is_none() =>
+            {
+                self.reset();
+            }
             Event::VoiceStateUpdate(update)
                 if update.user_id == self.user_id
                     && update.guild_id == Some(self.guild_id)

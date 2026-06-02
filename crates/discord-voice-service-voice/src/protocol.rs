@@ -7,6 +7,8 @@ use crate::error::VoiceError;
 use crate::session::VoiceContext;
 use crate::udp::DiscoveredUdpAddress;
 
+pub const SPEAKING_FLAG_MICROPHONE: u64 = 1;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hello {
     pub heartbeat_interval_ms: u64,

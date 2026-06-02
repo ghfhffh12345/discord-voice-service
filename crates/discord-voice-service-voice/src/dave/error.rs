@@ -44,4 +44,12 @@ impl DaveError {
             reason: reason.to_string(),
         }
     }
+
+    pub(crate) fn is_epoch_mismatch(&self) -> bool {
+        let reason = match self {
+            Self::MlsFailure { reason, .. } | Self::Operation { reason, .. } => reason,
+            _ => return false,
+        };
+        reason.contains("epoch differs")
+    }
 }

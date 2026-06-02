@@ -16,7 +16,10 @@ mod udp;
 mod ws;
 
 pub use error::VoiceError;
-pub use receive::{ObservedAudioFrame, ObservedVoiceSession, PendingObservedVoiceSession};
+pub use receive::{
+    ObservedAudioFrame, ObservedRtpPacket, ObservedSpeakingState, ObservedVoiceActivity,
+    ObservedVoiceSession, PendingObservedVoiceSession,
+};
 pub use session::{ConnectedVoiceSession, VoiceContext};
 
 #[doc(hidden)]

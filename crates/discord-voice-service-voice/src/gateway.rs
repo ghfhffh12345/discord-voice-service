@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 use serde_json::Value;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message, error::ProtocolError};
 
 use crate::dave::DaveSession;
 use crate::error::VoiceError;
@@ -37,6 +37,12 @@ impl VoiceGatewayClient {
 
     pub(crate) async fn seq_ack(&self) -> Option<u64> {
         *self.seq_ack.lock().await
+    }
+
+    pub async fn close(&self) -> Result<(), VoiceError> {
+        let mut writer = self.write.lock().await;
+        writer.close().await?;
+        Ok(())
     }
 
     pub async fn apply_gateway_event(&self, event: &GatewayEvent) {
@@ -87,7 +93,17 @@ impl VoiceGatewayClient {
     pub async fn receive_event(&self) -> Result<VoiceGatewayPayload, VoiceError> {
         let mut reader = self.read.lock().await;
         while let Some(message) = reader.next().await {
-            match message? {
+            let message = match message {
+                Ok(message) => message,
+                Err(err) if websocket_closed_during_receive(&err) => {
+                    return Err(VoiceError::InvalidState(
+                        "voice gateway closed during receive",
+                    ));
+                }
+                Err(err) => return Err(err.into()),
+            };
+
+            match message {
                 Message::Text(text) => {
                     let payload = protocol::parse_gateway_message(text.as_ref())?;
                     if let Some(seq) = payload.seq() {
@@ -152,6 +168,15 @@ impl VoiceGatewayClient {
         self.send_binary(protocol::dave_mls_key_package_payload(key_package))
             .await
     }
+}
+
+fn websocket_closed_during_receive(err: &WebSocketError) -> bool {
+    matches!(
+        err,
+        WebSocketError::ConnectionClosed
+            | WebSocketError::AlreadyClosed
+            | WebSocketError::Protocol(ProtocolError::ResetWithoutClosingHandshake)
+    )
 }
 
 fn heartbeat_timestamp_millis() -> Result<u64, VoiceError> {
