@@ -283,18 +283,19 @@ async fn join_voice_then_play_streams_end_to_end_playback_events_and_audio() {
         .await
         .unwrap();
 
-    let events = collect_proto_events(&mut stream, 5).await;
-    assert_eq!(events[0].kind, SessionEventKind::VoiceReady as i32);
-    assert_eq!(events[1].kind, SessionEventKind::TrackResolving as i32);
-    assert_eq!(events[2].kind, SessionEventKind::Buffering as i32);
-    assert_eq!(events[2].current_video_id, "video-1");
-    assert_eq!(events[2].selected_itag, 250);
-    assert_eq!(events[3].kind, SessionEventKind::Playing as i32);
+    let events = collect_proto_events(&mut stream, 6).await;
+    assert_eq!(events[0].kind, SessionEventKind::VoiceConnecting as i32);
+    assert_eq!(events[1].kind, SessionEventKind::VoiceReady as i32);
+    assert_eq!(events[2].kind, SessionEventKind::TrackResolving as i32);
+    assert_eq!(events[3].kind, SessionEventKind::Buffering as i32);
     assert_eq!(events[3].current_video_id, "video-1");
     assert_eq!(events[3].selected_itag, 250);
-    assert_eq!(events[4].kind, SessionEventKind::TrackEnded as i32);
+    assert_eq!(events[4].kind, SessionEventKind::Playing as i32);
     assert_eq!(events[4].current_video_id, "video-1");
     assert_eq!(events[4].selected_itag, 250);
+    assert_eq!(events[5].kind, SessionEventKind::TrackEnded as i32);
+    assert_eq!(events[5].current_video_id, "video-1");
+    assert_eq!(events[5].selected_itag, 250);
 
     let state = service
         .get_state(Request::new(GetStateRequest {}))

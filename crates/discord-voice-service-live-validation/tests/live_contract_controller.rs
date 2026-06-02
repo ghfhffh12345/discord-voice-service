@@ -102,7 +102,18 @@ fn evidence_json_captures_receive_side_success_contract() {
         outcome: "success".to_owned(),
         service_uri: "http://127.0.0.1:55051".to_owned(),
         ytmusic_addr: "http://127.0.0.1:50051".to_owned(),
+        validated_join_voice: true,
+        validated_update_voice_context: true,
+        validated_play: true,
+        validated_pause: true,
+        validated_resume: true,
+        validated_stop: true,
+        validated_leave_voice: true,
+        validated_get_state: true,
+        validated_subscribe_events: true,
+        saw_voice_connecting: true,
         saw_voice_ready: true,
+        saw_track_resolving: true,
         saw_playing: true,
         saw_track_ended: true,
         observed_packet_count: 144,
@@ -119,7 +130,18 @@ fn evidence_json_captures_receive_side_success_contract() {
             "outcome": "success",
             "service_uri": "http://127.0.0.1:55051",
             "ytmusic_addr": "http://127.0.0.1:50051",
+            "validated_join_voice": true,
+            "validated_update_voice_context": true,
+            "validated_play": true,
+            "validated_pause": true,
+            "validated_resume": true,
+            "validated_stop": true,
+            "validated_leave_voice": true,
+            "validated_get_state": true,
+            "validated_subscribe_events": true,
+            "saw_voice_connecting": true,
             "saw_voice_ready": true,
+            "saw_track_resolving": true,
             "saw_playing": true,
             "saw_track_ended": true,
             "observed_packet_count": 144,
@@ -167,6 +189,12 @@ fn live_contract_passes_when_track_ends_after_voice_ready_and_playing() {
     state
         .observe_event(event(SessionEventKind::VoiceReady, None), "video")
         .unwrap();
+    state
+        .observe_event(
+            event(SessionEventKind::TrackResolving, Some("video")),
+            "video",
+        )
+        .unwrap();
     assert!(
         !state
             .observe_event(event(SessionEventKind::Playing, Some("video")), "video")
@@ -186,6 +214,12 @@ fn live_contract_fails_when_track_end_video_id_differs_after_playing() {
 
     state
         .observe_event(event(SessionEventKind::VoiceReady, None), "video")
+        .unwrap();
+    state
+        .observe_event(
+            event(SessionEventKind::TrackResolving, Some("video")),
+            "video",
+        )
         .unwrap();
     state
         .observe_event(event(SessionEventKind::Playing, Some("video")), "video")
@@ -208,6 +242,12 @@ fn live_contract_fails_when_playing_video_id_differs_from_expected() {
     state
         .observe_event(event(SessionEventKind::VoiceReady, None), "video")
         .unwrap();
+    state
+        .observe_event(
+            event(SessionEventKind::TrackResolving, Some("video")),
+            "video",
+        )
+        .unwrap();
 
     let error = state
         .observe_event(
@@ -225,6 +265,12 @@ fn live_contract_fails_on_reconnecting_after_playing() {
 
     state
         .observe_event(event(SessionEventKind::VoiceReady, None), "video")
+        .unwrap();
+    state
+        .observe_event(
+            event(SessionEventKind::TrackResolving, Some("video")),
+            "video",
+        )
         .unwrap();
     state
         .observe_event(event(SessionEventKind::Playing, Some("video")), "video")
@@ -267,7 +313,18 @@ fn success_evidence_waits_for_cleanup_success() {
                 outcome: "success".to_owned(),
                 service_uri: "http://127.0.0.1:55051".to_owned(),
                 ytmusic_addr: "http://127.0.0.1:50051".to_owned(),
+                validated_join_voice: false,
+                validated_update_voice_context: false,
+                validated_play: false,
+                validated_pause: false,
+                validated_resume: false,
+                validated_stop: false,
+                validated_leave_voice: false,
+                validated_get_state: false,
+                validated_subscribe_events: false,
+                saw_voice_connecting: false,
                 saw_voice_ready: false,
+                saw_track_resolving: false,
                 saw_playing: false,
                 saw_track_ended: true,
                 observed_packet_count: 0,
@@ -303,6 +360,7 @@ async fn orchestration_waits_for_contract_and_play_completion() {
             saw_voice_ready: true,
             saw_playing: true,
             saw_track_ended: true,
+            ..LiveContractState::default()
         }))
         .expect("contract result should be sent");
 

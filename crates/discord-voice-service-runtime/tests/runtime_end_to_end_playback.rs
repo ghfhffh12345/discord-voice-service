@@ -39,18 +39,22 @@ async fn join_voice_then_play_reaches_connected_runtime_playback_path() {
         .await
         .unwrap();
 
-    let startup_events = collect_events(&mut stream, 4).await;
-    assert_eq!(startup_events[0].kind, SessionEventKind::VoiceReady as i32);
+    let startup_events = collect_events(&mut stream, 5).await;
     assert_eq!(
-        startup_events[1].kind,
+        startup_events[0].kind,
+        SessionEventKind::VoiceConnecting as i32
+    );
+    assert_eq!(startup_events[1].kind, SessionEventKind::VoiceReady as i32);
+    assert_eq!(
+        startup_events[2].kind,
         SessionEventKind::TrackResolving as i32
     );
-    assert_eq!(startup_events[2].kind, SessionEventKind::Buffering as i32);
-    assert_eq!(startup_events[2].current_video_id, "video-1");
-    assert_eq!(startup_events[2].selected_itag, 250);
-    assert_eq!(startup_events[3].kind, SessionEventKind::Playing as i32);
+    assert_eq!(startup_events[3].kind, SessionEventKind::Buffering as i32);
     assert_eq!(startup_events[3].current_video_id, "video-1");
     assert_eq!(startup_events[3].selected_itag, 250);
+    assert_eq!(startup_events[4].kind, SessionEventKind::Playing as i32);
+    assert_eq!(startup_events[4].current_video_id, "video-1");
+    assert_eq!(startup_events[4].selected_itag, 250);
 
     tokio::time::timeout(Duration::from_secs(2), speaking_observed.notified())
         .await
@@ -89,8 +93,12 @@ async fn join_voice_accepts_self_only_pending_initial_dave_session() {
         .await
         .unwrap();
 
-    let startup_events = collect_events(&mut stream, 1).await;
-    assert_eq!(startup_events[0].kind, SessionEventKind::VoiceReady as i32);
+    let startup_events = collect_events(&mut stream, 2).await;
+    assert_eq!(
+        startup_events[0].kind,
+        SessionEventKind::VoiceConnecting as i32
+    );
+    assert_eq!(startup_events[1].kind, SessionEventKind::VoiceReady as i32);
     assert_eq!(supervisor.snapshot().await.state, SessionState::VoiceReady);
     assert!(fake_voice.saw_dave_key_package_before_prepare_epoch().await);
     assert!(
@@ -119,8 +127,12 @@ async fn play_handles_queued_replayed_established_join_welcome_before_first_audi
         .await
         .unwrap();
 
-    let startup_events = collect_events(&mut stream, 1).await;
-    assert_eq!(startup_events[0].kind, SessionEventKind::VoiceReady as i32);
+    let startup_events = collect_events(&mut stream, 2).await;
+    assert_eq!(
+        startup_events[0].kind,
+        SessionEventKind::VoiceConnecting as i32
+    );
+    assert_eq!(startup_events[1].kind, SessionEventKind::VoiceReady as i32);
 
     fake_voice
         .replay_established_join_welcome_transition()
@@ -171,8 +183,12 @@ async fn play_handles_queued_replayed_local_init_creator_commit_before_first_aud
         .await
         .unwrap();
 
-    let startup_events = collect_events(&mut stream, 1).await;
-    assert_eq!(startup_events[0].kind, SessionEventKind::VoiceReady as i32);
+    let startup_events = collect_events(&mut stream, 2).await;
+    assert_eq!(
+        startup_events[0].kind,
+        SessionEventKind::VoiceConnecting as i32
+    );
+    assert_eq!(startup_events[1].kind, SessionEventKind::VoiceReady as i32);
 
     fake_voice
         .replay_local_init_creator_commit_transition()
@@ -231,14 +247,18 @@ async fn stop_interrupts_in_flight_playback_without_track_ended() {
             .await
     });
 
-    let startup_events = collect_events(&mut stream, 4).await;
-    assert_eq!(startup_events[0].kind, SessionEventKind::VoiceReady as i32);
+    let startup_events = collect_events(&mut stream, 5).await;
     assert_eq!(
-        startup_events[1].kind,
+        startup_events[0].kind,
+        SessionEventKind::VoiceConnecting as i32
+    );
+    assert_eq!(startup_events[1].kind, SessionEventKind::VoiceReady as i32);
+    assert_eq!(
+        startup_events[2].kind,
         SessionEventKind::TrackResolving as i32
     );
-    assert_eq!(startup_events[2].kind, SessionEventKind::Buffering as i32);
-    assert_eq!(startup_events[3].kind, SessionEventKind::Playing as i32);
+    assert_eq!(startup_events[3].kind, SessionEventKind::Buffering as i32);
+    assert_eq!(startup_events[4].kind, SessionEventKind::Playing as i32);
 
     tokio::time::timeout(Duration::from_secs(2), speaking_observed.notified())
         .await
@@ -294,13 +314,17 @@ async fn stop_during_resolution_prevents_canceled_track_state_from_reappearing()
             .await
     });
 
-    let startup_events = collect_events(&mut stream, 2).await;
-    assert_eq!(startup_events[0].kind, SessionEventKind::VoiceReady as i32);
+    let startup_events = collect_events(&mut stream, 3).await;
     assert_eq!(
-        startup_events[1].kind,
+        startup_events[0].kind,
+        SessionEventKind::VoiceConnecting as i32
+    );
+    assert_eq!(startup_events[1].kind, SessionEventKind::VoiceReady as i32);
+    assert_eq!(
+        startup_events[2].kind,
         SessionEventKind::TrackResolving as i32
     );
-    assert_eq!(startup_events[1].current_video_id, "video-1");
+    assert_eq!(startup_events[2].current_video_id, "video-1");
 
     let stop_started = Instant::now();
     supervisor.send(Command::Stop).await.unwrap();
@@ -365,14 +389,18 @@ async fn stop_then_replay_same_video_reaches_track_ended_again() {
             .await
     });
 
-    let startup_events = collect_events(&mut stream, 4).await;
-    assert_eq!(startup_events[0].kind, SessionEventKind::VoiceReady as i32);
+    let startup_events = collect_events(&mut stream, 5).await;
     assert_eq!(
-        startup_events[1].kind,
+        startup_events[0].kind,
+        SessionEventKind::VoiceConnecting as i32
+    );
+    assert_eq!(startup_events[1].kind, SessionEventKind::VoiceReady as i32);
+    assert_eq!(
+        startup_events[2].kind,
         SessionEventKind::TrackResolving as i32
     );
-    assert_eq!(startup_events[2].kind, SessionEventKind::Buffering as i32);
-    assert_eq!(startup_events[3].kind, SessionEventKind::Playing as i32);
+    assert_eq!(startup_events[3].kind, SessionEventKind::Buffering as i32);
+    assert_eq!(startup_events[4].kind, SessionEventKind::Playing as i32);
 
     tokio::time::timeout(Duration::from_secs(2), speaking_observed.notified())
         .await

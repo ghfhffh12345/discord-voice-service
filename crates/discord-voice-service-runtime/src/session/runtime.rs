@@ -81,14 +81,23 @@ impl VoiceSessionRuntime {
     }
 
     async fn join_voice(&self, voice: VoiceContext) -> Result<(), RuntimeError> {
-        {
-            let state = self.state.read().await;
+        let connecting_event = {
+            let mut state = self.state.write().await;
             ensure_joinable_session(&state)?;
-        }
+            apply_voice_context(&mut state, &voice);
+            state.current_video_id = None;
+            state.selected_itag = None;
+            state.queue_depth = 0;
+            state.position_ms = 0;
+            state.last_reason = None;
+            state.state = SessionState::ConnectingVoice;
+            SessionEventRecord::from_snapshot(SessionEventKind::VoiceConnecting, &state)
+        };
+        self.events.emit(connecting_event);
 
         let mut session = ConnectedVoiceSession::connect(voice).await?;
         session.settle_initial_dave_for_join().await?;
-        let event = {
+        let ready_event = {
             let mut state = self.state.write().await;
             apply_voice_context(&mut state, session.voice_context());
             apply_rollover_state(&mut state, &session);
@@ -104,15 +113,19 @@ impl VoiceSessionRuntime {
             };
 
             *self.voice.lock().await = Some(session);
-            let kind = if matches!(state.state, SessionState::VoiceReady) {
-                SessionEventKind::VoiceReady
+            if matches!(state.state, SessionState::VoiceReady) {
+                Some(SessionEventRecord::from_snapshot(
+                    SessionEventKind::VoiceReady,
+                    &state,
+                ))
             } else {
-                SessionEventKind::VoiceConnecting
-            };
-            SessionEventRecord::from_snapshot(kind, &state)
+                None
+            }
         };
 
-        self.events.emit(event);
+        if let Some(event) = ready_event {
+            self.events.emit(event);
+        }
         Ok(())
     }
 
