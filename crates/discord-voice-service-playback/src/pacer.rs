@@ -29,9 +29,21 @@ impl AudioPacer {
     }
 
     pub async fn wait_for(&mut self, duration: Duration) {
+        self.wait_until_ready().await;
+        self.mark_emitted(duration);
+    }
+
+    pub async fn wait_until_ready(&self) {
         time::sleep_until(self.next_deadline).await;
+    }
+
+    pub fn mark_emitted(&mut self, duration: Duration) {
         self.next_deadline += duration;
         self.emitted_frames += 1;
+    }
+
+    pub fn reset_deadline(&mut self) {
+        self.next_deadline = Instant::now();
     }
 
     pub async fn tick(&mut self) {

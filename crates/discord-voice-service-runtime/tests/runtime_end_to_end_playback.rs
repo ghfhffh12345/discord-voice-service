@@ -81,6 +81,84 @@ async fn join_voice_then_play_reaches_connected_runtime_playback_path() {
 }
 
 #[tokio::test]
+async fn pause_stops_audio_until_resume_without_bursting() {
+    let fake_yt = FakeYtMusic::spawn().await;
+    let http = spawn_stream_server("audio-itag250.webm").await;
+    fake_yt.set_playable_url(http.url()).await;
+    let fake_voice = FakeDiscordPeer::spawn().await;
+    let supervisor = Supervisor::with_ytmusic_endpoint(fake_yt.endpoint())
+        .await
+        .unwrap();
+    let mut stream = subscribe_events(supervisor.clone()).await;
+
+    supervisor
+        .send(Command::JoinVoice {
+            voice: fake_voice.voice_context("1", "2", "user-1", "session-1", "token-1"),
+        })
+        .await
+        .unwrap();
+
+    let play_supervisor = supervisor.clone();
+    let play_task = tokio::spawn(async move {
+        play_supervisor
+            .send(Command::Play {
+                video_id: "video-1".into(),
+            })
+            .await
+    });
+
+    let startup_events = collect_events(&mut stream, 5).await;
+    assert_eq!(
+        startup_events[0].kind,
+        SessionEventKind::VoiceConnecting as i32
+    );
+    assert_eq!(startup_events[1].kind, SessionEventKind::VoiceReady as i32);
+    assert_eq!(
+        startup_events[2].kind,
+        SessionEventKind::TrackResolving as i32
+    );
+    assert_eq!(startup_events[3].kind, SessionEventKind::Buffering as i32);
+    assert_eq!(startup_events[4].kind, SessionEventKind::Playing as i32);
+
+    assert!(fake_voice.audio_frame_count_at_least(4).await >= 4);
+
+    supervisor.send(Command::Pause).await.unwrap();
+    let pause_events = collect_events(&mut stream, 1).await;
+    assert_eq!(pause_events[0].kind, SessionEventKind::Paused as i32);
+
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    let paused_count = fake_voice.audio_frame_count().await;
+    tokio::time::sleep(Duration::from_millis(140)).await;
+    assert_eq!(
+        fake_voice.audio_frame_count().await,
+        paused_count,
+        "audio packets must stop while playback is paused"
+    );
+
+    let resume_started = Instant::now();
+    supervisor.send(Command::Resume).await.unwrap();
+    let resume_events = collect_events(&mut stream, 1).await;
+    assert_eq!(resume_events[0].kind, SessionEventKind::Playing as i32);
+
+    let resumed_target = paused_count + 4;
+    assert!(fake_voice.audio_frame_count_at_least(resumed_target).await >= resumed_target);
+    let resume_elapsed = resume_started.elapsed();
+    assert!(
+        resume_elapsed >= Duration::from_millis(45),
+        "resume should continue paced playback instead of bursting queued frames: {resume_elapsed:?}"
+    );
+
+    supervisor.send(Command::Stop).await.unwrap();
+    play_task.await.unwrap().unwrap();
+    let stop_events = collect_events(&mut stream, 2).await;
+    assert!(
+        stop_events
+            .iter()
+            .any(|event| event.kind == SessionEventKind::Stopped as i32)
+    );
+}
+
+#[tokio::test]
 async fn join_voice_accepts_self_only_pending_initial_dave_session() {
     let fake_voice = FakeDiscordPeer::spawn_with_dave_self_only_no_proposals().await;
     let supervisor = Supervisor::new();

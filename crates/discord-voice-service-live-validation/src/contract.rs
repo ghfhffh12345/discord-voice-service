@@ -11,6 +11,8 @@ pub struct LiveContractState {
     pub validated_play: bool,
     pub validated_pause: bool,
     pub validated_resume: bool,
+    pub observer_proved_pause: bool,
+    pub observer_proved_resume: bool,
     pub validated_stop: bool,
     pub validated_leave_voice: bool,
     pub validated_get_state: bool,
@@ -32,6 +34,10 @@ pub struct LiveValidationEvidence {
     pub validated_play: bool,
     pub validated_pause: bool,
     pub validated_resume: bool,
+    pub observer_proved_pause: bool,
+    pub observer_proved_resume: bool,
+    pub observer_pause_silence_ms: u64,
+    pub observer_resume_packet_count: u64,
     pub validated_stop: bool,
     pub validated_leave_voice: bool,
     pub validated_get_state: bool,
@@ -98,10 +104,12 @@ impl LiveContractState {
 
     pub fn mark_pause(&mut self) {
         self.validated_pause = true;
+        self.observer_proved_pause = true;
     }
 
     pub fn mark_resume(&mut self) {
         self.validated_resume = true;
+        self.observer_proved_resume = true;
     }
 
     pub fn mark_stop(&mut self) {
@@ -216,6 +224,12 @@ impl LiveContractState {
         }
         if !self.validated_resume {
             missing.push("Resume");
+        }
+        if !self.observer_proved_pause {
+            missing.push("Pause observer proof");
+        }
+        if !self.observer_proved_resume {
+            missing.push("Resume observer proof");
         }
         if !self.validated_stop {
             missing.push("Stop");

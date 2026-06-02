@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures::{Stream, StreamExt};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, timeout};
 use tracing::{info, warn};
 use twilight_gateway::error::ReceiveMessageErrorType;
@@ -25,7 +25,8 @@ use discord_voice_service_twilight::{
     leave_voice_channel,
 };
 use discord_voice_service_voice::{
-    ObservedVoiceSession, PendingObservedVoiceSession, VoiceContext as ObserverVoiceContext,
+    ObservedAudioFrame, ObservedVoiceSession, PendingObservedVoiceSession,
+    VoiceContext as ObserverVoiceContext, VoiceError,
 };
 
 use crate::audio::{AudioValidationAccumulator, AudioValidationStats, ObservedOpusPacket};
@@ -43,6 +44,11 @@ const MIN_DECODED_AUDIO_MS: u64 = 3_000;
 const MIN_NON_SILENT_AUDIO_MS: u64 = 1_000;
 const OBSERVER_AUDIO_DURATION_TOLERANCE_MS: u64 = 2_000;
 const OBSERVER_AUDIO_DURATION_MIN_RATIO_PERCENT: u64 = 90;
+const OBSERVER_AUDIO_STARTED_TIMEOUT: Duration = Duration::from_secs(30);
+const PAUSE_OBSERVER_SETTLE_DURATION: Duration = Duration::from_millis(250);
+const PAUSE_OBSERVER_SILENCE_DURATION: Duration = Duration::from_millis(600);
+const RESUME_OBSERVER_AUDIO_TIMEOUT: Duration = Duration::from_secs(10);
+const RESUME_OBSERVER_PACKET_TARGET: u64 = 4;
 
 fn to_observer_voice_context(context: &ServiceVoiceContext) -> ObserverVoiceContext {
     ObserverVoiceContext {
@@ -66,12 +72,20 @@ struct LiveGatewayDriverConfig {
 struct ValidatedLiveOutcome {
     live_contract: LiveContractState,
     audio_stats: AudioValidationStats,
+    observer_playback: ObserverPlaybackProof,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ObserverPlaybackProof {
+    pause_silence_ms: u64,
+    resume_observed_packet_count: u64,
 }
 
 #[derive(Debug, Clone, Default)]
 struct FailureEvidenceSnapshot {
     live_contract: Option<LiveContractState>,
     audio_stats: Option<AudioValidationStats>,
+    observer_playback: Option<ObserverPlaybackProof>,
 }
 
 #[derive(Debug)]
@@ -79,6 +93,25 @@ struct ServiceFlowOutcome {
     result: Result<ValidatedLiveOutcome>,
     failure_snapshot: FailureEvidenceSnapshot,
     service_joined: bool,
+}
+
+#[derive(Debug)]
+struct ObserverPauseProof {
+    silence_ms: u64,
+}
+
+#[derive(Debug)]
+struct ObserverResumeProof {
+    observed_packet_count: u64,
+}
+
+enum ObserverAudioProofCommand {
+    ProvePause {
+        respond_to: oneshot::Sender<Result<ObserverPauseProof>>,
+    },
+    ProveResume {
+        respond_to: oneshot::Sender<Result<ObserverResumeProof>>,
+    },
 }
 
 async fn await_observer_dave_ready<T, E, F>(ready: F) -> Result<T>
@@ -532,6 +565,7 @@ async fn run_service_flow(
     info!("observer voice session connected; awaiting DAVE readiness during Play");
 
     let observer_audio_snapshot = Arc::new(Mutex::new(None::<AudioValidationStats>));
+    let observer_playback_snapshot = Arc::new(Mutex::new(None::<ObserverPlaybackProof>));
     let play_rpc = async {
         play_client
             .play(config.test_video_id.clone())
@@ -540,8 +574,11 @@ async fn run_service_flow(
     };
 
     let (track_ended_tx, track_ended_rx) = oneshot::channel();
+    let (observer_audio_started_tx, observer_audio_started_rx) = oneshot::channel();
+    let (observer_proof_tx, observer_proof_rx) = mpsc::channel(2);
     let service_contract = {
         let live_contract_snapshot = Arc::clone(&live_contract_snapshot);
+        let observer_playback_snapshot = Arc::clone(&observer_playback_snapshot);
         async {
             let result = match timeout(
                 LIVE_CONTRACT_TIMEOUT,
@@ -551,6 +588,9 @@ async fn run_service_flow(
                     post_play_live_contract,
                     live_contract_snapshot,
                     &mut playback_control_client,
+                    observer_audio_started_rx,
+                    observer_proof_tx,
+                    observer_playback_snapshot,
                 ),
             )
             .await
@@ -567,6 +607,7 @@ async fn run_service_flow(
         }
     };
     let observer_audio_snapshot_for_proof = Arc::clone(&observer_audio_snapshot);
+    let observer_playback_snapshot_for_outcome = Arc::clone(&observer_playback_snapshot);
     let service_audio_user_id = service_user_id.to_string();
     let combined_validation = async move {
         let mut observer_session =
@@ -578,12 +619,17 @@ async fn run_service_flow(
             &service_audio_user_id,
             expected_duration_ms,
             observer_audio_snapshot_for_proof,
+            observer_audio_started_tx,
+            observer_proof_rx,
             track_ended_rx,
         );
-        let (live_contract, audio_stats) = tokio::try_join!(service_contract, observer_audio)?;
+        let ((live_contract, observer_playback), audio_stats) =
+            tokio::try_join!(service_contract, observer_audio)?;
+        *observer_playback_snapshot_for_outcome.lock().unwrap() = Some(observer_playback.clone());
         Ok(ValidatedLiveOutcome {
             live_contract,
             audio_stats,
+            observer_playback,
         })
     };
 
@@ -607,6 +653,7 @@ async fn run_service_flow(
     };
     failure_snapshot.live_contract = Some(live_contract_snapshot.lock().unwrap().clone());
     failure_snapshot.audio_stats = observer_audio_snapshot.lock().unwrap().clone();
+    failure_snapshot.observer_playback = observer_playback_snapshot.lock().unwrap().clone();
 
     let mut service_joined = true;
     if let Ok(validated) = &mut result {
@@ -625,6 +672,7 @@ async fn run_service_flow(
             service_joined = false;
         }
         failure_snapshot.live_contract = Some(live_contract_snapshot.lock().unwrap().clone());
+        failure_snapshot.observer_playback = observer_playback_snapshot.lock().unwrap().clone();
     }
 
     ServiceFlowOutcome {
@@ -785,11 +833,15 @@ async fn observe_audio_until_track_ended(
     expected_user_id: &str,
     expected_duration_ms: u64,
     snapshot: Arc<Mutex<Option<AudioValidationStats>>>,
+    audio_started: oneshot::Sender<()>,
+    mut proof_commands: mpsc::Receiver<ObserverAudioProofCommand>,
     mut track_ended: oneshot::Receiver<()>,
 ) -> Result<AudioValidationStats> {
     let deadline = Instant::now() + LIVE_CONTRACT_TIMEOUT;
     let mut accumulator = AudioValidationAccumulator::new();
     let mut last_stats: Option<AudioValidationStats> = None;
+    let mut audio_started = Some(audio_started);
+    let mut proof_commands_closed = false;
 
     loop {
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
@@ -812,6 +864,49 @@ async fn observe_audio_until_track_ended(
 
                 return Err(observer_threshold_error(Some(&stats), expected_duration_ms));
             }
+            command = proof_commands.recv(), if !proof_commands_closed => {
+                match command {
+                    Some(ObserverAudioProofCommand::ProvePause { respond_to }) => {
+                        let result = prove_observer_pause_silence(
+                            observer_session,
+                            expected_user_id,
+                            &mut accumulator,
+                            &snapshot,
+                            &mut audio_started,
+                        )
+                        .await;
+                        if let Ok(proof) = &result {
+                            info!(
+                                silence_ms = proof.silence_ms,
+                                "observer proved Pause by receiving no service audio",
+                            );
+                        }
+                        let _ = respond_to.send(result);
+                        last_stats = Some(accumulator.stats());
+                    }
+                    Some(ObserverAudioProofCommand::ProveResume { respond_to }) => {
+                        let result = prove_observer_resume_audio(
+                            observer_session,
+                            expected_user_id,
+                            &mut accumulator,
+                            &snapshot,
+                            &mut audio_started,
+                        )
+                        .await;
+                        if let Ok(proof) = &result {
+                            info!(
+                                observed_packet_count = proof.observed_packet_count,
+                                "observer proved Resume by receiving service audio",
+                            );
+                        }
+                        let _ = respond_to.send(result);
+                        last_stats = Some(accumulator.stats());
+                    }
+                    None => {
+                        proof_commands_closed = true;
+                    }
+                }
+            }
             frame = observer_session.receive_audio_frame_from(expected_user_id, remaining) => {
                 let frame = match frame {
                     Ok(frame) => frame,
@@ -833,17 +928,151 @@ async fn observe_audio_until_track_ended(
                     }
                 };
 
-                let stats = accumulator
-                    .observe_packet(ObservedOpusPacket {
-                        sequence: frame.sequence,
-                        payload: frame.payload.as_ref(),
-                    })
-                    .context("analyze observer audio packet")?;
-                *snapshot.lock().unwrap() = Some(stats.clone());
+                let stats = record_observer_audio_frame(
+                    frame,
+                    &mut accumulator,
+                    &snapshot,
+                    &mut audio_started,
+                )?;
                 last_stats = Some(stats);
             }
         }
     }
+}
+
+async fn prove_observer_pause_silence(
+    observer_session: &mut ObservedVoiceSession,
+    expected_user_id: &str,
+    accumulator: &mut AudioValidationAccumulator,
+    snapshot: &Arc<Mutex<Option<AudioValidationStats>>>,
+    audio_started: &mut Option<oneshot::Sender<()>>,
+) -> Result<ObserverPauseProof> {
+    let settle_deadline = Instant::now() + PAUSE_OBSERVER_SETTLE_DURATION;
+    while let Some(remaining) = settle_deadline.checked_duration_since(Instant::now()) {
+        match observer_session
+            .receive_audio_frame_from(expected_user_id, remaining)
+            .await
+        {
+            Ok(frame) => {
+                record_observer_audio_frame(frame, accumulator, snapshot, audio_started)?;
+            }
+            Err(error) if is_voice_receive_timeout(&error) => break,
+            Err(error) => {
+                return Err(error).context("observer pause proof failed during settle window");
+            }
+        }
+    }
+
+    let silence_deadline = Instant::now() + PAUSE_OBSERVER_SILENCE_DURATION;
+    while let Some(remaining) = silence_deadline.checked_duration_since(Instant::now()) {
+        match observer_session
+            .receive_audio_frame_from(expected_user_id, remaining)
+            .await
+        {
+            Ok(frame) => {
+                let sequence = frame.sequence;
+                let stats =
+                    record_observer_audio_frame(frame, accumulator, snapshot, audio_started)?;
+                bail!(
+                    "observer received service audio during Pause silence proof (sequence={} observed_packet_count={} decoded_audio_ms={} silence_window_ms={})",
+                    sequence,
+                    stats.observed_packet_count,
+                    stats.decoded_audio_ms,
+                    PAUSE_OBSERVER_SILENCE_DURATION.as_millis(),
+                );
+            }
+            Err(error) if is_voice_receive_timeout(&error) => {
+                return Ok(ObserverPauseProof {
+                    silence_ms: duration_ms(PAUSE_OBSERVER_SILENCE_DURATION),
+                });
+            }
+            Err(error) => {
+                return Err(error).context("observer pause proof failed during silence window");
+            }
+        }
+    }
+
+    Ok(ObserverPauseProof {
+        silence_ms: duration_ms(PAUSE_OBSERVER_SILENCE_DURATION),
+    })
+}
+
+async fn prove_observer_resume_audio(
+    observer_session: &mut ObservedVoiceSession,
+    expected_user_id: &str,
+    accumulator: &mut AudioValidationAccumulator,
+    snapshot: &Arc<Mutex<Option<AudioValidationStats>>>,
+    audio_started: &mut Option<oneshot::Sender<()>>,
+) -> Result<ObserverResumeProof> {
+    let start_count = accumulator.stats().observed_packet_count;
+    let deadline = Instant::now() + RESUME_OBSERVER_AUDIO_TIMEOUT;
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            bail!(
+                "observer did not receive resumed service audio within {} seconds (observed_after_resume={} required={})",
+                RESUME_OBSERVER_AUDIO_TIMEOUT.as_secs(),
+                accumulator
+                    .stats()
+                    .observed_packet_count
+                    .saturating_sub(start_count),
+                RESUME_OBSERVER_PACKET_TARGET,
+            );
+        };
+
+        match observer_session
+            .receive_audio_frame_from(expected_user_id, remaining)
+            .await
+        {
+            Ok(frame) => {
+                let stats =
+                    record_observer_audio_frame(frame, accumulator, snapshot, audio_started)?;
+                let observed_after_resume = stats.observed_packet_count.saturating_sub(start_count);
+                if observed_after_resume >= RESUME_OBSERVER_PACKET_TARGET {
+                    return Ok(ObserverResumeProof {
+                        observed_packet_count: observed_after_resume,
+                    });
+                }
+            }
+            Err(error) if is_voice_receive_timeout(&error) => {
+                bail!(
+                    "observer timed out waiting for resumed service audio (observed_after_resume={} required={})",
+                    accumulator
+                        .stats()
+                        .observed_packet_count
+                        .saturating_sub(start_count),
+                    RESUME_OBSERVER_PACKET_TARGET,
+                );
+            }
+            Err(error) => return Err(error).context("observer resume proof failed"),
+        }
+    }
+}
+
+fn record_observer_audio_frame(
+    frame: ObservedAudioFrame,
+    accumulator: &mut AudioValidationAccumulator,
+    snapshot: &Arc<Mutex<Option<AudioValidationStats>>>,
+    audio_started: &mut Option<oneshot::Sender<()>>,
+) -> Result<AudioValidationStats> {
+    let stats = accumulator
+        .observe_packet(ObservedOpusPacket {
+            sequence: frame.sequence,
+            payload: frame.payload.as_ref(),
+        })
+        .context("analyze observer audio packet")?;
+    *snapshot.lock().unwrap() = Some(stats.clone());
+    if let Some(audio_started) = audio_started.take() {
+        let _ = audio_started.send(());
+    }
+    Ok(stats)
+}
+
+fn is_voice_receive_timeout(error: &VoiceError) -> bool {
+    matches!(error, VoiceError::InvalidState("voice receive timed out"))
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
 }
 
 fn observer_thresholds_satisfied(stats: &AudioValidationStats, expected_duration_ms: u64) -> bool {
@@ -919,8 +1148,13 @@ async fn wait_for_play_completed_contract_with_controls(
     mut state: LiveContractState,
     snapshot: Arc<Mutex<LiveContractState>>,
     controls: &mut VoiceServiceClient,
-) -> Result<LiveContractState> {
+    observer_audio_started: oneshot::Receiver<()>,
+    observer_proof_tx: mpsc::Sender<ObserverAudioProofCommand>,
+    observer_playback_snapshot: Arc<Mutex<Option<ObserverPlaybackProof>>>,
+) -> Result<(LiveContractState, ObserverPlaybackProof)> {
     let mut pause_resume_validated = state.validated_pause && state.validated_resume;
+    let mut observer_audio_started = Some(observer_audio_started);
+    let mut observer_playback = ObserverPlaybackProof::default();
 
     loop {
         let maybe_event = events.next().await;
@@ -930,10 +1164,15 @@ async fn wait_for_play_completed_contract_with_controls(
         update_live_contract_snapshot(&snapshot, &state);
 
         if is_playing && !pause_resume_validated {
+            wait_for_observer_audio_started(&mut observer_audio_started).await?;
+
             controls
                 .pause()
                 .await
                 .context("call Pause through Twilight adapter during live playback")?;
+            let pause_proof = request_observer_pause_proof(&observer_proof_tx).await?;
+            observer_playback.pause_silence_ms = pause_proof.silence_ms;
+            *observer_playback_snapshot.lock().unwrap() = Some(observer_playback.clone());
             state.mark_pause();
             update_live_contract_snapshot(&snapshot, &state);
 
@@ -941,15 +1180,68 @@ async fn wait_for_play_completed_contract_with_controls(
                 .resume()
                 .await
                 .context("call Resume through Twilight adapter during live playback")?;
+            let resume_proof = request_observer_resume_proof(&observer_proof_tx).await?;
+            observer_playback.resume_observed_packet_count = resume_proof.observed_packet_count;
+            *observer_playback_snapshot.lock().unwrap() = Some(observer_playback.clone());
             state.mark_resume();
             update_live_contract_snapshot(&snapshot, &state);
             pause_resume_validated = true;
         }
 
         if state.saw_track_ended {
-            return Ok(state);
+            return Ok((state, observer_playback));
         }
     }
+}
+
+async fn wait_for_observer_audio_started(
+    observer_audio_started: &mut Option<oneshot::Receiver<()>>,
+) -> Result<()> {
+    let Some(observer_audio_started) = observer_audio_started.take() else {
+        return Ok(());
+    };
+
+    timeout(OBSERVER_AUDIO_STARTED_TIMEOUT, observer_audio_started)
+        .await
+        .context("timed out waiting for observer to receive service audio before Pause")?
+        .context("observer audio task ended before proving pre-Pause audio")?;
+    Ok(())
+}
+
+async fn request_observer_pause_proof(
+    observer_proof_tx: &mpsc::Sender<ObserverAudioProofCommand>,
+) -> Result<ObserverPauseProof> {
+    let (respond_to, response) = oneshot::channel();
+    observer_proof_tx
+        .send(ObserverAudioProofCommand::ProvePause { respond_to })
+        .await
+        .context("request observer Pause proof")?;
+
+    timeout(
+        PAUSE_OBSERVER_SETTLE_DURATION + PAUSE_OBSERVER_SILENCE_DURATION + Duration::from_secs(5),
+        response,
+    )
+    .await
+    .context("timed out waiting for observer Pause proof")?
+    .context("observer audio task ended before Pause proof")?
+}
+
+async fn request_observer_resume_proof(
+    observer_proof_tx: &mpsc::Sender<ObserverAudioProofCommand>,
+) -> Result<ObserverResumeProof> {
+    let (respond_to, response) = oneshot::channel();
+    observer_proof_tx
+        .send(ObserverAudioProofCommand::ProveResume { respond_to })
+        .await
+        .context("request observer Resume proof")?;
+
+    timeout(
+        RESUME_OBSERVER_AUDIO_TIMEOUT + Duration::from_secs(5),
+        response,
+    )
+    .await
+    .context("timed out waiting for observer Resume proof")?
+    .context("observer audio task ended before Resume proof")?
 }
 
 async fn wait_for_initial_voice_ready(
@@ -1224,6 +1516,10 @@ fn build_success_evidence(
         validated_play: validated.live_contract.validated_play,
         validated_pause: validated.live_contract.validated_pause,
         validated_resume: validated.live_contract.validated_resume,
+        observer_proved_pause: validated.live_contract.observer_proved_pause,
+        observer_proved_resume: validated.live_contract.observer_proved_resume,
+        observer_pause_silence_ms: validated.observer_playback.pause_silence_ms,
+        observer_resume_packet_count: validated.observer_playback.resume_observed_packet_count,
         validated_stop: validated.live_contract.validated_stop,
         validated_leave_voice: validated.live_contract.validated_leave_voice,
         validated_get_state: validated.live_contract.validated_get_state,
@@ -1247,6 +1543,7 @@ fn build_failure_evidence(
 ) -> LiveValidationEvidence {
     let live_contract = snapshot.and_then(|value| value.live_contract.as_ref());
     let audio_stats = snapshot.and_then(|value| value.audio_stats.as_ref());
+    let observer_playback = snapshot.and_then(|value| value.observer_playback.as_ref());
 
     LiveValidationEvidence {
         outcome: "failure".to_owned(),
@@ -1258,6 +1555,11 @@ fn build_failure_evidence(
         validated_play: live_contract.is_some_and(|state| state.validated_play),
         validated_pause: live_contract.is_some_and(|state| state.validated_pause),
         validated_resume: live_contract.is_some_and(|state| state.validated_resume),
+        observer_proved_pause: live_contract.is_some_and(|state| state.observer_proved_pause),
+        observer_proved_resume: live_contract.is_some_and(|state| state.observer_proved_resume),
+        observer_pause_silence_ms: observer_playback.map_or(0, |proof| proof.pause_silence_ms),
+        observer_resume_packet_count: observer_playback
+            .map_or(0, |proof| proof.resume_observed_packet_count),
         validated_stop: live_contract.is_some_and(|state| state.validated_stop),
         validated_leave_voice: live_contract.is_some_and(|state| state.validated_leave_voice),
         validated_get_state: live_contract.is_some_and(|state| state.validated_get_state),
@@ -1298,7 +1600,11 @@ fn finish_with_failure(
 
 fn classify_failure_reason(error: &anyhow::Error) -> String {
     let message = error.to_string().to_lowercase();
-    if message.contains("observer") && message.contains("timed out") {
+    if message.contains("pause silence proof") {
+        "observer_pause_failed".to_owned()
+    } else if message.contains("resume proof") || message.contains("resumed service audio") {
+        "observer_resume_failed".to_owned()
+    } else if message.contains("observer") && message.contains("timed out") {
         "observer_timeout".to_owned()
     } else if message.contains("observer audio proof") && message.contains("thresholds") {
         "observer_audio_incomplete".to_owned()
@@ -1500,6 +1806,10 @@ mod tests {
                 ..LiveContractState::default()
             }),
             audio_stats: None,
+            observer_playback: Some(ObserverPlaybackProof {
+                pause_silence_ms: 600,
+                resume_observed_packet_count: 0,
+            }),
         };
 
         let evidence = build_failure_evidence(
@@ -1511,6 +1821,8 @@ mod tests {
         assert!(evidence.saw_voice_ready);
         assert!(evidence.saw_playing);
         assert!(evidence.saw_track_ended);
+        assert_eq!(evidence.observer_pause_silence_ms, 600);
+        assert_eq!(evidence.observer_resume_packet_count, 0);
     }
 
     #[tokio::test]
@@ -1539,6 +1851,7 @@ mod tests {
         let failure_snapshot = FailureEvidenceSnapshot {
             live_contract: Some(snapshot.lock().unwrap().clone()),
             audio_stats: None,
+            observer_playback: None,
         };
         let error = anyhow!("observer audio proof timed out");
 

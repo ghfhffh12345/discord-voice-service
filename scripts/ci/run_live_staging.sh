@@ -88,7 +88,7 @@ trap cleanup EXIT
 install -m 644 /dev/null "${staged_browser_json}"
 printf '%s' "${BROWSER_JSON}" > "${staged_browser_json}"
 cat > "${validation_evidence_path}" <<EOF
-{"outcome":"failure","service_uri":"${DISCORD_VOICE_SERVICE_URI}","ytmusic_addr":"${DISCORD_VOICE_SERVICE_YTMUSIC_ADDR}","validated_join_voice":false,"validated_update_voice_context":false,"validated_play":false,"validated_pause":false,"validated_resume":false,"validated_stop":false,"validated_leave_voice":false,"validated_get_state":false,"validated_subscribe_events":false,"saw_voice_connecting":false,"saw_voice_ready":false,"saw_track_resolving":false,"saw_playing":false,"saw_track_ended":false,"observed_packet_count":0,"decoded_audio_ms":0,"non_silent_audio_ms":0,"failure_reason":"controller_not_started"}
+{"outcome":"failure","service_uri":"${DISCORD_VOICE_SERVICE_URI}","ytmusic_addr":"${DISCORD_VOICE_SERVICE_YTMUSIC_ADDR}","validated_join_voice":false,"validated_update_voice_context":false,"validated_play":false,"validated_pause":false,"validated_resume":false,"observer_proved_pause":false,"observer_proved_resume":false,"observer_pause_silence_ms":0,"observer_resume_packet_count":0,"validated_stop":false,"validated_leave_voice":false,"validated_get_state":false,"validated_subscribe_events":false,"saw_voice_connecting":false,"saw_voice_ready":false,"saw_track_resolving":false,"saw_playing":false,"saw_track_ended":false,"observed_packet_count":0,"decoded_audio_ms":0,"non_silent_audio_ms":0,"failure_reason":"controller_not_started"}
 EOF
 
 cargo build --locked -p discord-voice-service-live-validation --bin staging_live_check --bin ytmusic_ready_check

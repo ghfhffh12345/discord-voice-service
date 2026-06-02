@@ -6,7 +6,7 @@ use discord_voice_service_playback::PlaybackWorker;
 use discord_voice_service_playback::media::opus_queue::OpusFrameQueue;
 use discord_voice_service_playback::pacer::AudioPacer;
 use discord_voice_service_voice::{ConnectedVoiceSession, VoiceContext};
-use tokio::sync::{Mutex, RwLock, broadcast};
+use tokio::sync::{Mutex, RwLock, broadcast, watch};
 
 use super::events::{EventBus, SessionEventKind, SessionEventRecord};
 use super::readiness::{
@@ -27,6 +27,7 @@ pub struct VoiceSessionRuntime {
     playback_epoch: AtomicU64,
     rollover_epoch: AtomicU64,
     playback_reset_pending: AtomicBool,
+    playback_paused: watch::Sender<bool>,
 }
 
 impl Default for VoiceSessionRuntime {
@@ -45,6 +46,7 @@ impl VoiceSessionRuntime {
             playback_epoch: AtomicU64::new(0),
             rollover_epoch: AtomicU64::new(0),
             playback_reset_pending: AtomicBool::new(false),
+            playback_paused: watch::channel(false).0,
         }
     }
 
@@ -57,6 +59,7 @@ impl VoiceSessionRuntime {
             playback_epoch: AtomicU64::new(0),
             rollover_epoch: AtomicU64::new(0),
             playback_reset_pending: AtomicBool::new(false),
+            playback_paused: watch::channel(false).0,
         }
     }
 
@@ -260,8 +263,11 @@ impl VoiceSessionRuntime {
         self.events.emit(playing_event);
 
         let mut pacer = AudioPacer::new();
+        let mut pause_rx = self.playback_paused.subscribe();
         let mut position_ms = resume_position_ms;
         loop {
+            self.wait_while_paused(playback_epoch, &mut pause_rx, &mut pacer)
+                .await;
             if self.playback_interrupted(playback_epoch) {
                 return Ok(());
             }
@@ -312,7 +318,12 @@ impl VoiceSessionRuntime {
             let frame_duration = Duration::from_nanos(
                 u64::from(frame.duration_samples).saturating_mul(1_000_000_000) / 48_000,
             );
-            pacer.wait_for(frame_duration).await;
+            pacer.wait_until_ready().await;
+            if self.playback_interrupted(playback_epoch) {
+                return Ok(());
+            }
+            self.wait_while_paused(playback_epoch, &mut pause_rx, &mut pacer)
+                .await;
             if self.playback_interrupted(playback_epoch) {
                 return Ok(());
             }
@@ -385,6 +396,7 @@ impl VoiceSessionRuntime {
                     "runtime sent audio frame"
                 );
             }
+            pacer.mark_emitted(frame_duration);
             source.record_sent_packet(frame.duration_ms);
             position_ms += frame.duration_ms;
 
@@ -485,6 +497,7 @@ impl VoiceSessionRuntime {
             SessionEventRecord::from_snapshot(SessionEventKind::Paused, &state)
         };
 
+        self.playback_paused.send_replace(true);
         self.events.emit(event);
         Ok(())
     }
@@ -497,6 +510,7 @@ impl VoiceSessionRuntime {
             SessionEventRecord::from_snapshot(SessionEventKind::Playing, &state)
         };
 
+        self.playback_paused.send_replace(false);
         self.events.emit(event);
         Ok(())
     }
@@ -656,11 +670,14 @@ impl VoiceSessionRuntime {
     }
 
     fn begin_playback(&self) -> u64 {
-        self.playback_epoch.fetch_add(1, Ordering::SeqCst) + 1
+        let epoch = self.playback_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        self.playback_paused.send_replace(false);
+        epoch
     }
 
     fn invalidate_playback(&self) {
         self.playback_epoch.fetch_add(1, Ordering::SeqCst);
+        self.playback_paused.send_replace(false);
     }
 
     fn begin_rollover(&self) -> u64 {
@@ -681,6 +698,38 @@ impl VoiceSessionRuntime {
 
     fn playback_interrupted(&self, playback_epoch: u64) -> bool {
         self.playback_epoch.load(Ordering::SeqCst) != playback_epoch
+    }
+
+    async fn wait_while_paused(
+        &self,
+        playback_epoch: u64,
+        pause_rx: &mut watch::Receiver<bool>,
+        pacer: &mut AudioPacer,
+    ) {
+        let mut saw_pause = false;
+        loop {
+            if self.playback_interrupted(playback_epoch) {
+                return;
+            }
+
+            if !*pause_rx.borrow_and_update() {
+                if saw_pause {
+                    pacer.reset_deadline();
+                }
+                return;
+            }
+
+            saw_pause = true;
+            tokio::select! {
+                changed = pause_rx.changed() => {
+                    if changed.is_err() {
+                        pacer.reset_deadline();
+                        return;
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+        }
     }
 
     fn playback_state_is_current(&self, playback_epoch: u64) -> bool {
