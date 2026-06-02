@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use discord_voice_service_test_support::fake_discord::FakeDiscordPeer;
 use discord_voice_service_voice::{ConnectedVoiceSession, VoiceError};
-use tokio::time::{Duration, sleep};
+use tokio::time::{Duration, Instant, sleep};
 
 const BOT_USER_ID: &str = "1111111111111111";
 const GATEWAY_NOISE_COUNT_ABOVE_OLD_DRAIN_LIMIT: usize = 40;
@@ -155,6 +155,44 @@ async fn connected_voice_session_processes_late_dave_transition_behind_gateway_n
         .await
         .unwrap();
     assert_eq!(decrypted, later_opus);
+}
+
+#[tokio::test]
+async fn connected_voice_session_drains_idle_gateway_events_without_media_delay() {
+    let fake = FakeDiscordPeer::spawn_with_established_dave_group().await;
+    let voice = fake.voice_context("1", "2", BOT_USER_ID, "session-1", "token-1");
+    let mut session = ConnectedVoiceSession::connect(voice).await.unwrap();
+    assert!(session.dave_enabled());
+
+    let initial_opus = hex::decode("0dc5aedd5bdc3f20be5697e54dd1f437").unwrap();
+    session
+        .send_audio_frame(Bytes::from(initial_opus))
+        .await
+        .unwrap();
+    assert_eq!(fake.audio_frame_count_at_least(1).await, 1);
+
+    fake.send_heartbeat_ack(Some(123)).await.unwrap();
+    sleep(Duration::from_millis(25)).await;
+
+    let later_opus = hex::decode("f8b4011b2e11df489afb841af48c").unwrap();
+    let started = Instant::now();
+    session
+        .send_audio_frame(Bytes::from(later_opus.clone()))
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < Duration::from_millis(40),
+        "idle gateway events must not wait for DAVE follow-up traffic before sending media; elapsed={elapsed:?}"
+    );
+    assert_eq!(fake.audio_frame_count_at_least(2).await, 2);
+    assert_eq!(
+        fake.decrypt_last_dave_audio_frame_from_creator(BOT_USER_ID)
+            .await
+            .unwrap(),
+        later_opus
+    );
 }
 
 #[tokio::test]

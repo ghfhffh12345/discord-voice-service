@@ -46,7 +46,8 @@ const OBSERVER_AUDIO_DURATION_TOLERANCE_MS: u64 = 2_000;
 const OBSERVER_AUDIO_DURATION_MIN_RATIO_PERCENT: u64 = 90;
 const OBSERVER_AUDIO_STARTED_TIMEOUT: Duration = Duration::from_secs(30);
 const PAUSE_OBSERVER_SILENCE_DURATION: Duration = Duration::from_millis(600);
-const PRE_PAUSE_SPEAKING_SETTLE_DURATION: Duration = Duration::from_millis(1_500);
+const PAUSE_AFTER_PLAYBACK_START: Duration = Duration::from_secs(10);
+const PAUSE_HOLD_DURATION: Duration = Duration::from_secs(3);
 const OBSERVER_SPEAKING_STATE_TIMEOUT: Duration = Duration::from_secs(10);
 const RESUME_OBSERVER_AUDIO_TIMEOUT: Duration = Duration::from_secs(10);
 const RESUME_OBSERVER_PACKET_TARGET: u64 = 4;
@@ -1359,9 +1360,10 @@ async fn wait_for_play_completed_contract_with_controls(
         update_live_contract_snapshot(&snapshot, &state);
 
         if is_playing && !pause_resume_validated {
+            let pause_at = Instant::now() + PAUSE_AFTER_PLAYBACK_START;
             wait_for_observer_audio_started(&mut observer_audio_started).await?;
             request_observer_speaking_started_proof(&observer_proof_tx).await?;
-            tokio::time::sleep(PRE_PAUSE_SPEAKING_SETTLE_DURATION).await;
+            tokio::time::sleep_until(pause_at).await;
 
             controls
                 .resume()
@@ -1381,6 +1383,7 @@ async fn wait_for_play_completed_contract_with_controls(
             update_live_contract_snapshot(&snapshot, &state);
 
             let pause_proof = start_observer_pause_proof(&observer_proof_tx).await?;
+            let pause_started_at = Instant::now();
             controls
                 .pause()
                 .await
@@ -1412,6 +1415,7 @@ async fn wait_for_play_completed_contract_with_controls(
             state.mark_redundant_pause_ignored();
             update_live_contract_snapshot(&snapshot, &state);
 
+            tokio::time::sleep_until(pause_started_at + PAUSE_HOLD_DURATION).await;
             let resume_proof = start_observer_resume_proof(&observer_proof_tx).await?;
             controls
                 .resume()

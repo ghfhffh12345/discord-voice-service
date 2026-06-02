@@ -142,10 +142,15 @@ async fn pause_stops_audio_until_resume_without_bursting() {
         "Resume while already playing must leave playback running normally"
     );
 
+    let frames_before_pause = fake_voice.audio_frame_count().await;
     supervisor.send(Command::Pause).await.unwrap();
     let pause_events = collect_events(&mut stream, 1).await;
     assert_eq!(pause_events[0].kind, SessionEventKind::Paused as i32);
     assert!(fake_voice.speaking_state_count_at_least(0, 3).await >= 3);
+    assert!(
+        fake_voice.audio_frame_count().await >= frames_before_pause + 5,
+        "pause should flush Songbird-style Opus silence frames before going quiet"
+    );
 
     supervisor.send(Command::Pause).await.unwrap();
     tokio::time::timeout(Duration::from_millis(80), stream.next())
@@ -254,10 +259,15 @@ async fn pause_resume_without_voice_context_refresh_keeps_voice_media_connected(
     assert!(fake_voice.audio_frame_count_at_least(4).await >= 4);
     assert_eq!(fake_voice.discovery_count().await, 1);
 
+    let frames_before_pause = fake_voice.audio_frame_count().await;
     supervisor.send(Command::Pause).await.unwrap();
     let pause_events = collect_events(&mut stream, 1).await;
     assert_eq!(pause_events[0].kind, SessionEventKind::Paused as i32);
     assert!(fake_voice.speaking_state_count_at_least(0, 3).await >= 3);
+    assert!(
+        fake_voice.audio_frame_count().await >= frames_before_pause + 5,
+        "pause should flush Songbird-style Opus silence frames before going quiet"
+    );
 
     let paused_count = fake_voice.audio_frame_count().await;
     tokio::time::sleep(Duration::from_millis(140)).await;

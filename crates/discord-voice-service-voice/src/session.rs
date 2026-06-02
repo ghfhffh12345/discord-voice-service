@@ -354,8 +354,12 @@ impl ConnectedVoiceSession {
     }
 
     async fn process_pending_gateway_events(&mut self) -> Result<(), VoiceError> {
-        self.process_pending_gateway_events_with_initial_poll(DAVE_GATEWAY_IDLE_POLL)
-            .await
+        self.process_pending_gateway_events_with_initial_poll_policy(
+            DAVE_GATEWAY_IDLE_POLL,
+            false,
+            false,
+        )
+        .await
     }
 
     pub async fn wait_for_initial_dave_settle(&mut self) -> Result<(), VoiceError> {
@@ -367,6 +371,7 @@ impl ConnectedVoiceSession {
         self.process_pending_gateway_events_with_initial_poll_policy(
             DAVE_GATEWAY_TRANSITION_POLL,
             true,
+            true,
         )
         .await
     }
@@ -375,7 +380,7 @@ impl ConnectedVoiceSession {
         &mut self,
         initial_wait: Duration,
     ) -> Result<(), VoiceError> {
-        self.process_pending_gateway_events_with_initial_poll_policy(initial_wait, false)
+        self.process_pending_gateway_events_with_initial_poll_policy(initial_wait, false, true)
             .await
     }
 
@@ -383,6 +388,7 @@ impl ConnectedVoiceSession {
         &mut self,
         initial_wait: Duration,
         allow_pending_initial_dave: bool,
+        wait_for_idle_follow_up: bool,
     ) -> Result<(), VoiceError> {
         if self.dave_failed_closed {
             return Err(VoiceError::InvalidState("voice dave session failed closed"));
@@ -404,7 +410,7 @@ impl ConnectedVoiceSession {
             .clone()
             .ok_or(VoiceError::InvalidState("voice gateway unavailable"))?;
 
-        let mut drained_any_event = false;
+        let mut wait_for_follow_up = false;
         let mut reached_drain_limit = true;
         for _ in 0..DAVE_GATEWAY_EVENT_DRAIN_LIMIT {
             let wait = if self.pending_dave_transition.is_some()
@@ -414,7 +420,7 @@ impl ConnectedVoiceSession {
                 DAVE_GATEWAY_EXECUTE_POLL
             } else if !self.pending_dave_prepared_transitions.is_empty()
                 || !self.pending_dave_local_init_commit_echoes.is_empty()
-                || drained_any_event
+                || wait_for_follow_up
             {
                 DAVE_GATEWAY_TRANSITION_POLL
             } else {
@@ -428,9 +434,10 @@ impl ConnectedVoiceSession {
                     break;
                 }
             };
-            drained_any_event = true;
             let event = payload.into_event();
             let transition_id = dave_session_event_transition_id(&event);
+            wait_for_follow_up =
+                wait_for_idle_follow_up || dave_session_event_expects_follow_up(&event);
             tracing::debug!(
                 event = dave_session_event_name(&event),
                 transition_id,
@@ -1415,7 +1422,7 @@ impl ConnectedVoiceSession {
                 return Err(err);
             }
         }
-        self.speaking_started = false;
+        self.stop_speaking().await?;
         Ok(())
     }
 
@@ -1501,6 +1508,11 @@ fn dave_session_event_transition_id(event: &VoiceGatewayEvent) -> Option<u16> {
         VoiceGatewayEvent::DaveMlsWelcome(transition) => Some(transition.transition_id),
         _ => None,
     }
+}
+
+fn dave_session_event_expects_follow_up(event: &VoiceGatewayEvent) -> bool {
+    // Heartbeat acks are periodic maintenance; other events may precede DAVE transition material.
+    !matches!(event, VoiceGatewayEvent::HeartbeatAck(_))
 }
 
 impl Drop for ConnectedVoiceSession {
@@ -1751,6 +1763,13 @@ mod tests {
             .await
             .expect("speaking should be observed");
         assert_eq!(udp.silence_frame_count().await, 5);
+        assert!(
+            gateway
+                .speaking_state_count_at_least(0, STOP_SPEAKING_GATEWAY_REPEAT_COUNT)
+                .await
+                >= STOP_SPEAKING_GATEWAY_REPEAT_COUNT
+        );
+        assert!(!session.media_started());
     }
 
     #[tokio::test]
@@ -1805,6 +1824,7 @@ mod tests {
         session.stop_audio().await.unwrap();
 
         assert_eq!(udp.silence_frame_count().await, 5);
+        assert!(!session.media_started());
     }
 
     #[tokio::test]

@@ -75,6 +75,34 @@ async fn runtime_waits_for_each_frame_duration() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn runtime_does_not_add_send_overhead_to_frame_cadence() {
+    let mut pacer = AudioPacer::new();
+    let start = Instant::now();
+
+    pacer.wait_until_ready().await;
+    advance(Duration::from_millis(4)).await;
+    pacer.mark_emitted(Duration::from_millis(20));
+
+    let next_tick = tokio::spawn(async move {
+        pacer.wait_for(Duration::from_millis(20)).await;
+        pacer
+    });
+    yield_now().await;
+    assert!(!next_tick.is_finished());
+
+    advance(Duration::from_millis(15)).await;
+    yield_now().await;
+    assert!(!next_tick.is_finished());
+
+    advance(Duration::from_millis(1)).await;
+    yield_now().await;
+    let pacer = next_tick.await.unwrap();
+
+    assert_eq!(start.elapsed(), Duration::from_millis(20));
+    assert_eq!(pacer.emitted_frames(), 2);
+}
+
+#[tokio::test(start_paused = true)]
 async fn runtime_does_not_burst_after_slow_send() {
     let mut pacer = AudioPacer::new();
     let start = Instant::now();

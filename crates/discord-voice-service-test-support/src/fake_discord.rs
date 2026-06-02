@@ -2324,6 +2324,20 @@ impl FakeDiscordPeer {
             .map_err(|_| VoiceError::InvalidState("fake gateway send failed"))
     }
 
+    pub async fn send_heartbeat_ack(&self, nonce: Option<u64>) -> Result<(), VoiceError> {
+        self.gateway_messages
+            .send(Message::Text(
+                json!({
+                    "op": 6,
+                    "seq": 12,
+                    "d": nonce,
+                })
+                .to_string()
+                .into(),
+            ))
+            .map_err(|_| VoiceError::InvalidState("fake gateway send failed"))
+    }
+
     pub async fn encrypt_dave_audio_frame_from_creator(
         &self,
         frame: &[u8],

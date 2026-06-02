@@ -530,9 +530,9 @@ impl VoiceSessionRuntime {
             if let Some(session) = voice.as_mut()
                 && session.is_connected()
             {
-                tracing::debug!("runtime clearing voice speaking state for Pause");
-                session.stop_speaking().await?;
-                tracing::debug!("runtime cleared voice speaking state for Pause");
+                tracing::debug!("runtime stopping voice audio for Pause");
+                session.stop_audio().await?;
+                tracing::debug!("runtime stopped voice audio for Pause");
             }
         }
 
