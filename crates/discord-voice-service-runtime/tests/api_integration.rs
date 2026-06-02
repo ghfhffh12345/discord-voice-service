@@ -317,10 +317,11 @@ async fn join_voice_then_play_streams_end_to_end_playback_events_and_audio() {
     tokio::time::timeout(Duration::from_secs(2), speaking_observed.notified())
         .await
         .expect("speaking should be observed");
-    assert!(fake_discord.audio_frame_count_at_least(5).await >= 5);
+    assert!(fake_discord.non_silence_audio_frame_count_at_least(5).await >= 5);
+    let first_five_span = fake_discord.non_silence_audio_frame_span_for_first(5).await;
     assert!(
-        fake_discord.audio_frame_span_for_first(5).await >= Duration::from_millis(70),
-        "the first five audio frames should span at least four 20ms pacing intervals"
+        first_five_span >= Duration::from_millis(70),
+        "the first five audio frames should span at least four 20ms pacing intervals: {first_five_span:?}"
     );
 }
 

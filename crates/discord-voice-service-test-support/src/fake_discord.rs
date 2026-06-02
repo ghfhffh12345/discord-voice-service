@@ -8,7 +8,7 @@ use discord_voice_service_voice::VoiceError;
 use discord_voice_service_voice::crypto::{EncryptionMode, PREFERRED_MODE, REQUIRED_MODE};
 use discord_voice_service_voice::dave::{DaveExternalSender, DaveMediaType, DaveSession};
 use discord_voice_service_voice::test_support::{
-    ProtectionContext, RtpPacketBuilder, split_dave_mls_commit_welcome_payload,
+    OPUS_SILENCE_FRAME, ProtectionContext, RtpPacketBuilder, split_dave_mls_commit_welcome_payload,
 };
 use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
@@ -124,6 +124,8 @@ pub struct FakeDiscordPeer {
     speaking_states: Arc<Mutex<Vec<u64>>>,
     audio_frame_count: Arc<Mutex<usize>>,
     audio_frame_times: Arc<Mutex<Vec<Instant>>>,
+    non_silence_audio_frame_count: Arc<Mutex<usize>>,
+    non_silence_audio_frame_times: Arc<Mutex<Vec<Instant>>>,
     heartbeat_count: Arc<Mutex<usize>>,
     saw_identify: Arc<Mutex<bool>>,
     saw_resume: Arc<Mutex<bool>>,
@@ -471,6 +473,8 @@ impl FakeDiscordPeer {
         let speaking_states = Arc::new(Mutex::new(Vec::new()));
         let audio_frame_count = Arc::new(Mutex::new(0usize));
         let audio_frame_times = Arc::new(Mutex::new(Vec::new()));
+        let non_silence_audio_frame_count = Arc::new(Mutex::new(0usize));
+        let non_silence_audio_frame_times = Arc::new(Mutex::new(Vec::new()));
         let heartbeat_count = Arc::new(Mutex::new(0usize));
         let saw_identify = Arc::new(Mutex::new(false));
         let saw_resume = Arc::new(Mutex::new(false));
@@ -499,9 +503,13 @@ impl FakeDiscordPeer {
         let discovery_count_state = Arc::clone(&discovery_count);
         let audio_frame_count_state = Arc::clone(&audio_frame_count);
         let audio_frame_times_state = Arc::clone(&audio_frame_times);
+        let non_silence_audio_frame_count_state = Arc::clone(&non_silence_audio_frame_count);
+        let non_silence_audio_frame_times_state = Arc::clone(&non_silence_audio_frame_times);
         let last_audio_packet_state = Arc::clone(&last_audio_packet);
         let last_udp_peer_state = Arc::clone(&last_udp_peer);
         let udp_socket_state = Arc::clone(&udp_socket);
+        let encryption_mode_udp_state = Arc::clone(&encryption_mode);
+        let secret_key_udp_state = Arc::clone(&secret_key);
         tokio::spawn(async move {
             let mut buf = [0u8; 512];
             loop {
@@ -524,9 +532,22 @@ impl FakeDiscordPeer {
                 }
 
                 if len >= 12 {
+                    let received_at = Instant::now();
                     *audio_frame_count_state.lock().await += 1;
-                    audio_frame_times_state.lock().await.push(Instant::now());
+                    audio_frame_times_state.lock().await.push(received_at);
                     *last_audio_packet_state.lock().await = Some(buf[..len].to_vec());
+
+                    if !is_stop_silence_packet(
+                        &buf[..len],
+                        &encryption_mode_udp_state,
+                        &secret_key_udp_state,
+                    ) {
+                        *non_silence_audio_frame_count_state.lock().await += 1;
+                        non_silence_audio_frame_times_state
+                            .lock()
+                            .await
+                            .push(received_at);
+                    }
                 }
             }
         });
@@ -2180,6 +2201,8 @@ impl FakeDiscordPeer {
             speaking_states,
             audio_frame_count,
             audio_frame_times,
+            non_silence_audio_frame_count,
+            non_silence_audio_frame_times,
             heartbeat_count,
             saw_identify,
             saw_resume,
@@ -2630,6 +2653,27 @@ impl FakeDiscordPeer {
         }
     }
 
+    pub async fn non_silence_audio_frame_count_at_least(&self, minimum: usize) -> usize {
+        wait_for_value(&self.non_silence_audio_frame_count, |count| {
+            *count >= minimum
+        })
+        .await
+    }
+
+    pub async fn non_silence_audio_frame_span_for_first(&self, frame_count: usize) -> Duration {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let timestamps = self.non_silence_audio_frame_times.lock().await.clone();
+            if timestamps.len() >= frame_count {
+                return timestamps[frame_count - 1].saturating_duration_since(timestamps[0]);
+            }
+            if Instant::now() >= deadline {
+                return Duration::ZERO;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     pub async fn heartbeat_count_at_least(&self, minimum: usize) -> usize {
         wait_for_value(&self.heartbeat_count, |count| *count >= minimum).await
     }
@@ -2913,6 +2957,23 @@ fn dave_welcome_message(
     message.extend_from_slice(&transition_id.to_be_bytes());
     message.extend_from_slice(&welcome);
     message
+}
+
+fn is_stop_silence_packet(
+    packet: &[u8],
+    encryption_mode: &Arc<StdMutex<Option<EncryptionMode>>>,
+    secret_key: &Arc<StdMutex<Option<Vec<u8>>>>,
+) -> bool {
+    let mode = *encryption_mode.lock().unwrap();
+    let key = secret_key.lock().unwrap().clone();
+    let (Some(mode), Some(key)) = (mode, key) else {
+        return false;
+    };
+
+    ProtectionContext::new(mode, key)
+        .and_then(|protection| protection.unprotect_packet(packet))
+        .map(|(_header, payload)| payload.as_ref() == OPUS_SILENCE_FRAME.as_slice())
+        .unwrap_or(false)
 }
 
 async fn wait_for_value<T, F>(slot: &Arc<Mutex<T>>, ready: F) -> T

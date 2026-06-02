@@ -11,7 +11,7 @@ use tokio::sync::{Mutex, RwLock, broadcast, watch};
 use super::events::{EventBus, SessionEventKind, SessionEventRecord};
 use super::readiness::{
     ensure_active_voice_session, ensure_joinable_session, ensure_pauseable_track,
-    ensure_resumable_track,
+    ensure_resumable_track, ensure_track_loaded,
 };
 use super::state::{SessionState, Snapshot};
 use super::supervisor::Command;
@@ -515,6 +515,11 @@ impl VoiceSessionRuntime {
     async fn pause(&self) -> Result<(), RuntimeError> {
         {
             let state = self.state.read().await;
+            ensure_track_loaded(&state, "pause")?;
+            if matches!(state.state, SessionState::Paused) {
+                tracing::debug!("runtime ignoring redundant Pause while already paused");
+                return Ok(());
+            }
             ensure_pauseable_track(&state)?;
         }
         self.playback_paused.send_replace(true);
@@ -525,14 +530,19 @@ impl VoiceSessionRuntime {
             if let Some(session) = voice.as_mut()
                 && session.is_connected()
             {
-                tracing::debug!("runtime suspending voice media for Pause");
-                session.suspend_media().await?;
-                tracing::debug!("runtime suspended voice media for Pause");
+                tracing::debug!("runtime clearing voice speaking state for Pause");
+                session.stop_speaking().await?;
+                tracing::debug!("runtime cleared voice speaking state for Pause");
             }
         }
 
         let event = {
             let mut state = self.state.write().await;
+            ensure_track_loaded(&state, "pause")?;
+            if matches!(state.state, SessionState::Paused) {
+                tracing::debug!("runtime ignoring redundant Pause after state changed to paused");
+                return Ok(());
+            }
             ensure_pauseable_track(&state)?;
             state.state = SessionState::Paused;
             SessionEventRecord::from_snapshot(SessionEventKind::Paused, &state)
@@ -545,6 +555,11 @@ impl VoiceSessionRuntime {
     async fn resume(&self) -> Result<(), RuntimeError> {
         {
             let state = self.state.read().await;
+            ensure_track_loaded(&state, "resume")?;
+            if matches!(state.state, SessionState::Playing) {
+                tracing::debug!("runtime ignoring Resume while playback is already playing");
+                return Ok(());
+            }
             ensure_resumable_track(&state)?;
         }
 
@@ -590,6 +605,11 @@ impl VoiceSessionRuntime {
 
         let event = {
             let mut state = self.state.write().await;
+            ensure_track_loaded(&state, "resume")?;
+            if matches!(state.state, SessionState::Playing) {
+                tracing::debug!("runtime ignoring Resume after state changed to playing");
+                return Ok(());
+            }
             ensure_resumable_track(&state)?;
             state.state = SessionState::Playing;
             SessionEventRecord::from_snapshot(SessionEventKind::Playing, &state)

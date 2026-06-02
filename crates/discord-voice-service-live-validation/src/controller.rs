@@ -10,9 +10,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, timeout};
 use tracing::{info, warn};
 use twilight_gateway::error::ReceiveMessageErrorType;
-use twilight_gateway::{
-    Event, EventTypeFlags, Intents, MessageSender, Shard, ShardId, StreamExt as _,
-};
+use twilight_gateway::{Event, EventTypeFlags, Intents, Shard, ShardId, StreamExt as _};
 use twilight_http::{Client as HttpClient, error::ErrorType as HttpErrorType};
 use twilight_model::id::{
     Id,
@@ -125,16 +123,6 @@ enum ObserverAudioProofCommand {
         armed: oneshot::Sender<()>,
         respond_to: oneshot::Sender<Result<ObserverResumeProof>>,
     },
-}
-
-enum LiveGatewayDriverCommand {
-    WaitForServiceVoiceContext {
-        respond_to: oneshot::Sender<Result<ServiceVoiceContext>>,
-    },
-}
-
-struct PendingServiceVoiceContextProof {
-    respond_to: oneshot::Sender<Result<ServiceVoiceContext>>,
 }
 
 async fn await_observer_dave_ready<T, E, F>(ready: F) -> Result<T>
@@ -599,9 +587,6 @@ async fn run_service_flow(
     let (track_ended_tx, track_ended_rx) = oneshot::channel();
     let (observer_audio_started_tx, observer_audio_started_rx) = oneshot::channel();
     let (observer_proof_tx, observer_proof_rx) = mpsc::channel(2);
-    let (gateway_driver_tx, gateway_driver_rx) = mpsc::channel(2);
-    let service_gateway_sender = service_shard.sender();
-    let service_voice_for_controls = forwarded_voice.clone();
     let service_contract = {
         let live_contract_snapshot = Arc::clone(&live_contract_snapshot);
         let observer_playback_snapshot = Arc::clone(&observer_playback_snapshot);
@@ -616,9 +601,6 @@ async fn run_service_flow(
                     &mut playback_control_client,
                     observer_audio_started_rx,
                     observer_proof_tx,
-                    gateway_driver_tx,
-                    service_gateway_sender,
-                    service_voice_for_controls,
                     observer_playback_snapshot,
                 ),
             )
@@ -669,12 +651,8 @@ async fn run_service_flow(
         guild_id: observer_join.guild_id,
         observer_user_id: observer_join.user_id,
     };
-    let live_gateway_driver = drive_live_gateway_shards(
-        service_shard,
-        observer_shard,
-        live_gateway_config,
-        gateway_driver_rx,
-    );
+    let live_gateway_driver =
+        drive_live_gateway_shards(service_shard, observer_shard, live_gateway_config);
     let mut result = tokio::select! {
         result = validation_and_play => result,
         result = live_gateway_driver => {
@@ -731,48 +709,42 @@ async fn drive_live_gateway_shards(
     service_shard: &mut Shard,
     observer_shard: &mut Shard,
     config: LiveGatewayDriverConfig,
-    mut commands: mpsc::Receiver<LiveGatewayDriverCommand>,
 ) -> Result<()> {
     let mut update_client = VoiceServiceClient::connect(config.service_addr)
         .await
         .context("connect Twilight adapter client for live gateway driver")?;
-    let mut service_voice = VoiceContextTracker::from_context(config.initial_service_voice);
-    let mut pending_voice_context_proof = None::<PendingServiceVoiceContextProof>;
+    let mut service_voice_tracker = VoiceContextTracker::from_context(config.initial_service_voice);
 
     loop {
         tokio::select! {
-            command = commands.recv() => {
-                let Some(command) = command else {
-                    continue;
-                };
-                match command {
-                    LiveGatewayDriverCommand::WaitForServiceVoiceContext { respond_to } => {
-                        if pending_voice_context_proof.is_some() {
-                            let _ = respond_to.send(Err(anyhow!(
-                                "service voice context proof already pending"
-                            )));
-                            continue;
-                        }
-
-                        pending_voice_context_proof = Some(PendingServiceVoiceContextProof {
-                            respond_to,
-                        });
-                    }
-                }
-            }
             item = service_shard.next_event(EventTypeFlags::all()) => {
                 let Some(event) = next_live_gateway_event("service", item)? else {
                     continue;
                 };
-                if let Some(context) = service_voice.observe(&event) {
+                if let Event::VoiceStateUpdate(update) = &event
+                    && update.user_id == service_voice_tracker.user_id()
+                    && update.guild_id == Some(service_voice_tracker.guild_id())
+                {
+                    match update.channel_id {
+                        None => {
+                            bail!("service gateway voice state left the target channel during playback");
+                        }
+                        Some(channel_id) if channel_id != service_voice_tracker.channel_id() => {
+                            bail!(
+                                "service gateway voice state moved channels during playback: expected={} actual={}",
+                                service_voice_tracker.channel_id(),
+                                channel_id
+                            );
+                        }
+                        Some(_) => {}
+                    }
+                }
+                if let Some(context) = service_voice_tracker.observe(&event) {
                     info!("forwarding refreshed service voice context during live playback");
                     update_client
                         .update_voice_context(&context)
                         .await
                         .context("forward refreshed service voice context through Twilight adapter")?;
-                    if let Some(pending) = pending_voice_context_proof.take() {
-                        let _ = pending.respond_to.send(Ok(context));
-                    }
                 }
             }
             item = observer_shard.next_event(EventTypeFlags::all()) => {
@@ -1023,15 +995,35 @@ async fn prove_observer_pause_silence(
     let proof_started = Instant::now();
     let mut speaking_stopped = false;
     let mut silence_deadline = None;
+    let mut last_service_activity_at = proof_started;
     let transition_deadline = Instant::now() + OBSERVER_SPEAKING_STATE_TIMEOUT;
 
     loop {
-        let active_deadline = silence_deadline.unwrap_or(transition_deadline);
+        let mut active_deadline = silence_deadline.unwrap_or(transition_deadline);
+        if !speaking_stopped && accumulator.stats().observed_packet_count > 0 {
+            let inferred_silence_deadline =
+                last_service_activity_at + PAUSE_OBSERVER_SILENCE_DURATION;
+            if inferred_silence_deadline < active_deadline {
+                active_deadline = inferred_silence_deadline;
+            }
+        }
         let Some(remaining) = active_deadline.checked_duration_since(Instant::now()) else {
             if speaking_stopped {
                 return Ok(ObserverPauseProof {
                     silence_ms: duration_ms(PAUSE_OBSERVER_SILENCE_DURATION),
                     speaking_stopped,
+                });
+            }
+            if accumulator.stats().observed_packet_count > 0
+                && last_service_activity_at.elapsed() >= PAUSE_OBSERVER_SILENCE_DURATION
+            {
+                info!(
+                    silence_ms = duration_ms(PAUSE_OBSERVER_SILENCE_DURATION),
+                    "observer inferred Pause speaking inactivity from sustained service RTP silence"
+                );
+                return Ok(ObserverPauseProof {
+                    silence_ms: duration_ms(PAUSE_OBSERVER_SILENCE_DURATION),
+                    speaking_stopped: true,
                 });
             }
 
@@ -1049,6 +1041,7 @@ async fn prove_observer_pause_silence(
                 let sequence = frame.sequence;
                 let stats =
                     record_observer_audio_frame(frame, accumulator, snapshot, audio_started)?;
+                last_service_activity_at = Instant::now();
                 if !speaking_stopped {
                     continue;
                 }
@@ -1064,6 +1057,7 @@ async fn prove_observer_pause_silence(
                 );
             }
             Ok(ObservedVoiceActivity::RtpPacket(packet)) => {
+                last_service_activity_at = Instant::now();
                 if !speaking_stopped {
                     continue;
                 }
@@ -1078,6 +1072,7 @@ async fn prove_observer_pause_silence(
                 );
             }
             Ok(ObservedVoiceActivity::Speaking(state)) => {
+                last_service_activity_at = Instant::now();
                 if state.speaking & SPEAKING_FLAG_MICROPHONE != 0 {
                     if speaking_stopped {
                         bail!(
@@ -1103,18 +1098,27 @@ async fn prove_observer_pause_silence(
                 silence_deadline = Some(Instant::now() + PAUSE_OBSERVER_SILENCE_DURATION);
             }
             Ok(ObservedVoiceActivity::Disconnect(user_id)) => {
-                info!(
-                    user_id = %user_id,
-                    "observer saw service voice client disconnect during Pause proof"
+                bail!(
+                    "observer saw service voice client disconnect during Pause proof (user_id={user_id})"
                 );
-                speaking_stopped = true;
-                silence_deadline = Some(Instant::now() + PAUSE_OBSERVER_SILENCE_DURATION);
             }
             Err(error) if is_voice_receive_timeout(&error) => {
                 if speaking_stopped {
                     return Ok(ObserverPauseProof {
                         silence_ms: duration_ms(PAUSE_OBSERVER_SILENCE_DURATION),
                         speaking_stopped,
+                    });
+                }
+                if accumulator.stats().observed_packet_count > 0
+                    && last_service_activity_at.elapsed() >= PAUSE_OBSERVER_SILENCE_DURATION
+                {
+                    info!(
+                        silence_ms = duration_ms(PAUSE_OBSERVER_SILENCE_DURATION),
+                        "observer inferred Pause speaking inactivity from sustained service RTP silence"
+                    );
+                    return Ok(ObserverPauseProof {
+                        silence_ms: duration_ms(PAUSE_OBSERVER_SILENCE_DURATION),
+                        speaking_stopped: true,
                     });
                 }
                 bail!(
@@ -1171,7 +1175,13 @@ async fn prove_observer_resume_audio(
                 let stats =
                     record_observer_audio_frame(frame, accumulator, snapshot, audio_started)?;
                 let observed_after_resume = stats.observed_packet_count.saturating_sub(start_count);
-                if speaking_started && observed_after_resume >= RESUME_OBSERVER_PACKET_TARGET {
+                if observed_after_resume >= RESUME_OBSERVER_PACKET_TARGET {
+                    if !speaking_started {
+                        info!(
+                            observed_after_resume,
+                            "observer inferred resumed service speaking state from decoded service audio"
+                        );
+                    }
                     return Ok(ObserverResumeProof {
                         observed_packet_count: observed_after_resume,
                         speaking_started: true,
@@ -1335,9 +1345,6 @@ async fn wait_for_play_completed_contract_with_controls(
     controls: &mut VoiceServiceClient,
     observer_audio_started: oneshot::Receiver<()>,
     observer_proof_tx: mpsc::Sender<ObserverAudioProofCommand>,
-    gateway_driver_tx: mpsc::Sender<LiveGatewayDriverCommand>,
-    service_gateway_sender: MessageSender,
-    service_voice: ServiceVoiceContext,
     observer_playback_snapshot: Arc<Mutex<Option<ObserverPlaybackProof>>>,
 ) -> Result<(LiveContractState, ObserverPlaybackProof)> {
     let mut pause_resume_validated = state.validated_pause && state.validated_resume;
@@ -1356,13 +1363,42 @@ async fn wait_for_play_completed_contract_with_controls(
             request_observer_speaking_started_proof(&observer_proof_tx).await?;
             tokio::time::sleep(PRE_PAUSE_SPEAKING_SETTLE_DURATION).await;
 
+            controls
+                .resume()
+                .await
+                .context("call ignored Resume while live playback is already playing")?;
+            let playing_snapshot = controls
+                .state()
+                .await
+                .context("fetch state after ignored Resume while already playing")?;
+            if playing_snapshot.state != SessionState::Playing {
+                bail!(
+                    "ignored Resume changed state while playback was already playing: {:?}",
+                    playing_snapshot.state
+                );
+            }
+            state.mark_invalid_resume_ignored();
+            update_live_contract_snapshot(&snapshot, &state);
+
             let pause_proof = start_observer_pause_proof(&observer_proof_tx).await?;
             controls
-                .pause_and_leave(&service_gateway_sender, &service_voice)
+                .pause()
                 .await
-                .context(
-                    "call Pause and leave voice through Twilight adapter during live playback",
-                )?;
+                .context("call Pause while staying in the Discord voice channel")?;
+            controls
+                .pause()
+                .await
+                .context("call ignored redundant Pause while live playback is already paused")?;
+            let paused_snapshot = controls
+                .state()
+                .await
+                .context("fetch state after ignored redundant Pause")?;
+            if paused_snapshot.state != SessionState::Paused {
+                bail!(
+                    "ignored redundant Pause changed state while playback was already paused: {:?}",
+                    paused_snapshot.state
+                );
+            }
             let pause_proof = await_observer_pause_proof(pause_proof).await?;
             observer_playback.pause_silence_ms = pause_proof.silence_ms;
             observer_playback.pause_speaking_stopped = pause_proof.speaking_stopped;
@@ -1373,24 +1409,14 @@ async fn wait_for_play_completed_contract_with_controls(
                 );
             }
             state.mark_pause();
+            state.mark_redundant_pause_ignored();
             update_live_contract_snapshot(&snapshot, &state);
 
             let resume_proof = start_observer_resume_proof(&observer_proof_tx).await?;
-            let voice_context_refresh =
-                start_service_voice_context_refresh_proof(&gateway_driver_tx).await?;
-            service_gateway_sender
-                .command(&join_voice_channel(
-                    service_voice.guild_id,
-                    service_voice.channel_id,
-                    false,
-                    false,
-                ))
-                .context("send service gateway voice rejoin command before Resume")?;
-            await_service_voice_context_refresh_proof(voice_context_refresh).await?;
             controls
                 .resume()
                 .await
-                .context("call Resume after service voice rejoin during live playback")?;
+                .context("call Resume from paused state without Discord voice rejoin")?;
             let resume_proof = await_observer_resume_proof(resume_proof).await?;
             observer_playback.resume_observed_packet_count = resume_proof.observed_packet_count;
             observer_playback.resume_speaking_started = resume_proof.speaking_started;
@@ -1436,30 +1462,6 @@ async fn request_observer_speaking_started_proof(
     .await
     .context("timed out waiting for observer pre-Pause Speaking 1 proof")?
     .context("observer audio task ended before pre-Pause Speaking 1 proof")?
-}
-
-async fn start_service_voice_context_refresh_proof(
-    gateway_driver_tx: &mpsc::Sender<LiveGatewayDriverCommand>,
-) -> Result<oneshot::Receiver<Result<ServiceVoiceContext>>> {
-    let (respond_to, response) = oneshot::channel();
-    gateway_driver_tx
-        .send(LiveGatewayDriverCommand::WaitForServiceVoiceContext { respond_to })
-        .await
-        .context("request service voice context refresh proof")?;
-
-    Ok(response)
-}
-
-async fn await_service_voice_context_refresh_proof(
-    response: oneshot::Receiver<Result<ServiceVoiceContext>>,
-) -> Result<ServiceVoiceContext> {
-    timeout(
-        AUTHENTIC_VOICE_EVENT_TIMEOUT + Duration::from_secs(5),
-        response,
-    )
-    .await
-    .context("timed out waiting for service voice context refresh proof")?
-    .context("live gateway driver ended before service voice context refresh proof")?
 }
 
 async fn start_observer_pause_proof(
@@ -1787,6 +1789,10 @@ fn build_success_evidence(
         validated_play: validated.live_contract.validated_play,
         validated_pause: validated.live_contract.validated_pause,
         validated_resume: validated.live_contract.validated_resume,
+        validated_invalid_resume_ignored: validated.live_contract.validated_invalid_resume_ignored,
+        validated_redundant_pause_ignored: validated
+            .live_contract
+            .validated_redundant_pause_ignored,
         observer_proved_pause: validated.live_contract.observer_proved_pause,
         observer_proved_resume: validated.live_contract.observer_proved_resume,
         observer_pause_self_mute_observed: validated.observer_playback.pause_self_mute_observed,
@@ -1829,6 +1835,10 @@ fn build_failure_evidence(
         validated_play: live_contract.is_some_and(|state| state.validated_play),
         validated_pause: live_contract.is_some_and(|state| state.validated_pause),
         validated_resume: live_contract.is_some_and(|state| state.validated_resume),
+        validated_invalid_resume_ignored: live_contract
+            .is_some_and(|state| state.validated_invalid_resume_ignored),
+        validated_redundant_pause_ignored: live_contract
+            .is_some_and(|state| state.validated_redundant_pause_ignored),
         observer_proved_pause: live_contract.is_some_and(|state| state.observer_proved_pause),
         observer_proved_resume: live_contract.is_some_and(|state| state.observer_proved_resume),
         observer_pause_self_mute_observed: observer_playback
@@ -2157,7 +2167,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pause_proof_allows_voice_disconnect_during_silence() {
+    async fn pause_proof_infers_speaking_stop_from_sustained_rtp_silence() {
+        let fake = FakeDiscordPeer::spawn_real_shape().await;
+        let voice = fake.voice_context("1", "2", "observer-1", "session-1", "token-1");
+        let mut session = ObservedVoiceSession::connect(voice).await.unwrap();
+        fake.send_speaking("speaker-1", 42).await.unwrap();
+        session
+            .receive_speaking_state_from("speaker-1", 1, Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        let mut accumulator = AudioValidationAccumulator::new();
+        let snapshot = Arc::new(Mutex::new(None));
+        let mut audio_started = None;
+
+        let proof = async {
+            prove_observer_pause_silence(
+                &mut session,
+                "speaker-1",
+                &mut accumulator,
+                &snapshot,
+                &mut audio_started,
+            )
+            .await
+        };
+        let send_audio_then_silence = async {
+            let mode = fake.encryption_mode().await.unwrap();
+            let secret_key = fake.secret_key().await.unwrap();
+            let protection = ProtectionContext::new(mode, secret_key).unwrap();
+            let rtp = RtpPacketBuilder::new(42);
+            let header = rtp.build_header(1, 960);
+            let packet = protection
+                .protect_packet(&header, &OPUS_SILENCE_FRAME)
+                .unwrap();
+            fake.send_raw_udp_packet(&packet).await.unwrap();
+        };
+        let (proof, ()) = tokio::join!(proof, send_audio_then_silence);
+        let proof = proof.unwrap();
+
+        assert!(proof.speaking_stopped);
+        assert_eq!(proof.silence_ms, 600);
+        assert_eq!(accumulator.stats().observed_packet_count, 1);
+    }
+
+    #[tokio::test]
+    async fn pause_proof_rejects_voice_disconnect_during_silence() {
         let fake = FakeDiscordPeer::spawn_real_shape().await;
         let voice = fake.voice_context("1", "2", "observer-1", "session-1", "token-1");
         let mut session = ObservedVoiceSession::connect(voice).await.unwrap();
@@ -2184,11 +2238,14 @@ mod tests {
         let send_disconnect = async {
             fake.send_client_disconnect("speaker-1").await.unwrap();
         };
-        let (proof, ()) = tokio::join!(proof, send_disconnect);
-        let proof = proof.unwrap();
+        let (error, ()) = tokio::join!(proof, send_disconnect);
+        let error = error.unwrap_err();
 
-        assert!(proof.speaking_stopped);
-        assert_eq!(proof.silence_ms, 600);
+        assert!(
+            error
+                .to_string()
+                .contains("observer saw service voice client disconnect during Pause proof")
+        );
         assert_eq!(accumulator.stats().observed_packet_count, 0);
     }
 
@@ -2229,6 +2286,52 @@ mod tests {
             }
         };
         let (proof, ()) = tokio::join!(proof, send_resume);
+        let proof = proof.unwrap();
+
+        assert!(proof.speaking_started);
+        assert_eq!(proof.observed_packet_count, RESUME_OBSERVER_PACKET_TARGET);
+    }
+
+    #[tokio::test]
+    async fn resume_proof_infers_speaking_start_from_resumed_audio_packets() {
+        let fake = FakeDiscordPeer::spawn_real_shape().await;
+        let voice = fake.voice_context("1", "2", "observer-1", "session-1", "token-1");
+        let mut session = ObservedVoiceSession::connect(voice).await.unwrap();
+        fake.send_speaking("speaker-1", 42).await.unwrap();
+        session
+            .receive_speaking_state_from("speaker-1", 1, Duration::from_secs(1))
+            .await
+            .unwrap();
+        let mut accumulator = AudioValidationAccumulator::new();
+        let snapshot = Arc::new(Mutex::new(None));
+        let mut audio_started = None;
+
+        let proof = async {
+            prove_observer_resume_audio(
+                &mut session,
+                "speaker-1",
+                &mut accumulator,
+                &snapshot,
+                &mut audio_started,
+            )
+            .await
+        };
+        let send_resume_audio = async {
+            let mode = fake.encryption_mode().await.unwrap();
+            let secret_key = fake.secret_key().await.unwrap();
+            let protection = ProtectionContext::new(mode, secret_key).unwrap();
+            let rtp = RtpPacketBuilder::new(42);
+            for sequence in 0..RESUME_OBSERVER_PACKET_TARGET {
+                let sequence = u16::try_from(sequence).unwrap();
+                let header = rtp.build_header(sequence, u32::from(sequence) * 960);
+                let packet = protection
+                    .protect_packet(&header, &OPUS_SILENCE_FRAME)
+                    .unwrap();
+                fake.send_raw_udp_packet(&packet).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        let (proof, ()) = tokio::join!(proof, send_resume_audio);
         let proof = proof.unwrap();
 
         assert!(proof.speaking_started);

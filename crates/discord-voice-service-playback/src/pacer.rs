@@ -38,6 +38,10 @@ impl AudioPacer {
     }
 
     pub fn mark_emitted(&mut self, duration: Duration) {
+        let now = Instant::now();
+        if self.next_deadline < now {
+            self.next_deadline = now;
+        }
         self.next_deadline += duration;
         self.emitted_frames += 1;
     }

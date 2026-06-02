@@ -11,6 +11,8 @@ pub struct LiveContractState {
     pub validated_play: bool,
     pub validated_pause: bool,
     pub validated_resume: bool,
+    pub validated_invalid_resume_ignored: bool,
+    pub validated_redundant_pause_ignored: bool,
     pub observer_proved_pause: bool,
     pub observer_proved_resume: bool,
     pub validated_stop: bool,
@@ -34,6 +36,8 @@ pub struct LiveValidationEvidence {
     pub validated_play: bool,
     pub validated_pause: bool,
     pub validated_resume: bool,
+    pub validated_invalid_resume_ignored: bool,
+    pub validated_redundant_pause_ignored: bool,
     pub observer_proved_pause: bool,
     pub observer_proved_resume: bool,
     pub observer_pause_self_mute_observed: bool,
@@ -113,6 +117,14 @@ impl LiveContractState {
     pub fn mark_resume(&mut self) {
         self.validated_resume = true;
         self.observer_proved_resume = true;
+    }
+
+    pub fn mark_invalid_resume_ignored(&mut self) {
+        self.validated_invalid_resume_ignored = true;
+    }
+
+    pub fn mark_redundant_pause_ignored(&mut self) {
+        self.validated_redundant_pause_ignored = true;
     }
 
     pub fn mark_stop(&mut self) {
@@ -227,6 +239,12 @@ impl LiveContractState {
         }
         if !self.validated_resume {
             missing.push("Resume");
+        }
+        if !self.validated_invalid_resume_ignored {
+            missing.push("ignored invalid Resume");
+        }
+        if !self.validated_redundant_pause_ignored {
+            missing.push("ignored redundant Pause");
         }
         if !self.observer_proved_pause {
             missing.push("Pause observer proof");

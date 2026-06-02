@@ -172,8 +172,8 @@ For reproducible staging, pin `YTMUSIC_SERVICE_IMAGE_REF` to an immutable tag or
 
 During live staging, human listeners may remain in the channel while the staging bot validates playback against the short dedicated validation track.
 Live-staging success waits for the natural end of the validation track before the run is treated as release-ready.
-Live-staging success requires observer receive-side proof: authentic voice context, VoiceReady, Playing, natural TrackEnded, at least 120 observed packets, at least 3000 ms decoded audio, at least 1000 ms non-silent audio, and no reconnect/interruption/fatal error during validation.
-Live-staging always uploads a structured observer evidence artifact summarizing observed packets, decoded audio, non-silent audio, and failure_reason.
+Live-staging success requires observer receive-side proof: authentic voice context, VoiceReady, Playing, pause without leaving the voice channel, no service audio or speaking state during the paused interval, resume without voice-channel rejoin, natural TrackEnded, at least 120 observed packets, at least 3000 ms decoded audio, at least 1000 ms non-silent audio, and no reconnect/interruption/fatal error during validation.
+Live-staging always uploads a structured observer evidence artifact summarizing ignored invalid Resume, ignored redundant Pause, pause silence, resume packets, observed packets, decoded audio, non-silent audio, and failure_reason.
 
 The workflow intentionally starts the live dependencies itself instead of assuming external staging processes:
 

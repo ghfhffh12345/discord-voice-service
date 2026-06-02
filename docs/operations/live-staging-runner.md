@@ -33,8 +33,8 @@ Protected live staging requires `OBSERVER_BOT_TOKEN` for the muted, non-deafened
 - The controller build command remains `cargo build --locked -p discord-voice-service-live-validation --bin staging_live_check`.
 - The workflow materializes `BROWSER_JSON` into `${GITHUB_WORKSPACE}/browser.json`, mounts it into `ytmusic-service`, and removes it during cleanup.
 - Live-staging success waits for the natural end of the validation track before the run is treated as release-ready.
-- Live-staging success requires observer receive-side proof: authentic voice context, VoiceReady, Playing, natural TrackEnded, at least 120 observed packets, at least 3000 ms decoded audio, at least 1000 ms non-silent audio, and no reconnect/interruption/fatal error during validation.
-- Live-staging always uploads a structured observer evidence artifact summarizing observed packets, decoded audio, non-silent audio, and failure_reason.
+- Live-staging success requires observer receive-side proof: authentic voice context, VoiceReady, Playing, pause without leaving the voice channel, no service audio or speaking state during the paused interval, resume without voice-channel rejoin, natural TrackEnded, at least 120 observed packets, at least 3000 ms decoded audio, at least 1000 ms non-silent audio, and no reconnect/interruption/fatal error during validation.
+- Live-staging always uploads a structured observer evidence artifact summarizing ignored invalid Resume, ignored redundant Pause, pause silence, resume packets, observed packets, decoded audio, non-silent audio, and failure_reason.
 - A preflight failure is a configuration problem, not a flaky success condition.
 
 ## Failure diagnosis
