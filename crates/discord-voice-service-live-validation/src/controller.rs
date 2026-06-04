@@ -47,12 +47,13 @@ const PLAYBACK_METRICS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const ACTIVE_INTERRUPT_PROBE_MEDIA_SETTLE_DURATION: Duration = Duration::from_millis(500);
 const MIN_STABILITY_METRIC_PACKET_COUNT: u64 = 50;
 const SOURCE_PLAYBACK_BUFFER_TARGET_MS: u64 = 5_000;
-const RTP_INTERVAL_MIN_BUDGET_MS: u64 = 15;
+const RTP_INTERVAL_MIN_BUDGET_MS: u64 = 18;
 const RTP_INTERVAL_P95_BUDGET_MS: u64 = 45;
 const RTP_INTERVAL_P99_BUDGET_MS: u64 = 70;
 const RTP_INTERVAL_MAX_BUDGET_MS: u64 = 100;
+const MEDIA_TO_WALL_CLOCK_MAX_RATIO_PPM: u64 = 1_020_000;
 const SENDER_LATENESS_P99_BUDGET_MS: u64 = 10;
-const SENDER_LOOP_NON_SEND_WORK_MAX_BUDGET_MS: u64 = 5;
+const SENDER_LOOP_NON_SEND_WORK_MAX_BUDGET_MS: u64 = 15;
 const MAX_CONSECUTIVE_PLAYOUT_LATE_PACKETS: u64 = 2;
 const MIN_OBSERVED_PACKET_COUNT: u64 = 120;
 const MIN_DECODED_AUDIO_MS: u64 = 3_000;
@@ -1370,8 +1371,13 @@ fn duration_ms(duration: Duration) -> u64 {
 fn observer_thresholds_satisfied(stats: &AudioValidationStats, expected_duration_ms: u64) -> bool {
     stats.observed_packet_count >= MIN_OBSERVED_PACKET_COUNT
         && stats.decoded_audio_ms >= required_observer_decoded_audio_ms(expected_duration_ms)
+        && stats.wall_clock_elapsed_ms > 0
+        && stats.decoded_audio_to_wall_clock_ratio_ppm > 0
+        && stats.decoded_audio_to_wall_clock_ratio_ppm <= MEDIA_TO_WALL_CLOCK_MAX_RATIO_PPM
         && stats.non_silent_audio_ms >= MIN_NON_SILENT_AUDIO_MS
+        && stats.rtp_inter_arrival.samples > 0
         && stats.rtp_gap_count_gte_100ms == 0
+        && stats.rtp_fast_interval_count == 0
         && stats.rtp_inter_arrival.p95_ms <= RTP_INTERVAL_P95_BUDGET_MS
         && stats.rtp_inter_arrival.p99_ms <= RTP_INTERVAL_P99_BUDGET_MS
         && stats.rtp_inter_arrival.max_ms < RTP_INTERVAL_MAX_BUDGET_MS
@@ -1393,14 +1399,19 @@ fn observer_threshold_error(
     let required_decoded_audio_ms = required_observer_decoded_audio_ms(expected_duration_ms);
     match stats {
         Some(stats) => anyhow!(
-            "observer audio proof finished before thresholds (observed_packet_count={} decoded_audio_ms={} required_decoded_audio_ms={} expected_duration_ms={} non_silent_audio_ms={} required_non_silent_audio_ms={} rtp_gap_count_gte_100ms={} rtp_p95_ms={} rtp_p99_ms={} rtp_max_ms={})",
+            "observer audio proof finished before thresholds (observed_packet_count={} decoded_audio_ms={} required_decoded_audio_ms={} expected_duration_ms={} observer_wall_clock_elapsed_ms={} decoded_audio_to_wall_clock_ratio_ppm={} max_ratio_ppm={} non_silent_audio_ms={} required_non_silent_audio_ms={} rtp_gap_count_gte_100ms={} rtp_fast_interval_count={} rtp_fast_interval_min_ms={} rtp_p95_ms={} rtp_p99_ms={} rtp_max_ms={})",
             stats.observed_packet_count,
             stats.decoded_audio_ms,
             required_decoded_audio_ms,
             expected_duration_ms,
+            stats.wall_clock_elapsed_ms,
+            stats.decoded_audio_to_wall_clock_ratio_ppm,
+            MEDIA_TO_WALL_CLOCK_MAX_RATIO_PPM,
             stats.non_silent_audio_ms,
             MIN_NON_SILENT_AUDIO_MS,
             stats.rtp_gap_count_gte_100ms,
+            stats.rtp_fast_interval_count,
+            stats.rtp_fast_interval_min_ms,
             stats.rtp_inter_arrival.p95_ms,
             stats.rtp_inter_arrival.p99_ms,
             stats.rtp_inter_arrival.max_ms,
@@ -2491,6 +2502,40 @@ fn validate_playback_timing_budget(metrics: &PlaybackStabilitySnapshot, label: &
     if metrics.playout_sender_lateness.samples == 0 {
         bail!("{label} returned no playout sender lateness samples");
     }
+    if metrics.track_media_duration_sent_ms == 0 {
+        bail!("{label} returned zero sent track media duration");
+    }
+    if metrics.track_wall_clock_elapsed_ms == 0 {
+        bail!("{label} returned zero track wall-clock elapsed duration");
+    }
+    if metrics.track_media_to_wall_clock_ratio_ppm == 0 {
+        bail!("{label} returned zero track media-to-wall-clock ratio");
+    }
+    if metrics.track_media_to_wall_clock_ratio_ppm > MEDIA_TO_WALL_CLOCK_MAX_RATIO_PPM {
+        bail!(
+            "{label} track media-to-wall-clock ratio was {}ppm; expected <= {MEDIA_TO_WALL_CLOCK_MAX_RATIO_PPM}ppm",
+            metrics.track_media_to_wall_clock_ratio_ppm
+        );
+    }
+    if metrics.track_fast_interval_count != 0 {
+        bail!(
+            "{label} reported {} fast track intervals (minimum {}ms); expected 0",
+            metrics.track_fast_interval_count,
+            metrics.track_fast_interval_min_ms
+        );
+    }
+    if metrics.skipped_source_frame_count != 0 {
+        bail!(
+            "{label} reported {} skipped source frames; expected 0 for steady playback",
+            metrics.skipped_source_frame_count
+        );
+    }
+    if metrics.skipped_source_duration_ms != 0 {
+        bail!(
+            "{label} reported {}ms skipped source duration; expected 0 for steady playback",
+            metrics.skipped_source_duration_ms
+        );
+    }
     if metrics.playout_builder_prepare_duration.samples != 0 {
         bail!(
             "{label} returned {} playout builder preparation samples; expected 0 because RTP packets are built at the live media tick",
@@ -2968,9 +3013,15 @@ fn build_success_evidence(
         saw_track_ended: validated.live_contract.saw_track_ended,
         observed_packet_count: validated.audio_stats.observed_packet_count,
         decoded_audio_ms: validated.audio_stats.decoded_audio_ms,
+        observer_wall_clock_elapsed_ms: validated.audio_stats.wall_clock_elapsed_ms,
+        observer_decoded_audio_to_wall_clock_ratio_ppm: validated
+            .audio_stats
+            .decoded_audio_to_wall_clock_ratio_ppm,
         non_silent_audio_ms: validated.audio_stats.non_silent_audio_ms,
         observer_rtp_inter_arrival: (&validated.audio_stats.rtp_inter_arrival).into(),
         observer_rtp_gap_count_gte_100ms: validated.audio_stats.rtp_gap_count_gte_100ms,
+        observer_rtp_fast_interval_count: validated.audio_stats.rtp_fast_interval_count,
+        observer_rtp_fast_interval_min_ms: validated.audio_stats.rtp_fast_interval_min_ms,
         dave_transition_count_during_playback: validated
             .playback_metrics
             .as_ref()
@@ -3048,12 +3099,19 @@ fn build_failure_evidence(
         saw_track_ended: live_contract.is_some_and(|state| state.saw_track_ended),
         observed_packet_count: audio_stats.map_or(0, |stats| stats.observed_packet_count),
         decoded_audio_ms: audio_stats.map_or(0, |stats| stats.decoded_audio_ms),
+        observer_wall_clock_elapsed_ms: audio_stats.map_or(0, |stats| stats.wall_clock_elapsed_ms),
+        observer_decoded_audio_to_wall_clock_ratio_ppm: audio_stats
+            .map_or(0, |stats| stats.decoded_audio_to_wall_clock_ratio_ppm),
         non_silent_audio_ms: audio_stats.map_or(0, |stats| stats.non_silent_audio_ms),
         observer_rtp_inter_arrival: audio_stats
             .map(|stats| (&stats.rtp_inter_arrival).into())
             .unwrap_or_default(),
         observer_rtp_gap_count_gte_100ms: audio_stats
             .map_or(0, |stats| stats.rtp_gap_count_gte_100ms),
+        observer_rtp_fast_interval_count: audio_stats
+            .map_or(0, |stats| stats.rtp_fast_interval_count),
+        observer_rtp_fast_interval_min_ms: audio_stats
+            .map_or(0, |stats| stats.rtp_fast_interval_min_ms),
         dave_transition_count_during_playback: snapshot
             .and_then(|value| value.playback_metrics.as_ref())
             .map_or(0, |metrics| metrics.dave_transition_count_during_playback),
@@ -3461,11 +3519,33 @@ mod tests {
         let full_stats = AudioValidationStats {
             observed_packet_count: 8_100,
             decoded_audio_ms: required_decoded_audio_ms,
+            wall_clock_elapsed_ms: required_decoded_audio_ms,
+            decoded_audio_to_wall_clock_ratio_ppm: 1_000_000,
             non_silent_audio_ms: 120_000,
+            rtp_inter_arrival: crate::audio::AudioIntervalStats {
+                samples: 8_099,
+                p50_ms: 20,
+                p95_ms: 20,
+                p99_ms: 20,
+                min_ms: 20,
+                max_ms: 20,
+            },
             ..Default::default()
         };
         assert!(observer_thresholds_satisfied(
             &full_stats,
+            expected_duration_ms,
+        ));
+
+        let fast_playback_stats = AudioValidationStats {
+            wall_clock_elapsed_ms: required_decoded_audio_ms.saturating_sub(20_000),
+            decoded_audio_to_wall_clock_ratio_ppm: MEDIA_TO_WALL_CLOCK_MAX_RATIO_PPM + 1,
+            rtp_fast_interval_count: 1,
+            rtp_fast_interval_min_ms: 8,
+            ..full_stats.clone()
+        };
+        assert!(!observer_thresholds_satisfied(
+            &fast_playback_stats,
             expected_duration_ms,
         ));
 

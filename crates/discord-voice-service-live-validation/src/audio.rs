@@ -9,6 +9,9 @@ use std::{
 const SAMPLE_RATE_HZ: i32 = 48_000;
 const NON_SILENCE_PEAK_THRESHOLD: f32 = 0.001;
 const OBSERVER_GAP_THRESHOLD: Duration = Duration::from_millis(100);
+const FAST_INTERVAL_TOLERANCE: Duration = Duration::from_millis(2);
+const FAST_PLAYBACK_RATIO_PPM: u64 = 1_020_000;
+const FAST_PLAYBACK_MIN_OBSERVATION_MS: u64 = 1_000;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ObservedOpusPacket<'a> {
@@ -20,9 +23,13 @@ pub struct ObservedOpusPacket<'a> {
 pub struct AudioValidationStats {
     pub observed_packet_count: u64,
     pub decoded_audio_ms: u64,
+    pub wall_clock_elapsed_ms: u64,
+    pub decoded_audio_to_wall_clock_ratio_ppm: u64,
     pub non_silent_audio_ms: u64,
     pub rtp_inter_arrival: AudioIntervalStats,
     pub rtp_gap_count_gte_100ms: u64,
+    pub rtp_fast_interval_count: u64,
+    pub rtp_fast_interval_min_ms: u64,
     pub max_peak_amplitude: f32,
     pub rms_amplitude: f32,
     pub first_sequence: Option<u16>,
@@ -45,7 +52,9 @@ pub struct AudioValidationAccumulator {
     stats: AudioValidationStats,
     total_squared_amplitude: f64,
     total_samples: usize,
+    first_observed_at: Option<Instant>,
     last_observed_at: Option<Instant>,
+    last_packet_duration: Option<Duration>,
     inter_arrivals: Vec<Duration>,
 }
 
@@ -57,7 +66,9 @@ impl AudioValidationAccumulator {
             stats: AudioValidationStats::default(),
             total_squared_amplitude: 0.0,
             total_samples: 0,
+            first_observed_at: None,
             last_observed_at: None,
+            last_packet_duration: None,
             inter_arrivals: Vec::new(),
         }
     }
@@ -91,6 +102,7 @@ impl AudioValidationAccumulator {
             )
         })?;
         let duration_ms = (frame_samples as u64) / 48;
+        let packet_duration = Duration::from_millis(duration_ms);
         let decoder = match channels {
             1 => self.mono_decoder.get_or_insert(
                 OpusDecoder::new(SAMPLE_RATE_HZ, 1)
@@ -137,7 +149,9 @@ impl AudioValidationAccumulator {
         self.stats.max_peak_amplitude = self.stats.max_peak_amplitude.max(packet_peak);
         self.stats.first_sequence.get_or_insert(packet.sequence);
         self.stats.last_sequence = Some(packet.sequence);
-        self.record_inter_arrival(observed_at);
+        self.first_observed_at.get_or_insert(observed_at);
+        self.record_inter_arrival(observed_at, packet_duration);
+        self.last_packet_duration = Some(packet_duration);
 
         self.total_squared_amplitude += packet_square_sum;
         self.total_samples += pcm.len();
@@ -145,19 +159,60 @@ impl AudioValidationAccumulator {
         Ok(self.stats())
     }
 
-    fn record_inter_arrival(&mut self, observed_at: Instant) {
+    fn record_inter_arrival(&mut self, observed_at: Instant, current_packet_duration: Duration) {
         if let Some(previous) = self.last_observed_at.replace(observed_at) {
             let interval = observed_at.saturating_duration_since(previous);
             if interval >= OBSERVER_GAP_THRESHOLD {
                 self.stats.rtp_gap_count_gte_100ms += 1;
+            }
+            if let Some(previous_duration) = self.last_packet_duration
+                && interval.saturating_add(FAST_INTERVAL_TOLERANCE) < previous_duration
+                && self.observed_fast_playback_ratio_exceeded(observed_at, current_packet_duration)
+            {
+                self.stats.rtp_fast_interval_count =
+                    self.stats.rtp_fast_interval_count.saturating_add(1);
+                let interval_ms = duration_ms(interval);
+                self.stats.rtp_fast_interval_min_ms = if self.stats.rtp_fast_interval_min_ms == 0 {
+                    interval_ms
+                } else {
+                    self.stats.rtp_fast_interval_min_ms.min(interval_ms)
+                };
             }
             self.inter_arrivals.push(interval);
             self.stats.rtp_inter_arrival = interval_stats(&self.inter_arrivals);
         }
     }
 
+    fn observed_fast_playback_ratio_exceeded(
+        &self,
+        observed_at: Instant,
+        current_packet_duration: Duration,
+    ) -> bool {
+        let Some(first_observed_at) = self.first_observed_at else {
+            return false;
+        };
+        let wall_clock_elapsed_ms = duration_ms(
+            observed_at.saturating_duration_since(first_observed_at) + current_packet_duration,
+        );
+        wall_clock_elapsed_ms >= FAST_PLAYBACK_MIN_OBSERVATION_MS
+            && media_to_wall_clock_ratio_ppm(self.stats.decoded_audio_ms, wall_clock_elapsed_ms)
+                > FAST_PLAYBACK_RATIO_PPM
+    }
+
     pub fn stats(&self) -> AudioValidationStats {
         let mut stats = self.stats.clone();
+        if let (Some(first_observed_at), Some(last_observed_at), Some(last_packet_duration)) = (
+            self.first_observed_at,
+            self.last_observed_at,
+            self.last_packet_duration,
+        ) {
+            stats.wall_clock_elapsed_ms = duration_ms(
+                last_observed_at.saturating_duration_since(first_observed_at)
+                    + last_packet_duration,
+            );
+            stats.decoded_audio_to_wall_clock_ratio_ppm =
+                media_to_wall_clock_ratio_ppm(stats.decoded_audio_ms, stats.wall_clock_elapsed_ms);
+        }
         stats.rms_amplitude = if self.total_samples == 0 {
             0.0
         } else {
@@ -168,6 +223,7 @@ impl AudioValidationAccumulator {
 
     pub fn reset_inter_arrival_baseline(&mut self) {
         self.last_observed_at = None;
+        self.last_packet_duration = None;
     }
 
     pub fn into_stats(self) -> Result<AudioValidationStats> {
@@ -218,6 +274,16 @@ fn percentile_duration(sorted: &[Duration], percentile: usize) -> Duration {
 
 fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn media_to_wall_clock_ratio_ppm(media_duration_ms: u64, wall_clock_elapsed_ms: u64) -> u64 {
+    if media_duration_ms == 0 || wall_clock_elapsed_ms == 0 {
+        return 0;
+    }
+
+    ((u128::from(media_duration_ms) * 1_000_000) / u128::from(wall_clock_elapsed_ms))
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 fn opus_packet_frame_samples(packet: &[u8]) -> Option<usize> {

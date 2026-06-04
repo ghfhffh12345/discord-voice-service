@@ -7,7 +7,7 @@ use discord_voice_service_playback::media::opus_queue::{
     OpusBufferDepth, OpusFrame, OpusFrameQueue,
 };
 use discord_voice_service_playback::media::position::SharedPlaybackPosition;
-use discord_voice_service_playback::pacer::{AudioPacer, FRAME_DURATION};
+use discord_voice_service_playback::pacer::{AudioPacer, FRAME_DURATION, PacedPacketKind};
 use discord_voice_service_playback::recovery::PlaybackRecoveryMetrics;
 use discord_voice_service_playback::source::PlaybackSource;
 use discord_voice_service_playback::{PlaybackError, PlaybackWorker};
@@ -164,6 +164,7 @@ struct SenderSentMetric {
     non_send_work_duration: Duration,
     gateway_drain: VoiceGatewayDrainReport,
     media_clock_reset: bool,
+    tempo_rebased: bool,
     remaining_depth: OpusBufferDepth,
 }
 
@@ -591,6 +592,15 @@ impl VoiceSessionRuntime {
             rtp_interval_p99_ms = snapshot.track_interval.p99_ms,
             rtp_interval_min_ms = snapshot.track_interval.min_ms,
             rtp_interval_max_ms = snapshot.track_interval.max_ms,
+            track_media_duration_sent_ms = snapshot.track_media_duration_sent_ms,
+            track_wall_clock_elapsed_ms = snapshot.track_wall_clock_elapsed_ms,
+            track_media_to_wall_clock_ratio_ppm =
+                snapshot.track_media_to_wall_clock_ratio_ppm,
+            track_fast_interval_count = snapshot.track_fast_interval_count,
+            track_fast_interval_min_ms = snapshot.track_fast_interval_min_ms,
+            skipped_source_frame_count = snapshot.skipped_source_frame_count,
+            skipped_source_duration_ms = snapshot.skipped_source_duration_ms,
+            tempo_rebase_count = snapshot.tempo_rebase_count,
             sender_lateness_p50_ms = snapshot.sender_lateness.p50_ms,
             sender_lateness_p95_ms = snapshot.sender_lateness.p95_ms,
             sender_lateness_p99_ms = snapshot.sender_lateness.p99_ms,
@@ -927,6 +937,8 @@ impl VoiceSessionRuntime {
                                     sent.expected_deadline,
                                     sent.send_started_at,
                                     sent.sent_at,
+                                    sent.duration_ms,
+                                    sent.tempo_rebased,
                                 );
                                 update_adaptive_buffer_target_from_lateness(
                                     &mut buffer_policy,
@@ -1909,7 +1921,12 @@ impl LiveMediaDriver {
             self.session.send_current_slot_packet(packet).await?;
             let sent_at = Instant::now();
             let send_duration = sent_at.saturating_duration_since(send_started_at);
-            let media_clock_reset = pacer.mark_sent(expected_deadline, frame_duration, sent_at);
+            let pacer_mark = pacer.mark_sent(
+                PacedPacketKind::Track,
+                expected_deadline,
+                frame_duration,
+                sent_at,
+            );
 
             let _ =
                 self.metrics_tx
@@ -1923,7 +1940,8 @@ impl LiveMediaDriver {
                         send_duration,
                         non_send_work_duration,
                         gateway_drain,
-                        media_clock_reset,
+                        media_clock_reset: pacer_mark.media_clock_reset,
+                        tempo_rebased: pacer_mark.tempo_rebased,
                         remaining_depth,
                     }));
             packet_index = packet_index.saturating_add(1);

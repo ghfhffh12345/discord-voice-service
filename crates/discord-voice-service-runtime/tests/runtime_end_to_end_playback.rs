@@ -25,6 +25,9 @@ use tonic::Request;
 
 const SERVICE_USER_ID: &str = "1111111111111111";
 const LATE_LISTENER_USER_ID: &str = "7777777777777777";
+const TRACK_FRAME_DURATION: Duration = Duration::from_millis(20);
+const MIN_STEADY_TRACK_INTERVAL: Duration = Duration::from_millis(18);
+const MAX_MEDIA_TO_WALL_CLOCK_RATIO_PPM: u64 = 1_020_000;
 #[tokio::test]
 async fn runtime_end_to_end_playback_join_voice_then_play_reaches_connected_runtime_playback_path()
 {
@@ -284,8 +287,12 @@ async fn runtime_end_to_end_playback_packets_hold_near_20ms_cadence_without_refi
     );
 
     assert!(
-        stats.min >= Duration::from_millis(10),
-        "normal playback should not burst packets together: {stats:?}"
+        stats.min >= MIN_STEADY_TRACK_INTERVAL,
+        "normal playback should not emit 20ms frames faster than media time: {stats:?}"
+    );
+    assert!(
+        stats.p50 >= MIN_STEADY_TRACK_INTERVAL,
+        "normal playback median interval should remain at media cadence: {stats:?}"
     );
     assert!(
         stats.p95 <= Duration::from_millis(45),
@@ -298,6 +305,12 @@ async fn runtime_end_to_end_playback_packets_hold_near_20ms_cadence_without_refi
     assert!(
         stats.max < Duration::from_millis(100),
         "normal playback must not have a perceptible >=100ms interval: {stats:?}"
+    );
+    let observed_wall_clock =
+        timestamps[49].saturating_duration_since(timestamps[0]) + TRACK_FRAME_DURATION;
+    assert!(
+        observed_wall_clock >= Duration::from_millis(980),
+        "50 consecutive 20ms packets must occupy about one second of wall time: wall={observed_wall_clock:?}; stats={stats:?}"
     );
 
     let packets = fake_voice.audio_packets_at_least(50).await;
@@ -326,9 +339,24 @@ async fn runtime_end_to_end_playback_packets_hold_near_20ms_cadence_without_refi
     assert!(metrics.track_packet_count >= 50);
     assert!(metrics.track_interval.samples >= 49);
     assert!(
-        metrics.track_interval.min_ms >= 10,
-        "runtime metrics should detect packet bursts: {metrics:?}"
+        metrics.track_interval.min_ms >= 18,
+        "runtime metrics should detect fast track intervals: {metrics:?}"
     );
+    assert!(
+        metrics.track_media_duration_sent_ms >= 1_000,
+        "runtime metrics should report sent track media duration: {metrics:?}"
+    );
+    assert!(
+        metrics.track_wall_clock_elapsed_ms >= 980,
+        "runtime metrics should report near-real-time wall-clock duration: {metrics:?}"
+    );
+    assert!(
+        metrics.track_media_to_wall_clock_ratio_ppm <= MAX_MEDIA_TO_WALL_CLOCK_RATIO_PPM,
+        "runtime metrics must reject faster-than-real-time playback: {metrics:?}"
+    );
+    assert_eq!(metrics.track_fast_interval_count, 0);
+    assert_eq!(metrics.skipped_source_frame_count, 0);
+    assert_eq!(metrics.skipped_source_duration_ms, 0);
     assert!(
         metrics.track_interval.p95_ms <= 45,
         "runtime metrics p95 should stay near cadence: {metrics:?}"
@@ -396,7 +424,7 @@ async fn runtime_end_to_end_playback_does_not_burst_under_jittery_http_and_cpu_c
         "audio-long.webm",
         8 * 1024,
         Duration::from_millis(2),
-        Duration::from_millis(8),
+        Duration::from_millis(4 * 2),
     )
     .await;
     fake_yt.set_playable_url(http.url()).await;
@@ -441,6 +469,10 @@ async fn runtime_end_to_end_playback_does_not_burst_under_jittery_http_and_cpu_c
     eprintln!("stress playback cadence: {stats:?}");
 
     assert!(
+        stats.min >= MIN_STEADY_TRACK_INTERVAL,
+        "stress playback must not emit 20ms frames faster than media time: {stats:?}"
+    );
+    assert!(
         stats.p95 <= Duration::from_millis(45),
         "stress playback p95 should stay bounded under CPU and HTTP jitter: {stats:?}"
     );
@@ -478,9 +510,16 @@ async fn runtime_end_to_end_playback_does_not_burst_under_jittery_http_and_cpu_c
     eprintln!("stress playback metrics: {metrics:?}");
     assert!(metrics.track_packet_count >= 80);
     assert!(
-        metrics.track_interval.min_ms >= 15,
+        metrics.track_interval.min_ms >= 18,
         "stress metrics must not show catch-up bursts: {metrics:?}"
     );
+    assert!(
+        metrics.track_media_to_wall_clock_ratio_ppm <= MAX_MEDIA_TO_WALL_CLOCK_RATIO_PPM,
+        "stress metrics must reject faster-than-real-time playback: {metrics:?}"
+    );
+    assert_eq!(metrics.track_fast_interval_count, 0);
+    assert_eq!(metrics.skipped_source_frame_count, 0);
+    assert_eq!(metrics.skipped_source_duration_ms, 0);
     assert!(
         metrics.track_interval.p95_ms <= 45,
         "stress metrics p95 should stay bounded: {metrics:?}"
@@ -590,12 +629,12 @@ async fn runtime_end_to_end_playback_repeated_send_delay_keeps_twenty_ms_output_
     let stats = interval_stats(&intervals);
     eprintln!("repeated delayed-send cadence: {stats:?}");
     assert!(
-        stats.p50 <= Duration::from_millis(23),
-        "repeated 5ms send-path delay must not stretch cadence toward 25ms: {stats:?}"
+        stats.min >= MIN_STEADY_TRACK_INTERVAL,
+        "repeated 5ms send-path delay must not trigger fast catch-up intervals: {stats:?}"
     );
     assert!(
         stats.p95 <= Duration::from_millis(35),
-        "repeated 5ms send-path delay should keep p95 near cadence: {stats:?}"
+        "repeated 5ms send-path delay should remain bounded while preserving tempo: {stats:?}"
     );
     assert!(
         stats.max < Duration::from_millis(100),
@@ -611,8 +650,17 @@ async fn runtime_end_to_end_playback_repeated_send_delay_keeps_twenty_ms_output_
         .await
         .expect("playback should publish stability metrics");
     assert!(
-        metrics.track_interval.p50_ms <= 23,
-        "metrics must show scheduled-clock cadence despite repeated send delay: {metrics:?}"
+        metrics.track_interval.min_ms >= 18,
+        "metrics must reject catch-up bursts despite repeated send delay: {metrics:?}"
+    );
+    assert_eq!(metrics.track_fast_interval_count, 0);
+    assert!(
+        metrics.track_media_to_wall_clock_ratio_ppm <= MAX_MEDIA_TO_WALL_CLOCK_RATIO_PPM,
+        "metrics must reject faster-than-real-time playback under repeated send delay: {metrics:?}"
+    );
+    assert!(
+        metrics.tempo_rebase_count > 0,
+        "repeated injected send delay should be observable as tempo rebases: {metrics:?}"
     );
     assert_eq!(metrics.scheduler_late_reset_count, 0);
     assert_eq!(metrics.controlled_media_interruption_count, 0);
@@ -683,7 +731,7 @@ async fn runtime_end_to_end_playback_media_driver_does_not_burst_after_pause_or_
         "the hook must create a genuinely late media tick: {delayed_interval:?}; stats={stats:?}"
     );
     assert!(
-        post_delay_interval >= Duration::from_millis(10),
+        post_delay_interval >= MIN_STEADY_TRACK_INTERVAL,
         "late media tick recovery must not catch up with a burst: {post_delay_interval:?}; stats={stats:?}"
     );
     assert!(
@@ -691,7 +739,7 @@ async fn runtime_end_to_end_playback_media_driver_does_not_burst_after_pause_or_
         "late media tick recovery should resume near cadence: {post_delay_interval:?}; stats={stats:?}"
     );
     assert!(
-        stats.min >= Duration::from_millis(10),
+        stats.min >= MIN_STEADY_TRACK_INTERVAL,
         "late media tick recovery must not burst packets together: {stats:?}"
     );
 
@@ -707,7 +755,12 @@ async fn runtime_end_to_end_playback_media_driver_does_not_burst_after_pause_or_
         metrics.playout_sender_lateness.max_ms >= 250,
         "metrics should observe the injected late media tick: {metrics:?}"
     );
-    assert!(metrics.track_interval.min_ms >= 10);
+    assert!(metrics.track_interval.min_ms >= 18);
+    assert_eq!(metrics.track_fast_interval_count, 0);
+    assert!(
+        metrics.track_media_to_wall_clock_ratio_ppm <= MAX_MEDIA_TO_WALL_CLOCK_RATIO_PPM,
+        "late recovery must not run media faster than wall clock: {metrics:?}"
+    );
     assert_eq!(metrics.playout_underrun_count, 0);
     assert_eq!(metrics.source_underrun_count, 0);
     assert_eq!(metrics.sender_forbidden_work_count, 0);
@@ -971,7 +1024,7 @@ async fn runtime_end_to_end_playback_pause_resume_without_voice_context_refresh_
     let resumed_stats = interval_stats(&resumed_intervals);
     eprintln!("pause/resume cadence: {resumed_stats:?}");
     assert!(
-        resumed_stats.min >= Duration::from_millis(10),
+        resumed_stats.min >= MIN_STEADY_TRACK_INTERVAL,
         "resume should not burst non-silence packets together: {resumed_stats:?}"
     );
     assert!(
@@ -993,7 +1046,7 @@ async fn runtime_end_to_end_playback_pause_resume_without_voice_context_refresh_
         metrics
             .pause_resume_first_intervals_ms
             .iter()
-            .all(|interval_ms| *interval_ms >= 10),
+            .all(|interval_ms| *interval_ms >= 18),
         "resume metrics should not show burst intervals: {metrics:?}"
     );
     assert_eq!(metrics.buffer_underrun_count, 0);

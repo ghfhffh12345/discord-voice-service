@@ -8,6 +8,7 @@ use tokio::time::Instant;
 
 const FIRST_INTERVAL_SAMPLE_LIMIT: usize = 10;
 const LATE_PACKET_THRESHOLD: Duration = Duration::from_millis(5);
+const TRACK_FAST_INTERVAL_TOLERANCE: Duration = Duration::from_millis(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DurationStatsSnapshot {
@@ -83,6 +84,14 @@ pub struct PlaybackStabilitySnapshot {
     pub continuity_silence_packet_count: usize,
     pub inserted_silence_duration_ms: u64,
     pub track_interval: DurationStatsSnapshot,
+    pub track_media_duration_sent_ms: u64,
+    pub track_wall_clock_elapsed_ms: u64,
+    pub track_media_to_wall_clock_ratio_ppm: u64,
+    pub track_fast_interval_count: u64,
+    pub track_fast_interval_min_ms: u64,
+    pub skipped_source_frame_count: u64,
+    pub skipped_source_duration_ms: u64,
+    pub tempo_rebase_count: u64,
     pub all_packet_interval: DurationStatsSnapshot,
     pub sender_lateness: DurationStatsSnapshot,
     pub max_consecutive_late_packets: usize,
@@ -174,7 +183,9 @@ pub(crate) struct PlaybackStabilityCollector {
     sender_lateness: Vec<Duration>,
     refill_durations: Vec<Duration>,
     producer_stall_durations: Vec<Duration>,
+    first_track_send_at: Option<Instant>,
     last_track_send_at: Option<Instant>,
+    last_track_duration: Option<Duration>,
     last_any_send_at: Option<Instant>,
     last_producer_sample_at: Option<Instant>,
     max_producer_lag: Duration,
@@ -224,6 +235,12 @@ pub(crate) struct PlaybackStabilityCollector {
     dave_transition_count_during_playback: u64,
     stale_dave_send_prevented_count: u64,
     controlled_media_interruption_count: u64,
+    track_media_duration_sent_ms: u64,
+    track_fast_interval_count: u64,
+    track_fast_interval_min: Option<Duration>,
+    skipped_source_frame_count: u64,
+    skipped_source_duration_ms: u64,
+    tempo_rebase_count: u64,
     media_clock_reset_count: u64,
     scheduler_late_reset_count: u64,
     source_underrun_reset_count: u64,
@@ -256,7 +273,9 @@ impl PlaybackStabilityCollector {
             sender_lateness: Vec::new(),
             refill_durations: Vec::new(),
             producer_stall_durations: Vec::new(),
+            first_track_send_at: None,
             last_track_send_at: None,
+            last_track_duration: None,
             last_any_send_at: None,
             last_producer_sample_at: None,
             max_producer_lag: Duration::ZERO,
@@ -306,6 +325,12 @@ impl PlaybackStabilityCollector {
             dave_transition_count_during_playback: 0,
             stale_dave_send_prevented_count: 0,
             controlled_media_interruption_count: 0,
+            track_media_duration_sent_ms: 0,
+            track_fast_interval_count: 0,
+            track_fast_interval_min: None,
+            skipped_source_frame_count: 0,
+            skipped_source_duration_ms: 0,
+            tempo_rebase_count: 0,
             media_clock_reset_count: 0,
             scheduler_late_reset_count: 0,
             source_underrun_reset_count: 0,
@@ -441,6 +466,7 @@ impl PlaybackStabilityCollector {
 
     pub(crate) fn record_resumed_from_pause(&mut self) {
         self.last_track_send_at = None;
+        self.last_track_duration = None;
         self.last_any_send_at = None;
         self.pause_resume_intervals_remaining = FIRST_INTERVAL_SAMPLE_LIMIT;
         self.pause_resume_first_intervals_ms.clear();
@@ -451,7 +477,18 @@ impl PlaybackStabilityCollector {
         expected_deadline: Instant,
         send_started_at: Instant,
         sent_at: Instant,
+        duration_ms: u64,
+        tempo_rebased: bool,
     ) {
+        let frame_duration = Duration::from_millis(duration_ms);
+        self.first_track_send_at.get_or_insert(sent_at);
+        self.track_media_duration_sent_ms = self
+            .track_media_duration_sent_ms
+            .saturating_add(duration_ms);
+        if tempo_rebased {
+            self.tempo_rebase_count = self.tempo_rebase_count.saturating_add(1);
+        }
+
         let lateness = send_started_at
             .checked_duration_since(expected_deadline)
             .unwrap_or(Duration::ZERO);
@@ -477,6 +514,15 @@ impl PlaybackStabilityCollector {
         if let Some(previous) = self.last_track_send_at.replace(sent_at) {
             let interval = sent_at.saturating_duration_since(previous);
             self.track_intervals.push(interval);
+            if let Some(previous_duration) = self.last_track_duration
+                && interval.saturating_add(TRACK_FAST_INTERVAL_TOLERANCE) < previous_duration
+            {
+                self.track_fast_interval_count = self.track_fast_interval_count.saturating_add(1);
+                self.track_fast_interval_min = Some(
+                    self.track_fast_interval_min
+                        .map_or(interval, |current| current.min(interval)),
+                );
+            }
 
             if self.pause_resume_intervals_remaining > 0 {
                 self.pause_resume_first_intervals_ms
@@ -494,6 +540,7 @@ impl PlaybackStabilityCollector {
                 self.post_rebuffer_intervals_remaining -= 1;
             }
         }
+        self.last_track_duration = Some(frame_duration);
 
         self.record_any_packet(sent_at);
         self.track_packet_count = self.track_packet_count.saturating_add(1);
@@ -508,11 +555,30 @@ impl PlaybackStabilityCollector {
         self.record_any_packet(sent_at);
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn record_skipped_source_frames(&mut self, frame_count: u64, duration_ms: u64) {
+        self.skipped_source_frame_count =
+            self.skipped_source_frame_count.saturating_add(frame_count);
+        self.skipped_source_duration_ms =
+            self.skipped_source_duration_ms.saturating_add(duration_ms);
+    }
+
     fn record_any_packet(&mut self, sent_at: Instant) {
         if let Some(previous) = self.last_any_send_at.replace(sent_at) {
             self.all_packet_intervals
                 .push(sent_at.saturating_duration_since(previous));
         }
+    }
+
+    fn track_wall_clock_elapsed_ms(&self) -> u64 {
+        let Some(first_sent_at) = self.first_track_send_at else {
+            return 0;
+        };
+        let Some(last_sent_at) = self.last_track_send_at else {
+            return 0;
+        };
+        let last_duration = self.last_track_duration.unwrap_or(Duration::ZERO);
+        duration_millis(last_sent_at.saturating_duration_since(first_sent_at) + last_duration)
     }
 
     pub(crate) fn snapshot(
@@ -522,6 +588,11 @@ impl PlaybackStabilityCollector {
         reconnect_interruptions: u64,
         ended: bool,
     ) -> PlaybackStabilitySnapshot {
+        let track_wall_clock_elapsed_ms = self.track_wall_clock_elapsed_ms();
+        let track_media_to_wall_clock_ratio_ppm = media_to_wall_clock_ratio_ppm(
+            self.track_media_duration_sent_ms,
+            track_wall_clock_elapsed_ms,
+        );
         PlaybackStabilitySnapshot {
             playback_epoch: self.playback_epoch,
             video_id: Some(self.video_id.clone()),
@@ -530,6 +601,14 @@ impl PlaybackStabilityCollector {
             continuity_silence_packet_count: self.continuity_silence_packet_count,
             inserted_silence_duration_ms: self.inserted_silence_duration_ms,
             track_interval: DurationStatsSnapshot::from_samples(&self.track_intervals),
+            track_media_duration_sent_ms: self.track_media_duration_sent_ms,
+            track_wall_clock_elapsed_ms,
+            track_media_to_wall_clock_ratio_ppm,
+            track_fast_interval_count: self.track_fast_interval_count,
+            track_fast_interval_min_ms: self.track_fast_interval_min.map_or(0, duration_millis),
+            skipped_source_frame_count: self.skipped_source_frame_count,
+            skipped_source_duration_ms: self.skipped_source_duration_ms,
+            tempo_rebase_count: self.tempo_rebase_count,
             all_packet_interval: DurationStatsSnapshot::from_samples(&self.all_packet_intervals),
             sender_lateness: DurationStatsSnapshot::from_samples(&self.sender_lateness),
             max_consecutive_late_packets: self.max_consecutive_late_packets,
@@ -635,4 +714,14 @@ fn percentile_duration(sorted: &[Duration], percentile: usize) -> Duration {
 
 fn duration_millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn media_to_wall_clock_ratio_ppm(media_duration_ms: u64, wall_clock_elapsed_ms: u64) -> u64 {
+    if media_duration_ms == 0 || wall_clock_elapsed_ms == 0 {
+        return 0;
+    }
+
+    ((u128::from(media_duration_ms) * 1_000_000) / u128::from(wall_clock_elapsed_ms))
+        .try_into()
+        .unwrap_or(u64::MAX)
 }

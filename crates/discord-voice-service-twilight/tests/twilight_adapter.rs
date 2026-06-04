@@ -206,6 +206,14 @@ fn proto_playback_metrics_convert_to_typed_snapshot() {
             min_ms: 18,
             max_ms: 40,
         }),
+        track_media_duration_sent_ms: 1200,
+        track_wall_clock_elapsed_ms: 1200,
+        track_media_to_wall_clock_ratio_ppm: 1_000_000,
+        track_fast_interval_count: 0,
+        track_fast_interval_min_ms: 0,
+        skipped_source_frame_count: 0,
+        skipped_source_duration_ms: 0,
+        tempo_rebase_count: 2,
         all_packet_interval: Some(proto::DurationStatsSnapshot {
             samples: 60,
             p50_ms: 20,
@@ -367,6 +375,14 @@ fn proto_playback_metrics_convert_to_typed_snapshot() {
     assert_eq!(snapshot.continuity_silence_packet_count, 1);
     assert_eq!(snapshot.inserted_silence_duration_ms, 20);
     assert_eq!(snapshot.track_interval.p95_ms, 24);
+    assert_eq!(snapshot.track_media_duration_sent_ms, 1200);
+    assert_eq!(snapshot.track_wall_clock_elapsed_ms, 1200);
+    assert_eq!(snapshot.track_media_to_wall_clock_ratio_ppm, 1_000_000);
+    assert_eq!(snapshot.track_fast_interval_count, 0);
+    assert_eq!(snapshot.track_fast_interval_min_ms, 0);
+    assert_eq!(snapshot.skipped_source_frame_count, 0);
+    assert_eq!(snapshot.skipped_source_duration_ms, 0);
+    assert_eq!(snapshot.tempo_rebase_count, 2);
     assert_eq!(snapshot.all_packet_interval.samples, 60);
     assert_eq!(snapshot.sender_lateness.p99_ms, 8);
     assert_eq!(snapshot.current_buffer_depth.duration_samples, 7680);

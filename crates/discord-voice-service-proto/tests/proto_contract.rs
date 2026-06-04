@@ -51,6 +51,14 @@ fn generated_control_messages_expose_expected_fields() {
             min_ms: 19,
             max_ms: 28,
         }),
+        track_media_duration_sent_ms: 1_000,
+        track_wall_clock_elapsed_ms: 1_000,
+        track_media_to_wall_clock_ratio_ppm: 1_000_000,
+        track_fast_interval_count: 0,
+        track_fast_interval_min_ms: 0,
+        skipped_source_frame_count: 0,
+        skipped_source_duration_ms: 0,
+        tempo_rebase_count: 0,
         current_buffer_depth: Some(PlaybackBufferDepthSnapshot {
             packets: 10,
             bytes: 4096,
@@ -99,6 +107,10 @@ fn generated_control_messages_expose_expected_fields() {
     };
     assert!(metrics.available);
     assert_eq!(metrics.track_interval.as_ref().unwrap().p95_ms, 22);
+    assert_eq!(metrics.track_media_duration_sent_ms, 1_000);
+    assert_eq!(metrics.track_wall_clock_elapsed_ms, 1_000);
+    assert_eq!(metrics.track_media_to_wall_clock_ratio_ppm, 1_000_000);
+    assert_eq!(metrics.track_fast_interval_count, 0);
     assert_eq!(
         metrics
             .current_buffer_depth
@@ -191,6 +203,14 @@ fn control_proto_exposes_update_voice_context_and_reason_codes() {
     assert!(proto.contains("uint64 source_underrun_reset_count = 64;"));
     assert!(proto.contains("uint64 pause_resume_reset_count = 65;"));
     assert!(proto.contains("uint64 dave_transition_recovery_reset_count = 66;"));
+    assert!(proto.contains("uint64 track_media_duration_sent_ms = 67;"));
+    assert!(proto.contains("uint64 track_wall_clock_elapsed_ms = 68;"));
+    assert!(proto.contains("uint64 track_media_to_wall_clock_ratio_ppm = 69;"));
+    assert!(proto.contains("uint64 track_fast_interval_count = 70;"));
+    assert!(proto.contains("uint64 track_fast_interval_min_ms = 71;"));
+    assert!(proto.contains("uint64 skipped_source_frame_count = 72;"));
+    assert!(proto.contains("uint64 skipped_source_duration_ms = 73;"));
+    assert!(proto.contains("uint64 tempo_rebase_count = 74;"));
     assert!(proto.contains("VOICE_RECONNECTING"));
     for reason in [
         "SESSION_EVENT_REASON_UNSPECIFIED",

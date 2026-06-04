@@ -132,6 +132,14 @@ message PlaybackStabilitySnapshot {
   uint64 source_underrun_reset_count = 64;
   uint64 pause_resume_reset_count = 65;
   uint64 dave_transition_recovery_reset_count = 66;
+  uint64 track_media_duration_sent_ms = 67;
+  uint64 track_wall_clock_elapsed_ms = 68;
+  uint64 track_media_to_wall_clock_ratio_ppm = 69;
+  uint64 track_fast_interval_count = 70;
+  uint64 track_fast_interval_min_ms = 71;
+  uint64 skipped_source_frame_count = 72;
+  uint64 skipped_source_duration_ms = 73;
+  uint64 tempo_rebase_count = 74;
 }
 
 enum SessionEventKind {
