@@ -1,4 +1,5 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use tokio::net::UdpSocket;
@@ -14,8 +15,16 @@ pub struct DiscoveredUdpAddress {
     pub port: u16,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedVoicePacket {
+    pub bytes: Bytes,
+    pub duration_ms: u64,
+    pub duration_samples: u32,
+    pub is_track: bool,
+}
+
 pub struct VoiceUdpTransport {
-    socket: UdpSocket,
+    socket: Arc<UdpSocket>,
     server: SocketAddr,
     packet_builder: RtpPacketBuilder,
     sequence: RtpSequenceState,
@@ -42,7 +51,7 @@ impl VoiceUdpTransport {
         );
 
         Ok(Self {
-            socket,
+            socket: Arc::new(socket),
             server,
             packet_builder: RtpPacketBuilder::new(ssrc),
             sequence: RtpSequenceState::new(),
@@ -97,6 +106,22 @@ impl VoiceUdpTransport {
         frame: Bytes,
         duration_samples: u32,
     ) -> Result<(), VoiceError> {
+        let packet = self.prepare_audio_packet_with_duration_samples(
+            frame,
+            duration_ms_from_samples(duration_samples),
+            duration_samples,
+            true,
+        )?;
+        self.send_prepared_packet(&packet).await
+    }
+
+    pub fn prepare_audio_packet_with_duration_samples(
+        &mut self,
+        frame: Bytes,
+        duration_ms: u64,
+        duration_samples: u32,
+        is_track: bool,
+    ) -> Result<PreparedVoicePacket, VoiceError> {
         if duration_samples == 0 {
             return Err(VoiceError::InvalidState(
                 "voice audio frame duration invalid",
@@ -113,11 +138,29 @@ impl VoiceUdpTransport {
                 packet
             }
         };
-        self.socket.send_to(&packet, self.server).await?;
+        Ok(PreparedVoicePacket {
+            bytes: Bytes::from(packet),
+            duration_ms,
+            duration_samples,
+            is_track,
+        })
+    }
+
+    pub async fn send_prepared_packet(
+        &self,
+        packet: &PreparedVoicePacket,
+    ) -> Result<(), VoiceError> {
+        self.socket
+            .send_to(packet.bytes.as_ref(), self.server)
+            .await?;
         Ok(())
     }
 
     pub async fn stop_audio(&mut self) -> Result<(), VoiceError> {
         crate::speaking::send_stop_silence(self).await
     }
+}
+
+fn duration_ms_from_samples(duration_samples: u32) -> u64 {
+    u64::from(duration_samples).saturating_mul(1_000) / 48_000
 }

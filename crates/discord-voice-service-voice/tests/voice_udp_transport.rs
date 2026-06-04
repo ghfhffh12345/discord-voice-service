@@ -6,7 +6,7 @@ use discord_voice_service_voice::VoiceError;
 use discord_voice_service_voice::crypto::{EncryptionMode, choose_mode};
 use discord_voice_service_voice::test_support::{
     OPUS_SILENCE_FRAME, VoiceGatewayClient, VoiceUdpTransport, build_ip_discovery_packet,
-    discover_ip, parse_ip_discovery_response, send_speaking,
+    discover_ip, parse_ip_discovery_response, parse_rtp_header, send_speaking,
 };
 use futures::StreamExt;
 use serde_json::Value;
@@ -28,6 +28,7 @@ struct FakeUdpPeer {
     advertised_port: u16,
     discovery_count: Arc<Mutex<usize>>,
     silence_frame_count: Arc<Mutex<usize>>,
+    audio_packets: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
 impl FakeUdpPeer {
@@ -42,8 +43,10 @@ impl FakeUdpPeer {
         let advertised_port: u16 = 54_321;
         let discovery_count = Arc::new(Mutex::new(0usize));
         let silence_frame_count = Arc::new(Mutex::new(0usize));
+        let audio_packets = Arc::new(Mutex::new(Vec::new()));
         let discovery_count_state = Arc::clone(&discovery_count);
         let silence_frame_count_state = Arc::clone(&silence_frame_count);
+        let audio_packets_state = Arc::clone(&audio_packets);
         let advertised_ip_state = advertised_ip.clone();
 
         tokio::spawn(async move {
@@ -80,6 +83,9 @@ impl FakeUdpPeer {
                 if packet.ends_with(&OPUS_SILENCE_FRAME) {
                     *silence_frame_count_state.lock().await += 1;
                 }
+                if packet.len() >= 12 {
+                    audio_packets_state.lock().await.push(packet.to_vec());
+                }
             }
         });
 
@@ -89,6 +95,7 @@ impl FakeUdpPeer {
             advertised_port,
             discovery_count,
             silence_frame_count,
+            audio_packets,
         }
     }
 
@@ -102,6 +109,14 @@ impl FakeUdpPeer {
 
     async fn discovery_count(&self) -> usize {
         wait_for_value(&self.discovery_count, |count| *count >= 1).await
+    }
+
+    async fn audio_packets(&self, minimum: usize) -> Vec<Vec<u8>> {
+        wait_for_value(&self.audio_packets, |packets| packets.len() >= minimum).await
+    }
+
+    async fn audio_packet_count_now(&self) -> usize {
+        self.audio_packets.lock().await.len()
     }
 
     fn advertised_ip(&self) -> &str {
@@ -281,6 +296,91 @@ where
 }
 
 #[tokio::test]
+async fn voice_udp_transport_prepares_packet_without_sending() {
+    let fake = FakeUdpPeer::spawn().await;
+    let mut transport = VoiceUdpTransport::connect(fake.addr(), 77).await.unwrap();
+
+    let packet = transport
+        .prepare_audio_packet_with_duration_samples(Bytes::from_static(b"opus-a"), 20, 960, true)
+        .unwrap();
+
+    assert_eq!(packet.duration_ms, 20);
+    assert_eq!(packet.duration_samples, 960);
+    assert!(packet.is_track);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(fake.audio_packet_count_now().await, 0);
+}
+
+#[tokio::test]
+async fn voice_udp_transport_sends_prepared_packet() {
+    let fake = FakeUdpPeer::spawn().await;
+    let mut transport = VoiceUdpTransport::connect(fake.addr(), 77).await.unwrap();
+    let packet = transport
+        .prepare_audio_packet_with_duration_samples(Bytes::from_static(b"opus-a"), 20, 960, true)
+        .unwrap();
+
+    transport.send_prepared_packet(&packet).await.unwrap();
+
+    let packets = fake.audio_packets(1).await;
+    assert_eq!(packets.len(), 1);
+    assert_eq!(packets[0], packet.bytes.as_ref());
+}
+
+#[tokio::test]
+async fn prepared_packets_preserve_rtp_duration_timestamps() {
+    let fake = FakeUdpPeer::spawn().await;
+    let mut transport = VoiceUdpTransport::connect(fake.addr(), 77).await.unwrap();
+
+    let packets = [
+        transport
+            .prepare_audio_packet_with_duration_samples(
+                Bytes::from_static(b"opus-a"),
+                20,
+                960,
+                true,
+            )
+            .unwrap(),
+        transport
+            .prepare_audio_packet_with_duration_samples(
+                Bytes::from_static(b"opus-b"),
+                40,
+                1_920,
+                true,
+            )
+            .unwrap(),
+        transport
+            .prepare_audio_packet_with_duration_samples(
+                Bytes::from_static(b"opus-c"),
+                60,
+                2_880,
+                true,
+            )
+            .unwrap(),
+    ];
+    let headers = packets
+        .iter()
+        .map(|packet| parse_rtp_header(&packet.bytes).unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        headers
+            .iter()
+            .map(|header| header.sequence)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+    assert_eq!(
+        headers
+            .iter()
+            .map(|header| header.timestamp)
+            .collect::<Vec<_>>(),
+        vec![0, 960, 2_880]
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(fake.audio_packet_count_now().await, 0);
+}
+
+#[tokio::test]
 async fn voice_udp_transport_stop_sends_five_opus_silence_frames() {
     let fake = FakeUdpPeer::spawn().await;
     let mut transport = VoiceUdpTransport::connect(fake.addr(), 77).await.unwrap();
@@ -288,6 +388,46 @@ async fn voice_udp_transport_stop_sends_five_opus_silence_frames() {
     transport.stop_audio().await.unwrap();
 
     assert_eq!(fake.silence_frame_count().await, 5);
+}
+
+#[tokio::test]
+async fn voice_udp_transport_advances_rtp_timestamps_by_opus_duration_samples() {
+    let fake = FakeUdpPeer::spawn().await;
+    let mut transport = VoiceUdpTransport::connect(fake.addr(), 77).await.unwrap();
+
+    transport
+        .send_audio_frame_with_duration_samples(Bytes::from_static(b"opus-a"), 960)
+        .await
+        .unwrap();
+    transport
+        .send_audio_frame_with_duration_samples(Bytes::from_static(b"opus-b"), 1_920)
+        .await
+        .unwrap();
+    transport
+        .send_audio_frame_with_duration_samples(Bytes::from_static(b"opus-c"), 2_880)
+        .await
+        .unwrap();
+
+    let packets = fake.audio_packets(3).await;
+    let headers = packets
+        .iter()
+        .map(|packet| parse_rtp_header(packet).unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        headers
+            .iter()
+            .map(|header| header.sequence)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+    assert_eq!(
+        headers
+            .iter()
+            .map(|header| header.timestamp)
+            .collect::<Vec<_>>(),
+        vec![0, 960, 2_880]
+    );
 }
 
 #[tokio::test]

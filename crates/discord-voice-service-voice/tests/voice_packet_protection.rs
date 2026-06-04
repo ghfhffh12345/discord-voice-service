@@ -76,6 +76,46 @@ impl FakeUdpPeer {
 }
 
 #[tokio::test]
+async fn prepared_packet_protection_matches_legacy_send() {
+    let legacy_fake = FakeUdpPeer::spawn().await;
+    let prepared_fake = FakeUdpPeer::spawn().await;
+    let mut legacy =
+        VoiceUdpTransport::connect_protected(legacy_fake.server_addr(), 7, xchacha_test_context())
+            .await
+            .unwrap();
+    let mut prepared = VoiceUdpTransport::connect_protected(
+        prepared_fake.server_addr(),
+        7,
+        xchacha_test_context(),
+    )
+    .await
+    .unwrap();
+    let payload = Bytes::from_static(b"opus-frame");
+
+    legacy.send_audio_frame(payload.clone()).await.unwrap();
+    let prepared_packet = prepared
+        .prepare_audio_packet_with_duration_samples(payload.clone(), 20, 960, true)
+        .unwrap();
+    prepared
+        .send_prepared_packet(&prepared_packet)
+        .await
+        .unwrap();
+
+    let legacy_packet = legacy_fake.next_audio_packet().await;
+    let sent_prepared_packet = prepared_fake.next_audio_packet().await;
+    assert_eq!(
+        prepared_packet.bytes.as_ref(),
+        sent_prepared_packet.as_slice()
+    );
+    assert_eq!(legacy_packet, sent_prepared_packet);
+
+    let (_, plaintext) = xchacha_test_context()
+        .unprotect_packet(&sent_prepared_packet)
+        .unwrap();
+    assert_eq!(plaintext, payload);
+}
+
+#[tokio::test]
 async fn voice_udp_transport_round_trips_xchacha_packet_protection() {
     let fake = FakeUdpPeer::spawn().await;
     let protection = xchacha_test_context();

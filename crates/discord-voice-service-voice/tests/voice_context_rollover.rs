@@ -21,6 +21,8 @@ use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant, sleep, timeout};
 use tonic::Request;
 
+const SERVICE_USER_ID: &str = "1111111111111111";
+
 #[tokio::test]
 async fn rollover_rebuilds_transport_and_preserves_track_identity() {
     let initial_voice = FakeVoiceEndpoint::spawn().await;
@@ -139,6 +141,49 @@ async fn update_voice_context_reconnects_and_resumes_after_last_emitted_position
     harness.play_until_position_ms(2_000).await;
     harness.update_voice_context().await;
 
+    assert!(harness.resumed_after_position_ms(2_000).await);
+}
+
+#[tokio::test]
+async fn update_voice_context_matching_current_context_resumes_active_playback() {
+    let harness = RolloverHarness::spawn().await;
+
+    harness.play_until_position_ms(2_000).await;
+    harness
+        .supervisor
+        .send(Command::UpdateVoiceContext {
+            voice: harness
+                .initial_voice
+                .voice_context("1", "2", SERVICE_USER_ID, "3", "token"),
+        })
+        .await
+        .unwrap();
+
+    harness.wait_for_event_snapshot("voice-reconnecting").await;
+    let ready_snapshot = harness.wait_for_event_snapshot("voice-reconnected").await;
+    assert_eq!(ready_snapshot.current_video_id.as_deref(), Some("video-1"));
+    let playing_snapshot = harness.wait_for_event_snapshot("playing").await;
+    assert_eq!(
+        playing_snapshot.current_video_id.as_deref(),
+        Some("video-1")
+    );
+    harness.play_until_position_ms(2_200).await;
+}
+
+#[tokio::test]
+async fn update_voice_context_settles_replacement_initial_dave_before_resuming() {
+    let stream = spawn_stream_server("audio-long.webm").await;
+    let replacement_voice = FakeDiscordPeer::spawn_with_dave().await;
+    let harness = RolloverHarness::spawn_with_stream_url_and_replacement_voice(
+        stream.url(),
+        replacement_voice,
+    )
+    .await;
+
+    harness.play_until_position_ms(2_000).await;
+    harness.update_voice_context().await;
+
+    assert!(harness.replacement_voice.saw_dave_prepare_epoch().await);
     assert!(harness.resumed_after_position_ms(2_000).await);
 }
 
@@ -355,12 +400,19 @@ impl RolloverHarness {
     }
 
     async fn spawn_with_stream_url(stream_url: String) -> Self {
+        let replacement_voice =
+            FakeDiscordPeer::spawn_with_gateway_delay(Duration::from_millis(250)).await;
+        Self::spawn_with_stream_url_and_replacement_voice(stream_url, replacement_voice).await
+    }
+
+    async fn spawn_with_stream_url_and_replacement_voice(
+        stream_url: String,
+        replacement_voice: FakeDiscordPeer,
+    ) -> Self {
         let fake_yt = FakeYtMusic::spawn().await;
         fake_yt.set_playable_url(stream_url).await;
 
         let initial_voice = FakeDiscordPeer::spawn().await;
-        let replacement_voice =
-            FakeDiscordPeer::spawn_with_gateway_delay(Duration::from_millis(250)).await;
         let supervisor = Supervisor::with_ytmusic_endpoint(fake_yt.endpoint())
             .await
             .unwrap();
@@ -368,7 +420,7 @@ impl RolloverHarness {
 
         supervisor
             .send(Command::JoinVoice {
-                voice: initial_voice.voice_context("1", "2", "user-1", "3", "token"),
+                voice: initial_voice.voice_context("1", "2", SERVICE_USER_ID, "3", "token"),
             })
             .await
             .unwrap();
@@ -424,7 +476,7 @@ impl RolloverHarness {
         let voice = self.replacement_voice.voice_context(
             "1",
             "9",
-            "user-1",
+            SERVICE_USER_ID,
             "rotated-session",
             "rotated-token",
         );

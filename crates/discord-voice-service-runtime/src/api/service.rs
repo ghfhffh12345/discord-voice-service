@@ -4,8 +4,11 @@ use std::sync::Arc;
 use discord_voice_service_proto::discordvoice::v1::discord_voice_control_server::DiscordVoiceControl;
 use discord_voice_service_proto::discordvoice::v1::join_voice_request;
 use discord_voice_service_proto::discordvoice::v1::{
+    DurationStatsSnapshot as ProtoDurationStatsSnapshot, GetPlaybackMetricsRequest,
     GetStateRequest, JoinVoiceRequest, JoinVoiceResponse, LeaveVoiceRequest, LeaveVoiceResponse,
-    PauseRequest, PauseResponse, PlayRequest, PlayResponse, ResumeRequest, ResumeResponse,
+    PauseRequest, PauseResponse, PlayRequest, PlayResponse,
+    PlaybackBufferDepthSnapshot as ProtoPlaybackBufferDepthSnapshot,
+    PlaybackStabilitySnapshot as ProtoPlaybackStabilitySnapshot, ResumeRequest, ResumeResponse,
     SessionEvent, SessionState as ProtoSessionState, SessionStateSnapshot, StopRequest,
     StopResponse, SubscribeEventsRequest, UpdateVoiceContextRequest, UpdateVoiceContextResponse,
 };
@@ -14,7 +17,12 @@ use futures::{Stream, stream};
 use tonic::{Request, Response, Status};
 
 use crate::session::events::{SessionEventKind, SessionEventRecord};
-use crate::{Command, Readiness, SessionState, Supervisor, observability};
+use crate::{
+    Command, DurationStatsSnapshot as RuntimeDurationStatsSnapshot,
+    PlaybackBufferDepthSnapshot as RuntimePlaybackBufferDepthSnapshot,
+    PlaybackStabilitySnapshot as RuntimePlaybackStabilitySnapshot, Readiness, SessionState,
+    Supervisor, observability,
+};
 
 pub struct ControlService {
     pub supervisor: Supervisor,
@@ -158,6 +166,15 @@ impl DiscordVoiceControl for ControlService {
         }))
     }
 
+    async fn get_playback_metrics(
+        &self,
+        _request: Request<GetPlaybackMetricsRequest>,
+    ) -> Result<Response<ProtoPlaybackStabilitySnapshot>, Status> {
+        let snapshot = self.supervisor.playback_metrics().await;
+        observability::global().record_rpc("get_playback_metrics", tonic::Code::Ok);
+        Ok(Response::new(map_playback_stability_snapshot(snapshot)))
+    }
+
     async fn subscribe_events(
         &self,
         _request: Request<SubscribeEventsRequest>,
@@ -176,6 +193,122 @@ impl DiscordVoiceControl for ControlService {
         });
         Ok(Response::new(Box::pin(stream)))
     }
+}
+
+fn map_playback_stability_snapshot(
+    snapshot: Option<RuntimePlaybackStabilitySnapshot>,
+) -> ProtoPlaybackStabilitySnapshot {
+    let Some(snapshot) = snapshot else {
+        return ProtoPlaybackStabilitySnapshot {
+            available: false,
+            ..Default::default()
+        };
+    };
+
+    ProtoPlaybackStabilitySnapshot {
+        available: true,
+        playback_epoch: snapshot.playback_epoch,
+        video_id: snapshot.video_id.unwrap_or_default(),
+        selected_itag: snapshot.selected_itag.unwrap_or_default(),
+        track_packet_count: usize_to_u64(snapshot.track_packet_count),
+        continuity_silence_packet_count: usize_to_u64(snapshot.continuity_silence_packet_count),
+        inserted_silence_duration_ms: snapshot.inserted_silence_duration_ms,
+        track_interval: Some(map_duration_stats(snapshot.track_interval)),
+        all_packet_interval: Some(map_duration_stats(snapshot.all_packet_interval)),
+        sender_lateness: Some(map_duration_stats(snapshot.sender_lateness)),
+        max_consecutive_late_packets: usize_to_u64(snapshot.max_consecutive_late_packets),
+        current_consecutive_late_packets: usize_to_u64(snapshot.current_consecutive_late_packets),
+        current_buffer_depth: Some(map_buffer_depth(snapshot.current_buffer_depth)),
+        min_buffer_depth: Some(map_buffer_depth(snapshot.min_buffer_depth)),
+        max_buffer_depth: Some(map_buffer_depth(snapshot.max_buffer_depth)),
+        current_source_buffer_depth: Some(map_buffer_depth(snapshot.current_source_buffer_depth)),
+        min_source_buffer_depth: Some(map_buffer_depth(snapshot.min_source_buffer_depth)),
+        max_source_buffer_depth: Some(map_buffer_depth(snapshot.max_source_buffer_depth)),
+        current_playout_buffer_depth: Some(map_buffer_depth(snapshot.current_playout_buffer_depth)),
+        min_playout_buffer_depth: Some(map_buffer_depth(snapshot.min_playout_buffer_depth)),
+        max_playout_buffer_depth: Some(map_buffer_depth(snapshot.max_playout_buffer_depth)),
+        prepared_rtp_queue_depth_ms: snapshot.prepared_rtp_queue_depth_ms,
+        source_buffer_target_ms: snapshot.source_buffer_target_ms,
+        adaptive_buffer_target_ms: snapshot.adaptive_buffer_target_ms,
+        max_adaptive_buffer_target_ms: snapshot.max_adaptive_buffer_target_ms,
+        buffer_low_watermark_count: snapshot.buffer_low_watermark_count,
+        source_buffer_low_watermark_count: snapshot.source_buffer_low_watermark_count,
+        playout_buffer_low_watermark_count: snapshot.playout_buffer_low_watermark_count,
+        buffer_underrun_count: snapshot.buffer_underrun_count,
+        playout_underrun_count: snapshot.playout_underrun_count,
+        rebuffer_count: snapshot.rebuffer_count,
+        refill_duration: Some(map_duration_stats(snapshot.refill_duration)),
+        producer_stall_duration: Some(map_duration_stats(snapshot.producer_stall_duration)),
+        max_producer_lag_ms: snapshot.max_producer_lag_ms,
+        http_retry_count: snapshot.http_retry_count,
+        response_open_count: snapshot.response_open_count,
+        range_reopen_count: snapshot.range_reopen_count,
+        read_error_reopen_count: snapshot.read_error_reopen_count,
+        url_reresolve_count: snapshot.url_reresolve_count,
+        pause_resume_first_intervals_ms: snapshot.pause_resume_first_intervals_ms,
+        post_stall_first_intervals_ms: snapshot.post_stall_first_intervals_ms,
+        post_rebuffer_first_intervals_ms: snapshot.post_rebuffer_first_intervals_ms,
+        playout_sender_lateness: Some(map_duration_stats(snapshot.playout_sender_lateness)),
+        max_consecutive_playout_late_packets: usize_to_u64(
+            snapshot.max_consecutive_playout_late_packets,
+        ),
+        speaking_prepare_duration: Some(map_duration_stats(snapshot.speaking_prepare_duration)),
+        source_underrun_count: snapshot.source_underrun_count,
+        source_producer_fill_duration: Some(map_duration_stats(
+            snapshot.source_producer_fill_duration,
+        )),
+        playout_builder_prepare_duration: Some(map_duration_stats(
+            snapshot.playout_builder_prepare_duration,
+        )),
+        sender_send_duration: Some(map_duration_stats(snapshot.sender_send_duration)),
+        sender_loop_non_send_work_duration: Some(map_duration_stats(
+            snapshot.sender_loop_non_send_work_duration,
+        )),
+        sender_forbidden_work_count: snapshot.sender_forbidden_work_count,
+        gateway_event_drain_duration: Some(map_duration_stats(
+            snapshot.gateway_event_drain_duration,
+        )),
+        gateway_event_drain_count: snapshot.gateway_event_drain_count,
+        dave_transition_count: snapshot.dave_transition_count,
+        dave_transition_count_during_playback: snapshot.dave_transition_count_during_playback,
+        stale_dave_send_prevented_count: snapshot.stale_dave_send_prevented_count,
+        controlled_media_interruption_count: snapshot.controlled_media_interruption_count,
+        media_clock_reset_count: snapshot.media_clock_reset_count,
+        scheduler_late_reset_count: snapshot.scheduler_late_reset_count,
+        source_underrun_reset_count: snapshot.source_underrun_reset_count,
+        pause_resume_reset_count: snapshot.pause_resume_reset_count,
+        dave_transition_recovery_reset_count: snapshot.dave_transition_recovery_reset_count,
+        gateway_interruptions: snapshot.gateway_interruptions,
+        dave_interruptions: snapshot.dave_interruptions,
+        reconnect_interruptions: snapshot.reconnect_interruptions,
+        ended: snapshot.ended,
+    }
+}
+
+fn map_duration_stats(snapshot: RuntimeDurationStatsSnapshot) -> ProtoDurationStatsSnapshot {
+    ProtoDurationStatsSnapshot {
+        samples: usize_to_u64(snapshot.samples),
+        p50_ms: snapshot.p50_ms,
+        p95_ms: snapshot.p95_ms,
+        p99_ms: snapshot.p99_ms,
+        min_ms: snapshot.min_ms,
+        max_ms: snapshot.max_ms,
+    }
+}
+
+fn map_buffer_depth(
+    snapshot: RuntimePlaybackBufferDepthSnapshot,
+) -> ProtoPlaybackBufferDepthSnapshot {
+    ProtoPlaybackBufferDepthSnapshot {
+        packets: usize_to_u64(snapshot.packets),
+        bytes: usize_to_u64(snapshot.bytes),
+        duration_ms: snapshot.duration_ms,
+        duration_samples: snapshot.duration_samples,
+    }
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 fn map_app_error(error: crate::error::RuntimeError) -> Status {

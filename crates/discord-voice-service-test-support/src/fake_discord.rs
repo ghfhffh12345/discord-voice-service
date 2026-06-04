@@ -119,6 +119,7 @@ pub struct FakeDiscordPeer {
     secret_key: Arc<StdMutex<Option<Vec<u8>>>>,
     last_udp_peer: Arc<StdMutex<Option<SocketAddr>>>,
     last_audio_packet: Arc<Mutex<Option<Vec<u8>>>>,
+    audio_packets: Arc<Mutex<Vec<Vec<u8>>>>,
     discovery_count: Arc<Mutex<usize>>,
     speaking_observed: Arc<Notify>,
     speaking_states: Arc<Mutex<Vec<u64>>>,
@@ -468,6 +469,7 @@ impl FakeDiscordPeer {
         let secret_key = Arc::new(StdMutex::new(None));
         let last_udp_peer = Arc::new(StdMutex::new(None));
         let last_audio_packet = Arc::new(Mutex::new(None::<Vec<u8>>));
+        let audio_packets = Arc::new(Mutex::new(Vec::new()));
         let discovery_count = Arc::new(Mutex::new(0usize));
         let speaking_observed = Arc::new(Notify::new());
         let speaking_states = Arc::new(Mutex::new(Vec::new()));
@@ -506,6 +508,7 @@ impl FakeDiscordPeer {
         let non_silence_audio_frame_count_state = Arc::clone(&non_silence_audio_frame_count);
         let non_silence_audio_frame_times_state = Arc::clone(&non_silence_audio_frame_times);
         let last_audio_packet_state = Arc::clone(&last_audio_packet);
+        let audio_packets_state = Arc::clone(&audio_packets);
         let last_udp_peer_state = Arc::clone(&last_udp_peer);
         let udp_socket_state = Arc::clone(&udp_socket);
         let encryption_mode_udp_state = Arc::clone(&encryption_mode);
@@ -536,6 +539,7 @@ impl FakeDiscordPeer {
                     *audio_frame_count_state.lock().await += 1;
                     audio_frame_times_state.lock().await.push(received_at);
                     *last_audio_packet_state.lock().await = Some(buf[..len].to_vec());
+                    audio_packets_state.lock().await.push(buf[..len].to_vec());
 
                     if !is_stop_silence_packet(
                         &buf[..len],
@@ -2196,6 +2200,7 @@ impl FakeDiscordPeer {
             secret_key,
             last_udp_peer,
             last_audio_packet,
+            audio_packets,
             discovery_count,
             speaking_observed,
             speaking_states,
@@ -2653,6 +2658,17 @@ impl FakeDiscordPeer {
         *self.audio_frame_count.lock().await
     }
 
+    pub async fn audio_packets_at_least(&self, minimum: usize) -> Vec<Vec<u8>> {
+        wait_for_value(&self.audio_packets, |packets| packets.len() >= minimum).await
+    }
+
+    pub async fn audio_frame_times_at_least(&self, minimum: usize) -> Vec<Instant> {
+        wait_for_value(&self.audio_frame_times, |timestamps| {
+            timestamps.len() >= minimum
+        })
+        .await
+    }
+
     pub async fn audio_frame_span_for_first(&self, frame_count: usize) -> Duration {
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
@@ -2670,6 +2686,17 @@ impl FakeDiscordPeer {
     pub async fn non_silence_audio_frame_count_at_least(&self, minimum: usize) -> usize {
         wait_for_value(&self.non_silence_audio_frame_count, |count| {
             *count >= minimum
+        })
+        .await
+    }
+
+    pub async fn non_silence_audio_frame_count(&self) -> usize {
+        *self.non_silence_audio_frame_count.lock().await
+    }
+
+    pub async fn non_silence_audio_frame_times_at_least(&self, minimum: usize) -> Vec<Instant> {
+        wait_for_value(&self.non_silence_audio_frame_times, |timestamps| {
+            timestamps.len() >= minimum
         })
         .await
     }

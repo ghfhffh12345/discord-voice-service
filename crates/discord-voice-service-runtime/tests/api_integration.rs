@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use discord_voice_service_proto::discordvoice::v1::discord_voice_control_server::DiscordVoiceControl;
 use discord_voice_service_proto::discordvoice::v1::{
-    GetStateRequest, JoinVoiceRequest, PauseRequest, PlayRequest, ResumeRequest, SessionEvent,
-    SessionEventKind, SessionStateSnapshot, SubscribeEventsRequest, UpdateVoiceContextRequest,
-    join_voice_request,
+    GetPlaybackMetricsRequest, GetStateRequest, JoinVoiceRequest, PauseRequest, PlayRequest,
+    ResumeRequest, SessionEvent, SessionEventKind, SessionStateSnapshot, SubscribeEventsRequest,
+    UpdateVoiceContextRequest, join_voice_request,
 };
 use discord_voice_service_runtime::{ControlService, Readiness, Supervisor};
 use discord_voice_service_test_support::fake_discord::FakeDiscordPeer;
@@ -311,6 +311,36 @@ async fn join_voice_then_play_streams_end_to_end_playback_events_and_audio() {
     assert_eq!(state.queue_depth, 0);
     assert!(state.message.is_empty());
 
+    let metrics = wait_for_playback_metrics(&service).await;
+    assert!(metrics.available);
+    assert!(metrics.ended);
+    assert_eq!(metrics.video_id, "video-1");
+    assert_eq!(metrics.selected_itag, 250);
+    assert!(metrics.track_packet_count >= 5);
+    assert_eq!(metrics.buffer_underrun_count, 0);
+    assert_eq!(metrics.continuity_silence_packet_count, 0);
+    assert_eq!(metrics.inserted_silence_duration_ms, 0);
+    assert_eq!(metrics.source_buffer_target_ms, 5_000);
+    assert!(metrics.max_source_buffer_depth.unwrap().duration_ms <= 5_000);
+    assert_eq!(metrics.adaptive_buffer_target_ms, 5_000);
+    assert_eq!(metrics.max_adaptive_buffer_target_ms, 5_000);
+    assert_eq!(metrics.rebuffer_count, 0);
+    assert!(metrics.sender_lateness.unwrap().samples >= 5);
+    assert_eq!(metrics.source_underrun_count, 0);
+    assert_eq!(metrics.sender_forbidden_work_count, 0);
+    assert_eq!(metrics.current_playout_buffer_depth.unwrap().duration_ms, 0);
+    assert_eq!(metrics.max_playout_buffer_depth.unwrap().duration_ms, 0);
+    assert_eq!(metrics.prepared_rtp_queue_depth_ms, 0);
+    assert_eq!(metrics.playout_builder_prepare_duration.unwrap().samples, 0);
+    assert!(metrics.sender_send_duration.unwrap().samples >= 5);
+    assert!(metrics.sender_loop_non_send_work_duration.unwrap().max_ms <= 2);
+    assert!(metrics.gateway_event_drain_duration.unwrap().samples >= 5);
+    assert_eq!(metrics.gateway_event_drain_count, 0);
+    assert_eq!(metrics.dave_transition_count, 0);
+    assert_eq!(metrics.dave_transition_count_during_playback, 0);
+    assert_eq!(metrics.stale_dave_send_prevented_count, 0);
+    assert_eq!(metrics.controlled_media_interruption_count, 0);
+
     let gateway_path = fake_discord.gateway_path().await.unwrap();
     assert_eq!(gateway_path, "/?v=8&encoding=json");
     assert_eq!(fake_discord.discovery_count().await, 1);
@@ -435,6 +465,27 @@ impl ApiHarness {
             .await
             .unwrap()
             .into_inner()
+    }
+}
+
+async fn wait_for_playback_metrics(
+    service: &ControlService,
+) -> discord_voice_service_proto::discordvoice::v1::PlaybackStabilitySnapshot {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let metrics = service
+            .get_playback_metrics(Request::new(GetPlaybackMetricsRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        if metrics.available && metrics.ended {
+            return metrics;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "playback metrics should become available after TrackEnded"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 

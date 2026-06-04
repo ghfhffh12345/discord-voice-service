@@ -20,9 +20,9 @@ use twilight_model::voice::VoiceState;
 
 use discord_voice_service_playback::YtMusicClient;
 use discord_voice_service_twilight::{
-    Client as VoiceServiceClient, SessionEvent, SessionEventKind, SessionState,
-    VoiceContext as ServiceVoiceContext, VoiceContextTracker, join_voice_channel,
-    leave_voice_channel,
+    Client as VoiceServiceClient, PlaybackStabilitySnapshot, SessionEvent, SessionEventKind,
+    SessionState, StateSnapshot, VoiceContext as ServiceVoiceContext, VoiceContextTracker,
+    join_voice_channel, leave_voice_channel,
 };
 use discord_voice_service_voice::{
     ObservedAudioFrame, ObservedVoiceActivity, ObservedVoiceSession, PendingObservedVoiceSession,
@@ -32,13 +32,28 @@ use discord_voice_service_voice::{
 use crate::audio::{AudioValidationAccumulator, AudioValidationStats, ObservedOpusPacket};
 use crate::config::StagingConfig;
 use crate::contract::{
-    LiveContractState, LiveValidationEvidence, emit_validation_evidence, finalize_success_evidence,
+    LiveContractState, LiveValidationEvidence, PlaybackStabilityEvidence, emit_validation_evidence,
+    finalize_success_evidence,
 };
 
 const AUTHENTIC_VOICE_EVENT_TIMEOUT: Duration = Duration::from_secs(45);
 const GATEWAY_LEAVE_TIMEOUT: Duration = Duration::from_secs(30);
 const GATEWAY_LEAVE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const LIVE_CONTRACT_TIMEOUT: Duration = Duration::from_secs(240);
+const LIVE_INTERRUPT_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+const INTERRUPT_PROBE_PLAY_TASK_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const PLAYBACK_METRICS_TIMEOUT: Duration = Duration::from_secs(5);
+const PLAYBACK_METRICS_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const ACTIVE_INTERRUPT_PROBE_MEDIA_SETTLE_DURATION: Duration = Duration::from_millis(500);
+const MIN_STABILITY_METRIC_PACKET_COUNT: u64 = 50;
+const SOURCE_PLAYBACK_BUFFER_TARGET_MS: u64 = 5_000;
+const RTP_INTERVAL_MIN_BUDGET_MS: u64 = 15;
+const RTP_INTERVAL_P95_BUDGET_MS: u64 = 45;
+const RTP_INTERVAL_P99_BUDGET_MS: u64 = 70;
+const RTP_INTERVAL_MAX_BUDGET_MS: u64 = 100;
+const SENDER_LATENESS_P99_BUDGET_MS: u64 = 10;
+const SENDER_LOOP_NON_SEND_WORK_MAX_BUDGET_MS: u64 = 5;
+const MAX_CONSECUTIVE_PLAYOUT_LATE_PACKETS: u64 = 2;
 const MIN_OBSERVED_PACKET_COUNT: u64 = 120;
 const MIN_DECODED_AUDIO_MS: u64 = 3_000;
 const MIN_NON_SILENT_AUDIO_MS: u64 = 1_000;
@@ -76,6 +91,9 @@ struct ValidatedLiveOutcome {
     live_contract: LiveContractState,
     audio_stats: AudioValidationStats,
     observer_playback: ObserverPlaybackProof,
+    playback_metrics: Option<PlaybackStabilityEvidence>,
+    reconnect_probe_metrics: Option<PlaybackStabilityEvidence>,
+    long_track_metrics: Option<PlaybackStabilityEvidence>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -92,6 +110,9 @@ struct FailureEvidenceSnapshot {
     live_contract: Option<LiveContractState>,
     audio_stats: Option<AudioValidationStats>,
     observer_playback: Option<ObserverPlaybackProof>,
+    playback_metrics: Option<PlaybackStabilityEvidence>,
+    reconnect_probe_metrics: Option<PlaybackStabilityEvidence>,
+    long_track_metrics: Option<PlaybackStabilityEvidence>,
 }
 
 #[derive(Debug)]
@@ -99,6 +120,56 @@ struct ServiceFlowOutcome {
     result: Result<ValidatedLiveOutcome>,
     failure_snapshot: FailureEvidenceSnapshot,
     service_joined: bool,
+}
+
+#[derive(Debug)]
+struct CompletedPostPlayControlEvidence {
+    playback_metrics: PlaybackStabilityEvidence,
+    reconnect_probe_metrics: PlaybackStabilityEvidence,
+    long_track_metrics: PlaybackStabilityEvidence,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PostPlayControlEvidence {
+    playback_metrics: Option<PlaybackStabilityEvidence>,
+    reconnect_probe_metrics: Option<PlaybackStabilityEvidence>,
+    long_track_metrics: Option<PlaybackStabilityEvidence>,
+}
+
+#[derive(Debug)]
+struct PostPlayControlFailure {
+    error: anyhow::Error,
+    evidence: PostPlayControlEvidence,
+}
+
+impl PostPlayControlEvidence {
+    fn fail<T>(self, error: anyhow::Error) -> std::result::Result<T, Box<PostPlayControlFailure>> {
+        Err(Box::new(PostPlayControlFailure {
+            error,
+            evidence: self,
+        }))
+    }
+}
+
+impl FailureEvidenceSnapshot {
+    fn record_post_play_evidence(&mut self, evidence: PostPlayControlEvidence) {
+        if evidence.playback_metrics.is_some() {
+            self.playback_metrics = evidence.playback_metrics;
+        }
+        if evidence.reconnect_probe_metrics.is_some() {
+            self.reconnect_probe_metrics = evidence.reconnect_probe_metrics;
+        }
+        if evidence.long_track_metrics.is_some() {
+            self.long_track_metrics = evidence.long_track_metrics;
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PostPlayProbeConfig<'a> {
+    expected_video_id: &'a str,
+    long_video_id: &'a str,
+    long_track_min_packets: u64,
 }
 
 #[derive(Debug)]
@@ -114,13 +185,13 @@ struct ObserverResumeProof {
 }
 
 enum ObserverAudioProofCommand {
-    ProveSpeakingStarted {
+    SpeakingStarted {
         respond_to: oneshot::Sender<Result<()>>,
     },
-    ProvePause {
+    Pause {
         respond_to: oneshot::Sender<Result<ObserverPauseProof>>,
     },
-    ProveResume {
+    Resume {
         armed: oneshot::Sender<()>,
         respond_to: oneshot::Sender<Result<ObserverResumeProof>>,
     },
@@ -642,10 +713,14 @@ async fn run_service_flow(
             live_contract,
             audio_stats,
             observer_playback,
+            playback_metrics: None,
+            reconnect_probe_metrics: None,
+            long_track_metrics: None,
         })
     };
 
     let validation_and_play = wait_for_play_and_live_contract(combined_validation, play_rpc);
+    let service_voice_for_reconnect_probe = forwarded_voice.clone();
     let live_gateway_config = LiveGatewayDriverConfig {
         service_addr: config.discord_voice_service_uri.clone(),
         initial_service_voice: forwarded_voice,
@@ -672,16 +747,36 @@ async fn run_service_flow(
         validated.live_contract.mark_play();
         update_live_contract_snapshot(&live_contract_snapshot, &validated.live_contract);
 
-        if let Err(error) = validate_post_play_control_rpcs(
+        match validate_post_play_control_rpcs(
             &mut control_client,
+            &config.discord_voice_service_uri,
+            &mut events,
+            &service_voice_for_reconnect_probe,
+            PostPlayProbeConfig {
+                expected_video_id: &config.test_video_id,
+                long_video_id: &config.test_long_video_id,
+                long_track_min_packets: config.live_staging_long_track_min_packets,
+            },
             &mut validated.live_contract,
             &live_contract_snapshot,
         )
         .await
         {
-            result = Err(error);
-        } else {
-            service_joined = false;
+            Ok(post_play) => {
+                validated.playback_metrics = Some(post_play.playback_metrics);
+                validated.reconnect_probe_metrics = Some(post_play.reconnect_probe_metrics);
+                validated.long_track_metrics = Some(post_play.long_track_metrics);
+                failure_snapshot.playback_metrics = validated.playback_metrics.clone();
+                failure_snapshot.reconnect_probe_metrics =
+                    validated.reconnect_probe_metrics.clone();
+                failure_snapshot.long_track_metrics = validated.long_track_metrics.clone();
+                service_joined = false;
+            }
+            Err(failure) => {
+                let PostPlayControlFailure { error, evidence } = *failure;
+                failure_snapshot.record_post_play_evidence(evidence);
+                result = Err(error);
+            }
         }
         failure_snapshot.live_contract = Some(live_contract_snapshot.lock().unwrap().clone());
         failure_snapshot.observer_playback = observer_playback_snapshot.lock().unwrap().clone();
@@ -896,7 +991,7 @@ async fn observe_audio_until_track_ended(
             }
             command = proof_commands.recv(), if !proof_commands_closed => {
                 match command {
-                    Some(ObserverAudioProofCommand::ProveSpeakingStarted { respond_to }) => {
+                    Some(ObserverAudioProofCommand::SpeakingStarted { respond_to }) => {
                         let result = prove_observer_speaking_started(
                             observer_session,
                             expected_user_id,
@@ -907,7 +1002,7 @@ async fn observe_audio_until_track_ended(
                         }
                         let _ = respond_to.send(result);
                     }
-                    Some(ObserverAudioProofCommand::ProvePause { respond_to }) => {
+                    Some(ObserverAudioProofCommand::Pause { respond_to }) => {
                         let result = prove_observer_pause_silence(
                             observer_session,
                             expected_user_id,
@@ -916,18 +1011,18 @@ async fn observe_audio_until_track_ended(
                             &mut audio_started,
                         )
                         .await;
-                        if let Ok(proof) = &result {
-                            if proof.speaking_stopped {
-                                info!(
-                                    silence_ms = proof.silence_ms,
-                                    "observer proved Pause by observing service speaking disappearance and no service audio",
-                                );
-                            }
+                        if let Ok(proof) = &result
+                            && proof.speaking_stopped
+                        {
+                            info!(
+                                silence_ms = proof.silence_ms,
+                                "observer proved Pause by observing service speaking disappearance and no service audio",
+                            );
                         }
                         let _ = respond_to.send(result);
                         last_stats = Some(accumulator.stats());
                     }
-                    Some(ObserverAudioProofCommand::ProveResume { armed, respond_to }) => {
+                    Some(ObserverAudioProofCommand::Resume { armed, respond_to }) => {
                         observer_session.set_dave_proposal_authoring(true);
                         let _ = armed.send(());
                         let result = prove_observer_resume_audio(
@@ -1152,6 +1247,7 @@ async fn prove_observer_resume_audio(
     audio_started: &mut Option<oneshot::Sender<()>>,
 ) -> Result<ObserverResumeProof> {
     let start_count = accumulator.stats().observed_packet_count;
+    accumulator.reset_inter_arrival_baseline();
     let mut speaking_started = false;
     let deadline = Instant::now() + RESUME_OBSERVER_AUDIO_TIMEOUT;
     loop {
@@ -1275,6 +1371,10 @@ fn observer_thresholds_satisfied(stats: &AudioValidationStats, expected_duration
     stats.observed_packet_count >= MIN_OBSERVED_PACKET_COUNT
         && stats.decoded_audio_ms >= required_observer_decoded_audio_ms(expected_duration_ms)
         && stats.non_silent_audio_ms >= MIN_NON_SILENT_AUDIO_MS
+        && stats.rtp_gap_count_gte_100ms == 0
+        && stats.rtp_inter_arrival.p95_ms <= RTP_INTERVAL_P95_BUDGET_MS
+        && stats.rtp_inter_arrival.p99_ms <= RTP_INTERVAL_P99_BUDGET_MS
+        && stats.rtp_inter_arrival.max_ms < RTP_INTERVAL_MAX_BUDGET_MS
 }
 
 fn required_observer_decoded_audio_ms(expected_duration_ms: u64) -> u64 {
@@ -1293,13 +1393,17 @@ fn observer_threshold_error(
     let required_decoded_audio_ms = required_observer_decoded_audio_ms(expected_duration_ms);
     match stats {
         Some(stats) => anyhow!(
-            "observer audio proof finished before thresholds (observed_packet_count={} decoded_audio_ms={} required_decoded_audio_ms={} expected_duration_ms={} non_silent_audio_ms={} required_non_silent_audio_ms={})",
+            "observer audio proof finished before thresholds (observed_packet_count={} decoded_audio_ms={} required_decoded_audio_ms={} expected_duration_ms={} non_silent_audio_ms={} required_non_silent_audio_ms={} rtp_gap_count_gte_100ms={} rtp_p95_ms={} rtp_p99_ms={} rtp_max_ms={})",
             stats.observed_packet_count,
             stats.decoded_audio_ms,
             required_decoded_audio_ms,
             expected_duration_ms,
             stats.non_silent_audio_ms,
             MIN_NON_SILENT_AUDIO_MS,
+            stats.rtp_gap_count_gte_100ms,
+            stats.rtp_inter_arrival.p95_ms,
+            stats.rtp_inter_arrival.p99_ms,
+            stats.rtp_inter_arrival.max_ms,
         ),
         None => anyhow!(
             "observer audio proof timed out before any packets were received (expected_duration_ms={} required_decoded_audio_ms={})",
@@ -1338,6 +1442,7 @@ async fn wait_for_play_completed_contract_with_snapshot(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn wait_for_play_completed_contract_with_controls(
     events: &mut (impl Stream<Item = Result<SessionEvent, tonic::Status>> + Unpin),
     expected_video_id: &str,
@@ -1455,7 +1560,7 @@ async fn request_observer_speaking_started_proof(
 ) -> Result<()> {
     let (respond_to, response) = oneshot::channel();
     observer_proof_tx
-        .send(ObserverAudioProofCommand::ProveSpeakingStarted { respond_to })
+        .send(ObserverAudioProofCommand::SpeakingStarted { respond_to })
         .await
         .context("request observer pre-Pause Speaking 1 proof")?;
 
@@ -1473,7 +1578,7 @@ async fn start_observer_pause_proof(
 ) -> Result<oneshot::Receiver<Result<ObserverPauseProof>>> {
     let (respond_to, response) = oneshot::channel();
     observer_proof_tx
-        .send(ObserverAudioProofCommand::ProvePause { respond_to })
+        .send(ObserverAudioProofCommand::Pause { respond_to })
         .await
         .context("request observer Pause proof")?;
 
@@ -1498,7 +1603,7 @@ async fn start_observer_resume_proof(
     let (armed, armed_rx) = oneshot::channel();
     let (respond_to, response) = oneshot::channel();
     observer_proof_tx
-        .send(ObserverAudioProofCommand::ProveResume { armed, respond_to })
+        .send(ObserverAudioProofCommand::Resume { armed, respond_to })
         .await
         .context("request observer Resume proof")?;
     timeout(Duration::from_secs(5), armed_rx)
@@ -1560,24 +1665,1020 @@ async fn validate_ready_state_rpc(
 
 async fn validate_post_play_control_rpcs(
     client: &mut VoiceServiceClient,
+    service_addr: &str,
+    events: &mut (impl Stream<Item = Result<SessionEvent, tonic::Status>> + Unpin),
+    voice: &ServiceVoiceContext,
+    probe_config: PostPlayProbeConfig<'_>,
     state: &mut LiveContractState,
     snapshot: &Arc<Mutex<LiveContractState>>,
-) -> Result<()> {
+) -> std::result::Result<CompletedPostPlayControlEvidence, Box<PostPlayControlFailure>> {
+    let mut evidence = PostPlayControlEvidence::default();
+    let expected_video_id = probe_config.expected_video_id;
+    let playback_metrics = match fetch_finished_playback_metrics(client, expected_video_id).await {
+        Ok(metrics) => metrics,
+        Err(error) => return evidence.fail(error),
+    };
+    let playback_metrics_evidence: PlaybackStabilityEvidence = (&playback_metrics).into();
+    evidence.playback_metrics = Some(playback_metrics_evidence.clone());
+    if let Err(error) = validate_finished_playback_metrics(&playback_metrics, expected_video_id) {
+        return evidence.fail(error);
+    }
+    state.mark_get_playback_metrics();
+    update_live_contract_snapshot(snapshot, state);
+
+    let reconnect_probe_metrics = match validate_active_reconnect_rollover_during_playback(
+        client,
+        service_addr,
+        events,
+        voice,
+        expected_video_id,
+        state,
+        snapshot,
+    )
+    .await
+    {
+        Ok(metrics) => metrics,
+        Err(error) => return evidence.fail(error),
+    };
+    evidence.reconnect_probe_metrics = Some(reconnect_probe_metrics.clone());
+
+    if let Err(error) = validate_active_stop_during_playback(
+        client,
+        service_addr,
+        events,
+        expected_video_id,
+        state,
+        snapshot,
+    )
+    .await
+    {
+        return evidence.fail(error);
+    }
+
+    let long_track_metrics = match validate_long_track_playback(
+        client,
+        service_addr,
+        events,
+        probe_config.long_video_id,
+        probe_config.long_track_min_packets,
+    )
+    .await
+    {
+        Ok(metrics) => metrics,
+        Err(error) => return evidence.fail(error),
+    };
+    evidence.long_track_metrics = Some(long_track_metrics.clone());
+
+    if let Err(error) = validate_active_leave_voice_during_playback(
+        client,
+        service_addr,
+        events,
+        expected_video_id,
+        state,
+        snapshot,
+    )
+    .await
+    {
+        return evidence.fail(error);
+    }
+
+    if let Err(error) = state.ensure_complete() {
+        return evidence.fail(error);
+    }
+    Ok(CompletedPostPlayControlEvidence {
+        playback_metrics: playback_metrics_evidence,
+        reconnect_probe_metrics,
+        long_track_metrics,
+    })
+}
+
+async fn validate_active_reconnect_rollover_during_playback(
+    client: &mut VoiceServiceClient,
+    service_addr: &str,
+    events: &mut (impl Stream<Item = Result<SessionEvent, tonic::Status>> + Unpin),
+    voice: &ServiceVoiceContext,
+    expected_video_id: &str,
+    state: &mut LiveContractState,
+    snapshot: &Arc<Mutex<LiveContractState>>,
+) -> Result<PlaybackStabilityEvidence> {
+    let mut probe_play_client = VoiceServiceClient::connect(service_addr.to_owned())
+        .await
+        .context("connect active reconnect rollover probe play client")?;
+    let probe_video_id = expected_video_id.to_owned();
+    let play_task = tokio::spawn(async move {
+        probe_play_client
+            .play(probe_video_id)
+            .await
+            .context("call Play for active reconnect rollover probe")
+    });
+
+    let mut play_task = wait_for_interrupt_probe_playing_with_play_task(
+        events,
+        expected_video_id,
+        "ReconnectRollover",
+        play_task,
+    )
+    .await?;
+    if let Err(error) =
+        wait_for_active_interrupt_probe_media(&mut play_task, "ReconnectRollover").await
+    {
+        cancel_interrupt_probe_play_task(play_task).await;
+        return Err(error);
+    }
+    if let Err(error) = client
+        .update_voice_context(voice)
+        .await
+        .context("call UpdateVoiceContext while live validation probe playback is Playing")
+    {
+        cancel_interrupt_probe_play_task(play_task).await;
+        return Err(error);
+    }
+
+    await_interrupt_probe_play_task(play_task, "ReconnectRollover").await?;
+    wait_for_reconnect_rollover_probe_resumed(events, expected_video_id).await?;
+    let reconnect_probe_metrics = fetch_reconnect_probe_metrics(client, expected_video_id).await?;
+
     client
         .stop()
         .await
-        .context("call Stop through Twilight adapter after natural TrackEnded")?;
-    state.mark_stop();
-    update_live_contract_snapshot(snapshot, state);
+        .context("call Stop after active reconnect rollover probe resumed")?;
+    wait_for_interrupt_probe_stopped(events, expected_video_id, "ReconnectRollover").await?;
+    let stopped = client
+        .state()
+        .await
+        .context("fetch service state after active reconnect rollover probe")?;
+    ensure_state_after_active_stop(&stopped)?;
 
-    client
+    state.mark_reconnect_rollover_during_playback();
+    update_live_contract_snapshot(snapshot, state);
+    Ok((&reconnect_probe_metrics).into())
+}
+
+async fn validate_active_stop_during_playback(
+    client: &mut VoiceServiceClient,
+    service_addr: &str,
+    events: &mut (impl Stream<Item = Result<SessionEvent, tonic::Status>> + Unpin),
+    expected_video_id: &str,
+    state: &mut LiveContractState,
+    snapshot: &Arc<Mutex<LiveContractState>>,
+) -> Result<()> {
+    let mut probe_play_client = VoiceServiceClient::connect(service_addr.to_owned())
+        .await
+        .context("connect active Stop probe play client")?;
+    let probe_video_id = expected_video_id.to_owned();
+    let play_task = tokio::spawn(async move {
+        probe_play_client
+            .play(probe_video_id)
+            .await
+            .context("call Play for active Stop probe")
+    });
+
+    let mut play_task = wait_for_interrupt_probe_playing_with_play_task(
+        events,
+        expected_video_id,
+        "Stop",
+        play_task,
+    )
+    .await?;
+    if let Err(error) = wait_for_active_interrupt_probe_media(&mut play_task, "Stop").await {
+        cancel_interrupt_probe_play_task(play_task).await;
+        return Err(error);
+    }
+    if let Err(error) = client
+        .stop()
+        .await
+        .context("call Stop while live validation probe playback is Playing")
+    {
+        cancel_interrupt_probe_play_task(play_task).await;
+        return Err(error);
+    }
+    if let Err(error) = wait_for_interrupt_probe_stopped(events, expected_video_id, "Stop").await {
+        cancel_interrupt_probe_play_task(play_task).await;
+        return Err(error);
+    }
+    await_interrupt_probe_play_task(play_task, "Stop").await?;
+
+    let stopped = client
+        .state()
+        .await
+        .context("fetch service state after active Stop probe")?;
+    ensure_state_after_active_stop(&stopped)?;
+    state.mark_stop_during_playback();
+    update_live_contract_snapshot(snapshot, state);
+    Ok(())
+}
+
+async fn validate_long_track_playback(
+    client: &mut VoiceServiceClient,
+    service_addr: &str,
+    events: &mut (impl Stream<Item = Result<SessionEvent, tonic::Status>> + Unpin),
+    long_video_id: &str,
+    min_packets: u64,
+) -> Result<PlaybackStabilityEvidence> {
+    if min_packets < MIN_STABILITY_METRIC_PACKET_COUNT {
+        bail!(
+            "long-track probe requires at least {MIN_STABILITY_METRIC_PACKET_COUNT} packets; configured {min_packets}"
+        );
+    }
+
+    let mut probe_play_client = VoiceServiceClient::connect(service_addr.to_owned())
+        .await
+        .context("connect long-track probe play client")?;
+    let probe_video_id = long_video_id.to_owned();
+    let play_task = tokio::spawn(async move {
+        probe_play_client
+            .play(probe_video_id)
+            .await
+            .context("call Play for long-track staging probe")
+    });
+
+    let play_task = wait_for_interrupt_probe_playing_with_play_task(
+        events,
+        long_video_id,
+        "LongTrack",
+        play_task,
+    )
+    .await?;
+
+    tokio::time::sleep(Duration::from_millis(
+        min_packets
+            .saturating_mul(RTP_INTERVAL_P95_BUDGET_MS)
+            .saturating_add(1_000),
+    ))
+    .await;
+
+    if let Err(error) = client
+        .stop()
+        .await
+        .context("call Stop after long-track staging probe reached sustained playback")
+    {
+        cancel_interrupt_probe_play_task(play_task).await;
+        return Err(error);
+    }
+    if let Err(error) = wait_for_interrupt_probe_stopped(events, long_video_id, "LongTrack").await {
+        cancel_interrupt_probe_play_task(play_task).await;
+        return Err(error);
+    }
+    await_interrupt_probe_play_task(play_task, "LongTrack").await?;
+
+    let metrics = fetch_interrupted_playback_metrics(client, long_video_id, min_packets).await?;
+    validate_long_track_metrics(&metrics, long_video_id, min_packets)?;
+    Ok((&metrics).into())
+}
+
+async fn validate_active_leave_voice_during_playback(
+    client: &mut VoiceServiceClient,
+    service_addr: &str,
+    events: &mut (impl Stream<Item = Result<SessionEvent, tonic::Status>> + Unpin),
+    expected_video_id: &str,
+    state: &mut LiveContractState,
+    snapshot: &Arc<Mutex<LiveContractState>>,
+) -> Result<()> {
+    let mut probe_play_client = VoiceServiceClient::connect(service_addr.to_owned())
+        .await
+        .context("connect active LeaveVoice probe play client")?;
+    let probe_video_id = expected_video_id.to_owned();
+    let play_task = tokio::spawn(async move {
+        probe_play_client
+            .play(probe_video_id)
+            .await
+            .context("call Play for active LeaveVoice probe")
+    });
+
+    let mut play_task = wait_for_interrupt_probe_playing_with_play_task(
+        events,
+        expected_video_id,
+        "LeaveVoice",
+        play_task,
+    )
+    .await?;
+    if let Err(error) = wait_for_active_interrupt_probe_media(&mut play_task, "LeaveVoice").await {
+        cancel_interrupt_probe_play_task(play_task).await;
+        return Err(error);
+    }
+    if let Err(error) = client
         .leave_voice()
         .await
-        .context("call LeaveVoice through Twilight adapter after Stop")?;
-    state.mark_leave_voice();
-    update_live_contract_snapshot(snapshot, state);
+        .context("call LeaveVoice while live validation probe playback is Playing")
+    {
+        cancel_interrupt_probe_play_task(play_task).await;
+        return Err(error);
+    }
+    await_interrupt_probe_play_task(play_task, "LeaveVoice").await?;
 
-    state.ensure_complete()?;
+    let left = client
+        .state()
+        .await
+        .context("fetch service state after active LeaveVoice probe")?;
+    ensure_state_after_active_leave_voice(&left)?;
+    state.mark_leave_voice_during_playback();
+    update_live_contract_snapshot(snapshot, state);
+    Ok(())
+}
+
+async fn await_interrupt_probe_play_task(
+    play_task: tokio::task::JoinHandle<Result<()>>,
+    label: &str,
+) -> Result<()> {
+    timeout(LIVE_INTERRUPT_PROBE_TIMEOUT, play_task)
+        .await
+        .with_context(|| {
+            format!(
+                "timed out waiting for active {label} probe Play RPC to return after interruption"
+            )
+        })?
+        .context("active interrupt probe Play task panicked")?
+        .with_context(|| format!("active {label} probe Play RPC failed after interruption"))
+}
+
+async fn cancel_interrupt_probe_play_task(play_task: tokio::task::JoinHandle<Result<()>>) {
+    play_task.abort();
+    let _ = play_task.await;
+}
+
+#[cfg(test)]
+async fn wait_for_interrupt_probe_playing(
+    events: &mut (impl Stream<Item = Result<SessionEvent, tonic::Status>> + Unpin),
+    expected_video_id: &str,
+    label: &str,
+) -> Result<()> {
+    let deadline = Instant::now() + LIVE_INTERRUPT_PROBE_TIMEOUT;
+    loop {
+        let event = next_session_event_before_deadline(events, deadline, label).await?;
+        if validate_interrupt_probe_playing_event(&event, expected_video_id, label)? {
+            return Ok(());
+        }
+    }
+}
+
+async fn wait_for_interrupt_probe_playing_with_play_task(
+    events: &mut (impl Stream<Item = Result<SessionEvent, tonic::Status>> + Unpin),
+    expected_video_id: &str,
+    label: &str,
+    mut play_task: tokio::task::JoinHandle<Result<()>>,
+) -> Result<tokio::task::JoinHandle<Result<()>>> {
+    let deadline = Instant::now() + LIVE_INTERRUPT_PROBE_TIMEOUT;
+    loop {
+        fail_if_interrupt_probe_play_task_finished(&mut play_task, label).await?;
+
+        let remaining = match deadline.checked_duration_since(Instant::now()) {
+            Some(remaining) => remaining,
+            None => {
+                cancel_interrupt_probe_play_task(play_task).await;
+                bail!(
+                    "timed out waiting for active {label} probe service events after {} seconds",
+                    LIVE_INTERRUPT_PROBE_TIMEOUT.as_secs()
+                );
+            }
+        };
+        let event_wait = remaining.min(INTERRUPT_PROBE_PLAY_TASK_POLL_INTERVAL);
+
+        if let Ok(maybe_event) = timeout(event_wait, events.next()).await {
+            let event = match next_session_event(maybe_event) {
+                Ok(event) => event,
+                Err(error) => {
+                    cancel_interrupt_probe_play_task(play_task).await;
+                    return Err(error);
+                }
+            };
+            match validate_interrupt_probe_playing_event(&event, expected_video_id, label) {
+                Ok(true) => return Ok(play_task),
+                Ok(false) => {}
+                Err(error) => {
+                    cancel_interrupt_probe_play_task(play_task).await;
+                    return Err(error);
+                }
+            };
+        }
+    }
+}
+
+async fn fail_if_interrupt_probe_play_task_finished(
+    play_task: &mut tokio::task::JoinHandle<Result<()>>,
+    label: &str,
+) -> Result<()> {
+    if !play_task.is_finished() {
+        return Ok(());
+    }
+
+    let play_result = play_task
+        .await
+        .context("active interrupt probe Play task panicked")?;
+    match play_result {
+        Ok(()) => bail!("active {label} probe Play RPC returned before Playing"),
+        Err(error) => Err(error)
+            .with_context(|| format!("active {label} probe Play RPC failed before Playing")),
+    }
+}
+
+async fn wait_for_active_interrupt_probe_media(
+    play_task: &mut tokio::task::JoinHandle<Result<()>>,
+    label: &str,
+) -> Result<()> {
+    let deadline = Instant::now() + ACTIVE_INTERRUPT_PROBE_MEDIA_SETTLE_DURATION;
+    loop {
+        fail_if_interrupt_probe_play_task_finished(play_task, label).await?;
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Ok(());
+        };
+        tokio::time::sleep(remaining.min(INTERRUPT_PROBE_PLAY_TASK_POLL_INTERVAL)).await;
+    }
+}
+
+fn validate_interrupt_probe_playing_event(
+    event: &SessionEvent,
+    expected_video_id: &str,
+    label: &str,
+) -> Result<bool> {
+    match event.kind {
+        SessionEventKind::TrackResolving
+        | SessionEventKind::Buffering
+        | SessionEventKind::Playing => {
+            validate_interrupt_probe_video_id(event, expected_video_id, label)?;
+            Ok(event.kind == SessionEventKind::Playing)
+        }
+        SessionEventKind::TrackEnded => {
+            bail!("active {label} probe reached TrackEnded before interruption");
+        }
+        SessionEventKind::Stopped => {
+            bail!("active {label} probe observed Stopped before issuing the interrupt command");
+        }
+        SessionEventKind::PlaybackInterrupted => {
+            bail!(
+                "active {label} probe observed PlaybackInterrupted before issuing the interrupt command: {}",
+                display_probe_event_message(event)
+            );
+        }
+        SessionEventKind::FatalError => {
+            bail!(
+                "active {label} probe observed FatalError before issuing the interrupt command: {}",
+                display_probe_event_message(event)
+            );
+        }
+        SessionEventKind::VoiceReconnecting => {
+            bail!(
+                "active {label} probe observed VoiceReconnecting before issuing the interrupt command: {}",
+                display_probe_event_message(event)
+            );
+        }
+        _ => Ok(false),
+    }
+}
+
+async fn wait_for_interrupt_probe_stopped(
+    events: &mut (impl Stream<Item = Result<SessionEvent, tonic::Status>> + Unpin),
+    expected_video_id: &str,
+    label: &str,
+) -> Result<()> {
+    let deadline = Instant::now() + LIVE_INTERRUPT_PROBE_TIMEOUT;
+    loop {
+        let event = next_session_event_before_deadline(events, deadline, label).await?;
+        match event.kind {
+            SessionEventKind::Stopped => return Ok(()),
+            SessionEventKind::TrackEnded => {
+                bail!("active {label} probe reached TrackEnded after Stop");
+            }
+            SessionEventKind::TrackResolving
+            | SessionEventKind::Buffering
+            | SessionEventKind::Playing => {
+                validate_interrupt_probe_video_id(&event, expected_video_id, label)?;
+            }
+            SessionEventKind::PlaybackInterrupted => {
+                bail!(
+                    "active {label} probe observed PlaybackInterrupted after Stop: {}",
+                    display_probe_event_message(&event)
+                );
+            }
+            SessionEventKind::FatalError => {
+                bail!(
+                    "active {label} probe observed FatalError after Stop: {}",
+                    display_probe_event_message(&event)
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn wait_for_reconnect_rollover_probe_resumed(
+    events: &mut (impl Stream<Item = Result<SessionEvent, tonic::Status>> + Unpin),
+    expected_video_id: &str,
+) -> Result<()> {
+    let deadline = Instant::now() + LIVE_INTERRUPT_PROBE_TIMEOUT;
+    let mut saw_reconnecting = false;
+    let mut saw_voice_ready = false;
+
+    loop {
+        let event =
+            next_session_event_before_deadline(events, deadline, "ReconnectRollover").await?;
+        match event.kind {
+            SessionEventKind::VoiceReconnecting => {
+                validate_interrupt_probe_video_id(&event, expected_video_id, "ReconnectRollover")?;
+                saw_reconnecting = true;
+            }
+            SessionEventKind::VoiceReady => {
+                if saw_reconnecting {
+                    saw_voice_ready = true;
+                }
+            }
+            SessionEventKind::TrackResolving | SessionEventKind::Buffering => {
+                validate_interrupt_probe_video_id(&event, expected_video_id, "ReconnectRollover")?;
+            }
+            SessionEventKind::Playing => {
+                validate_interrupt_probe_video_id(&event, expected_video_id, "ReconnectRollover")?;
+                if saw_reconnecting && saw_voice_ready {
+                    return Ok(());
+                }
+            }
+            SessionEventKind::TrackEnded => {
+                bail!("active ReconnectRollover probe reached TrackEnded before resumed playback");
+            }
+            SessionEventKind::Stopped => {
+                bail!("active ReconnectRollover probe observed Stopped before resumed playback");
+            }
+            SessionEventKind::PlaybackInterrupted => {
+                bail!(
+                    "active ReconnectRollover probe observed PlaybackInterrupted before resumed playback: {}",
+                    display_probe_event_message(&event)
+                );
+            }
+            SessionEventKind::FatalError => {
+                bail!(
+                    "active ReconnectRollover probe observed FatalError before resumed playback: {}",
+                    display_probe_event_message(&event)
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn next_session_event_before_deadline(
+    events: &mut (impl Stream<Item = Result<SessionEvent, tonic::Status>> + Unpin),
+    deadline: Instant,
+    label: &str,
+) -> Result<SessionEvent> {
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or_else(|| {
+            anyhow!(
+                "timed out waiting for active {label} probe service events after {} seconds",
+                LIVE_INTERRUPT_PROBE_TIMEOUT.as_secs()
+            )
+        })?;
+    let maybe_event = timeout(remaining, events.next()).await.map_err(|_| {
+        anyhow!(
+            "timed out waiting for active {label} probe service events after {} seconds",
+            LIVE_INTERRUPT_PROBE_TIMEOUT.as_secs()
+        )
+    })?;
+
+    next_session_event(maybe_event)
+}
+
+fn validate_interrupt_probe_video_id(
+    event: &SessionEvent,
+    expected_video_id: &str,
+    label: &str,
+) -> Result<()> {
+    if event.current_video_id.as_deref() == Some(expected_video_id) {
+        return Ok(());
+    }
+
+    bail!(
+        "active {label} probe observed {} for current_video_id {:?}; expected `{expected_video_id}`",
+        event.kind.as_str_name(),
+        event.current_video_id,
+    );
+}
+
+fn ensure_state_after_active_stop(snapshot: &StateSnapshot) -> Result<()> {
+    if snapshot.state != SessionState::VoiceReady {
+        bail!(
+            "active Stop probe left service in {:?}; expected VoiceReady",
+            snapshot.state
+        );
+    }
+    if snapshot.current_video_id.is_some() || snapshot.selected_itag.is_some() {
+        bail!(
+            "active Stop probe left track metadata in state: current_video_id={:?} selected_itag={:?}",
+            snapshot.current_video_id,
+            snapshot.selected_itag,
+        );
+    }
+
+    Ok(())
+}
+
+fn ensure_state_after_active_leave_voice(snapshot: &StateSnapshot) -> Result<()> {
+    if snapshot.state != SessionState::Idle {
+        bail!(
+            "active LeaveVoice probe left service in {:?}; expected Idle",
+            snapshot.state
+        );
+    }
+    if snapshot.guild_id.is_some()
+        || snapshot.channel_id.is_some()
+        || snapshot.current_video_id.is_some()
+        || snapshot.selected_itag.is_some()
+    {
+        bail!(
+            "active LeaveVoice probe left voice or track metadata in state: guild_id={:?} channel_id={:?} current_video_id={:?} selected_itag={:?}",
+            snapshot.guild_id,
+            snapshot.channel_id,
+            snapshot.current_video_id,
+            snapshot.selected_itag,
+        );
+    }
+
+    Ok(())
+}
+
+fn display_probe_event_message(event: &SessionEvent) -> String {
+    event
+        .message
+        .as_deref()
+        .filter(|message| !message.trim().is_empty())
+        .unwrap_or("no message")
+        .to_owned()
+}
+
+async fn fetch_finished_playback_metrics(
+    client: &mut VoiceServiceClient,
+    expected_video_id: &str,
+) -> Result<PlaybackStabilitySnapshot> {
+    let started_at = Instant::now();
+    loop {
+        let metrics = client
+            .playback_metrics()
+            .await
+            .context("call GetPlaybackMetrics through Twilight adapter after TrackEnded")?;
+        if metrics.available
+            && metrics.ended
+            && metrics.video_id.as_deref() == Some(expected_video_id)
+        {
+            return Ok(metrics);
+        }
+
+        if started_at.elapsed() >= PLAYBACK_METRICS_TIMEOUT {
+            bail!(
+                "GetPlaybackMetrics did not return finished metrics for `{expected_video_id}` within {} seconds",
+                PLAYBACK_METRICS_TIMEOUT.as_secs()
+            );
+        }
+
+        tokio::time::sleep(PLAYBACK_METRICS_POLL_INTERVAL).await;
+    }
+}
+
+async fn fetch_reconnect_probe_metrics(
+    client: &mut VoiceServiceClient,
+    expected_video_id: &str,
+) -> Result<PlaybackStabilitySnapshot> {
+    let started_at = Instant::now();
+    loop {
+        let metrics = client
+            .playback_metrics()
+            .await
+            .context("call GetPlaybackMetrics after active reconnect rollover probe")?;
+        if metrics.available
+            && !metrics.ended
+            && metrics.video_id.as_deref() == Some(expected_video_id)
+            && metrics.reconnect_interruptions > 0
+        {
+            validate_reconnect_probe_metrics(&metrics, expected_video_id)?;
+            return Ok(metrics);
+        }
+
+        if started_at.elapsed() >= PLAYBACK_METRICS_TIMEOUT {
+            bail!(
+                "GetPlaybackMetrics did not return active reconnect rollover probe metrics for `{expected_video_id}` within {} seconds",
+                PLAYBACK_METRICS_TIMEOUT.as_secs()
+            );
+        }
+
+        tokio::time::sleep(PLAYBACK_METRICS_POLL_INTERVAL).await;
+    }
+}
+
+async fn fetch_interrupted_playback_metrics(
+    client: &mut VoiceServiceClient,
+    expected_video_id: &str,
+    min_packets: u64,
+) -> Result<PlaybackStabilitySnapshot> {
+    let started_at = Instant::now();
+    loop {
+        let metrics = client
+            .playback_metrics()
+            .await
+            .context("call GetPlaybackMetrics after interrupted long-track probe")?;
+        if metrics.available
+            && !metrics.ended
+            && metrics.video_id.as_deref() == Some(expected_video_id)
+            && metrics.track_packet_count >= min_packets
+        {
+            return Ok(metrics);
+        }
+
+        if started_at.elapsed() >= PLAYBACK_METRICS_TIMEOUT {
+            bail!(
+                "GetPlaybackMetrics did not return interrupted long-track metrics for `{expected_video_id}` with at least {min_packets} packets within {} seconds",
+                PLAYBACK_METRICS_TIMEOUT.as_secs()
+            );
+        }
+
+        tokio::time::sleep(PLAYBACK_METRICS_POLL_INTERVAL).await;
+    }
+}
+
+fn validate_finished_playback_metrics(
+    metrics: &PlaybackStabilitySnapshot,
+    expected_video_id: &str,
+) -> Result<()> {
+    if !metrics.available {
+        bail!("GetPlaybackMetrics returned unavailable metrics after TrackEnded");
+    }
+    if metrics.video_id.as_deref() != Some(expected_video_id) {
+        bail!(
+            "GetPlaybackMetrics returned video_id {:?}; expected `{expected_video_id}`",
+            metrics.video_id
+        );
+    }
+    if !metrics.ended {
+        bail!("GetPlaybackMetrics returned a snapshot that was not marked ended");
+    }
+    if metrics.track_packet_count < MIN_STABILITY_METRIC_PACKET_COUNT {
+        bail!(
+            "GetPlaybackMetrics reported only {} track packets; expected at least {}",
+            metrics.track_packet_count,
+            MIN_STABILITY_METRIC_PACKET_COUNT
+        );
+    }
+    if metrics.track_interval.samples == 0 {
+        bail!("GetPlaybackMetrics returned no track RTP interval samples");
+    }
+    if metrics.sender_lateness.samples == 0 {
+        bail!("GetPlaybackMetrics returned no sender lateness samples");
+    }
+    if metrics.refill_duration.samples == 0 {
+        bail!("GetPlaybackMetrics returned no refill duration samples");
+    }
+    validate_source_buffer_target(metrics, "GetPlaybackMetrics")?;
+    validate_playback_timing_budget(metrics, "finished playback")?;
+
+    Ok(())
+}
+
+fn validate_long_track_metrics(
+    metrics: &PlaybackStabilitySnapshot,
+    expected_video_id: &str,
+    min_packets: u64,
+) -> Result<()> {
+    if !metrics.available {
+        bail!("GetPlaybackMetrics returned unavailable metrics after long-track probe");
+    }
+    if metrics.video_id.as_deref() != Some(expected_video_id) {
+        bail!(
+            "GetPlaybackMetrics returned long-track video_id {:?}; expected `{expected_video_id}`",
+            metrics.video_id
+        );
+    }
+    if metrics.ended {
+        bail!("long-track staging probe ended naturally before interruption");
+    }
+    if metrics.track_packet_count < min_packets {
+        bail!(
+            "long-track staging probe reported only {} track packets; expected at least {min_packets}",
+            metrics.track_packet_count
+        );
+    }
+    if metrics.refill_duration.samples == 0 {
+        bail!("long-track staging probe returned no refill duration samples");
+    }
+    validate_source_buffer_target(metrics, "long-track staging probe")?;
+    validate_playback_timing_budget(metrics, "long-track staging probe")
+}
+
+fn validate_source_buffer_target(metrics: &PlaybackStabilitySnapshot, label: &str) -> Result<()> {
+    if metrics.source_buffer_target_ms != SOURCE_PLAYBACK_BUFFER_TARGET_MS {
+        bail!(
+            "{label} returned source_buffer_target_ms {}; expected source buffer target {SOURCE_PLAYBACK_BUFFER_TARGET_MS}",
+            metrics.source_buffer_target_ms
+        );
+    }
+    if metrics.adaptive_buffer_target_ms != SOURCE_PLAYBACK_BUFFER_TARGET_MS {
+        bail!(
+            "{label} returned adaptive_buffer_target_ms {}; expected source buffer target {SOURCE_PLAYBACK_BUFFER_TARGET_MS}",
+            metrics.adaptive_buffer_target_ms
+        );
+    }
+    if metrics.max_adaptive_buffer_target_ms != SOURCE_PLAYBACK_BUFFER_TARGET_MS {
+        bail!(
+            "{label} returned max_adaptive_buffer_target_ms {}; expected source buffer target {SOURCE_PLAYBACK_BUFFER_TARGET_MS}",
+            metrics.max_adaptive_buffer_target_ms
+        );
+    }
+    Ok(())
+}
+
+fn validate_playback_timing_budget(metrics: &PlaybackStabilitySnapshot, label: &str) -> Result<()> {
+    if metrics.track_interval.samples == 0 {
+        bail!("{label} returned no track RTP interval samples");
+    }
+    if metrics.sender_lateness.samples == 0 {
+        bail!("{label} returned no sender lateness samples");
+    }
+    if metrics.playout_sender_lateness.samples == 0 {
+        bail!("{label} returned no playout sender lateness samples");
+    }
+    if metrics.playout_builder_prepare_duration.samples != 0 {
+        bail!(
+            "{label} returned {} playout builder preparation samples; expected 0 because RTP packets are built at the live media tick",
+            metrics.playout_builder_prepare_duration.samples
+        );
+    }
+    if metrics.sender_send_duration.samples == 0 {
+        bail!("{label} returned no sender UDP send duration samples");
+    }
+    if metrics.sender_loop_non_send_work_duration.samples == 0 {
+        bail!("{label} returned no sender non-send work duration samples");
+    }
+    if metrics.gateway_event_drain_duration.samples == 0 {
+        bail!("{label} returned no gateway event drain duration samples");
+    }
+    if metrics.sender_loop_non_send_work_duration.max_ms > SENDER_LOOP_NON_SEND_WORK_MAX_BUDGET_MS {
+        bail!(
+            "{label} sender non-send work max was {}ms; expected <= {SENDER_LOOP_NON_SEND_WORK_MAX_BUDGET_MS}ms",
+            metrics.sender_loop_non_send_work_duration.max_ms
+        );
+    }
+    if metrics.current_playout_buffer_depth.duration_ms != 0 {
+        bail!(
+            "{label} current prepared RTP queue depth was {}ms; expected 0",
+            metrics.current_playout_buffer_depth.duration_ms
+        );
+    }
+    if metrics.prepared_rtp_queue_depth_ms != 0 {
+        bail!(
+            "{label} prepared_rtp_queue_depth_ms was {}; expected 0",
+            metrics.prepared_rtp_queue_depth_ms
+        );
+    }
+    if metrics.min_playout_buffer_depth.duration_ms != 0 {
+        bail!(
+            "{label} min prepared RTP queue depth was {}ms; expected 0",
+            metrics.min_playout_buffer_depth.duration_ms
+        );
+    }
+    if metrics.max_playout_buffer_depth.duration_ms != 0 {
+        bail!(
+            "{label} max prepared RTP queue depth was {}ms; expected 0",
+            metrics.max_playout_buffer_depth.duration_ms
+        );
+    }
+    if metrics.track_interval.min_ms < RTP_INTERVAL_MIN_BUDGET_MS {
+        bail!(
+            "{label} minimum RTP interval was {}ms; expected >= {RTP_INTERVAL_MIN_BUDGET_MS}ms",
+            metrics.track_interval.min_ms
+        );
+    }
+    if metrics.track_interval.p95_ms > RTP_INTERVAL_P95_BUDGET_MS {
+        bail!(
+            "{label} RTP interval p95 was {}ms; expected <= {RTP_INTERVAL_P95_BUDGET_MS}ms",
+            metrics.track_interval.p95_ms
+        );
+    }
+    if metrics.track_interval.p99_ms > RTP_INTERVAL_P99_BUDGET_MS {
+        bail!(
+            "{label} RTP interval p99 was {}ms; expected <= {RTP_INTERVAL_P99_BUDGET_MS}ms",
+            metrics.track_interval.p99_ms
+        );
+    }
+    if metrics.track_interval.max_ms >= RTP_INTERVAL_MAX_BUDGET_MS {
+        bail!(
+            "{label} RTP interval max was {}ms; expected < {RTP_INTERVAL_MAX_BUDGET_MS}ms",
+            metrics.track_interval.max_ms
+        );
+    }
+    if metrics.sender_lateness.p99_ms > SENDER_LATENESS_P99_BUDGET_MS {
+        bail!(
+            "{label} sender lateness p99 was {}ms; expected <= {SENDER_LATENESS_P99_BUDGET_MS}ms",
+            metrics.sender_lateness.p99_ms
+        );
+    }
+    if metrics.playout_sender_lateness.p99_ms > SENDER_LATENESS_P99_BUDGET_MS {
+        bail!(
+            "{label} playout sender lateness p99 was {}ms; expected <= {SENDER_LATENESS_P99_BUDGET_MS}ms",
+            metrics.playout_sender_lateness.p99_ms
+        );
+    }
+    if metrics.buffer_underrun_count != 0 {
+        bail!(
+            "{label} reported {} buffer underruns; expected 0",
+            metrics.buffer_underrun_count
+        );
+    }
+    if metrics.rebuffer_count != 0 {
+        bail!(
+            "{label} reported {} rebuffers; expected 0",
+            metrics.rebuffer_count
+        );
+    }
+    if metrics.playout_underrun_count != 0 {
+        bail!(
+            "{label} reported {} playout underruns; expected 0",
+            metrics.playout_underrun_count
+        );
+    }
+    if metrics.source_underrun_count != 0 {
+        bail!(
+            "{label} reported {} source underruns; expected 0",
+            metrics.source_underrun_count
+        );
+    }
+    if metrics.sender_forbidden_work_count != 0 {
+        bail!(
+            "{label} reported {} forbidden sender work samples; expected 0",
+            metrics.sender_forbidden_work_count
+        );
+    }
+    if metrics.stale_dave_send_prevented_count != 0 {
+        bail!(
+            "{label} reported {} stale DAVE sends prevented; expected 0 for steady playback",
+            metrics.stale_dave_send_prevented_count
+        );
+    }
+    if metrics.controlled_media_interruption_count != 0 {
+        bail!(
+            "{label} reported {} controlled media interruptions; expected 0 for steady playback",
+            metrics.controlled_media_interruption_count
+        );
+    }
+    if metrics.scheduler_late_reset_count != 0 {
+        bail!(
+            "{label} reported {} scheduler-late media clock resets; expected 0",
+            metrics.scheduler_late_reset_count
+        );
+    }
+    if metrics.source_underrun_reset_count != 0 {
+        bail!(
+            "{label} reported {} source-underrun media clock resets; expected 0",
+            metrics.source_underrun_reset_count
+        );
+    }
+    if metrics.dave_transition_recovery_reset_count != 0 {
+        bail!(
+            "{label} reported {} DAVE transition recovery resets; expected 0 for steady playback",
+            metrics.dave_transition_recovery_reset_count
+        );
+    }
+    if metrics.max_consecutive_playout_late_packets > MAX_CONSECUTIVE_PLAYOUT_LATE_PACKETS {
+        bail!(
+            "{label} reported {} consecutive playout-late packets; expected <= {MAX_CONSECUTIVE_PLAYOUT_LATE_PACKETS}",
+            metrics.max_consecutive_playout_late_packets
+        );
+    }
+    if metrics.continuity_silence_packet_count != 0 {
+        bail!(
+            "{label} reported {} continuity silence packets during playback; expected 0",
+            metrics.continuity_silence_packet_count
+        );
+    }
+    if metrics.inserted_silence_duration_ms != 0 {
+        bail!(
+            "{label} reported {}ms of inserted silence during playback; expected 0",
+            metrics.inserted_silence_duration_ms
+        );
+    }
+    Ok(())
+}
+
+fn validate_reconnect_probe_metrics(
+    metrics: &PlaybackStabilitySnapshot,
+    expected_video_id: &str,
+) -> Result<()> {
+    if !metrics.available {
+        bail!("Reconnect rollover probe metrics were unavailable");
+    }
+    if metrics.video_id.as_deref() != Some(expected_video_id) {
+        bail!(
+            "Reconnect rollover probe metrics returned video_id {:?}; expected `{expected_video_id}`",
+            metrics.video_id
+        );
+    }
+    if metrics.ended {
+        bail!("Reconnect rollover probe metrics unexpectedly reported ended=true");
+    }
+    if metrics.reconnect_interruptions == 0 {
+        bail!("Reconnect rollover probe metrics did not count a reconnect interruption");
+    }
+    if metrics.track_packet_count == 0 {
+        bail!("Reconnect rollover probe metrics did not observe any track packets before rollover");
+    }
+    if metrics.sender_lateness.samples == 0 {
+        bail!("Reconnect rollover probe metrics returned no sender lateness samples");
+    }
+
     Ok(())
 }
 
@@ -1635,9 +2736,13 @@ pub(crate) async fn cleanup_gateway_voice(
     guild_id: Id<GuildMarker>,
     user_id: Id<UserMarker>,
 ) -> Result<()> {
-    sender
-        .command(&leave_voice_channel(guild_id))
-        .context("failed to send gateway leave command")?;
+    if let Err(source) = sender.command(&leave_voice_channel(guild_id)) {
+        if user_absent_from_guild_voice(http, guild_id, user_id).await? {
+            return Ok(());
+        }
+
+        return Err(source).context("failed to send gateway leave command");
+    }
 
     wait_for_gateway_leave(http, shard, guild_id, user_id).await
 }
@@ -1654,7 +2759,7 @@ async fn wait_for_gateway_leave(
     loop {
         let now = Instant::now();
         if now >= deadline {
-            if current_user_absent_from_guild_voice(http, guild_id).await? {
+            if user_absent_from_guild_voice(http, guild_id, user_id).await? {
                 return Ok(());
             }
 
@@ -1662,7 +2767,7 @@ async fn wait_for_gateway_leave(
         }
 
         if now >= next_voice_state_poll {
-            if current_user_absent_from_guild_voice(http, guild_id).await? {
+            if user_absent_from_guild_voice(http, guild_id, user_id).await? {
                 return Ok(());
             }
 
@@ -1684,7 +2789,7 @@ async fn wait_for_gateway_leave(
         };
 
         let Some(item) = next else {
-            if current_user_absent_from_guild_voice(http, guild_id).await? {
+            if user_absent_from_guild_voice(http, guild_id, user_id).await? {
                 return Ok(());
             }
 
@@ -1695,7 +2800,7 @@ async fn wait_for_gateway_leave(
             Ok(event) => event,
             Err(source) => {
                 if is_fatal_gateway_receive_error(&source) {
-                    if current_user_absent_from_guild_voice(http, guild_id).await? {
+                    if user_absent_from_guild_voice(http, guild_id, user_id).await? {
                         return Ok(());
                     }
 
@@ -1753,6 +2858,41 @@ pub async fn current_user_absent_from_guild_voice(
     leave_confirmed_by_rest_voice_state(status.get(), Some(&voice_state))
 }
 
+pub async fn user_absent_from_guild_voice(
+    http: &HttpClient,
+    guild_id: Id<GuildMarker>,
+    user_id: Id<UserMarker>,
+) -> Result<bool> {
+    let response = match http.user_voice_state(guild_id, user_id).await {
+        Ok(response) => response,
+        Err(source) => {
+            if let HttpErrorType::Response { status, .. } = source.kind()
+                && status.get() == 404
+            {
+                return Ok(true);
+            }
+
+            return Err(source).context("query user voice state during cleanup");
+        }
+    };
+    let status = response.status();
+
+    if status == 404 {
+        return leave_confirmed_by_rest_voice_state(status.get(), None);
+    }
+
+    if !status.is_success() {
+        bail!("user voice state lookup during cleanup failed with status {status}");
+    }
+
+    let voice_state = response
+        .model()
+        .await
+        .context("decode user voice state during cleanup")?;
+
+    leave_confirmed_by_rest_voice_state(status.get(), Some(&voice_state))
+}
+
 pub fn leave_confirmed_by_rest_voice_state(
     status: u16,
     voice_state: Option<&VoiceState>,
@@ -1788,6 +2928,11 @@ fn build_success_evidence(
         outcome: "success".to_owned(),
         service_uri: config.discord_voice_service_uri.clone(),
         ytmusic_addr: config.discord_voice_service_ytmusic_addr.clone(),
+        live_staging_profile: config.live_staging_profile.clone(),
+        live_staging_service_cpus: config.live_staging_service_cpus.clone(),
+        live_staging_cpu_contention_workers: config.live_staging_cpu_contention_workers,
+        live_staging_http_read_delay_ms: config.live_staging_http_read_delay_ms,
+        live_staging_http_read_jitter_ms: config.live_staging_http_read_jitter_ms,
         validated_join_voice: validated.live_contract.validated_join_voice,
         validated_update_voice_context: validated.live_contract.validated_update_voice_context,
         validated_play: validated.live_contract.validated_play,
@@ -1804,9 +2949,17 @@ fn build_success_evidence(
         observer_resume_speaking_started: validated.observer_playback.resume_speaking_started,
         observer_pause_silence_ms: validated.observer_playback.pause_silence_ms,
         observer_resume_packet_count: validated.observer_playback.resume_observed_packet_count,
+        validated_reconnect_rollover_during_playback: validated
+            .live_contract
+            .validated_reconnect_rollover_during_playback,
         validated_stop: validated.live_contract.validated_stop,
+        validated_stop_during_playback: validated.live_contract.validated_stop_during_playback,
         validated_leave_voice: validated.live_contract.validated_leave_voice,
+        validated_leave_voice_during_playback: validated
+            .live_contract
+            .validated_leave_voice_during_playback,
         validated_get_state: validated.live_contract.validated_get_state,
+        validated_get_playback_metrics: validated.live_contract.validated_get_playback_metrics,
         validated_subscribe_events: validated.live_contract.validated_subscribe_events,
         saw_voice_connecting: validated.live_contract.saw_voice_connecting,
         saw_voice_ready: validated.live_contract.saw_voice_ready,
@@ -1816,6 +2969,20 @@ fn build_success_evidence(
         observed_packet_count: validated.audio_stats.observed_packet_count,
         decoded_audio_ms: validated.audio_stats.decoded_audio_ms,
         non_silent_audio_ms: validated.audio_stats.non_silent_audio_ms,
+        observer_rtp_inter_arrival: (&validated.audio_stats.rtp_inter_arrival).into(),
+        observer_rtp_gap_count_gte_100ms: validated.audio_stats.rtp_gap_count_gte_100ms,
+        dave_transition_count_during_playback: validated
+            .playback_metrics
+            .as_ref()
+            .map_or(0, |metrics| metrics.dave_transition_count_during_playback),
+        playback_metrics: validated.playback_metrics.clone(),
+        reconnect_probe_metrics: validated.reconnect_probe_metrics.clone(),
+        validated_constrained_profile: constrained_profile_configured(config)
+            && validated.long_track_metrics.is_some(),
+        validated_slow_jittery_http: slow_jittery_http_configured(config)
+            && validated.long_track_metrics.is_some(),
+        validated_long_track_playback: validated.long_track_metrics.is_some(),
+        long_track_metrics: validated.long_track_metrics.clone(),
         failure_reason: None,
     }
 }
@@ -1828,11 +2995,18 @@ fn build_failure_evidence(
     let live_contract = snapshot.and_then(|value| value.live_contract.as_ref());
     let audio_stats = snapshot.and_then(|value| value.audio_stats.as_ref());
     let observer_playback = snapshot.and_then(|value| value.observer_playback.as_ref());
+    let reconnect_probe_metrics = snapshot.and_then(|value| value.reconnect_probe_metrics.clone());
+    let long_track_metrics = snapshot.and_then(|value| value.long_track_metrics.clone());
 
     LiveValidationEvidence {
         outcome: "failure".to_owned(),
         service_uri: config.discord_voice_service_uri.clone(),
         ytmusic_addr: config.discord_voice_service_ytmusic_addr.clone(),
+        live_staging_profile: config.live_staging_profile.clone(),
+        live_staging_service_cpus: config.live_staging_service_cpus.clone(),
+        live_staging_cpu_contention_workers: config.live_staging_cpu_contention_workers,
+        live_staging_http_read_delay_ms: config.live_staging_http_read_delay_ms,
+        live_staging_http_read_jitter_ms: config.live_staging_http_read_jitter_ms,
         validated_join_voice: live_contract.is_some_and(|state| state.validated_join_voice),
         validated_update_voice_context: live_contract
             .is_some_and(|state| state.validated_update_voice_context),
@@ -1854,9 +3028,17 @@ fn build_failure_evidence(
         observer_pause_silence_ms: observer_playback.map_or(0, |proof| proof.pause_silence_ms),
         observer_resume_packet_count: observer_playback
             .map_or(0, |proof| proof.resume_observed_packet_count),
+        validated_reconnect_rollover_during_playback: live_contract
+            .is_some_and(|state| state.validated_reconnect_rollover_during_playback),
         validated_stop: live_contract.is_some_and(|state| state.validated_stop),
+        validated_stop_during_playback: live_contract
+            .is_some_and(|state| state.validated_stop_during_playback),
         validated_leave_voice: live_contract.is_some_and(|state| state.validated_leave_voice),
+        validated_leave_voice_during_playback: live_contract
+            .is_some_and(|state| state.validated_leave_voice_during_playback),
         validated_get_state: live_contract.is_some_and(|state| state.validated_get_state),
+        validated_get_playback_metrics: live_contract
+            .is_some_and(|state| state.validated_get_playback_metrics),
         validated_subscribe_events: live_contract
             .is_some_and(|state| state.validated_subscribe_events),
         saw_voice_connecting: live_contract.is_some_and(|state| state.saw_voice_connecting),
@@ -1867,8 +3049,32 @@ fn build_failure_evidence(
         observed_packet_count: audio_stats.map_or(0, |stats| stats.observed_packet_count),
         decoded_audio_ms: audio_stats.map_or(0, |stats| stats.decoded_audio_ms),
         non_silent_audio_ms: audio_stats.map_or(0, |stats| stats.non_silent_audio_ms),
+        observer_rtp_inter_arrival: audio_stats
+            .map(|stats| (&stats.rtp_inter_arrival).into())
+            .unwrap_or_default(),
+        observer_rtp_gap_count_gte_100ms: audio_stats
+            .map_or(0, |stats| stats.rtp_gap_count_gte_100ms),
+        dave_transition_count_during_playback: snapshot
+            .and_then(|value| value.playback_metrics.as_ref())
+            .map_or(0, |metrics| metrics.dave_transition_count_during_playback),
+        playback_metrics: snapshot.and_then(|value| value.playback_metrics.clone()),
+        reconnect_probe_metrics,
+        validated_constrained_profile: false,
+        validated_slow_jittery_http: false,
+        validated_long_track_playback: long_track_metrics.is_some(),
+        long_track_metrics,
         failure_reason: Some(classify_failure_reason(error)),
     }
+}
+
+fn constrained_profile_configured(config: &StagingConfig) -> bool {
+    !config.live_staging_profile.eq_ignore_ascii_case("none")
+        && config.live_staging_cpu_contention_workers > 0
+        && !config.live_staging_service_cpus.trim().is_empty()
+}
+
+fn slow_jittery_http_configured(config: &StagingConfig) -> bool {
+    config.live_staging_http_read_delay_ms > 0 && config.live_staging_http_read_jitter_ms > 0
 }
 
 fn emit_failure_evidence(
@@ -1962,6 +3168,150 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn interrupt_probe_waits_for_playing_with_expected_video() {
+        let mut events = stream::iter([
+            Ok(event(SessionEventKind::TrackResolving, Some("video"))),
+            Ok(event(SessionEventKind::Buffering, Some("video"))),
+            Ok(event(SessionEventKind::Playing, Some("video"))),
+        ]);
+
+        wait_for_interrupt_probe_playing(&mut events, "video", "Stop")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn interrupt_probe_rejects_wrong_video_before_interrupt() {
+        let mut events = stream::iter([Ok(event(
+            SessionEventKind::Playing,
+            Some("different-video"),
+        ))]);
+
+        let error = wait_for_interrupt_probe_playing(&mut events, "video", "Stop")
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("expected `video`"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupt_probe_reports_play_failure_before_playing_timeout() {
+        let mut events = stream::pending::<Result<SessionEvent, tonic::Status>>();
+        let play_task = tokio::spawn(async { Err(anyhow!("resolve failed")) });
+
+        let error = wait_for_interrupt_probe_playing_with_play_task(
+            &mut events,
+            "video",
+            "LongTrack",
+            play_task,
+        )
+        .await
+        .unwrap_err();
+
+        let error = error.to_string();
+        assert!(
+            error.contains("active LongTrack probe Play RPC failed before Playing"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupt_probe_rejects_track_end_after_stop() {
+        let mut events = stream::iter([Ok(event(SessionEventKind::TrackEnded, Some("video")))]);
+
+        let error = wait_for_interrupt_probe_stopped(&mut events, "video", "Stop")
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("reached TrackEnded after Stop"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_rollover_probe_waits_for_reconnect_ready_and_resumed_playing() {
+        let mut events = stream::iter([
+            Ok(event(SessionEventKind::VoiceReconnecting, Some("video"))),
+            Ok(event(SessionEventKind::VoiceReady, Some("video"))),
+            Ok(event(SessionEventKind::TrackResolving, Some("video"))),
+            Ok(event(SessionEventKind::Buffering, Some("video"))),
+            Ok(event(SessionEventKind::Playing, Some("video"))),
+        ]);
+
+        wait_for_reconnect_rollover_probe_resumed(&mut events, "video")
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn reconnect_probe_metrics_require_reconnect_counter() {
+        let metrics = PlaybackStabilitySnapshot {
+            available: true,
+            video_id: Some("video".to_owned()),
+            track_packet_count: 1,
+            sender_lateness: discord_voice_service_twilight::DurationStatsSnapshot {
+                samples: 1,
+                ..Default::default()
+            },
+            reconnect_interruptions: 1,
+            ..Default::default()
+        };
+        validate_reconnect_probe_metrics(&metrics, "video").unwrap();
+
+        let without_reconnect = PlaybackStabilitySnapshot {
+            reconnect_interruptions: 0,
+            ..metrics
+        };
+        let error = validate_reconnect_probe_metrics(&without_reconnect, "video").unwrap_err();
+        assert!(
+            error.to_string().contains("reconnect interruption"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn active_interrupt_state_checks_require_stopped_or_left_shape() {
+        let stopped = StateSnapshot {
+            state: SessionState::VoiceReady,
+            guild_id: Some(Id::new(1)),
+            channel_id: Some(Id::new(2)),
+            current_video_id: None,
+            queue_depth: 0,
+            selected_itag: None,
+            message: None,
+        };
+        ensure_state_after_active_stop(&stopped).unwrap();
+
+        let still_playing = StateSnapshot {
+            state: SessionState::Playing,
+            ..stopped.clone()
+        };
+        assert!(ensure_state_after_active_stop(&still_playing).is_err());
+
+        let left = StateSnapshot {
+            state: SessionState::Idle,
+            guild_id: None,
+            channel_id: None,
+            current_video_id: None,
+            queue_depth: 0,
+            selected_itag: None,
+            message: None,
+        };
+        ensure_state_after_active_leave_voice(&left).unwrap();
+
+        let still_joined = StateSnapshot {
+            state: SessionState::Idle,
+            guild_id: Some(Id::new(1)),
+            ..left
+        };
+        assert!(ensure_state_after_active_leave_voice(&still_joined).is_err());
+    }
+
     fn valid_test_config() -> StagingConfig {
         StagingConfig::from_env_map(HashMap::from([
             ("BOT_TOKEN".to_owned(), "token".to_owned()),
@@ -1970,6 +3320,7 @@ mod tests {
             ("TEST_GUILD_ID".to_owned(), "2".to_owned()),
             ("TEST_VOICE_CHANNEL_ID".to_owned(), "3".to_owned()),
             ("TEST_VIDEO_ID".to_owned(), "video".to_owned()),
+            ("TEST_LONG_VIDEO_ID".to_owned(), "long-video".to_owned()),
             (
                 "DISCORD_VOICE_SERVICE_URI".to_owned(),
                 "http://127.0.0.1:55051".to_owned(),
@@ -1977,6 +3328,24 @@ mod tests {
             (
                 "DISCORD_VOICE_SERVICE_YTMUSIC_ADDR".to_owned(),
                 "http://127.0.0.1:50051".to_owned(),
+            ),
+            (
+                "LIVE_STAGING_PROFILE".to_owned(),
+                "constrained-github-hosted".to_owned(),
+            ),
+            ("LIVE_STAGING_SERVICE_CPUS".to_owned(), "1.0".to_owned()),
+            (
+                "LIVE_STAGING_CPU_CONTENTION_WORKERS".to_owned(),
+                "2".to_owned(),
+            ),
+            ("LIVE_STAGING_HTTP_READ_DELAY_MS".to_owned(), "5".to_owned()),
+            (
+                "LIVE_STAGING_HTTP_READ_JITTER_MS".to_owned(),
+                "25".to_owned(),
+            ),
+            (
+                "LIVE_STAGING_LONG_TRACK_MIN_PACKETS".to_owned(),
+                "300".to_owned(),
             ),
         ]))
         .expect("config should parse")
@@ -2097,6 +3466,31 @@ mod tests {
         };
         assert!(observer_thresholds_satisfied(
             &full_stats,
+            expected_duration_ms,
+        ));
+
+        let gapped_stats = AudioValidationStats {
+            rtp_gap_count_gte_100ms: 1,
+            ..full_stats.clone()
+        };
+        assert!(!observer_thresholds_satisfied(
+            &gapped_stats,
+            expected_duration_ms,
+        ));
+
+        let high_p99_stats = AudioValidationStats {
+            rtp_inter_arrival: crate::audio::AudioIntervalStats {
+                samples: 8_099,
+                p50_ms: 20,
+                p95_ms: 40,
+                p99_ms: RTP_INTERVAL_P99_BUDGET_MS + 1,
+                min_ms: 18,
+                max_ms: RTP_INTERVAL_P99_BUDGET_MS + 1,
+            },
+            ..full_stats
+        };
+        assert!(!observer_thresholds_satisfied(
+            &high_p99_stats,
             expected_duration_ms,
         ));
     }
@@ -2347,8 +3741,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
         let mut request = tokio::spawn(async move { start_observer_resume_proof(&tx).await });
 
-        let Some(ObserverAudioProofCommand::ProveResume { armed, respond_to }) = rx.recv().await
-        else {
+        let Some(ObserverAudioProofCommand::Resume { armed, respond_to }) = rx.recv().await else {
             panic!("expected Resume proof request");
         };
 
@@ -2391,6 +3784,9 @@ mod tests {
                 resume_speaking_started: false,
                 resume_observed_packet_count: 0,
             }),
+            playback_metrics: None,
+            reconnect_probe_metrics: None,
+            long_track_metrics: None,
         };
 
         let evidence = build_failure_evidence(
@@ -2407,6 +3803,62 @@ mod tests {
         assert!(!evidence.observer_resume_speaking_started);
         assert_eq!(evidence.observer_pause_silence_ms, 600);
         assert_eq!(evidence.observer_resume_packet_count, 0);
+    }
+
+    #[test]
+    fn failure_evidence_preserves_partial_post_play_metrics() {
+        let playback_metrics = PlaybackStabilityEvidence {
+            video_id: Some("natural-track".to_owned()),
+            track_packet_count: 144,
+            ended: true,
+            ..PlaybackStabilityEvidence::default()
+        };
+        let reconnect_probe_metrics = PlaybackStabilityEvidence {
+            video_id: Some("natural-track".to_owned()),
+            track_packet_count: 64,
+            reconnect_interruptions: 1,
+            ..PlaybackStabilityEvidence::default()
+        };
+        let mut snapshot = FailureEvidenceSnapshot::default();
+        snapshot.record_post_play_evidence(PostPlayControlEvidence {
+            playback_metrics: Some(playback_metrics.clone()),
+            reconnect_probe_metrics: Some(reconnect_probe_metrics.clone()),
+            long_track_metrics: None,
+        });
+
+        let evidence = build_failure_evidence(
+            &valid_test_config(),
+            &anyhow!("long-track probe Play RPC failed before Playing"),
+            Some(&snapshot),
+        );
+
+        assert_eq!(evidence.playback_metrics, Some(playback_metrics));
+        assert_eq!(
+            evidence.reconnect_probe_metrics,
+            Some(reconnect_probe_metrics)
+        );
+        assert!(!evidence.validated_long_track_playback);
+        assert!(evidence.long_track_metrics.is_none());
+    }
+
+    #[test]
+    fn success_evidence_reports_playback_dave_transition_counter() {
+        let playback_metrics = PlaybackStabilityEvidence {
+            dave_transition_count_during_playback: 3,
+            ..PlaybackStabilityEvidence::default()
+        };
+        let outcome = ValidatedLiveOutcome {
+            live_contract: LiveContractState::default(),
+            audio_stats: AudioValidationStats::default(),
+            observer_playback: ObserverPlaybackProof::default(),
+            playback_metrics: Some(playback_metrics),
+            reconnect_probe_metrics: None,
+            long_track_metrics: None,
+        };
+
+        let evidence = build_success_evidence(&valid_test_config(), &outcome);
+
+        assert_eq!(evidence.dave_transition_count_during_playback, 3);
     }
 
     #[tokio::test]
@@ -2436,6 +3888,9 @@ mod tests {
             live_contract: Some(snapshot.lock().unwrap().clone()),
             audio_stats: None,
             observer_playback: None,
+            playback_metrics: None,
+            reconnect_probe_metrics: None,
+            long_track_metrics: None,
         };
         let error = anyhow!("observer audio proof timed out");
 

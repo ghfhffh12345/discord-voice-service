@@ -1,9 +1,11 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use discord_voice_service_playback::{PlaybackWorker, YtMusicClient};
 use tokio::sync::broadcast;
 
 use super::events::SessionEventRecord;
+use super::metrics::PlaybackStabilitySnapshot;
 use super::runtime::VoiceSessionRuntime;
 use super::state::Snapshot;
 use crate::error::RuntimeError;
@@ -53,6 +55,26 @@ impl Supervisor {
 
     pub async fn snapshot(&self) -> Snapshot {
         self.runtime.snapshot().await
+    }
+
+    pub async fn playback_metrics(&self) -> Option<PlaybackStabilitySnapshot> {
+        self.runtime.playback_metrics().await
+    }
+
+    #[doc(hidden)]
+    #[cfg(debug_assertions)]
+    pub fn set_live_media_send_delay_for_tests<F>(&self, delay_for_packet: F)
+    where
+        F: Fn(u64) -> Option<Duration> + Send + Sync + 'static,
+    {
+        self.runtime
+            .set_live_media_send_delay_for_tests(delay_for_packet);
+    }
+
+    #[doc(hidden)]
+    #[cfg(debug_assertions)]
+    pub fn clear_live_media_send_delay_for_tests(&self) {
+        self.runtime.clear_live_media_send_delay_for_tests();
     }
 
     pub(crate) fn subscribe_events(&self) -> broadcast::Receiver<SessionEventRecord> {

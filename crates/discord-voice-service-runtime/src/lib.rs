@@ -6,7 +6,8 @@ mod session;
 pub use api::ControlService;
 pub use error::RuntimeError;
 pub use session::{
-    Command, Readiness, ReadinessSnapshot, SessionState, Snapshot, Supervisor, VoiceContext,
+    Command, DurationStatsSnapshot, PlaybackBufferDepthSnapshot, PlaybackStabilitySnapshot,
+    Readiness, ReadinessSnapshot, SessionState, Snapshot, Supervisor, VoiceContext,
 };
 
 pub fn record_ytmusic_probe(healthy: bool) {

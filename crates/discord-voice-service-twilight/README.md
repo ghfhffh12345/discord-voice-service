@@ -6,7 +6,7 @@ Use it from a Twilight bot when you want to:
 
 - build `UpdateVoiceState` join/leave commands with `Id<GuildMarker>` and `Id<ChannelMarker>` values
 - collect the authenticated voice context from `VoiceStateUpdate` plus `VoiceServerUpdate`
-- call `JoinVoice`, `UpdateVoiceContext`, `Play`, `Pause`, `Resume`, `Stop`, `LeaveVoice`, `GetState`, and `SubscribeEvents` without hand-building protobuf messages
+- call `JoinVoice`, `UpdateVoiceContext`, `Play`, `Pause`, `Resume`, `Stop`, `LeaveVoice`, `GetState`, `GetPlaybackMetrics`, and `SubscribeEvents` without hand-building protobuf messages
 - receive service state/events with Twilight-typed guild and channel IDs
 
 Sketch:

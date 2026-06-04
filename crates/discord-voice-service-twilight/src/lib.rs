@@ -33,7 +33,10 @@ use twilight_model::{
 };
 
 use crate::proto::{
-    GetStateRequest, JoinVoiceRequest, LeaveVoiceRequest, PauseRequest, PlayRequest, ResumeRequest,
+    DurationStatsSnapshot as ProtoDurationStatsSnapshot, GetPlaybackMetricsRequest,
+    GetStateRequest, JoinVoiceRequest, LeaveVoiceRequest, PauseRequest, PlayRequest,
+    PlaybackBufferDepthSnapshot as ProtoPlaybackBufferDepthSnapshot,
+    PlaybackStabilitySnapshot as ProtoPlaybackStabilitySnapshot, ResumeRequest,
     SessionEvent as ProtoSessionEvent, SessionEventKind as ProtoSessionEventKind,
     SessionEventReason as ProtoSessionEventReason, SessionState as ProtoSessionState,
     SessionStateSnapshot as ProtoSessionStateSnapshot, StopRequest, SubscribeEventsRequest,
@@ -236,6 +239,17 @@ impl Client {
         let snapshot = self.inner.get_state(GetStateRequest {}).await?.into_inner();
 
         StateSnapshot::try_from(snapshot).map_err(Status::from)
+    }
+
+    /// Fetch the latest playback stability metrics snapshot.
+    pub async fn playback_metrics(&mut self) -> Result<PlaybackStabilitySnapshot, Status> {
+        let snapshot = self
+            .inner
+            .get_playback_metrics(GetPlaybackMetricsRequest {})
+            .await?
+            .into_inner();
+
+        Ok(snapshot.into())
     }
 
     /// Subscribe to service session events with Twilight-typed IDs.
@@ -489,6 +503,212 @@ impl TryFrom<ProtoSessionStateSnapshot> for StateSnapshot {
             selected_itag: non_zero(value.selected_itag),
             message: non_empty(value.message),
         })
+    }
+}
+
+/// Duration percentile statistics captured by the service.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DurationStatsSnapshot {
+    pub samples: u64,
+    pub p50_ms: u64,
+    pub p95_ms: u64,
+    pub p99_ms: u64,
+    pub min_ms: u64,
+    pub max_ms: u64,
+}
+
+impl From<ProtoDurationStatsSnapshot> for DurationStatsSnapshot {
+    fn from(value: ProtoDurationStatsSnapshot) -> Self {
+        Self {
+            samples: value.samples,
+            p50_ms: value.p50_ms,
+            p95_ms: value.p95_ms,
+            p99_ms: value.p99_ms,
+            min_ms: value.min_ms,
+            max_ms: value.max_ms,
+        }
+    }
+}
+
+/// Compressed Opus buffer depth captured by the service.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlaybackBufferDepthSnapshot {
+    pub packets: u64,
+    pub bytes: u64,
+    pub duration_ms: u64,
+    pub duration_samples: u64,
+}
+
+impl From<ProtoPlaybackBufferDepthSnapshot> for PlaybackBufferDepthSnapshot {
+    fn from(value: ProtoPlaybackBufferDepthSnapshot) -> Self {
+        Self {
+            packets: value.packets,
+            bytes: value.bytes,
+            duration_ms: value.duration_ms,
+            duration_samples: value.duration_samples,
+        }
+    }
+}
+
+/// Latest structured stability metrics for a playback epoch.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlaybackStabilitySnapshot {
+    pub available: bool,
+    pub playback_epoch: u64,
+    pub video_id: Option<String>,
+    pub selected_itag: Option<u32>,
+    pub track_packet_count: u64,
+    pub continuity_silence_packet_count: u64,
+    pub inserted_silence_duration_ms: u64,
+    pub track_interval: DurationStatsSnapshot,
+    pub all_packet_interval: DurationStatsSnapshot,
+    pub sender_lateness: DurationStatsSnapshot,
+    pub max_consecutive_late_packets: u64,
+    pub current_consecutive_late_packets: u64,
+    pub current_buffer_depth: PlaybackBufferDepthSnapshot,
+    pub min_buffer_depth: PlaybackBufferDepthSnapshot,
+    pub max_buffer_depth: PlaybackBufferDepthSnapshot,
+    pub current_source_buffer_depth: PlaybackBufferDepthSnapshot,
+    pub min_source_buffer_depth: PlaybackBufferDepthSnapshot,
+    pub max_source_buffer_depth: PlaybackBufferDepthSnapshot,
+    pub current_playout_buffer_depth: PlaybackBufferDepthSnapshot,
+    pub min_playout_buffer_depth: PlaybackBufferDepthSnapshot,
+    pub max_playout_buffer_depth: PlaybackBufferDepthSnapshot,
+    pub prepared_rtp_queue_depth_ms: u64,
+    pub source_buffer_target_ms: u64,
+    pub adaptive_buffer_target_ms: u64,
+    pub max_adaptive_buffer_target_ms: u64,
+    pub buffer_low_watermark_count: u64,
+    pub source_buffer_low_watermark_count: u64,
+    pub playout_buffer_low_watermark_count: u64,
+    pub buffer_underrun_count: u64,
+    pub playout_underrun_count: u64,
+    pub source_underrun_count: u64,
+    pub rebuffer_count: u64,
+    pub refill_duration: DurationStatsSnapshot,
+    pub source_producer_fill_duration: DurationStatsSnapshot,
+    pub producer_stall_duration: DurationStatsSnapshot,
+    pub max_producer_lag_ms: u64,
+    pub http_retry_count: u64,
+    pub response_open_count: u64,
+    pub range_reopen_count: u64,
+    pub read_error_reopen_count: u64,
+    pub url_reresolve_count: u64,
+    pub pause_resume_first_intervals_ms: Vec<u64>,
+    pub post_stall_first_intervals_ms: Vec<u64>,
+    pub post_rebuffer_first_intervals_ms: Vec<u64>,
+    pub playout_sender_lateness: DurationStatsSnapshot,
+    pub playout_builder_prepare_duration: DurationStatsSnapshot,
+    pub sender_send_duration: DurationStatsSnapshot,
+    pub sender_loop_non_send_work_duration: DurationStatsSnapshot,
+    pub max_consecutive_playout_late_packets: u64,
+    pub speaking_prepare_duration: DurationStatsSnapshot,
+    pub sender_forbidden_work_count: u64,
+    pub gateway_event_drain_duration: DurationStatsSnapshot,
+    pub gateway_event_drain_count: u64,
+    pub dave_transition_count: u64,
+    pub dave_transition_count_during_playback: u64,
+    pub stale_dave_send_prevented_count: u64,
+    pub controlled_media_interruption_count: u64,
+    pub media_clock_reset_count: u64,
+    pub scheduler_late_reset_count: u64,
+    pub source_underrun_reset_count: u64,
+    pub pause_resume_reset_count: u64,
+    pub dave_transition_recovery_reset_count: u64,
+    pub gateway_interruptions: u64,
+    pub dave_interruptions: u64,
+    pub reconnect_interruptions: u64,
+    pub ended: bool,
+}
+
+impl From<ProtoPlaybackStabilitySnapshot> for PlaybackStabilitySnapshot {
+    fn from(value: ProtoPlaybackStabilitySnapshot) -> Self {
+        Self {
+            available: value.available,
+            playback_epoch: value.playback_epoch,
+            video_id: non_empty(value.video_id),
+            selected_itag: non_zero(value.selected_itag),
+            track_packet_count: value.track_packet_count,
+            continuity_silence_packet_count: value.continuity_silence_packet_count,
+            inserted_silence_duration_ms: value.inserted_silence_duration_ms,
+            track_interval: value.track_interval.unwrap_or_default().into(),
+            all_packet_interval: value.all_packet_interval.unwrap_or_default().into(),
+            sender_lateness: value.sender_lateness.unwrap_or_default().into(),
+            max_consecutive_late_packets: value.max_consecutive_late_packets,
+            current_consecutive_late_packets: value.current_consecutive_late_packets,
+            current_buffer_depth: value.current_buffer_depth.unwrap_or_default().into(),
+            min_buffer_depth: value.min_buffer_depth.unwrap_or_default().into(),
+            max_buffer_depth: value.max_buffer_depth.unwrap_or_default().into(),
+            current_source_buffer_depth: value
+                .current_source_buffer_depth
+                .unwrap_or_default()
+                .into(),
+            min_source_buffer_depth: value.min_source_buffer_depth.unwrap_or_default().into(),
+            max_source_buffer_depth: value.max_source_buffer_depth.unwrap_or_default().into(),
+            current_playout_buffer_depth: value
+                .current_playout_buffer_depth
+                .unwrap_or_default()
+                .into(),
+            min_playout_buffer_depth: value.min_playout_buffer_depth.unwrap_or_default().into(),
+            max_playout_buffer_depth: value.max_playout_buffer_depth.unwrap_or_default().into(),
+            prepared_rtp_queue_depth_ms: value.prepared_rtp_queue_depth_ms,
+            source_buffer_target_ms: value.source_buffer_target_ms,
+            adaptive_buffer_target_ms: value.adaptive_buffer_target_ms,
+            max_adaptive_buffer_target_ms: value.max_adaptive_buffer_target_ms,
+            buffer_low_watermark_count: value.buffer_low_watermark_count,
+            source_buffer_low_watermark_count: value.source_buffer_low_watermark_count,
+            playout_buffer_low_watermark_count: value.playout_buffer_low_watermark_count,
+            buffer_underrun_count: value.buffer_underrun_count,
+            playout_underrun_count: value.playout_underrun_count,
+            source_underrun_count: value.source_underrun_count,
+            rebuffer_count: value.rebuffer_count,
+            refill_duration: value.refill_duration.unwrap_or_default().into(),
+            source_producer_fill_duration: value
+                .source_producer_fill_duration
+                .unwrap_or_default()
+                .into(),
+            producer_stall_duration: value.producer_stall_duration.unwrap_or_default().into(),
+            max_producer_lag_ms: value.max_producer_lag_ms,
+            http_retry_count: value.http_retry_count,
+            response_open_count: value.response_open_count,
+            range_reopen_count: value.range_reopen_count,
+            read_error_reopen_count: value.read_error_reopen_count,
+            url_reresolve_count: value.url_reresolve_count,
+            pause_resume_first_intervals_ms: value.pause_resume_first_intervals_ms,
+            post_stall_first_intervals_ms: value.post_stall_first_intervals_ms,
+            post_rebuffer_first_intervals_ms: value.post_rebuffer_first_intervals_ms,
+            playout_sender_lateness: value.playout_sender_lateness.unwrap_or_default().into(),
+            playout_builder_prepare_duration: value
+                .playout_builder_prepare_duration
+                .unwrap_or_default()
+                .into(),
+            sender_send_duration: value.sender_send_duration.unwrap_or_default().into(),
+            sender_loop_non_send_work_duration: value
+                .sender_loop_non_send_work_duration
+                .unwrap_or_default()
+                .into(),
+            max_consecutive_playout_late_packets: value.max_consecutive_playout_late_packets,
+            speaking_prepare_duration: value.speaking_prepare_duration.unwrap_or_default().into(),
+            sender_forbidden_work_count: value.sender_forbidden_work_count,
+            gateway_event_drain_duration: value
+                .gateway_event_drain_duration
+                .unwrap_or_default()
+                .into(),
+            gateway_event_drain_count: value.gateway_event_drain_count,
+            dave_transition_count: value.dave_transition_count,
+            dave_transition_count_during_playback: value.dave_transition_count_during_playback,
+            stale_dave_send_prevented_count: value.stale_dave_send_prevented_count,
+            controlled_media_interruption_count: value.controlled_media_interruption_count,
+            media_clock_reset_count: value.media_clock_reset_count,
+            scheduler_late_reset_count: value.scheduler_late_reset_count,
+            source_underrun_reset_count: value.source_underrun_reset_count,
+            pause_resume_reset_count: value.pause_resume_reset_count,
+            dave_transition_recovery_reset_count: value.dave_transition_recovery_reset_count,
+            gateway_interruptions: value.gateway_interruptions,
+            dave_interruptions: value.dave_interruptions,
+            reconnect_interruptions: value.reconnect_interruptions,
+            ended: value.ended,
+        }
     }
 }
 

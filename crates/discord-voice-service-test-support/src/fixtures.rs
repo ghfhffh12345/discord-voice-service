@@ -34,6 +34,24 @@ pub async fn spawn_stream_server_with_initial_delay(path: &str, delay: Duration)
     .await
 }
 
+pub async fn spawn_stream_server_with_chunk_jitter(
+    path: &str,
+    chunk_size: usize,
+    base_delay: Duration,
+    jitter_delay: Duration,
+) -> RangeServer {
+    let payload = load_fixture_bytes(path);
+    spawn_test_server(
+        ServerBehavior::HonorRangeWithChunkJitter {
+            chunk_size,
+            base_delay,
+            jitter_delay,
+        },
+        payload,
+    )
+    .await
+}
+
 pub async fn spawn_hanging_server() -> RangeServer {
     spawn_test_server(ServerBehavior::HangBeforeResponse, Bytes::new()).await
 }
@@ -139,7 +157,9 @@ async fn spawn_test_server(behavior: ServerBehavior, payload: Bytes) -> RangeSer
                 ServerBehavior::HonorRangeWith416AtEof if start >= payload.len() as u64 => {
                     (&[][..], "HTTP/1.1 416 Range Not Satisfiable", None, 0)
                 }
-                ServerBehavior::HonorRange | ServerBehavior::HonorRangeWithInitialDelay { .. }
+                ServerBehavior::HonorRange
+                | ServerBehavior::HonorRangeWithInitialDelay { .. }
+                | ServerBehavior::HonorRangeWithChunkJitter { .. }
                     if start > 0 =>
                 {
                     (
@@ -210,19 +230,42 @@ async fn spawn_test_server(behavior: ServerBehavior, payload: Bytes) -> RangeSer
             if stream.write_all(response.as_bytes()).is_err() {
                 continue;
             }
-            let _ = stream.write_all(body);
+            if let ServerBehavior::HonorRangeWithChunkJitter {
+                chunk_size,
+                base_delay,
+                jitter_delay,
+            } = behavior
+            {
+                for (index, chunk) in body.chunks(chunk_size.max(1)).enumerate() {
+                    let delay = if index % 2 == 0 {
+                        base_delay
+                    } else {
+                        jitter_delay
+                    };
+                    if !delay.is_zero() {
+                        thread::sleep(delay);
+                    }
+                    if stream.write_all(chunk).is_err() {
+                        break;
+                    }
+                }
+            } else {
+                let _ = stream.write_all(body);
+            }
         }
     });
 
     RangeServer {
         url: format!("http://{address}"),
         last_range_header,
+        request_count,
     }
 }
 
 pub struct RangeServer {
     url: String,
     last_range_header: Arc<Mutex<Option<String>>>,
+    request_count: Arc<Mutex<usize>>,
 }
 
 impl RangeServer {
@@ -236,6 +279,13 @@ impl RangeServer {
             .expect("range header mutex should lock")
             .clone()
     }
+
+    pub async fn request_count(&self) -> usize {
+        *self
+            .request_count
+            .lock()
+            .expect("request count mutex should lock")
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -243,6 +293,11 @@ enum ServerBehavior {
     HonorRange,
     HonorRangeWithInitialDelay {
         delay: Duration,
+    },
+    HonorRangeWithChunkJitter {
+        chunk_size: usize,
+        base_delay: Duration,
+        jitter_delay: Duration,
     },
     HangBeforeResponse,
     HonorRangeWith416AtEof,

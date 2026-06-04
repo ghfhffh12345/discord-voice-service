@@ -50,6 +50,7 @@ env:
   TEST_GUILD_ID: ${{ secrets.TEST_GUILD_ID }}
   TEST_VOICE_CHANNEL_ID: ${{ secrets.TEST_VOICE_CHANNEL_ID }}
   TEST_VIDEO_ID: ${{ secrets.TEST_VIDEO_ID }}
+  TEST_LONG_VIDEO_ID: ${{ secrets.TEST_LONG_VIDEO_ID }}
   BROWSER_JSON: ${{ secrets.BROWSER_JSON }}
   DISCORD_VOICE_SERVICE_URI: http://127.0.0.1:55051
   DISCORD_VOICE_SERVICE_BIND_ADDR: 0.0.0.0:55051
@@ -62,6 +63,12 @@ env:
   YTMUSIC_SERVICE_PUBLIC_ADDR: 0.0.0.0:50051
   YTMUSIC_SERVICE_ADMIN_ADDR: 0.0.0.0:50052
   YTMUSIC_SERVICE_BROWSER_JSON: /run/secrets/browser.json
+  LIVE_STAGING_PROFILE: constrained-github-hosted
+  LIVE_STAGING_SERVICE_CPUS: "1.0"
+  LIVE_STAGING_CPU_CONTENTION_WORKERS: "2"
+  LIVE_STAGING_HTTP_READ_DELAY_MS: "5"
+  LIVE_STAGING_HTTP_READ_JITTER_MS: "25"
+  LIVE_STAGING_LONG_TRACK_MIN_PACKETS: "300"
   LIVE_VALIDATION_EVIDENCE_PATH: ${{ github.workspace }}/live-validation-evidence.json
 
 concurrency:
@@ -187,6 +194,8 @@ jobs:
             echo "- Source commit: \`${{ steps.source.outputs.source_sha }}\`"
             echo "- ytmusic-service image ref: \`${YTMUSIC_SERVICE_IMAGE_REF:-not resolved}\`"
             echo "- browser.json source: \`BROWSER_JSON\` secret materialized for the run"
-            echo "- Validation mode: observer receive-side live contract"
+            echo "- Validation mode: observer receive-side live contract with constrained CPU, slow/jittery HTTP reads, and long-track probe"
+            echo "- Constrained profile: \`${LIVE_STAGING_PROFILE}\`, service CPUs \`${LIVE_STAGING_SERVICE_CPUS}\`, CPU contention workers \`${LIVE_STAGING_CPU_CONTENTION_WORKERS}\`"
+            echo "- HTTP read stress: delay \`${LIVE_STAGING_HTTP_READ_DELAY_MS}ms\`, jitter \`${LIVE_STAGING_HTTP_READ_JITTER_MS}ms\`"
             echo "- Structured observer evidence artifact: \`${LIVE_VALIDATION_EVIDENCE_PATH}\`"
           } >> "${GITHUB_STEP_SUMMARY}"

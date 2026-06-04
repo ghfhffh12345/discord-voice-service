@@ -20,7 +20,8 @@ pub use receive::{
     ObservedAudioFrame, ObservedRtpPacket, ObservedSpeakingState, ObservedVoiceActivity,
     ObservedVoiceSession, PendingObservedVoiceSession,
 };
-pub use session::{ConnectedVoiceSession, VoiceContext};
+pub use session::{ConnectedVoiceSession, VoiceContext, VoiceGatewayDrainReport};
+pub use udp::PreparedVoicePacket;
 
 #[doc(hidden)]
 pub mod test_support {
@@ -33,5 +34,5 @@ pub mod test_support {
     pub use crate::resume::GatewayEvent;
     pub use crate::rtp::{RtpPacketBuilder, parse_rtp_header};
     pub use crate::speaking::{OPUS_SILENCE_FRAME, send_speaking};
-    pub use crate::udp::VoiceUdpTransport;
+    pub use crate::udp::{PreparedVoicePacket, VoiceUdpTransport};
 }

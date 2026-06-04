@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 
 use crate::media::http_stream::HttpOpusStream;
+use crate::media::http_stream::HttpOpusStreamMetrics;
 use crate::media::position::{PlaybackPosition, SharedPlaybackPosition};
 use crate::media::webm_demux::{DemuxedPacket, WebmOpusDemux};
 
@@ -80,6 +81,10 @@ impl PlaybackSource {
 
     pub fn stream_mut(&mut self) -> &mut HttpOpusStream {
         &mut self.stream
+    }
+
+    pub fn stream_metrics(&self) -> HttpOpusStreamMetrics {
+        self.stream.metrics()
     }
 
     pub fn demux_mut(&mut self) -> &mut WebmOpusDemux {

@@ -3,16 +3,16 @@ use crate::error::PlaybackError;
 use crate::media::opus_queue::{OpusFrame, OpusFrameQueue};
 use crate::media::position::{PlaybackPosition, SharedPlaybackPosition, shared_playback_position};
 use crate::media::webm_demux::DemuxedPacket;
-use crate::recovery::PlaybackRecovery;
+use crate::recovery::{PlaybackRecovery, PlaybackRecoveryMetrics};
 use crate::source::PlaybackSource;
 
-const DEFAULT_PREBUFFER_TARGET: usize = 4;
+const DEFAULT_PREBUFFER_TARGET_MS: u64 = 80;
 
 pub struct PlaybackWorker {
     current_video_id: Option<String>,
     recovery: PlaybackRecovery,
     position: SharedPlaybackPosition,
-    prebuffer_target: usize,
+    prebuffer_target_ms: u64,
 }
 
 impl PlaybackWorker {
@@ -21,7 +21,7 @@ impl PlaybackWorker {
             current_video_id: None,
             recovery: PlaybackRecovery::new(client),
             position: shared_playback_position(PlaybackPosition::default()),
-            prebuffer_target: DEFAULT_PREBUFFER_TARGET,
+            prebuffer_target_ms: DEFAULT_PREBUFFER_TARGET_MS,
         }
     }
 
@@ -30,6 +30,10 @@ impl PlaybackWorker {
         video_id: &str,
         queue: &mut OpusFrameQueue,
     ) -> Result<PlaybackSource, PlaybackError> {
+        if queue.is_full() {
+            return Err(PlaybackError::BufferFull);
+        }
+
         let resume_position_ms = if self.current_video_id.as_deref() == Some(video_id) {
             self.position.lock().unwrap().sent_duration_ms()
         } else {
@@ -55,12 +59,31 @@ impl PlaybackWorker {
         self.position = shared_playback_position(PlaybackPosition::default());
     }
 
+    pub fn recovery_metrics(&self) -> PlaybackRecoveryMetrics {
+        self.recovery.metrics()
+    }
+
+    pub fn set_prebuffer_target_ms(&mut self, target_ms: u64) {
+        self.prebuffer_target_ms = target_ms.max(DEFAULT_PREBUFFER_TARGET_MS);
+    }
+
     pub async fn fill_queue(
         &mut self,
         source: &mut PlaybackSource,
         queue: &mut OpusFrameQueue,
     ) -> Result<(), PlaybackError> {
-        while queue.len() < self.prebuffer_target {
+        self.fill_queue_to_duration_ms(source, queue, self.prebuffer_target_ms)
+            .await
+    }
+
+    pub async fn fill_queue_to_duration_ms(
+        &mut self,
+        source: &mut PlaybackSource,
+        queue: &mut OpusFrameQueue,
+        target_ms: u64,
+    ) -> Result<(), PlaybackError> {
+        let target_ms = target_ms.max(1);
+        while queue.buffered_duration_ms() < target_ms && !queue.is_full() {
             if let Some(packet) = source.pending_packets_mut().pop_front() {
                 self.buffer_packet(queue, packet)?;
                 continue;
@@ -75,9 +98,10 @@ impl PlaybackWorker {
                 demux.push_bytes(chunk);
                 demux.drain_packets()?
             };
+            tokio::task::yield_now().await;
 
             for packet in packets {
-                if queue.len() < self.prebuffer_target {
+                if queue.buffered_duration_ms() < target_ms && !queue.is_full() {
                     self.buffer_packet(queue, packet)?;
                 } else {
                     source.pending_packets_mut().push_back(packet);
@@ -94,12 +118,12 @@ impl PlaybackWorker {
         packet: DemuxedPacket,
     ) -> Result<(), PlaybackError> {
         self.position.lock().unwrap().record_buffered(&packet);
-        queue
-            .push(OpusFrame::with_duration_samples(
-                packet.data.clone(),
-                packet.duration_ms,
-                packet.duration_samples,
-            ))
-            .map_err(|_| PlaybackError::BufferFull)
+        let frame = OpusFrame::with_duration_samples(
+            packet.data.clone(),
+            packet.duration_ms,
+            packet.duration_samples,
+        )
+        .with_metadata(None, 0);
+        queue.push(frame).map_err(|_| PlaybackError::BufferFull)
     }
 }

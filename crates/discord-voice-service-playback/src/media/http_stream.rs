@@ -1,16 +1,58 @@
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use reqwest::StatusCode;
 use reqwest::header::{CONTENT_RANGE, RANGE};
+use std::time::Duration;
 
 use crate::error::PlaybackError;
 
 use super::position::PlaybackPosition;
 
+const MAX_READ_CHUNK_BYTES: usize = 64 * 1024;
+const HTTP_READ_DELAY_ENV: &str = "DISCORD_VOICE_SERVICE_HTTP_READ_DELAY_MS";
+const HTTP_READ_JITTER_ENV: &str = "DISCORD_VOICE_SERVICE_HTTP_READ_JITTER_MS";
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HttpOpusStreamMetrics {
+    pub response_open_count: u64,
+    pub range_reopen_count: u64,
+    pub bounded_chunk_count: u64,
+    pub read_error_reopen_count: u64,
+}
+
 #[derive(Debug)]
 pub struct HttpOpusStream {
     client: reqwest::Client,
     url: String,
+    response: Option<reqwest::Response>,
+    response_start: u64,
+    pending: BytesMut,
     position: PlaybackPosition,
+    metrics: HttpOpusStreamMetrics,
+    read_stress: HttpReadStressProfile,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct HttpReadStressProfile {
+    base_delay_ms: u64,
+    jitter_ms: u64,
+}
+
+impl HttpReadStressProfile {
+    fn from_env() -> Self {
+        Self {
+            base_delay_ms: read_u64_env(HTTP_READ_DELAY_ENV),
+            jitter_ms: read_u64_env(HTTP_READ_JITTER_ENV),
+        }
+    }
+
+    fn delay_for_chunk(self, chunk_index: u64) -> Duration {
+        let jitter_ms = if self.jitter_ms == 0 {
+            0
+        } else {
+            pseudo_jitter_ms(chunk_index, self.jitter_ms)
+        };
+        Duration::from_millis(self.base_delay_ms.saturating_add(jitter_ms))
+    }
 }
 
 impl HttpOpusStream {
@@ -18,7 +60,12 @@ impl HttpOpusStream {
         Self {
             client: reqwest::Client::new(),
             url: url.into(),
+            response: None,
+            response_start: 0,
+            pending: BytesMut::new(),
             position: PlaybackPosition::default(),
+            metrics: HttpOpusStreamMetrics::default(),
+            read_stress: HttpReadStressProfile::from_env(),
         }
     }
 
@@ -26,42 +73,117 @@ impl HttpOpusStream {
         self.position
     }
 
+    pub fn metrics(&self) -> HttpOpusStreamMetrics {
+        self.metrics
+    }
+
     pub fn set_resume_offset(&mut self, byte_offset: u64) {
         self.position.set_byte_offset(byte_offset);
+        self.response = None;
+        self.response_start = byte_offset;
+        self.pending.clear();
     }
 
     pub async fn read_chunk(&mut self) -> Result<Option<Bytes>, PlaybackError> {
+        loop {
+            if let Some(chunk) = self.take_pending_chunk() {
+                self.apply_read_stress().await;
+                return Ok(Some(chunk));
+            }
+
+            if self.response.is_none() {
+                match self.open_response().await? {
+                    Some(response) => {
+                        self.response_start = self.position.byte_offset();
+                        self.response = Some(response);
+                    }
+                    None => return Ok(None),
+                }
+            }
+
+            let Some(response) = self.response.as_mut() else {
+                continue;
+            };
+
+            match response.chunk().await {
+                Ok(Some(chunk)) => self.pending.extend_from_slice(&chunk),
+                Ok(None) => {
+                    self.response = None;
+                    return Ok(None);
+                }
+                Err(_err) if !self.pending.is_empty() => {
+                    self.response = None;
+                }
+                Err(_err) if self.position.byte_offset() > self.response_start => {
+                    self.response = None;
+                    self.metrics.read_error_reopen_count =
+                        self.metrics.read_error_reopen_count.saturating_add(1);
+                }
+                Err(err) => {
+                    self.response = None;
+                    return Err(err.into());
+                }
+            }
+        }
+    }
+
+    async fn open_response(&mut self) -> Result<Option<reqwest::Response>, PlaybackError> {
         let expected_start = self.position.byte_offset();
-        let range = format!("bytes={expected_start}-");
-        let mut response = self
-            .client
-            .get(&self.url)
-            .header(RANGE, range)
-            .send()
-            .await?;
+        let mut request = self.client.get(&self.url);
+        if expected_start > 0 {
+            request = request.header(RANGE, format!("bytes={expected_start}-"));
+            self.metrics.range_reopen_count = self.metrics.range_reopen_count.saturating_add(1);
+        }
+        self.metrics.response_open_count = self.metrics.response_open_count.saturating_add(1);
+
+        let response = request.send().await?;
         if expected_start > 0 && response.status() == StatusCode::RANGE_NOT_SATISFIABLE {
             return Ok(None);
         }
-        response = response.error_for_status()?;
+
+        let response = response.error_for_status()?;
         validate_resume_response(&response, expected_start)?;
-        let mut body = BytesMut::new();
-        loop {
-            match response.chunk().await {
-                Ok(Some(chunk)) => body.extend_from_slice(&chunk),
-                Ok(None) => break,
-                Err(_err) if !body.is_empty() => break,
-                Err(err) => return Err(err.into()),
-            }
-        }
-
-        let bytes = body.freeze();
-        if bytes.is_empty() {
-            return Ok(None);
-        }
-
-        self.position.advance_bytes(bytes.len() as u64);
-        Ok(Some(bytes))
+        Ok(Some(response))
     }
+
+    fn take_pending_chunk(&mut self) -> Option<Bytes> {
+        if self.pending.is_empty() {
+            return None;
+        }
+
+        let chunk_len = self.pending.len().min(MAX_READ_CHUNK_BYTES);
+        let bytes = self.pending.copy_to_bytes(chunk_len);
+        if bytes.is_empty() {
+            return None;
+        }
+        self.metrics.bounded_chunk_count = self.metrics.bounded_chunk_count.saturating_add(1);
+        self.position.advance_bytes(bytes.len() as u64);
+        Some(bytes)
+    }
+
+    async fn apply_read_stress(&self) {
+        let delay = self
+            .read_stress
+            .delay_for_chunk(self.metrics.bounded_chunk_count);
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+    }
+}
+
+fn read_u64_env(name: &str) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+fn pseudo_jitter_ms(chunk_index: u64, max_jitter_ms: u64) -> u64 {
+    let mut value = chunk_index.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    value ^= value >> 33;
+    value = value.wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    value ^= value >> 29;
+    value % max_jitter_ms.saturating_add(1)
 }
 
 fn validate_resume_response(

@@ -11,6 +11,7 @@ service DiscordVoiceControl {
   rpc Stop(StopRequest) returns (StopResponse);
   rpc LeaveVoice(LeaveVoiceRequest) returns (LeaveVoiceResponse);
   rpc GetState(GetStateRequest) returns (SessionStateSnapshot);
+  rpc GetPlaybackMetrics(GetPlaybackMetricsRequest) returns (PlaybackStabilitySnapshot);
   rpc SubscribeEvents(SubscribeEventsRequest) returns (stream SessionEvent);
 }
 
@@ -45,7 +46,93 @@ message StopResponse {}
 message LeaveVoiceRequest {}
 message LeaveVoiceResponse {}
 message GetStateRequest {}
+message GetPlaybackMetricsRequest {}
 message SubscribeEventsRequest {}
+
+message DurationStatsSnapshot {
+  uint64 samples = 1;
+  uint64 p50_ms = 2;
+  uint64 p95_ms = 3;
+  uint64 p99_ms = 4;
+  uint64 min_ms = 5;
+  uint64 max_ms = 6;
+}
+
+message PlaybackBufferDepthSnapshot {
+  uint64 packets = 1;
+  uint64 bytes = 2;
+  uint64 duration_ms = 3;
+  uint64 duration_samples = 4;
+}
+
+message PlaybackStabilitySnapshot {
+  bool available = 1;
+  uint64 playback_epoch = 2;
+  string video_id = 3;
+  uint32 selected_itag = 4;
+  uint64 track_packet_count = 5;
+  uint64 continuity_silence_packet_count = 6;
+  uint64 inserted_silence_duration_ms = 7;
+  DurationStatsSnapshot track_interval = 8;
+  DurationStatsSnapshot all_packet_interval = 9;
+  DurationStatsSnapshot sender_lateness = 10;
+  uint64 max_consecutive_late_packets = 11;
+  uint64 current_consecutive_late_packets = 12;
+  PlaybackBufferDepthSnapshot current_buffer_depth = 13;
+  PlaybackBufferDepthSnapshot min_buffer_depth = 14;
+  PlaybackBufferDepthSnapshot max_buffer_depth = 15;
+  uint64 buffer_low_watermark_count = 16;
+  uint64 buffer_underrun_count = 17;
+  DurationStatsSnapshot refill_duration = 18;
+  DurationStatsSnapshot producer_stall_duration = 19;
+  uint64 max_producer_lag_ms = 20;
+  uint64 http_retry_count = 21;
+  uint64 response_open_count = 22;
+  uint64 range_reopen_count = 23;
+  uint64 read_error_reopen_count = 24;
+  uint64 url_reresolve_count = 25;
+  repeated uint64 pause_resume_first_intervals_ms = 26;
+  repeated uint64 post_stall_first_intervals_ms = 27;
+  uint64 gateway_interruptions = 28;
+  uint64 dave_interruptions = 29;
+  uint64 reconnect_interruptions = 30;
+  bool ended = 31;
+  uint64 adaptive_buffer_target_ms = 32;
+  uint64 max_adaptive_buffer_target_ms = 33;
+  PlaybackBufferDepthSnapshot current_source_buffer_depth = 34;
+  PlaybackBufferDepthSnapshot min_source_buffer_depth = 35;
+  PlaybackBufferDepthSnapshot max_source_buffer_depth = 36;
+  uint64 source_buffer_target_ms = 37;
+  uint64 source_buffer_low_watermark_count = 38;
+  uint64 rebuffer_count = 39;
+  PlaybackBufferDepthSnapshot current_playout_buffer_depth = 40;
+  PlaybackBufferDepthSnapshot min_playout_buffer_depth = 41;
+  PlaybackBufferDepthSnapshot max_playout_buffer_depth = 42;
+  uint64 playout_buffer_low_watermark_count = 43;
+  uint64 playout_underrun_count = 44;
+  DurationStatsSnapshot playout_sender_lateness = 45;
+  uint64 max_consecutive_playout_late_packets = 46;
+  DurationStatsSnapshot speaking_prepare_duration = 47;
+  repeated uint64 post_rebuffer_first_intervals_ms = 48;
+  uint64 source_underrun_count = 49;
+  DurationStatsSnapshot source_producer_fill_duration = 50;
+  DurationStatsSnapshot playout_builder_prepare_duration = 51;
+  DurationStatsSnapshot sender_send_duration = 52;
+  DurationStatsSnapshot sender_loop_non_send_work_duration = 53;
+  uint64 sender_forbidden_work_count = 54;
+  uint64 prepared_rtp_queue_depth_ms = 55;
+  DurationStatsSnapshot gateway_event_drain_duration = 56;
+  uint64 gateway_event_drain_count = 57;
+  uint64 dave_transition_count = 58;
+  uint64 dave_transition_count_during_playback = 59;
+  uint64 stale_dave_send_prevented_count = 60;
+  uint64 controlled_media_interruption_count = 61;
+  uint64 media_clock_reset_count = 62;
+  uint64 scheduler_late_reset_count = 63;
+  uint64 source_underrun_reset_count = 64;
+  uint64 pause_resume_reset_count = 65;
+  uint64 dave_transition_recovery_reset_count = 66;
+}
 
 enum SessionEventKind {
   SESSION_EVENT_KIND_UNSPECIFIED = 0;

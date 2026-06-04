@@ -15,11 +15,18 @@ const INITIAL_OPEN_CHUNK_TIMEOUT: Duration = Duration::from_secs(15);
 const STEADY_STATE_CHUNK_TIMEOUT: Duration = Duration::from_secs(2);
 const OPEN_CHUNK_ATTEMPTS: usize = 2;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PlaybackRecoveryMetrics {
+    pub http_retry_count: u64,
+    pub url_reresolve_count: u64,
+}
+
 #[derive(Debug)]
 pub struct PlaybackRecovery {
     client: YtMusicClient,
     last_video_id: Option<String>,
     last_resolved: Option<ResolvedPlaybackSource>,
+    metrics: PlaybackRecoveryMetrics,
 }
 
 impl PlaybackRecovery {
@@ -28,6 +35,7 @@ impl PlaybackRecovery {
             client,
             last_video_id: None,
             last_resolved: None,
+            metrics: PlaybackRecoveryMetrics::default(),
         }
     }
 
@@ -48,6 +56,10 @@ impl PlaybackRecovery {
     pub fn reset(&mut self) {
         self.last_video_id = None;
         self.last_resolved = None;
+    }
+
+    pub fn metrics(&self) -> PlaybackRecoveryMetrics {
+        self.metrics
     }
 
     fn remember_source(&mut self, video_id: &str, source: &PlaybackSource) {
@@ -80,6 +92,8 @@ impl PlaybackRecovery {
                 Ok(source)
             }
             Err(err) if should_reresolve_after_open_failure(&err) => {
+                self.metrics.url_reresolve_count =
+                    self.metrics.url_reresolve_count.saturating_add(1);
                 let resolved = self.client.resolve_playback_source(video_id).await?;
                 let source = self.open_from_position(resolved, position_ms).await?;
                 self.remember_source(video_id, &source);
@@ -99,7 +113,12 @@ impl PlaybackRecovery {
         let mut pending_packets = VecDeque::new();
         let mut position = PlaybackPosition::default();
 
-        let Some(chunk) = read_opening_chunk(&mut stream, &resolved.playable_url).await? else {
+        let opening = read_opening_chunk(&mut stream, &resolved.playable_url).await?;
+        self.metrics.http_retry_count = self
+            .metrics
+            .http_retry_count
+            .saturating_add(opening.retry_count);
+        let Some(chunk) = opening.chunk else {
             return Err(PlaybackError::MediaParse("unexpected end of stream"));
         };
         demux.push_bytes(chunk);
@@ -153,11 +172,15 @@ fn packet_end_ms(packet: &DemuxedPacket) -> u64 {
 async fn read_opening_chunk(
     stream: &mut HttpOpusStream,
     playable_url: &str,
-) -> Result<Option<bytes::Bytes>, PlaybackError> {
+) -> Result<OpeningChunk, PlaybackError> {
+    let mut retry_count = 0;
     for attempt in 1..=OPEN_CHUNK_ATTEMPTS {
         match timeout(INITIAL_OPEN_CHUNK_TIMEOUT, stream.read_chunk()).await {
-            Ok(result) => return result,
+            Ok(result) => {
+                return result.map(|chunk| OpeningChunk { chunk, retry_count });
+            }
             Err(_) if attempt < OPEN_CHUNK_ATTEMPTS => {
+                retry_count += 1;
                 warn!(
                     attempt,
                     timeout_ms = INITIAL_OPEN_CHUNK_TIMEOUT.as_millis(),
@@ -174,6 +197,11 @@ async fn read_opening_chunk(
     }
 
     unreachable!("open chunk attempts loop must return")
+}
+
+struct OpeningChunk {
+    chunk: Option<bytes::Bytes>,
+    retry_count: u64,
 }
 
 async fn read_chunk_with_timeout(

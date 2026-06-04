@@ -1,6 +1,7 @@
 use discord_voice_service_twilight::{
-    SessionEvent, SessionEventKind, SessionEventReason, SessionState, StateSnapshot, VoiceContext,
-    VoiceContextTracker, join_voice_channel, leave_voice_channel, proto,
+    PlaybackStabilitySnapshot, SessionEvent, SessionEventKind, SessionEventReason, SessionState,
+    StateSnapshot, VoiceContext, VoiceContextTracker, join_voice_channel, leave_voice_channel,
+    proto,
 };
 use twilight_gateway::Event;
 use twilight_model::{
@@ -185,6 +186,230 @@ fn proto_state_snapshot_converts_to_typed_state() {
     assert_eq!(snapshot.queue_depth, 7);
     assert_eq!(snapshot.selected_itag, Some(251));
     assert_eq!(snapshot.message.as_deref(), Some("steady"));
+}
+
+#[test]
+fn proto_playback_metrics_convert_to_typed_snapshot() {
+    let snapshot = PlaybackStabilitySnapshot::from(proto::PlaybackStabilitySnapshot {
+        available: true,
+        playback_epoch: 9,
+        video_id: "video-1".into(),
+        selected_itag: 250,
+        track_packet_count: 60,
+        continuity_silence_packet_count: 1,
+        inserted_silence_duration_ms: 20,
+        track_interval: Some(proto::DurationStatsSnapshot {
+            samples: 59,
+            p50_ms: 20,
+            p95_ms: 24,
+            p99_ms: 31,
+            min_ms: 18,
+            max_ms: 40,
+        }),
+        all_packet_interval: Some(proto::DurationStatsSnapshot {
+            samples: 60,
+            p50_ms: 20,
+            p95_ms: 23,
+            p99_ms: 30,
+            min_ms: 18,
+            max_ms: 40,
+        }),
+        sender_lateness: Some(proto::DurationStatsSnapshot {
+            samples: 60,
+            p50_ms: 0,
+            p95_ms: 4,
+            p99_ms: 8,
+            min_ms: 0,
+            max_ms: 10,
+        }),
+        current_buffer_depth: Some(proto::PlaybackBufferDepthSnapshot {
+            packets: 8,
+            bytes: 4096,
+            duration_ms: 160,
+            duration_samples: 7680,
+        }),
+        min_buffer_depth: Some(proto::PlaybackBufferDepthSnapshot {
+            packets: 4,
+            bytes: 2048,
+            duration_ms: 80,
+            duration_samples: 3840,
+        }),
+        max_buffer_depth: Some(proto::PlaybackBufferDepthSnapshot {
+            packets: 100,
+            bytes: 51200,
+            duration_ms: 2000,
+            duration_samples: 96000,
+        }),
+        current_source_buffer_depth: Some(proto::PlaybackBufferDepthSnapshot {
+            packets: 240,
+            bytes: 122880,
+            duration_ms: 4800,
+            duration_samples: 230400,
+        }),
+        min_source_buffer_depth: Some(proto::PlaybackBufferDepthSnapshot {
+            packets: 50,
+            bytes: 25600,
+            duration_ms: 1000,
+            duration_samples: 48000,
+        }),
+        max_source_buffer_depth: Some(proto::PlaybackBufferDepthSnapshot {
+            packets: 250,
+            bytes: 128000,
+            duration_ms: 5000,
+            duration_samples: 240000,
+        }),
+        current_playout_buffer_depth: Some(proto::PlaybackBufferDepthSnapshot {
+            packets: 12,
+            bytes: 6144,
+            duration_ms: 240,
+            duration_samples: 11520,
+        }),
+        min_playout_buffer_depth: Some(proto::PlaybackBufferDepthSnapshot {
+            packets: 6,
+            bytes: 3072,
+            duration_ms: 120,
+            duration_samples: 5760,
+        }),
+        max_playout_buffer_depth: Some(proto::PlaybackBufferDepthSnapshot {
+            packets: 20,
+            bytes: 10240,
+            duration_ms: 400,
+            duration_samples: 19200,
+        }),
+        source_buffer_target_ms: 5000,
+        source_buffer_low_watermark_count: 2,
+        playout_buffer_low_watermark_count: 3,
+        playout_underrun_count: 4,
+        source_underrun_count: 5,
+        playout_sender_lateness: Some(proto::DurationStatsSnapshot {
+            samples: 60,
+            p50_ms: 0,
+            p95_ms: 3,
+            p99_ms: 7,
+            min_ms: 0,
+            max_ms: 9,
+        }),
+        source_producer_fill_duration: Some(proto::DurationStatsSnapshot {
+            samples: 2,
+            p50_ms: 4,
+            p95_ms: 6,
+            p99_ms: 7,
+            min_ms: 3,
+            max_ms: 7,
+        }),
+        playout_builder_prepare_duration: Some(proto::DurationStatsSnapshot {
+            samples: 20,
+            p50_ms: 1,
+            p95_ms: 2,
+            p99_ms: 3,
+            min_ms: 0,
+            max_ms: 3,
+        }),
+        sender_send_duration: Some(proto::DurationStatsSnapshot {
+            samples: 60,
+            p50_ms: 0,
+            p95_ms: 1,
+            p99_ms: 2,
+            min_ms: 0,
+            max_ms: 2,
+        }),
+        sender_loop_non_send_work_duration: Some(proto::DurationStatsSnapshot {
+            samples: 60,
+            p50_ms: 0,
+            p95_ms: 1,
+            p99_ms: 1,
+            min_ms: 0,
+            max_ms: 1,
+        }),
+        sender_forbidden_work_count: 0,
+        prepared_rtp_queue_depth_ms: 0,
+        gateway_event_drain_duration: Some(proto::DurationStatsSnapshot {
+            samples: 60,
+            p50_ms: 0,
+            p95_ms: 1,
+            p99_ms: 2,
+            min_ms: 0,
+            max_ms: 2,
+        }),
+        gateway_event_drain_count: 4,
+        dave_transition_count: 3,
+        dave_transition_count_during_playback: 2,
+        stale_dave_send_prevented_count: 1,
+        controlled_media_interruption_count: 1,
+        media_clock_reset_count: 5,
+        scheduler_late_reset_count: 1,
+        source_underrun_reset_count: 2,
+        pause_resume_reset_count: 3,
+        dave_transition_recovery_reset_count: 4,
+        max_consecutive_playout_late_packets: 2,
+        speaking_prepare_duration: Some(proto::DurationStatsSnapshot {
+            samples: 1,
+            p50_ms: 100,
+            p95_ms: 100,
+            p99_ms: 100,
+            min_ms: 100,
+            max_ms: 100,
+        }),
+        rebuffer_count: 1,
+        pause_resume_first_intervals_ms: vec![20, 21],
+        post_stall_first_intervals_ms: vec![22],
+        post_rebuffer_first_intervals_ms: vec![23],
+        adaptive_buffer_target_ms: 5000,
+        max_adaptive_buffer_target_ms: 5000,
+        ended: true,
+        ..Default::default()
+    });
+
+    assert!(snapshot.available);
+    assert_eq!(snapshot.video_id.as_deref(), Some("video-1"));
+    assert_eq!(snapshot.selected_itag, Some(250));
+    assert_eq!(snapshot.track_packet_count, 60);
+    assert_eq!(snapshot.continuity_silence_packet_count, 1);
+    assert_eq!(snapshot.inserted_silence_duration_ms, 20);
+    assert_eq!(snapshot.track_interval.p95_ms, 24);
+    assert_eq!(snapshot.all_packet_interval.samples, 60);
+    assert_eq!(snapshot.sender_lateness.p99_ms, 8);
+    assert_eq!(snapshot.current_buffer_depth.duration_samples, 7680);
+    assert_eq!(snapshot.min_buffer_depth.duration_ms, 80);
+    assert_eq!(snapshot.max_buffer_depth.packets, 100);
+    assert_eq!(snapshot.current_source_buffer_depth.duration_ms, 4800);
+    assert_eq!(snapshot.min_source_buffer_depth.duration_ms, 1000);
+    assert_eq!(snapshot.max_source_buffer_depth.duration_ms, 5000);
+    assert_eq!(snapshot.current_playout_buffer_depth.duration_ms, 240);
+    assert_eq!(snapshot.min_playout_buffer_depth.duration_ms, 120);
+    assert_eq!(snapshot.max_playout_buffer_depth.duration_ms, 400);
+    assert_eq!(snapshot.source_buffer_target_ms, 5000);
+    assert_eq!(snapshot.source_buffer_low_watermark_count, 2);
+    assert_eq!(snapshot.playout_buffer_low_watermark_count, 3);
+    assert_eq!(snapshot.playout_underrun_count, 4);
+    assert_eq!(snapshot.source_underrun_count, 5);
+    assert_eq!(snapshot.playout_sender_lateness.p99_ms, 7);
+    assert_eq!(snapshot.source_producer_fill_duration.samples, 2);
+    assert_eq!(snapshot.playout_builder_prepare_duration.samples, 20);
+    assert_eq!(snapshot.sender_send_duration.max_ms, 2);
+    assert_eq!(snapshot.sender_loop_non_send_work_duration.max_ms, 1);
+    assert_eq!(snapshot.sender_forbidden_work_count, 0);
+    assert_eq!(snapshot.prepared_rtp_queue_depth_ms, 0);
+    assert_eq!(snapshot.gateway_event_drain_duration.max_ms, 2);
+    assert_eq!(snapshot.gateway_event_drain_count, 4);
+    assert_eq!(snapshot.dave_transition_count, 3);
+    assert_eq!(snapshot.dave_transition_count_during_playback, 2);
+    assert_eq!(snapshot.stale_dave_send_prevented_count, 1);
+    assert_eq!(snapshot.controlled_media_interruption_count, 1);
+    assert_eq!(snapshot.media_clock_reset_count, 5);
+    assert_eq!(snapshot.scheduler_late_reset_count, 1);
+    assert_eq!(snapshot.source_underrun_reset_count, 2);
+    assert_eq!(snapshot.pause_resume_reset_count, 3);
+    assert_eq!(snapshot.dave_transition_recovery_reset_count, 4);
+    assert_eq!(snapshot.max_consecutive_playout_late_packets, 2);
+    assert_eq!(snapshot.speaking_prepare_duration.max_ms, 100);
+    assert_eq!(snapshot.rebuffer_count, 1);
+    assert_eq!(snapshot.adaptive_buffer_target_ms, 5000);
+    assert_eq!(snapshot.max_adaptive_buffer_target_ms, 5000);
+    assert_eq!(snapshot.pause_resume_first_intervals_ms, vec![20, 21]);
+    assert_eq!(snapshot.post_stall_first_intervals_ms, vec![22]);
+    assert_eq!(snapshot.post_rebuffer_first_intervals_ms, vec![23]);
+    assert!(snapshot.ended);
 }
 
 #[test]

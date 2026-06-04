@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use bytes::Bytes;
 use tokio::sync::oneshot;
-use tokio::time::{Duration, timeout};
+use tokio::time::{Duration, Instant, timeout};
 
 use crate::dave::{DaveExternalSender, DaveRuntimeContext, DaveSession};
 use crate::error::VoiceError;
@@ -15,7 +15,7 @@ use crate::protocol::{
 };
 use crate::rollover::VoiceSessionRollover;
 use crate::speaking::{OPUS_SILENCE_FRAME, send_not_speaking, send_speaking};
-use crate::udp::VoiceUdpTransport;
+use crate::udp::{PreparedVoicePacket, VoiceUdpTransport};
 
 const DAVE_GATEWAY_EVENT_DRAIN_LIMIT: usize = 256;
 const DAVE_GATEWAY_IDLE_POLL: Duration = Duration::from_millis(1);
@@ -58,6 +58,13 @@ pub struct VoiceContext {
     pub session_id: String,
     pub endpoint: String,
     pub token: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VoiceGatewayDrainReport {
+    pub duration: Duration,
+    pub event_count: u64,
+    pub dave_transition_count: u64,
 }
 
 pub struct ConnectedVoiceSession {
@@ -320,18 +327,42 @@ impl ConnectedVoiceSession {
                 return Err(err);
             }
         }
+        self.prepare_speaking_before_media().await?;
+        let packet = self.prepare_current_slot_audio_packet(frame, duration_samples)?;
+        self.send_current_slot_packet(packet).await
+    }
+
+    pub async fn prepare_media_state_before_slot(
+        &mut self,
+        slot_send_at: Instant,
+    ) -> Result<VoiceGatewayDrainReport, VoiceError> {
+        self.process_pending_gateway_events_before_deadline(slot_send_at)
+            .await
+    }
+
+    pub async fn prepare_speaking_before_media(&mut self) -> Result<Duration, VoiceError> {
+        if self.speaking_started {
+            return Ok(Duration::ZERO);
+        }
+
+        let started = Instant::now();
         let ssrc = self
             .ssrc
             .ok_or(VoiceError::InvalidState("voice ssrc unavailable"))?;
-        if !self.speaking_started {
-            let gateway = self
-                .gateway
-                .as_ref()
-                .ok_or(VoiceError::InvalidState("voice gateway unavailable"))?;
-            send_speaking_repeated(gateway, ssrc).await?;
-            self.speaking_started = true;
-        }
+        let gateway = self
+            .gateway
+            .as_ref()
+            .ok_or(VoiceError::InvalidState("voice gateway unavailable"))?;
+        send_speaking_repeated(gateway, ssrc).await?;
+        self.speaking_started = true;
+        Ok(started.elapsed())
+    }
 
+    pub fn prepare_current_slot_audio_packet(
+        &mut self,
+        frame: Bytes,
+        duration_samples: u32,
+    ) -> Result<PreparedVoicePacket, VoiceError> {
         let frame = if frame.as_ref() == OPUS_SILENCE_FRAME.as_slice() {
             frame
         } else if let Some(dave) = self.dave.as_mut() {
@@ -346,23 +377,47 @@ impl ConnectedVoiceSession {
             .transport
             .as_mut()
             .ok_or(VoiceError::InvalidState("voice transport unavailable"))?;
-        transport
-            .send_audio_frame_with_duration_samples(frame, duration_samples)
-            .await?;
+        transport.prepare_audio_packet_with_duration_samples(
+            frame,
+            audio_duration_ms_from_samples(duration_samples),
+            duration_samples,
+            true,
+        )
+    }
+
+    pub async fn send_current_slot_packet(
+        &mut self,
+        packet: PreparedVoicePacket,
+    ) -> Result<(), VoiceError> {
+        let transport = self
+            .transport
+            .as_ref()
+            .ok_or(VoiceError::InvalidState("voice transport unavailable"))?;
+        transport.send_prepared_packet(&packet).await?;
         self.speaking_started = true;
         Ok(())
     }
 
-    async fn process_pending_gateway_events(&mut self) -> Result<(), VoiceError> {
+    async fn process_pending_gateway_events(
+        &mut self,
+    ) -> Result<VoiceGatewayDrainReport, VoiceError> {
         self.process_pending_gateway_events_with_initial_poll_policy(
             DAVE_GATEWAY_IDLE_POLL,
             false,
             false,
+            None,
         )
         .await
     }
 
     pub async fn wait_for_initial_dave_settle(&mut self) -> Result<(), VoiceError> {
+        self.settle_pending_dave_transition_for_playback().await?;
+        Ok(())
+    }
+
+    pub async fn settle_pending_dave_transition_for_playback(
+        &mut self,
+    ) -> Result<VoiceGatewayDrainReport, VoiceError> {
         self.process_pending_gateway_events_with_initial_poll(DAVE_GATEWAY_TRANSITION_POLL)
             .await
     }
@@ -372,16 +427,36 @@ impl ConnectedVoiceSession {
             DAVE_GATEWAY_TRANSITION_POLL,
             true,
             true,
+            None,
         )
-        .await
+        .await?;
+        Ok(())
     }
 
     async fn process_pending_gateway_events_with_initial_poll(
         &mut self,
         initial_wait: Duration,
-    ) -> Result<(), VoiceError> {
-        self.process_pending_gateway_events_with_initial_poll_policy(initial_wait, false, true)
-            .await
+    ) -> Result<VoiceGatewayDrainReport, VoiceError> {
+        self.process_pending_gateway_events_with_initial_poll_policy(
+            initial_wait,
+            false,
+            true,
+            None,
+        )
+        .await
+    }
+
+    async fn process_pending_gateway_events_before_deadline(
+        &mut self,
+        slot_send_at: Instant,
+    ) -> Result<VoiceGatewayDrainReport, VoiceError> {
+        self.process_pending_gateway_events_with_initial_poll_policy(
+            DAVE_GATEWAY_IDLE_POLL,
+            false,
+            false,
+            Some(slot_send_at),
+        )
+        .await
     }
 
     async fn process_pending_gateway_events_with_initial_poll_policy(
@@ -389,12 +464,16 @@ impl ConnectedVoiceSession {
         initial_wait: Duration,
         allow_pending_initial_dave: bool,
         wait_for_idle_follow_up: bool,
-    ) -> Result<(), VoiceError> {
+        deadline: Option<Instant>,
+    ) -> Result<VoiceGatewayDrainReport, VoiceError> {
+        let drain_started = Instant::now();
+        let mut report = VoiceGatewayDrainReport::default();
         if self.dave_failed_closed {
             return Err(VoiceError::InvalidState("voice dave session failed closed"));
         }
         if self.gateway_receive_closed {
-            return Ok(());
+            report.duration = drain_started.elapsed();
+            return Ok(report);
         }
         if self.dave.is_none()
             && self.pending_initial_dave.is_none()
@@ -403,7 +482,8 @@ impl ConnectedVoiceSession {
             && self.pending_dave_prepared_transitions.is_empty()
             && self.pending_dave_local_init_commit_echoes.is_empty()
         {
-            return Ok(());
+            report.duration = drain_started.elapsed();
+            return Ok(report);
         }
         let gateway = self
             .gateway
@@ -413,7 +493,7 @@ impl ConnectedVoiceSession {
         let mut wait_for_follow_up = false;
         let mut reached_drain_limit = true;
         for _ in 0..DAVE_GATEWAY_EVENT_DRAIN_LIMIT {
-            let wait = if self.pending_dave_transition.is_some()
+            let desired_wait = if self.pending_dave_transition.is_some()
                 || self.pending_dave_local_commit_transition.is_some()
                 || (self.pending_initial_dave.is_some() && self.pending_initial_dave_recovery)
             {
@@ -426,6 +506,16 @@ impl ConnectedVoiceSession {
             } else {
                 initial_wait
             };
+            let wait = if let Some(deadline) = deadline {
+                let now = Instant::now();
+                if now >= deadline {
+                    reached_drain_limit = false;
+                    break;
+                }
+                desired_wait.min(deadline - now)
+            } else {
+                desired_wait
+            };
             let payload = match timeout(wait, gateway.receive_event()).await {
                 Ok(Ok(payload)) => payload,
                 Ok(Err(err)) => return Err(err),
@@ -436,6 +526,10 @@ impl ConnectedVoiceSession {
             };
             let event = payload.into_event();
             let transition_id = dave_session_event_transition_id(&event);
+            report.event_count = report.event_count.saturating_add(1);
+            if transition_id.is_some() {
+                report.dave_transition_count = report.dave_transition_count.saturating_add(1);
+            }
             wait_for_follow_up =
                 wait_for_idle_follow_up || dave_session_event_expects_follow_up(&event);
             tracing::debug!(
@@ -477,7 +571,8 @@ impl ConnectedVoiceSession {
                 "voice dave prepared transition pending",
             ));
         }
-        Ok(())
+        report.duration = drain_started.elapsed();
+        Ok(report)
     }
 
     async fn process_gateway_event_for_dave(
@@ -1457,6 +1552,10 @@ async fn send_speaking_repeated(gateway: &VoiceGatewayClient, ssrc: u32) -> Resu
     Ok(())
 }
 
+fn audio_duration_ms_from_samples(duration_samples: u32) -> u64 {
+    u64::from(duration_samples).saturating_mul(1_000) / 48_000
+}
+
 async fn send_not_speaking_repeated(
     gateway: &VoiceGatewayClient,
     ssrc: u32,
@@ -1727,6 +1826,15 @@ mod tests {
             .count()
         }
 
+        async fn speaking_state_count_now(&self, speaking: u64) -> usize {
+            self.speaking_states
+                .lock()
+                .await
+                .iter()
+                .filter(|state| **state == speaking)
+                .count()
+        }
+
         async fn saw_dave_transition_ready(&self, transition_id: u16) -> bool {
             let ids = wait_for_value(&self.dave_transition_ready_ids, |ids| {
                 ids.contains(&transition_id)
@@ -1747,6 +1855,54 @@ mod tests {
             let count = wait_for_value(&self.dave_key_package_count, |count| *count > 0).await;
             count > 0
         }
+    }
+
+    #[tokio::test]
+    async fn live_session_starts_speaking_before_media() {
+        let gateway = FakeVoiceGateway::spawn().await;
+        let udp = FakeUdpPeer::spawn().await;
+        let mut session = test_connected_session(gateway.url(), udp.addr()).await;
+
+        session
+            .send_audio_frame_with_duration_samples(Bytes::from_static(b"opus-frame"), 960)
+            .await
+            .unwrap();
+
+        assert!(session.media_started());
+        assert!(
+            gateway
+                .speaking_state_count_at_least(1, START_SPEAKING_GATEWAY_REPEAT_COUNT)
+                .await
+                >= START_SPEAKING_GATEWAY_REPEAT_COUNT
+        );
+    }
+
+    #[tokio::test]
+    async fn live_session_consecutive_media_does_not_restart_speaking() {
+        let gateway = FakeVoiceGateway::spawn().await;
+        let udp = FakeUdpPeer::spawn().await;
+        let mut session = test_connected_session(gateway.url(), udp.addr()).await;
+        session
+            .send_audio_frame_with_duration_samples(Bytes::from_static(b"opus-frame-1"), 960)
+            .await
+            .unwrap();
+        assert!(
+            gateway
+                .speaking_state_count_at_least(1, START_SPEAKING_GATEWAY_REPEAT_COUNT)
+                .await
+                >= START_SPEAKING_GATEWAY_REPEAT_COUNT
+        );
+
+        session
+            .send_audio_frame_with_duration_samples(Bytes::from_static(b"opus-frame-2"), 960)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        assert_eq!(
+            gateway.speaking_state_count_now(1).await,
+            START_SPEAKING_GATEWAY_REPEAT_COUNT
+        );
     }
 
     #[tokio::test]
@@ -1825,6 +1981,43 @@ mod tests {
 
         assert_eq!(udp.silence_frame_count().await, 5);
         assert!(!session.media_started());
+    }
+
+    #[tokio::test]
+    async fn live_session_restarts_speaking_before_media_after_stop_audio() {
+        let gateway = FakeVoiceGateway::spawn().await;
+        let udp = FakeUdpPeer::spawn().await;
+        let mut session = test_connected_session(gateway.url(), udp.addr()).await;
+        session
+            .send_audio_frame_with_duration_samples(Bytes::from_static(b"opus-frame-1"), 960)
+            .await
+            .unwrap();
+
+        assert!(
+            gateway
+                .speaking_state_count_at_least(1, START_SPEAKING_GATEWAY_REPEAT_COUNT)
+                .await
+                >= START_SPEAKING_GATEWAY_REPEAT_COUNT
+        );
+        session.stop_audio().await.unwrap();
+        assert!(
+            gateway
+                .speaking_state_count_at_least(0, STOP_SPEAKING_GATEWAY_REPEAT_COUNT)
+                .await
+                >= STOP_SPEAKING_GATEWAY_REPEAT_COUNT
+        );
+
+        session
+            .send_audio_frame_with_duration_samples(Bytes::from_static(b"opus-frame-2"), 960)
+            .await
+            .unwrap();
+
+        assert!(
+            gateway
+                .speaking_state_count_at_least(1, START_SPEAKING_GATEWAY_REPEAT_COUNT * 2)
+                .await
+                >= START_SPEAKING_GATEWAY_REPEAT_COUNT * 2
+        );
     }
 
     #[tokio::test]

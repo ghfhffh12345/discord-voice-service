@@ -1,10 +1,14 @@
 use anyhow::{Context, Result, bail};
 use opus_rs::OpusDecoder;
 use serde::Serialize;
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::{
+    panic::{AssertUnwindSafe, catch_unwind},
+    time::{Duration, Instant},
+};
 
 const SAMPLE_RATE_HZ: i32 = 48_000;
 const NON_SILENCE_PEAK_THRESHOLD: f32 = 0.001;
+const OBSERVER_GAP_THRESHOLD: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Copy)]
 pub struct ObservedOpusPacket<'a> {
@@ -17,10 +21,22 @@ pub struct AudioValidationStats {
     pub observed_packet_count: u64,
     pub decoded_audio_ms: u64,
     pub non_silent_audio_ms: u64,
+    pub rtp_inter_arrival: AudioIntervalStats,
+    pub rtp_gap_count_gte_100ms: u64,
     pub max_peak_amplitude: f32,
     pub rms_amplitude: f32,
     pub first_sequence: Option<u16>,
     pub last_sequence: Option<u16>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct AudioIntervalStats {
+    pub samples: u64,
+    pub p50_ms: u64,
+    pub p95_ms: u64,
+    pub p99_ms: u64,
+    pub min_ms: u64,
+    pub max_ms: u64,
 }
 
 pub struct AudioValidationAccumulator {
@@ -29,6 +45,8 @@ pub struct AudioValidationAccumulator {
     stats: AudioValidationStats,
     total_squared_amplitude: f64,
     total_samples: usize,
+    last_observed_at: Option<Instant>,
+    inter_arrivals: Vec<Duration>,
 }
 
 impl AudioValidationAccumulator {
@@ -39,12 +57,22 @@ impl AudioValidationAccumulator {
             stats: AudioValidationStats::default(),
             total_squared_amplitude: 0.0,
             total_samples: 0,
+            last_observed_at: None,
+            inter_arrivals: Vec::new(),
         }
     }
 
     pub fn observe_packet(
         &mut self,
         packet: ObservedOpusPacket<'_>,
+    ) -> Result<AudioValidationStats> {
+        self.observe_packet_at(packet, Instant::now())
+    }
+
+    pub fn observe_packet_at(
+        &mut self,
+        packet: ObservedOpusPacket<'_>,
+        observed_at: Instant,
     ) -> Result<AudioValidationStats> {
         if packet.payload.is_empty() {
             bail!("observed opus payload must not be empty");
@@ -109,11 +137,23 @@ impl AudioValidationAccumulator {
         self.stats.max_peak_amplitude = self.stats.max_peak_amplitude.max(packet_peak);
         self.stats.first_sequence.get_or_insert(packet.sequence);
         self.stats.last_sequence = Some(packet.sequence);
+        self.record_inter_arrival(observed_at);
 
         self.total_squared_amplitude += packet_square_sum;
         self.total_samples += pcm.len();
 
         Ok(self.stats())
+    }
+
+    fn record_inter_arrival(&mut self, observed_at: Instant) {
+        if let Some(previous) = self.last_observed_at.replace(observed_at) {
+            let interval = observed_at.saturating_duration_since(previous);
+            if interval >= OBSERVER_GAP_THRESHOLD {
+                self.stats.rtp_gap_count_gte_100ms += 1;
+            }
+            self.inter_arrivals.push(interval);
+            self.stats.rtp_inter_arrival = interval_stats(&self.inter_arrivals);
+        }
     }
 
     pub fn stats(&self) -> AudioValidationStats {
@@ -124,6 +164,10 @@ impl AudioValidationAccumulator {
             ((self.total_squared_amplitude / self.total_samples as f64).sqrt()) as f32
         };
         stats
+    }
+
+    pub fn reset_inter_arrival_baseline(&mut self) {
+        self.last_observed_at = None;
     }
 
     pub fn into_stats(self) -> Result<AudioValidationStats> {
@@ -153,6 +197,27 @@ where
     }
 
     accumulator.into_stats()
+}
+
+fn interval_stats(intervals: &[Duration]) -> AudioIntervalStats {
+    let mut sorted = intervals.to_vec();
+    sorted.sort_unstable();
+    AudioIntervalStats {
+        samples: u64::try_from(sorted.len()).unwrap_or(u64::MAX),
+        p50_ms: duration_ms(percentile_duration(&sorted, 50)),
+        p95_ms: duration_ms(percentile_duration(&sorted, 95)),
+        p99_ms: duration_ms(percentile_duration(&sorted, 99)),
+        min_ms: duration_ms(sorted[0]),
+        max_ms: duration_ms(sorted[sorted.len() - 1]),
+    }
+}
+
+fn percentile_duration(sorted: &[Duration], percentile: usize) -> Duration {
+    sorted[((sorted.len() - 1) * percentile).div_ceil(100)]
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn opus_packet_frame_samples(packet: &[u8]) -> Option<usize> {

@@ -31,7 +31,7 @@ The main bot should continue to own commands and high-level playback decisions. 
 
 - One gRPC listener on `DISCORD_VOICE_SERVICE_BIND_ADDR`
 - Standard gRPC health checks on the same listener
-- `discordvoice.v1.DiscordVoiceControl` with these RPCs: `JoinVoice`, `UpdateVoiceContext`, `Play`, `Pause`, `Resume`, `Stop`, `LeaveVoice`, `GetState`, `SubscribeEvents`
+- `discordvoice.v1.DiscordVoiceControl` with these RPCs: `JoinVoice`, `UpdateVoiceContext`, `Play`, `Pause`, `Resume`, `Stop`, `LeaveVoice`, `GetState`, `GetPlaybackMetrics`, `SubscribeEvents`
 - Runtime event emission for voice/session state transitions such as `VoiceConnecting`, `VoiceReady`, `TrackResolving`, `Playing`, and `TrackEnded`
 - A real runtime playback path that connects to a Discord voice endpoint, performs UDP discovery, sends speaking updates, and emits Opus RTP frames for supported sources
 - Distroless container packaging in [`Containerfile`](Containerfile)
@@ -131,6 +131,7 @@ The staging environment must provide:
 - `TEST_GUILD_ID`
 - `TEST_VOICE_CHANNEL_ID`
 - `TEST_VIDEO_ID`
+- `TEST_LONG_VIDEO_ID`
 - `BROWSER_JSON`
 
 There is no self-hosted runner setup and no runner-local browser path variable in the hosted design. `BROWSER_JSON` stores the actual browser configuration contents, and the workflow materializes it into a temporary `browser.json` file during the run.
@@ -147,12 +148,19 @@ The live validation controller contract is:
 | `TEST_GUILD_ID` | Dedicated staging guild ID | `234567890123456789` |
 | `TEST_VOICE_CHANNEL_ID` | Dedicated non-stage voice channel ID inside that guild | `345678901234567890` |
 | `TEST_VIDEO_ID` | YouTube video ID for the short dedicated validation track used by live staging | `dQw4w9WgXcQ` |
+| `TEST_LONG_VIDEO_ID` | YouTube video ID for a distinct long validation track used by the sustained staging probe | `long-video-id` |
 | `BROWSER_JSON` | Browser configuration contents materialized into a temporary `browser.json` file for `ytmusic-service` | `{"cookies":[]}` |
 | `DISCORD_VOICE_SERVICE_URI` | Host-side gRPC URI used by `staging_live_check` to reach the published service port | `http://127.0.0.1:55051` |
 | `DISCORD_VOICE_SERVICE_BIND_ADDR` | In-container bind address used by the `discord-voice-service` container during live staging | `0.0.0.0:55051` |
 | `DISCORD_VOICE_SERVICE_YTMUSIC_ADDR` | Base gRPC endpoint reserved for the service/controller contract with `ytmusic-service` | `http://127.0.0.1:50051` |
+| `LIVE_STAGING_PROFILE` | Non-secret label for the constrained staging profile | `constrained-github-hosted` |
+| `LIVE_STAGING_SERVICE_CPUS` | Docker CPU limit applied to the `discord-voice-service` container | `1.0` |
+| `LIVE_STAGING_CPU_CONTENTION_WORKERS` | Number of CPU-contention workers started by the staging runner | `2` |
+| `LIVE_STAGING_HTTP_READ_DELAY_MS` | Per-chunk HTTP media read delay injected inside `discord-voice-service` during staging | `5` |
+| `LIVE_STAGING_HTTP_READ_JITTER_MS` | Deterministic per-chunk HTTP media read jitter injected during staging | `25` |
+| `LIVE_STAGING_LONG_TRACK_MIN_PACKETS` | Minimum long-track RTP packets required before the sustained probe is stopped and checked | `300` |
 
-For local real-Discord live staging, run `scripts/ci/run_local_live_staging.sh`; the helper loads secrets from `.env`, loads `BROWSER_JSON` from `./browser.json`, starts a disposable local `ytmusic-service` container, waits for its gRPC readiness, then starts a source-built `discord-voice-service` before running observer validation.
+For local real-Discord live staging, run `scripts/ci/run_local_live_staging.sh`; the helper loads secrets from `.env`, loads `BROWSER_JSON` from `./browser.json`, starts a disposable local `ytmusic-service` container and CPU-contention container, waits for `ytmusic-service` gRPC readiness, then starts a source-built `discord-voice-service` with the HTTP read stress profile before running observer validation.
 
 For reproducible local live staging, optionally set `YTMUSIC_SERVICE_IMAGE_REF`; otherwise the helper defaults to `ghcr.io/ghfhffh12345/ytmusic-service:latest`.
 
@@ -173,7 +181,11 @@ For reproducible staging, pin `YTMUSIC_SERVICE_IMAGE_REF` to an immutable tag or
 During live staging, human listeners may remain in the channel while the staging bot validates playback against the short dedicated validation track.
 Live-staging success waits for the natural end of the validation track before the run is treated as release-ready.
 Live-staging success requires observer receive-side proof: authentic voice context, VoiceReady, Playing, pause without leaving the voice channel, no service audio or speaking state during the paused interval, resume without voice-channel rejoin, natural TrackEnded, at least 120 observed packets, at least 3000 ms decoded audio, at least 1000 ms non-silent audio, and no reconnect/interruption/fatal error during validation.
-Live-staging always uploads a structured observer evidence artifact summarizing ignored invalid Resume, ignored redundant Pause, pause silence, resume packets, observed packets, decoded audio, non-silent audio, and failure_reason.
+Live-staging success requires service-side playback stability metrics from `GetPlaybackMetrics`, including RTP interval stats, sender lateness, buffer depth, refill durations, underruns, inserted silence, and interruption counters.
+Live-staging success runs a constrained profile with CPU contention, a service CPU limit, and slow/jittery HTTP media reads configured by the `LIVE_STAGING_*` variables.
+Live-staging success requires a distinct long-track staging probe using `TEST_LONG_VIDEO_ID`; the probe must reach at least `LIVE_STAGING_LONG_TRACK_MIN_PACKETS` RTP packets before Stop and must satisfy the same RTP interval, sender lateness, and underrun budgets.
+After natural playback metrics are captured, live-staging success also starts fresh probe playbacks and validates active `UpdateVoiceContext` reconnect rollover, `Stop`, and `LeaveVoice` while those probes are actively Playing.
+Live-staging always uploads a structured evidence artifact summarizing the constrained profile, slow/jittery HTTP read settings, ignored invalid Resume, ignored redundant Pause, pause silence, resume packets, active reconnect rollover, active Stop, active LeaveVoice, observed packets, decoded audio, non-silent audio, natural playback stability metrics, reconnect probe metrics, long-track metrics, and failure_reason.
 
 The workflow intentionally starts the live dependencies itself instead of assuming external staging processes:
 
@@ -193,7 +205,11 @@ Every successful live staging validation should record this evidence in the impl
 - candidate manifest digest
 - whether authentic voice context was acquired
 - whether `VoiceReady`, `Playing`, and `TrackEnded` were observed through the natural end of the validation track
+- whether active probe playbacks validated `UpdateVoiceContext` reconnect rollover, `Stop`, and `LeaveVoice`
+- constrained profile name, service CPU limit, CPU-contention worker count, and HTTP read delay/jitter settings
+- whether the distinct long-track probe reached the required packet count and met the RTP stability budgets
 - observed packet count, decoded audio duration, and non-silent audio duration from the uploaded observer artifact
+- playback stability metrics from `GetPlaybackMetrics`, including RTP interval stats, sender lateness, buffer depth, refill durations, underruns, inserted silence, and interruption counters
 - whether cleanup succeeded
 
 ## Rollback

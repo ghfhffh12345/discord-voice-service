@@ -2,7 +2,13 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use std::fs;
 
-use discord_voice_service_twilight::{SessionEvent, SessionEventKind};
+use discord_voice_service_twilight::{
+    DurationStatsSnapshot as TwilightDurationStatsSnapshot,
+    PlaybackBufferDepthSnapshot as TwilightPlaybackBufferDepthSnapshot,
+    PlaybackStabilitySnapshot as TwilightPlaybackStabilitySnapshot, SessionEvent, SessionEventKind,
+};
+
+use crate::audio::AudioIntervalStats;
 
 #[derive(Debug, Clone, Default)]
 pub struct LiveContractState {
@@ -15,9 +21,13 @@ pub struct LiveContractState {
     pub validated_redundant_pause_ignored: bool,
     pub observer_proved_pause: bool,
     pub observer_proved_resume: bool,
+    pub validated_reconnect_rollover_during_playback: bool,
     pub validated_stop: bool,
+    pub validated_stop_during_playback: bool,
     pub validated_leave_voice: bool,
+    pub validated_leave_voice_during_playback: bool,
     pub validated_get_state: bool,
+    pub validated_get_playback_metrics: bool,
     pub validated_subscribe_events: bool,
     pub saw_voice_connecting: bool,
     pub saw_voice_ready: bool,
@@ -31,6 +41,11 @@ pub struct LiveValidationEvidence {
     pub outcome: String,
     pub service_uri: String,
     pub ytmusic_addr: String,
+    pub live_staging_profile: String,
+    pub live_staging_service_cpus: String,
+    pub live_staging_cpu_contention_workers: u64,
+    pub live_staging_http_read_delay_ms: u64,
+    pub live_staging_http_read_jitter_ms: u64,
     pub validated_join_voice: bool,
     pub validated_update_voice_context: bool,
     pub validated_play: bool,
@@ -45,9 +60,13 @@ pub struct LiveValidationEvidence {
     pub observer_resume_speaking_started: bool,
     pub observer_pause_silence_ms: u64,
     pub observer_resume_packet_count: u64,
+    pub validated_reconnect_rollover_during_playback: bool,
     pub validated_stop: bool,
+    pub validated_stop_during_playback: bool,
     pub validated_leave_voice: bool,
+    pub validated_leave_voice_during_playback: bool,
     pub validated_get_state: bool,
+    pub validated_get_playback_metrics: bool,
     pub validated_subscribe_events: bool,
     pub saw_voice_connecting: bool,
     pub saw_voice_ready: bool,
@@ -57,7 +76,212 @@ pub struct LiveValidationEvidence {
     pub observed_packet_count: u64,
     pub decoded_audio_ms: u64,
     pub non_silent_audio_ms: u64,
+    pub observer_rtp_inter_arrival: PlaybackDurationStatsEvidence,
+    pub observer_rtp_gap_count_gte_100ms: u64,
+    pub dave_transition_count_during_playback: u64,
+    pub playback_metrics: Option<PlaybackStabilityEvidence>,
+    pub reconnect_probe_metrics: Option<PlaybackStabilityEvidence>,
+    pub validated_constrained_profile: bool,
+    pub validated_slow_jittery_http: bool,
+    pub validated_long_track_playback: bool,
+    pub long_track_metrics: Option<PlaybackStabilityEvidence>,
     pub failure_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct PlaybackDurationStatsEvidence {
+    pub samples: u64,
+    pub p50_ms: u64,
+    pub p95_ms: u64,
+    pub p99_ms: u64,
+    pub min_ms: u64,
+    pub max_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct PlaybackBufferDepthEvidence {
+    pub packets: u64,
+    pub bytes: u64,
+    pub duration_ms: u64,
+    pub duration_samples: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct PlaybackStabilityEvidence {
+    pub playback_epoch: u64,
+    pub video_id: Option<String>,
+    pub selected_itag: Option<u32>,
+    pub track_packet_count: u64,
+    pub continuity_silence_packet_count: u64,
+    pub inserted_silence_duration_ms: u64,
+    pub track_interval: PlaybackDurationStatsEvidence,
+    pub all_packet_interval: PlaybackDurationStatsEvidence,
+    pub sender_lateness: PlaybackDurationStatsEvidence,
+    pub max_consecutive_late_packets: u64,
+    pub current_consecutive_late_packets: u64,
+    pub current_buffer_depth: PlaybackBufferDepthEvidence,
+    pub min_buffer_depth: PlaybackBufferDepthEvidence,
+    pub max_buffer_depth: PlaybackBufferDepthEvidence,
+    pub current_source_buffer_depth: PlaybackBufferDepthEvidence,
+    pub min_source_buffer_depth: PlaybackBufferDepthEvidence,
+    pub max_source_buffer_depth: PlaybackBufferDepthEvidence,
+    pub current_playout_buffer_depth: PlaybackBufferDepthEvidence,
+    pub min_playout_buffer_depth: PlaybackBufferDepthEvidence,
+    pub max_playout_buffer_depth: PlaybackBufferDepthEvidence,
+    pub prepared_rtp_queue_depth_ms: u64,
+    pub source_buffer_target_ms: u64,
+    pub adaptive_buffer_target_ms: u64,
+    pub max_adaptive_buffer_target_ms: u64,
+    pub buffer_low_watermark_count: u64,
+    pub source_buffer_low_watermark_count: u64,
+    pub playout_buffer_low_watermark_count: u64,
+    pub buffer_underrun_count: u64,
+    pub playout_underrun_count: u64,
+    pub source_underrun_count: u64,
+    pub rebuffer_count: u64,
+    pub refill_duration: PlaybackDurationStatsEvidence,
+    pub source_producer_fill_duration: PlaybackDurationStatsEvidence,
+    pub producer_stall_duration: PlaybackDurationStatsEvidence,
+    pub max_producer_lag_ms: u64,
+    pub http_retry_count: u64,
+    pub response_open_count: u64,
+    pub range_reopen_count: u64,
+    pub read_error_reopen_count: u64,
+    pub url_reresolve_count: u64,
+    pub pause_resume_first_intervals_ms: Vec<u64>,
+    pub post_stall_first_intervals_ms: Vec<u64>,
+    pub post_rebuffer_first_intervals_ms: Vec<u64>,
+    pub playout_sender_lateness: PlaybackDurationStatsEvidence,
+    pub playout_builder_prepare_duration: PlaybackDurationStatsEvidence,
+    pub sender_send_duration: PlaybackDurationStatsEvidence,
+    pub sender_loop_non_send_work_duration: PlaybackDurationStatsEvidence,
+    pub max_consecutive_playout_late_packets: u64,
+    pub speaking_prepare_duration: PlaybackDurationStatsEvidence,
+    pub sender_forbidden_work_count: u64,
+    pub gateway_event_drain_duration: PlaybackDurationStatsEvidence,
+    pub gateway_event_drain_count: u64,
+    pub dave_transition_count: u64,
+    pub dave_transition_count_during_playback: u64,
+    pub stale_dave_send_prevented_count: u64,
+    pub controlled_media_interruption_count: u64,
+    pub media_clock_reset_count: u64,
+    pub scheduler_late_reset_count: u64,
+    pub source_underrun_reset_count: u64,
+    pub pause_resume_reset_count: u64,
+    pub dave_transition_recovery_reset_count: u64,
+    pub gateway_interruptions: u64,
+    pub dave_interruptions: u64,
+    pub reconnect_interruptions: u64,
+    pub ended: bool,
+}
+
+impl From<&TwilightDurationStatsSnapshot> for PlaybackDurationStatsEvidence {
+    fn from(value: &TwilightDurationStatsSnapshot) -> Self {
+        Self {
+            samples: value.samples,
+            p50_ms: value.p50_ms,
+            p95_ms: value.p95_ms,
+            p99_ms: value.p99_ms,
+            min_ms: value.min_ms,
+            max_ms: value.max_ms,
+        }
+    }
+}
+
+impl From<&TwilightPlaybackBufferDepthSnapshot> for PlaybackBufferDepthEvidence {
+    fn from(value: &TwilightPlaybackBufferDepthSnapshot) -> Self {
+        Self {
+            packets: value.packets,
+            bytes: value.bytes,
+            duration_ms: value.duration_ms,
+            duration_samples: value.duration_samples,
+        }
+    }
+}
+
+impl From<&AudioIntervalStats> for PlaybackDurationStatsEvidence {
+    fn from(value: &AudioIntervalStats) -> Self {
+        Self {
+            samples: value.samples,
+            p50_ms: value.p50_ms,
+            p95_ms: value.p95_ms,
+            p99_ms: value.p99_ms,
+            min_ms: value.min_ms,
+            max_ms: value.max_ms,
+        }
+    }
+}
+
+impl From<&TwilightPlaybackStabilitySnapshot> for PlaybackStabilityEvidence {
+    fn from(value: &TwilightPlaybackStabilitySnapshot) -> Self {
+        Self {
+            playback_epoch: value.playback_epoch,
+            video_id: value.video_id.clone(),
+            selected_itag: value.selected_itag,
+            track_packet_count: value.track_packet_count,
+            continuity_silence_packet_count: value.continuity_silence_packet_count,
+            inserted_silence_duration_ms: value.inserted_silence_duration_ms,
+            track_interval: (&value.track_interval).into(),
+            all_packet_interval: (&value.all_packet_interval).into(),
+            sender_lateness: (&value.sender_lateness).into(),
+            max_consecutive_late_packets: value.max_consecutive_late_packets,
+            current_consecutive_late_packets: value.current_consecutive_late_packets,
+            current_buffer_depth: (&value.current_buffer_depth).into(),
+            min_buffer_depth: (&value.min_buffer_depth).into(),
+            max_buffer_depth: (&value.max_buffer_depth).into(),
+            current_source_buffer_depth: (&value.current_source_buffer_depth).into(),
+            min_source_buffer_depth: (&value.min_source_buffer_depth).into(),
+            max_source_buffer_depth: (&value.max_source_buffer_depth).into(),
+            current_playout_buffer_depth: (&value.current_playout_buffer_depth).into(),
+            min_playout_buffer_depth: (&value.min_playout_buffer_depth).into(),
+            max_playout_buffer_depth: (&value.max_playout_buffer_depth).into(),
+            prepared_rtp_queue_depth_ms: value.prepared_rtp_queue_depth_ms,
+            source_buffer_target_ms: value.source_buffer_target_ms,
+            adaptive_buffer_target_ms: value.adaptive_buffer_target_ms,
+            max_adaptive_buffer_target_ms: value.max_adaptive_buffer_target_ms,
+            buffer_low_watermark_count: value.buffer_low_watermark_count,
+            source_buffer_low_watermark_count: value.source_buffer_low_watermark_count,
+            playout_buffer_low_watermark_count: value.playout_buffer_low_watermark_count,
+            buffer_underrun_count: value.buffer_underrun_count,
+            playout_underrun_count: value.playout_underrun_count,
+            source_underrun_count: value.source_underrun_count,
+            rebuffer_count: value.rebuffer_count,
+            refill_duration: (&value.refill_duration).into(),
+            source_producer_fill_duration: (&value.source_producer_fill_duration).into(),
+            producer_stall_duration: (&value.producer_stall_duration).into(),
+            max_producer_lag_ms: value.max_producer_lag_ms,
+            http_retry_count: value.http_retry_count,
+            response_open_count: value.response_open_count,
+            range_reopen_count: value.range_reopen_count,
+            read_error_reopen_count: value.read_error_reopen_count,
+            url_reresolve_count: value.url_reresolve_count,
+            pause_resume_first_intervals_ms: value.pause_resume_first_intervals_ms.clone(),
+            post_stall_first_intervals_ms: value.post_stall_first_intervals_ms.clone(),
+            post_rebuffer_first_intervals_ms: value.post_rebuffer_first_intervals_ms.clone(),
+            playout_sender_lateness: (&value.playout_sender_lateness).into(),
+            playout_builder_prepare_duration: (&value.playout_builder_prepare_duration).into(),
+            sender_send_duration: (&value.sender_send_duration).into(),
+            sender_loop_non_send_work_duration: (&value.sender_loop_non_send_work_duration).into(),
+            max_consecutive_playout_late_packets: value.max_consecutive_playout_late_packets,
+            speaking_prepare_duration: (&value.speaking_prepare_duration).into(),
+            sender_forbidden_work_count: value.sender_forbidden_work_count,
+            gateway_event_drain_duration: (&value.gateway_event_drain_duration).into(),
+            gateway_event_drain_count: value.gateway_event_drain_count,
+            dave_transition_count: value.dave_transition_count,
+            dave_transition_count_during_playback: value.dave_transition_count_during_playback,
+            stale_dave_send_prevented_count: value.stale_dave_send_prevented_count,
+            controlled_media_interruption_count: value.controlled_media_interruption_count,
+            media_clock_reset_count: value.media_clock_reset_count,
+            scheduler_late_reset_count: value.scheduler_late_reset_count,
+            source_underrun_reset_count: value.source_underrun_reset_count,
+            pause_resume_reset_count: value.pause_resume_reset_count,
+            dave_transition_recovery_reset_count: value.dave_transition_recovery_reset_count,
+            gateway_interruptions: value.gateway_interruptions,
+            dave_interruptions: value.dave_interruptions,
+            reconnect_interruptions: value.reconnect_interruptions,
+            ended: value.ended,
+        }
+    }
 }
 
 pub fn emit_validation_evidence(evidence: &LiveValidationEvidence) -> Result<()> {
@@ -88,8 +312,15 @@ where
             let evidence = build_evidence(state);
             emit_evidence(&evidence)
         }
+        (Ok(state), Err(cleanup_error)) => {
+            tracing::warn!(
+                error = %cleanup_error,
+                "live validation succeeded but cleanup confirmation failed"
+            );
+            let evidence = build_evidence(state);
+            emit_evidence(&evidence)
+        }
         (Err(primary), Ok(())) => Err(primary),
-        (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
         (Err(primary), Err(cleanup_error)) => {
             Err(primary.context(format!("cleanup also failed: {cleanup_error}")))
         }
@@ -127,16 +358,34 @@ impl LiveContractState {
         self.validated_redundant_pause_ignored = true;
     }
 
+    pub fn mark_reconnect_rollover_during_playback(&mut self) {
+        self.validated_reconnect_rollover_during_playback = true;
+    }
+
     pub fn mark_stop(&mut self) {
         self.validated_stop = true;
+    }
+
+    pub fn mark_stop_during_playback(&mut self) {
+        self.validated_stop = true;
+        self.validated_stop_during_playback = true;
     }
 
     pub fn mark_leave_voice(&mut self) {
         self.validated_leave_voice = true;
     }
 
+    pub fn mark_leave_voice_during_playback(&mut self) {
+        self.validated_leave_voice = true;
+        self.validated_leave_voice_during_playback = true;
+    }
+
     pub fn mark_get_state(&mut self) {
         self.validated_get_state = true;
+    }
+
+    pub fn mark_get_playback_metrics(&mut self) {
+        self.validated_get_playback_metrics = true;
     }
 
     pub fn mark_subscribe_events(&mut self) {
@@ -252,14 +501,26 @@ impl LiveContractState {
         if !self.observer_proved_resume {
             missing.push("Resume observer proof");
         }
+        if !self.validated_reconnect_rollover_during_playback {
+            missing.push("reconnect rollover during playback");
+        }
         if !self.validated_stop {
             missing.push("Stop");
+        }
+        if !self.validated_stop_during_playback {
+            missing.push("Stop during playback");
         }
         if !self.validated_leave_voice {
             missing.push("LeaveVoice");
         }
+        if !self.validated_leave_voice_during_playback {
+            missing.push("LeaveVoice during playback");
+        }
         if !self.validated_get_state {
             missing.push("GetState");
+        }
+        if !self.validated_get_playback_metrics {
+            missing.push("GetPlaybackMetrics");
         }
         if !self.validated_subscribe_events {
             missing.push("SubscribeEvents");

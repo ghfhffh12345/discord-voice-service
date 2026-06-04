@@ -8,11 +8,18 @@ required_vars=(
   TEST_GUILD_ID
   TEST_VOICE_CHANNEL_ID
   TEST_VIDEO_ID
+  TEST_LONG_VIDEO_ID
   BROWSER_JSON
   DISCORD_VOICE_SERVICE_URI
   DISCORD_VOICE_SERVICE_BIND_ADDR
   DISCORD_VOICE_SERVICE_IMAGE_REF
   DISCORD_VOICE_SERVICE_YTMUSIC_ADDR
+  LIVE_STAGING_PROFILE
+  LIVE_STAGING_SERVICE_CPUS
+  LIVE_STAGING_CPU_CONTENTION_WORKERS
+  LIVE_STAGING_HTTP_READ_DELAY_MS
+  LIVE_STAGING_HTTP_READ_JITTER_MS
+  LIVE_STAGING_LONG_TRACK_MIN_PACKETS
 )
 
 required_tools=(
@@ -35,6 +42,27 @@ for required_var in "${required_vars[@]}"; do
     exit 1
   fi
 done
+
+if [[ "${TEST_LONG_VIDEO_ID}" == "${TEST_VIDEO_ID}" ]]; then
+  echo "::error::TEST_LONG_VIDEO_ID must be distinct from TEST_VIDEO_ID"
+  exit 1
+fi
+
+for numeric_var in \
+  LIVE_STAGING_CPU_CONTENTION_WORKERS \
+  LIVE_STAGING_HTTP_READ_DELAY_MS \
+  LIVE_STAGING_HTTP_READ_JITTER_MS \
+  LIVE_STAGING_LONG_TRACK_MIN_PACKETS; do
+  if [[ ! "${!numeric_var}" =~ ^[0-9]+$ || "${!numeric_var}" -eq 0 ]]; then
+    echo "::error::${numeric_var} must be a positive integer"
+    exit 1
+  fi
+done
+
+if [[ "${LIVE_STAGING_LONG_TRACK_MIN_PACKETS}" -lt 50 ]]; then
+  echo "::error::LIVE_STAGING_LONG_TRACK_MIN_PACKETS must be at least 50"
+  exit 1
+fi
 
 resolved_digest="$(
   skopeo inspect --format '{{.Digest}}' "docker://${DISCORD_VOICE_SERVICE_IMAGE_REF}"
