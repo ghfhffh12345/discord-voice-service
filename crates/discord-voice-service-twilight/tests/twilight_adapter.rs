@@ -211,6 +211,19 @@ fn proto_playback_metrics_convert_to_typed_snapshot() {
         track_media_to_wall_clock_ratio_ppm: 1_000_000,
         track_fast_interval_count: 0,
         track_fast_interval_min_ms: 0,
+        track_fast_interval_min_us: 0,
+        track_tempo_window_count: 12,
+        track_tempo_window_post_source_buffer_count: 3,
+        track_tempo_window_min_ratio_ppm: 1_000_000,
+        track_tempo_window_max_ratio_ppm: 1_000_000,
+        track_tempo_window_fast_count: 0,
+        track_tempo_window_fastest_ratio_ppm: 0,
+        track_tempo_window_fastest_media_ms: 0,
+        track_tempo_window_fastest_wall_clock_us: 0,
+        track_tempo_window_slow_count: 0,
+        track_tempo_window_slowest_ratio_ppm: 0,
+        track_tempo_window_slowest_media_ms: 0,
+        track_tempo_window_slowest_wall_clock_us: 0,
         skipped_source_frame_count: 0,
         skipped_source_duration_ms: 0,
         tempo_rebase_count: 2,
@@ -380,6 +393,13 @@ fn proto_playback_metrics_convert_to_typed_snapshot() {
     assert_eq!(snapshot.track_media_to_wall_clock_ratio_ppm, 1_000_000);
     assert_eq!(snapshot.track_fast_interval_count, 0);
     assert_eq!(snapshot.track_fast_interval_min_ms, 0);
+    assert_eq!(snapshot.track_fast_interval_min_us, 0);
+    assert_eq!(snapshot.track_tempo_window_count, 12);
+    assert_eq!(snapshot.track_tempo_window_post_source_buffer_count, 3);
+    assert_eq!(snapshot.track_tempo_window_min_ratio_ppm, 1_000_000);
+    assert_eq!(snapshot.track_tempo_window_max_ratio_ppm, 1_000_000);
+    assert_eq!(snapshot.track_tempo_window_fast_count, 0);
+    assert_eq!(snapshot.track_tempo_window_slow_count, 0);
     assert_eq!(snapshot.skipped_source_frame_count, 0);
     assert_eq!(snapshot.skipped_source_duration_ms, 0);
     assert_eq!(snapshot.tempo_rebase_count, 2);

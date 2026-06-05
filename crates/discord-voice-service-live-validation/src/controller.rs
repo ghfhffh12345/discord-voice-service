@@ -47,16 +47,18 @@ const PLAYBACK_METRICS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const ACTIVE_INTERRUPT_PROBE_MEDIA_SETTLE_DURATION: Duration = Duration::from_millis(500);
 const MIN_STABILITY_METRIC_PACKET_COUNT: u64 = 50;
 const SOURCE_PLAYBACK_BUFFER_TARGET_MS: u64 = 5_000;
-const RTP_INTERVAL_MIN_BUDGET_MS: u64 = 18;
+const DISCORD_EGRESS_BUFFER_TARGET_MS: u64 = 400;
+const DISCORD_EGRESS_BUFFER_HIGH_WATERMARK_MS: u64 = 500;
 const RTP_INTERVAL_P95_BUDGET_MS: u64 = 45;
 const RTP_INTERVAL_P99_BUDGET_MS: u64 = 70;
 const RTP_INTERVAL_MAX_BUDGET_MS: u64 = 100;
+const MEDIA_TO_WALL_CLOCK_MIN_RATIO_PPM: u64 = 980_000;
 const MEDIA_TO_WALL_CLOCK_MAX_RATIO_PPM: u64 = 1_020_000;
 const SENDER_LATENESS_P99_BUDGET_MS: u64 = 10;
 const SENDER_LOOP_NON_SEND_WORK_MAX_BUDGET_MS: u64 = 15;
 const MAX_CONSECUTIVE_PLAYOUT_LATE_PACKETS: u64 = 2;
 const MIN_OBSERVED_PACKET_COUNT: u64 = 120;
-const MIN_DECODED_AUDIO_MS: u64 = 3_000;
+const MIN_DECODED_AUDIO_MS: u64 = 6_000;
 const MIN_NON_SILENT_AUDIO_MS: u64 = 1_000;
 const OBSERVER_AUDIO_DURATION_TOLERANCE_MS: u64 = 2_000;
 const OBSERVER_AUDIO_DURATION_MIN_RATIO_PERCENT: u64 = 90;
@@ -1350,6 +1352,7 @@ fn record_observer_audio_frame(
     let stats = accumulator
         .observe_packet(ObservedOpusPacket {
             sequence: frame.sequence,
+            timestamp: frame.timestamp,
             payload: frame.payload.as_ref(),
         })
         .context("analyze observer audio packet")?;
@@ -1373,14 +1376,24 @@ fn observer_thresholds_satisfied(stats: &AudioValidationStats, expected_duration
         && stats.decoded_audio_ms >= required_observer_decoded_audio_ms(expected_duration_ms)
         && stats.wall_clock_elapsed_ms > 0
         && stats.decoded_audio_to_wall_clock_ratio_ppm > 0
+        && stats.decoded_audio_to_wall_clock_ratio_ppm >= MEDIA_TO_WALL_CLOCK_MIN_RATIO_PPM
         && stats.decoded_audio_to_wall_clock_ratio_ppm <= MEDIA_TO_WALL_CLOCK_MAX_RATIO_PPM
         && stats.non_silent_audio_ms >= MIN_NON_SILENT_AUDIO_MS
         && stats.rtp_inter_arrival.samples > 0
         && stats.rtp_gap_count_gte_100ms == 0
         && stats.rtp_fast_interval_count == 0
+        && stats.decoded_audio_tempo_window_count > 0
+        && stats.decoded_audio_tempo_window_fast_count == 0
+        && stats.decoded_audio_tempo_window_slow_count == 0
+        && (!observer_post_source_buffer_window_required(expected_duration_ms)
+            || stats.decoded_audio_tempo_window_post_source_buffer_count > 0)
         && stats.rtp_inter_arrival.p95_ms <= RTP_INTERVAL_P95_BUDGET_MS
         && stats.rtp_inter_arrival.p99_ms <= RTP_INTERVAL_P99_BUDGET_MS
         && stats.rtp_inter_arrival.max_ms < RTP_INTERVAL_MAX_BUDGET_MS
+}
+
+fn observer_post_source_buffer_window_required(expected_duration_ms: u64) -> bool {
+    expected_duration_ms >= SOURCE_PLAYBACK_BUFFER_TARGET_MS.saturating_add(1_000)
 }
 
 fn required_observer_decoded_audio_ms(expected_duration_ms: u64) -> u64 {
@@ -1399,19 +1412,29 @@ fn observer_threshold_error(
     let required_decoded_audio_ms = required_observer_decoded_audio_ms(expected_duration_ms);
     match stats {
         Some(stats) => anyhow!(
-            "observer audio proof finished before thresholds (observed_packet_count={} decoded_audio_ms={} required_decoded_audio_ms={} expected_duration_ms={} observer_wall_clock_elapsed_ms={} decoded_audio_to_wall_clock_ratio_ppm={} max_ratio_ppm={} non_silent_audio_ms={} required_non_silent_audio_ms={} rtp_gap_count_gte_100ms={} rtp_fast_interval_count={} rtp_fast_interval_min_ms={} rtp_p95_ms={} rtp_p99_ms={} rtp_max_ms={})",
+            "observer audio proof finished before thresholds (observed_packet_count={} decoded_audio_ms={} required_decoded_audio_ms={} expected_duration_ms={} observer_wall_clock_elapsed_ms={} decoded_audio_to_wall_clock_ratio_ppm={} min_ratio_ppm={} max_ratio_ppm={} non_silent_audio_ms={} required_non_silent_audio_ms={} rtp_gap_count_gte_100ms={} rtp_fast_interval_count={} rtp_fast_interval_min_ms={} rtp_fast_interval_min_us={} decoded_audio_tempo_window_count={} decoded_audio_tempo_window_post_source_buffer_count={} decoded_audio_tempo_window_min_ratio_ppm={} decoded_audio_tempo_window_max_ratio_ppm={} decoded_audio_tempo_window_fast_count={} decoded_audio_tempo_window_fastest_ratio_ppm={} decoded_audio_tempo_window_slow_count={} decoded_audio_tempo_window_slowest_ratio_ppm={} rtp_p95_ms={} rtp_p99_ms={} rtp_max_ms={})",
             stats.observed_packet_count,
             stats.decoded_audio_ms,
             required_decoded_audio_ms,
             expected_duration_ms,
             stats.wall_clock_elapsed_ms,
             stats.decoded_audio_to_wall_clock_ratio_ppm,
+            MEDIA_TO_WALL_CLOCK_MIN_RATIO_PPM,
             MEDIA_TO_WALL_CLOCK_MAX_RATIO_PPM,
             stats.non_silent_audio_ms,
             MIN_NON_SILENT_AUDIO_MS,
             stats.rtp_gap_count_gte_100ms,
             stats.rtp_fast_interval_count,
             stats.rtp_fast_interval_min_ms,
+            stats.rtp_fast_interval_min_us,
+            stats.decoded_audio_tempo_window_count,
+            stats.decoded_audio_tempo_window_post_source_buffer_count,
+            stats.decoded_audio_tempo_window_min_ratio_ppm,
+            stats.decoded_audio_tempo_window_max_ratio_ppm,
+            stats.decoded_audio_tempo_window_fast_count,
+            stats.decoded_audio_tempo_window_fastest_ratio_ppm,
+            stats.decoded_audio_tempo_window_slow_count,
+            stats.decoded_audio_tempo_window_slowest_ratio_ppm,
             stats.rtp_inter_arrival.p95_ms,
             stats.rtp_inter_arrival.p99_ms,
             stats.rtp_inter_arrival.max_ms,
@@ -2511,17 +2534,61 @@ fn validate_playback_timing_budget(metrics: &PlaybackStabilitySnapshot, label: &
     if metrics.track_media_to_wall_clock_ratio_ppm == 0 {
         bail!("{label} returned zero track media-to-wall-clock ratio");
     }
+    if metrics.track_media_to_wall_clock_ratio_ppm < MEDIA_TO_WALL_CLOCK_MIN_RATIO_PPM {
+        bail!(
+            "{label} track media-to-wall-clock ratio was {}ppm; expected >= {MEDIA_TO_WALL_CLOCK_MIN_RATIO_PPM}ppm",
+            metrics.track_media_to_wall_clock_ratio_ppm
+        );
+    }
     if metrics.track_media_to_wall_clock_ratio_ppm > MEDIA_TO_WALL_CLOCK_MAX_RATIO_PPM {
         bail!(
             "{label} track media-to-wall-clock ratio was {}ppm; expected <= {MEDIA_TO_WALL_CLOCK_MAX_RATIO_PPM}ppm",
             metrics.track_media_to_wall_clock_ratio_ppm
         );
     }
+    if metrics.track_tempo_window_count == 0 {
+        bail!("{label} returned no rolling track tempo windows");
+    }
+    if metrics.track_tempo_window_min_ratio_ppm == 0
+        || metrics.track_tempo_window_max_ratio_ppm == 0
+    {
+        bail!(
+            "{label} returned incomplete rolling tempo ratio bounds (min={} max={})",
+            metrics.track_tempo_window_min_ratio_ppm,
+            metrics.track_tempo_window_max_ratio_ppm
+        );
+    }
+    if metrics.track_media_duration_sent_ms
+        >= SOURCE_PLAYBACK_BUFFER_TARGET_MS.saturating_add(1_000)
+        && metrics.track_tempo_window_post_source_buffer_count == 0
+    {
+        bail!(
+            "{label} returned no rolling tempo windows starting after the {SOURCE_PLAYBACK_BUFFER_TARGET_MS}ms source reservoir"
+        );
+    }
+    if metrics.track_tempo_window_fast_count != 0 {
+        bail!(
+            "{label} reported {} faster-than-real-time rolling tempo windows (fastest_ratio_ppm={} media_ms={} wall_us={}); expected 0",
+            metrics.track_tempo_window_fast_count,
+            metrics.track_tempo_window_fastest_ratio_ppm,
+            metrics.track_tempo_window_fastest_media_ms,
+            metrics.track_tempo_window_fastest_wall_clock_us
+        );
+    }
+    if metrics.track_tempo_window_slow_count != 0 {
+        bail!(
+            "{label} reported {} slower-than-real-time rolling tempo windows (slowest_ratio_ppm={} media_ms={} wall_us={}); expected 0",
+            metrics.track_tempo_window_slow_count,
+            metrics.track_tempo_window_slowest_ratio_ppm,
+            metrics.track_tempo_window_slowest_media_ms,
+            metrics.track_tempo_window_slowest_wall_clock_us
+        );
+    }
     if metrics.track_fast_interval_count != 0 {
         bail!(
-            "{label} reported {} fast track intervals (minimum {}ms); expected 0",
+            "{label} reported {} shortened local track intervals (min_us={}); expected 0",
             metrics.track_fast_interval_count,
-            metrics.track_fast_interval_min_ms
+            metrics.track_fast_interval_min_us
         );
     }
     if metrics.skipped_source_frame_count != 0 {
@@ -2557,34 +2624,34 @@ fn validate_playback_timing_budget(metrics: &PlaybackStabilitySnapshot, label: &
             metrics.sender_loop_non_send_work_duration.max_ms
         );
     }
-    if metrics.current_playout_buffer_depth.duration_ms != 0 {
-        bail!(
-            "{label} current prepared RTP queue depth was {}ms; expected 0",
-            metrics.current_playout_buffer_depth.duration_ms
-        );
-    }
     if metrics.prepared_rtp_queue_depth_ms != 0 {
         bail!(
             "{label} prepared_rtp_queue_depth_ms was {}; expected 0",
             metrics.prepared_rtp_queue_depth_ms
         );
     }
-    if metrics.min_playout_buffer_depth.duration_ms != 0 {
+    if metrics.egress_buffer_target_ms != DISCORD_EGRESS_BUFFER_TARGET_MS {
         bail!(
-            "{label} min prepared RTP queue depth was {}ms; expected 0",
-            metrics.min_playout_buffer_depth.duration_ms
+            "{label} returned egress_buffer_target_ms {}; expected {DISCORD_EGRESS_BUFFER_TARGET_MS}",
+            metrics.egress_buffer_target_ms
         );
     }
-    if metrics.max_playout_buffer_depth.duration_ms != 0 {
+    if metrics.max_egress_buffer_depth.duration_ms == 0 {
         bail!(
-            "{label} max prepared RTP queue depth was {}ms; expected 0",
-            metrics.max_playout_buffer_depth.duration_ms
+            "{label} reported no Discord egress buffering; expected bounded raw Opus egress depth"
         );
     }
-    if metrics.track_interval.min_ms < RTP_INTERVAL_MIN_BUDGET_MS {
+    if metrics.max_egress_buffer_depth.duration_ms > DISCORD_EGRESS_BUFFER_HIGH_WATERMARK_MS {
         bail!(
-            "{label} minimum RTP interval was {}ms; expected >= {RTP_INTERVAL_MIN_BUDGET_MS}ms",
-            metrics.track_interval.min_ms
+            "{label} max Discord egress depth was {}ms; expected <= {DISCORD_EGRESS_BUFFER_HIGH_WATERMARK_MS}ms",
+            metrics.max_egress_buffer_depth.duration_ms
+        );
+    }
+    if metrics.max_playout_buffer_depth != metrics.max_egress_buffer_depth {
+        bail!(
+            "{label} playout depth {:?} did not match egress depth {:?}",
+            metrics.max_playout_buffer_depth,
+            metrics.max_egress_buffer_depth
         );
     }
     if metrics.track_interval.p95_ms > RTP_INTERVAL_P95_BUDGET_MS {
@@ -2635,6 +2702,12 @@ fn validate_playback_timing_budget(metrics: &PlaybackStabilitySnapshot, label: &
             metrics.playout_underrun_count
         );
     }
+    if metrics.egress_underrun_count != 0 {
+        bail!(
+            "{label} reported {} egress underruns; expected 0",
+            metrics.egress_underrun_count
+        );
+    }
     if metrics.source_underrun_count != 0 {
         bail!(
             "{label} reported {} source underruns; expected 0",
@@ -2683,6 +2756,12 @@ fn validate_playback_timing_budget(metrics: &PlaybackStabilitySnapshot, label: &
             metrics.max_consecutive_playout_late_packets
         );
     }
+    if metrics.max_consecutive_late_egress_ticks > MAX_CONSECUTIVE_PLAYOUT_LATE_PACKETS {
+        bail!(
+            "{label} reported {} consecutive late egress ticks; expected <= {MAX_CONSECUTIVE_PLAYOUT_LATE_PACKETS}",
+            metrics.max_consecutive_late_egress_ticks
+        );
+    }
     if metrics.continuity_silence_packet_count != 0 {
         bail!(
             "{label} reported {} continuity silence packets during playback; expected 0",
@@ -2693,6 +2772,21 @@ fn validate_playback_timing_budget(metrics: &PlaybackStabilitySnapshot, label: &
         bail!(
             "{label} reported {}ms of inserted silence during playback; expected 0",
             metrics.inserted_silence_duration_ms
+        );
+    }
+    if metrics.egress_inserted_silence_duration_ms != 0 {
+        bail!(
+            "{label} reported {}ms of egress inserted silence during playback; expected 0",
+            metrics.egress_inserted_silence_duration_ms
+        );
+    }
+    if metrics.egress_dropped_music_frame_count != 0
+        || metrics.egress_dropped_music_duration_ms != 0
+    {
+        bail!(
+            "{label} reported dropped egress music frames={} duration_ms={}; expected 0 for steady playback",
+            metrics.egress_dropped_music_frame_count,
+            metrics.egress_dropped_music_duration_ms
         );
     }
     Ok(())
@@ -3022,6 +3116,43 @@ fn build_success_evidence(
         observer_rtp_gap_count_gte_100ms: validated.audio_stats.rtp_gap_count_gte_100ms,
         observer_rtp_fast_interval_count: validated.audio_stats.rtp_fast_interval_count,
         observer_rtp_fast_interval_min_ms: validated.audio_stats.rtp_fast_interval_min_ms,
+        observer_rtp_fast_interval_min_us: validated.audio_stats.rtp_fast_interval_min_us,
+        observer_decoded_audio_tempo_window_count: validated
+            .audio_stats
+            .decoded_audio_tempo_window_count,
+        observer_decoded_audio_tempo_window_post_source_buffer_count: validated
+            .audio_stats
+            .decoded_audio_tempo_window_post_source_buffer_count,
+        observer_decoded_audio_tempo_window_min_ratio_ppm: validated
+            .audio_stats
+            .decoded_audio_tempo_window_min_ratio_ppm,
+        observer_decoded_audio_tempo_window_max_ratio_ppm: validated
+            .audio_stats
+            .decoded_audio_tempo_window_max_ratio_ppm,
+        observer_decoded_audio_tempo_window_fast_count: validated
+            .audio_stats
+            .decoded_audio_tempo_window_fast_count,
+        observer_decoded_audio_tempo_window_fastest_ratio_ppm: validated
+            .audio_stats
+            .decoded_audio_tempo_window_fastest_ratio_ppm,
+        observer_decoded_audio_tempo_window_fastest_media_ms: validated
+            .audio_stats
+            .decoded_audio_tempo_window_fastest_media_ms,
+        observer_decoded_audio_tempo_window_fastest_wall_clock_us: validated
+            .audio_stats
+            .decoded_audio_tempo_window_fastest_wall_clock_us,
+        observer_decoded_audio_tempo_window_slow_count: validated
+            .audio_stats
+            .decoded_audio_tempo_window_slow_count,
+        observer_decoded_audio_tempo_window_slowest_ratio_ppm: validated
+            .audio_stats
+            .decoded_audio_tempo_window_slowest_ratio_ppm,
+        observer_decoded_audio_tempo_window_slowest_media_ms: validated
+            .audio_stats
+            .decoded_audio_tempo_window_slowest_media_ms,
+        observer_decoded_audio_tempo_window_slowest_wall_clock_us: validated
+            .audio_stats
+            .decoded_audio_tempo_window_slowest_wall_clock_us,
         dave_transition_count_during_playback: validated
             .playback_metrics
             .as_ref()
@@ -3112,6 +3243,38 @@ fn build_failure_evidence(
             .map_or(0, |stats| stats.rtp_fast_interval_count),
         observer_rtp_fast_interval_min_ms: audio_stats
             .map_or(0, |stats| stats.rtp_fast_interval_min_ms),
+        observer_rtp_fast_interval_min_us: audio_stats
+            .map_or(0, |stats| stats.rtp_fast_interval_min_us),
+        observer_decoded_audio_tempo_window_count: audio_stats
+            .map_or(0, |stats| stats.decoded_audio_tempo_window_count),
+        observer_decoded_audio_tempo_window_post_source_buffer_count: audio_stats
+            .map_or(0, |stats| {
+                stats.decoded_audio_tempo_window_post_source_buffer_count
+            }),
+        observer_decoded_audio_tempo_window_min_ratio_ppm: audio_stats
+            .map_or(0, |stats| stats.decoded_audio_tempo_window_min_ratio_ppm),
+        observer_decoded_audio_tempo_window_max_ratio_ppm: audio_stats
+            .map_or(0, |stats| stats.decoded_audio_tempo_window_max_ratio_ppm),
+        observer_decoded_audio_tempo_window_fast_count: audio_stats
+            .map_or(0, |stats| stats.decoded_audio_tempo_window_fast_count),
+        observer_decoded_audio_tempo_window_fastest_ratio_ppm: audio_stats.map_or(0, |stats| {
+            stats.decoded_audio_tempo_window_fastest_ratio_ppm
+        }),
+        observer_decoded_audio_tempo_window_fastest_media_ms: audio_stats
+            .map_or(0, |stats| stats.decoded_audio_tempo_window_fastest_media_ms),
+        observer_decoded_audio_tempo_window_fastest_wall_clock_us: audio_stats.map_or(0, |stats| {
+            stats.decoded_audio_tempo_window_fastest_wall_clock_us
+        }),
+        observer_decoded_audio_tempo_window_slow_count: audio_stats
+            .map_or(0, |stats| stats.decoded_audio_tempo_window_slow_count),
+        observer_decoded_audio_tempo_window_slowest_ratio_ppm: audio_stats.map_or(0, |stats| {
+            stats.decoded_audio_tempo_window_slowest_ratio_ppm
+        }),
+        observer_decoded_audio_tempo_window_slowest_media_ms: audio_stats
+            .map_or(0, |stats| stats.decoded_audio_tempo_window_slowest_media_ms),
+        observer_decoded_audio_tempo_window_slowest_wall_clock_us: audio_stats.map_or(0, |stats| {
+            stats.decoded_audio_tempo_window_slowest_wall_clock_us
+        }),
         dave_transition_count_during_playback: snapshot
             .and_then(|value| value.playback_metrics.as_ref())
             .map_or(0, |metrics| metrics.dave_transition_count_during_playback),
@@ -3522,6 +3685,12 @@ mod tests {
             wall_clock_elapsed_ms: required_decoded_audio_ms,
             decoded_audio_to_wall_clock_ratio_ppm: 1_000_000,
             non_silent_audio_ms: 120_000,
+            decoded_audio_tempo_window_count: 8_051,
+            decoded_audio_tempo_window_post_source_buffer_count: 7_801,
+            decoded_audio_tempo_window_min_ratio_ppm: 1_000_000,
+            decoded_audio_tempo_window_max_ratio_ppm: 1_000_000,
+            decoded_audio_tempo_window_fast_count: 0,
+            decoded_audio_tempo_window_slow_count: 0,
             rtp_inter_arrival: crate::audio::AudioIntervalStats {
                 samples: 8_099,
                 p50_ms: 20,
@@ -3542,10 +3711,37 @@ mod tests {
             decoded_audio_to_wall_clock_ratio_ppm: MEDIA_TO_WALL_CLOCK_MAX_RATIO_PPM + 1,
             rtp_fast_interval_count: 1,
             rtp_fast_interval_min_ms: 8,
+            rtp_fast_interval_min_us: 8_000,
             ..full_stats.clone()
         };
         assert!(!observer_thresholds_satisfied(
             &fast_playback_stats,
+            expected_duration_ms,
+        ));
+
+        let local_fast_interval_with_stable_ratio = AudioValidationStats {
+            rtp_fast_interval_count: 1,
+            rtp_fast_interval_min_ms: 19,
+            rtp_fast_interval_min_us: 19_000,
+            decoded_audio_to_wall_clock_ratio_ppm: 1_000_000,
+            decoded_audio_tempo_window_fast_count: 0,
+            decoded_audio_tempo_window_slow_count: 0,
+            decoded_audio_tempo_window_min_ratio_ppm: 1_000_000,
+            decoded_audio_tempo_window_max_ratio_ppm: 1_000_000,
+            ..full_stats.clone()
+        };
+        assert!(!observer_thresholds_satisfied(
+            &local_fast_interval_with_stable_ratio,
+            expected_duration_ms,
+        ));
+
+        let slow_playback_stats = AudioValidationStats {
+            wall_clock_elapsed_ms: required_decoded_audio_ms.saturating_add(20_000),
+            decoded_audio_to_wall_clock_ratio_ppm: MEDIA_TO_WALL_CLOCK_MIN_RATIO_PPM - 1,
+            ..full_stats.clone()
+        };
+        assert!(!observer_thresholds_satisfied(
+            &slow_playback_stats,
             expected_duration_ms,
         ));
 
@@ -3555,6 +3751,41 @@ mod tests {
         };
         assert!(!observer_thresholds_satisfied(
             &gapped_stats,
+            expected_duration_ms,
+        ));
+
+        let missing_post_reservoir_window_stats = AudioValidationStats {
+            decoded_audio_tempo_window_post_source_buffer_count: 0,
+            ..full_stats.clone()
+        };
+        assert!(!observer_thresholds_satisfied(
+            &missing_post_reservoir_window_stats,
+            expected_duration_ms,
+        ));
+
+        let fast_rolling_window_stats = AudioValidationStats {
+            decoded_audio_tempo_window_fast_count: 1,
+            decoded_audio_tempo_window_fastest_ratio_ppm: MEDIA_TO_WALL_CLOCK_MAX_RATIO_PPM + 1,
+            decoded_audio_tempo_window_fastest_media_ms: 1_000,
+            decoded_audio_tempo_window_fastest_wall_clock_us: 980_000,
+            decoded_audio_tempo_window_max_ratio_ppm: MEDIA_TO_WALL_CLOCK_MAX_RATIO_PPM + 1,
+            ..full_stats.clone()
+        };
+        assert!(!observer_thresholds_satisfied(
+            &fast_rolling_window_stats,
+            expected_duration_ms,
+        ));
+
+        let slow_rolling_window_stats = AudioValidationStats {
+            decoded_audio_tempo_window_slow_count: 1,
+            decoded_audio_tempo_window_slowest_ratio_ppm: MEDIA_TO_WALL_CLOCK_MIN_RATIO_PPM - 1,
+            decoded_audio_tempo_window_slowest_media_ms: 1_000,
+            decoded_audio_tempo_window_slowest_wall_clock_us: 1_030_000,
+            decoded_audio_tempo_window_min_ratio_ppm: MEDIA_TO_WALL_CLOCK_MIN_RATIO_PPM - 1,
+            ..full_stats.clone()
+        };
+        assert!(!observer_thresholds_satisfied(
+            &slow_rolling_window_stats,
             expected_duration_ms,
         ));
 

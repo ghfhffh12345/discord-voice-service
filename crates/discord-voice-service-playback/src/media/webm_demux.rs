@@ -7,6 +7,7 @@ use webm_iterable::errors::{TagIteratorError, WebmCoercionError};
 use webm_iterable::matroska_spec::{Block, Frame, Master, MatroskaSpec, SimpleBlock};
 
 use crate::error::PlaybackError;
+use crate::media::opus_queue::{OpusPacketDuration, opus_packet_duration};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DemuxedPacket {
@@ -52,7 +53,6 @@ impl WebmOpusDemux {
 #[derive(Clone, Copy, Debug, Default)]
 struct TrackState {
     number: u64,
-    default_duration_ms: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -131,23 +131,18 @@ impl WebmDemuxState {
         let mut number = None;
         let mut codec_id = None;
         let mut track_type = None;
-        let mut default_duration_ns = None;
 
         for child in children {
             match child {
                 MatroskaSpec::TrackNumber(value) => number = Some(value),
                 MatroskaSpec::CodecID(value) => codec_id = Some(value),
                 MatroskaSpec::TrackType(value) => track_type = Some(value),
-                MatroskaSpec::DefaultDuration(value) => default_duration_ns = Some(value),
                 _ => {}
             }
         }
 
         if track_type == Some(2) && codec_id.as_deref() == Some("A_OPUS") {
-            self.opus_track = number.map(|number| TrackState {
-                number,
-                default_duration_ms: default_duration_ns.map(|value| value / 1_000_000),
-            });
+            self.opus_track = number.map(|number| TrackState { number });
         }
     }
 
@@ -160,8 +155,7 @@ impl WebmDemuxState {
         }
 
         let frames = block.read_frame_data().map_err(map_webm_coercion_error)?;
-        let fallback_duration = self.opus_track.and_then(|track| track.default_duration_ms);
-        self.frames_to_packets(block.timestamp, frames, None, fallback_duration)
+        self.frames_to_packets(block.timestamp, frames)
     }
 
     fn extract_block_group(
@@ -169,15 +163,11 @@ impl WebmDemuxState {
         children: Vec<MatroskaSpec>,
     ) -> Result<Vec<DemuxedPacket>, PlaybackError> {
         let mut block_data = None;
-        let mut block_duration_ms = None;
 
         for child in children {
             match child {
                 MatroskaSpec::Block(data) => {
                     block_data = Some(data);
-                }
-                MatroskaSpec::BlockDuration(duration) => {
-                    block_duration_ms = Some(self.scale_timestamp_to_ms(duration)?);
                 }
                 _ => {}
             }
@@ -193,35 +183,21 @@ impl WebmDemuxState {
         }
 
         let frames = block.read_frame_data().map_err(map_webm_coercion_error)?;
-        let fallback_duration = self.opus_track.and_then(|track| track.default_duration_ms);
-        self.frames_to_packets(
-            block.timestamp,
-            frames,
-            block_duration_ms,
-            fallback_duration,
-        )
+        self.frames_to_packets(block.timestamp, frames)
     }
 
     fn frames_to_packets(
         &self,
         relative_timestamp: i16,
         frames: Vec<Frame<'_>>,
-        block_duration_ms: Option<u64>,
-        fallback_duration_ms: Option<u64>,
     ) -> Result<Vec<DemuxedPacket>, PlaybackError> {
         if frames.is_empty() {
             return Ok(Vec::new());
         }
 
-        let durations = if let Some(durations) = opus_frame_durations(&frames) {
-            durations
-        } else if let Some(block_duration_ms) = block_duration_ms {
-            distribute_duration(block_duration_ms, frames.len())
-        } else if let Some(fallback_duration_ms) = fallback_duration_ms {
-            distribute_duration(fallback_duration_ms, frames.len())
-        } else {
-            distribute_duration(20, frames.len())
-        };
+        let durations = opus_frame_durations(&frames).ok_or(PlaybackError::MediaParse(
+            "unsupported opus packet duration",
+        ))?;
 
         let mut timestamp_ms = self.block_timestamp_ms(relative_timestamp)?;
         let mut packets = Vec::with_capacity(frames.len());
@@ -262,72 +238,11 @@ impl WebmDemuxState {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PacketDuration {
-    ms: u64,
-    samples: u32,
-}
-
-fn opus_frame_durations(frames: &[Frame<'_>]) -> Option<Vec<PacketDuration>> {
+fn opus_frame_durations(frames: &[Frame<'_>]) -> Option<Vec<OpusPacketDuration>> {
     frames
         .iter()
         .map(|frame| opus_packet_duration(frame.data))
         .collect()
-}
-
-fn opus_packet_duration(packet: &[u8]) -> Option<PacketDuration> {
-    let toc = *packet.first()?;
-    let samples_per_frame = if (toc & 0x80) != 0 {
-        let shift = usize::from((toc >> 3) & 0x03);
-        (48_000usize << shift) / 400
-    } else if (toc & 0x60) == 0x60 {
-        if (toc & 0x08) != 0 {
-            48_000usize / 50
-        } else {
-            48_000usize / 100
-        }
-    } else {
-        let index = usize::from((toc >> 3) & 0x03);
-        if index == 3 {
-            48_000usize * 60 / 1_000
-        } else {
-            (48_000usize << index) / 100
-        }
-    };
-
-    let frames = match toc & 0x03 {
-        0 => 1usize,
-        1 | 2 => 2usize,
-        3 => usize::from(*packet.get(1)? & 0x3F),
-        _ => return None,
-    };
-
-    let samples = samples_per_frame.checked_mul(frames)?.try_into().ok()?;
-    Some(PacketDuration {
-        ms: u64::from(samples) / 48,
-        samples,
-    })
-}
-
-fn distribute_duration(total_duration_ms: u64, parts: usize) -> Vec<PacketDuration> {
-    if parts == 0 {
-        return Vec::new();
-    }
-
-    let base = total_duration_ms / parts as u64;
-    let remainder = total_duration_ms % parts as u64;
-    let mut durations = Vec::with_capacity(parts);
-
-    for index in 0..parts {
-        let extra = u64::from((index as u64) < remainder);
-        let ms = base + extra;
-        durations.push(PacketDuration {
-            ms,
-            samples: crate::media::opus_queue::samples_from_duration_ms(ms),
-        });
-    }
-
-    durations
 }
 
 fn map_webm_coercion_error(error: WebmCoercionError) -> PlaybackError {

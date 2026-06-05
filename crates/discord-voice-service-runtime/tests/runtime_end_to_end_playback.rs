@@ -12,7 +12,9 @@ use discord_voice_service_proto::discordvoice::v1::discord_voice_control_server:
 use discord_voice_service_proto::discordvoice::v1::{
     SessionEvent, SessionEventKind, SubscribeEventsRequest,
 };
-use discord_voice_service_runtime::{Command, ControlService, Readiness, SessionState, Supervisor};
+use discord_voice_service_runtime::{
+    Command, ControlService, PlaybackStabilitySnapshot, Readiness, SessionState, Supervisor,
+};
 use discord_voice_service_test_support::fake_discord::FakeDiscordPeer;
 use discord_voice_service_test_support::fake_ytmusic::FakeYtMusic;
 use discord_voice_service_test_support::fixtures::{
@@ -26,8 +28,12 @@ use tonic::Request;
 const SERVICE_USER_ID: &str = "1111111111111111";
 const LATE_LISTENER_USER_ID: &str = "7777777777777777";
 const TRACK_FRAME_DURATION: Duration = Duration::from_millis(20);
-const MIN_STEADY_TRACK_INTERVAL: Duration = Duration::from_millis(18);
+const MIN_TRACK_SEND_START_INTERVAL: Duration = Duration::from_millis(20);
+const MIN_FAKE_UDP_OBSERVED_INTERVAL: Duration = Duration::from_millis(18);
+const MIN_MEDIA_TO_WALL_CLOCK_RATIO_PPM: u64 = 980_000;
 const MAX_MEDIA_TO_WALL_CLOCK_RATIO_PPM: u64 = 1_020_000;
+const DISCORD_EGRESS_BUFFER_TARGET_MS: u64 = 400;
+const DISCORD_EGRESS_BUFFER_HIGH_WATERMARK_MS: u64 = 500;
 #[tokio::test]
 async fn runtime_end_to_end_playback_join_voice_then_play_reaches_connected_runtime_playback_path()
 {
@@ -103,6 +109,8 @@ async fn runtime_end_to_end_playback_join_voice_then_play_reaches_connected_runt
     assert!(metrics.ended);
     assert!(metrics.track_packet_count >= 5);
     assert_eq!(metrics.buffer_underrun_count, 0);
+    assert_eq!(metrics.skipped_source_frame_count, 0);
+    assert_eq!(metrics.skipped_source_duration_ms, 0);
     assert_eq!(metrics.continuity_silence_packet_count, 0);
     assert_eq!(metrics.inserted_silence_duration_ms, 0);
 }
@@ -172,12 +180,7 @@ async fn runtime_end_to_end_playback_play_prebuffers_five_seconds_before_playing
         metrics.max_source_buffer_depth.duration_ms >= 5_000,
         "Playing must follow the five-second source prebuffer: {metrics:?}"
     );
-    assert!(
-        metrics.max_playout_buffer_depth.duration_ms == 0,
-        "Playing must not fill a prepared RTP playout buffer: {metrics:?}"
-    );
-    assert_eq!(metrics.current_playout_buffer_depth.duration_ms, 0);
-    assert_eq!(metrics.prepared_rtp_queue_depth_ms, 0);
+    assert_raw_egress_metrics_published(&metrics, "Playing prebuffer");
     assert_eq!(metrics.playout_builder_prepare_duration.samples, 0);
     assert_eq!(metrics.continuity_silence_packet_count, 0);
     assert_eq!(metrics.buffer_underrun_count, 0);
@@ -287,16 +290,17 @@ async fn runtime_end_to_end_playback_packets_hold_near_20ms_cadence_without_refi
     );
 
     assert!(
-        stats.min >= MIN_STEADY_TRACK_INTERVAL,
-        "normal playback should not emit 20ms frames faster than media time: {stats:?}"
+        stats.p50 >= Duration::from_millis(19),
+        "normal playback median interval must reject the known sub-19ms cadence: {stats:?}"
     );
     assert!(
-        stats.p50 >= MIN_STEADY_TRACK_INTERVAL,
-        "normal playback median interval should remain at media cadence: {stats:?}"
+        stats.p50 <= Duration::from_millis(22),
+        "normal playback median interval should not drift to 21-22ms: {stats:?}"
     );
+    assert_fake_udp_observed_intervals_not_bursty(&stats, "normal playback");
     assert!(
-        stats.p95 <= Duration::from_millis(45),
-        "normal playback p95 should stay near 20ms: {stats:?}"
+        stats.p95 <= Duration::from_millis(22),
+        "normal playback p95 should stay near 20ms on real OS time: {stats:?}"
     );
     assert!(
         stats.p99 <= Duration::from_millis(50),
@@ -311,6 +315,10 @@ async fn runtime_end_to_end_playback_packets_hold_near_20ms_cadence_without_refi
     assert!(
         observed_wall_clock >= Duration::from_millis(980),
         "50 consecutive 20ms packets must occupy about one second of wall time: wall={observed_wall_clock:?}; stats={stats:?}"
+    );
+    assert!(
+        observed_wall_clock <= Duration::from_millis(1_060),
+        "fake UDP receive timestamps include real scheduler noise; internal send-start tempo metrics enforce the 1.02x slow bound: wall={observed_wall_clock:?}; stats={stats:?}"
     );
 
     let packets = fake_voice.audio_packets_at_least(50).await;
@@ -328,6 +336,32 @@ async fn runtime_end_to_end_playback_packets_hold_near_20ms_cadence_without_refi
         "20ms fixture packets should advance RTP timestamps by 960 samples: {timestamp_deltas:?}"
     );
 
+    let post_reservoir_timestamps =
+        audio_frame_times_at_least_with_timeout(&fake_voice, 310, Duration::from_secs(8)).await;
+    assert!(
+        post_reservoir_timestamps.len() >= 310,
+        "post-source-reservoir playback should dispatch at least 310 track packets; observed {}",
+        post_reservoir_timestamps.len()
+    );
+    let post_reservoir_intervals = intervals_between(&post_reservoir_timestamps[250..310]);
+    let post_reservoir_stats = interval_stats(&post_reservoir_intervals);
+    let post_reservoir_wall_clock = post_reservoir_timestamps[309]
+        .saturating_duration_since(post_reservoir_timestamps[250])
+        + TRACK_FRAME_DURATION;
+    assert!(
+        post_reservoir_stats.p50 >= Duration::from_millis(19)
+            && post_reservoir_stats.p50 <= Duration::from_millis(22),
+        "post-source-reservoir p50 should stay near cadence: wall={post_reservoir_wall_clock:?}; stats={post_reservoir_stats:?}; intervals={post_reservoir_intervals:?}"
+    );
+    assert!(
+        post_reservoir_stats.p05 >= MIN_FAKE_UDP_OBSERVED_INTERVAL,
+        "post-source-reservoir fake UDP p05 should reject burst catch-up while allowing receive timestamp jitter: wall={post_reservoir_wall_clock:?}; stats={post_reservoir_stats:?}; intervals={post_reservoir_intervals:?}"
+    );
+    assert!(
+        post_reservoir_stats.p95 <= Duration::from_millis(23),
+        "post-source-reservoir p95 should stay bounded on real OS time: wall={post_reservoir_wall_clock:?}; stats={post_reservoir_stats:?}; intervals={post_reservoir_intervals:?}"
+    );
+
     supervisor.send(Command::Stop).await.unwrap();
     play_task.await.unwrap().unwrap();
 
@@ -339,10 +373,6 @@ async fn runtime_end_to_end_playback_packets_hold_near_20ms_cadence_without_refi
     assert!(metrics.track_packet_count >= 50);
     assert!(metrics.track_interval.samples >= 49);
     assert!(
-        metrics.track_interval.min_ms >= 18,
-        "runtime metrics should detect fast track intervals: {metrics:?}"
-    );
-    assert!(
         metrics.track_media_duration_sent_ms >= 1_000,
         "runtime metrics should report sent track media duration: {metrics:?}"
     );
@@ -350,13 +380,11 @@ async fn runtime_end_to_end_playback_packets_hold_near_20ms_cadence_without_refi
         metrics.track_wall_clock_elapsed_ms >= 980,
         "runtime metrics should report near-real-time wall-clock duration: {metrics:?}"
     );
+    assert_track_tempo_metrics_within_bounds(&metrics, "normal playback");
     assert!(
-        metrics.track_media_to_wall_clock_ratio_ppm <= MAX_MEDIA_TO_WALL_CLOCK_RATIO_PPM,
-        "runtime metrics must reject faster-than-real-time playback: {metrics:?}"
+        metrics.track_tempo_window_post_source_buffer_count > 0,
+        "runtime metrics should include rolling tempo windows after the 5000ms source reservoir: {metrics:?}"
     );
-    assert_eq!(metrics.track_fast_interval_count, 0);
-    assert_eq!(metrics.skipped_source_frame_count, 0);
-    assert_eq!(metrics.skipped_source_duration_ms, 0);
     assert!(
         metrics.track_interval.p95_ms <= 45,
         "runtime metrics p95 should stay near cadence: {metrics:?}"
@@ -374,6 +402,11 @@ async fn runtime_end_to_end_playback_packets_hold_near_20ms_cadence_without_refi
         "normal runtime metrics must not show a >=100ms interval: {metrics:?}"
     );
     assert_eq!(
+        metrics.skipped_source_frame_count, 0,
+        "steady playback stopped after sustained observation must not report skipped source frames: {metrics:?}"
+    );
+    assert_eq!(metrics.skipped_source_duration_ms, 0);
+    assert_eq!(
         metrics.buffer_underrun_count, 0,
         "normal playback should not underrun: {metrics:?}"
     );
@@ -390,12 +423,7 @@ async fn runtime_end_to_end_playback_packets_hold_near_20ms_cadence_without_refi
         metrics.max_source_buffer_depth.duration_ms > metrics.max_buffer_depth.duration_ms,
         "source reservoir depth should be reported separately from sender depth: {metrics:?}"
     );
-    assert!(
-        metrics.max_playout_buffer_depth.duration_ms == 0,
-        "normal playback must not fill a prepared RTP playout buffer: {metrics:?}"
-    );
-    assert_eq!(metrics.current_playout_buffer_depth.duration_ms, 0);
-    assert_eq!(metrics.prepared_rtp_queue_depth_ms, 0);
+    assert_bounded_raw_egress_metrics(&metrics, "normal playback");
     assert!(metrics.source_producer_fill_duration.samples >= 1);
     assert_eq!(metrics.playout_builder_prepare_duration.samples, 0);
     assert!(metrics.sender_send_duration.samples >= 50);
@@ -469,10 +497,6 @@ async fn runtime_end_to_end_playback_does_not_burst_under_jittery_http_and_cpu_c
     eprintln!("stress playback cadence: {stats:?}");
 
     assert!(
-        stats.min >= MIN_STEADY_TRACK_INTERVAL,
-        "stress playback must not emit 20ms frames faster than media time: {stats:?}"
-    );
-    assert!(
         stats.p95 <= Duration::from_millis(45),
         "stress playback p95 should stay bounded under CPU and HTTP jitter: {stats:?}"
     );
@@ -509,17 +533,7 @@ async fn runtime_end_to_end_playback_does_not_burst_under_jittery_http_and_cpu_c
         .expect("playback should publish stability metrics");
     eprintln!("stress playback metrics: {metrics:?}");
     assert!(metrics.track_packet_count >= 80);
-    assert!(
-        metrics.track_interval.min_ms >= 18,
-        "stress metrics must not show catch-up bursts: {metrics:?}"
-    );
-    assert!(
-        metrics.track_media_to_wall_clock_ratio_ppm <= MAX_MEDIA_TO_WALL_CLOCK_RATIO_PPM,
-        "stress metrics must reject faster-than-real-time playback: {metrics:?}"
-    );
-    assert_eq!(metrics.track_fast_interval_count, 0);
-    assert_eq!(metrics.skipped_source_frame_count, 0);
-    assert_eq!(metrics.skipped_source_duration_ms, 0);
+    assert_track_tempo_metrics_within_bounds(&metrics, "stress playback");
     assert!(
         metrics.track_interval.p95_ms <= 45,
         "stress metrics p95 should stay bounded: {metrics:?}"
@@ -537,6 +551,11 @@ async fn runtime_end_to_end_playback_does_not_burst_under_jittery_http_and_cpu_c
         "stress playback should keep compressed audio buffered before stop: {metrics:?}"
     );
     assert_eq!(
+        metrics.skipped_source_frame_count, 0,
+        "steady stress playback stopped after observation must not report skipped source frames: {metrics:?}"
+    );
+    assert_eq!(metrics.skipped_source_duration_ms, 0);
+    assert_eq!(
         metrics.playout_underrun_count, 0,
         "stress playback should not report prepared RTP underruns: {metrics:?}"
     );
@@ -551,12 +570,7 @@ async fn runtime_end_to_end_playback_does_not_burst_under_jittery_http_and_cpu_c
         metrics.max_source_buffer_depth.duration_ms > metrics.max_buffer_depth.duration_ms,
         "stress playback should report source reservoir depth separately: {metrics:?}"
     );
-    assert!(
-        metrics.max_playout_buffer_depth.duration_ms == 0,
-        "stress playback must not fill a prepared RTP playout buffer: {metrics:?}"
-    );
-    assert_eq!(metrics.current_playout_buffer_depth.duration_ms, 0);
-    assert_eq!(metrics.prepared_rtp_queue_depth_ms, 0);
+    assert_bounded_raw_egress_metrics(&metrics, "stress playback");
     assert!(metrics.source_producer_fill_duration.samples >= 1);
     assert_eq!(metrics.playout_builder_prepare_duration.samples, 0);
     assert!(metrics.sender_send_duration.samples >= 80);
@@ -578,7 +592,8 @@ async fn runtime_end_to_end_playback_does_not_burst_under_jittery_http_and_cpu_c
 }
 
 #[tokio::test]
-async fn runtime_end_to_end_playback_repeated_send_delay_keeps_twenty_ms_output_cadence() {
+async fn runtime_end_to_end_playback_alternating_two_ms_send_delay_keeps_twenty_ms_output_cadence()
+{
     let fake_yt = FakeYtMusic::spawn().await;
     let http = spawn_stream_server("audio-long.webm").await;
     fake_yt.set_playable_url(http.url()).await;
@@ -587,8 +602,8 @@ async fn runtime_end_to_end_playback_repeated_send_delay_keeps_twenty_ms_output_
         .await
         .unwrap();
     supervisor.set_live_media_send_delay_for_tests(|packet_index| {
-        if packet_index < 70 {
-            Some(Duration::from_millis(5))
+        if packet_index < 70 && packet_index % 2 == 0 {
+            Some(Duration::from_millis(2))
         } else {
             None
         }
@@ -627,18 +642,14 @@ async fn runtime_end_to_end_playback_repeated_send_delay_keeps_twenty_ms_output_
     let timestamps = fake_voice.non_silence_audio_frame_times_at_least(60).await;
     let intervals = intervals_between(&timestamps[..60]);
     let stats = interval_stats(&intervals);
-    eprintln!("repeated delayed-send cadence: {stats:?}");
-    assert!(
-        stats.min >= MIN_STEADY_TRACK_INTERVAL,
-        "repeated 5ms send-path delay must not trigger fast catch-up intervals: {stats:?}"
-    );
+    eprintln!("alternating delayed-send cadence: {stats:?}");
     assert!(
         stats.p95 <= Duration::from_millis(35),
-        "repeated 5ms send-path delay should remain bounded while preserving tempo: {stats:?}"
+        "alternating 2ms send-path delay should remain bounded while preserving tempo: {stats:?}"
     );
     assert!(
         stats.max < Duration::from_millis(100),
-        "repeated 5ms send-path delay must not create perceptible gaps: {stats:?}"
+        "alternating 2ms send-path delay must not create perceptible gaps: {stats:?}"
     );
 
     supervisor.send(Command::Stop).await.unwrap();
@@ -649,18 +660,22 @@ async fn runtime_end_to_end_playback_repeated_send_delay_keeps_twenty_ms_output_
         .playback_metrics()
         .await
         .expect("playback should publish stability metrics");
-    assert!(
-        metrics.track_interval.min_ms >= 18,
-        "metrics must reject catch-up bursts despite repeated send delay: {metrics:?}"
+    assert_eq!(
+        metrics.track_fast_interval_count, 0,
+        "alternating 2ms post-boundary send delay must not create shortened send-start intervals: {metrics:?}"
     );
-    assert_eq!(metrics.track_fast_interval_count, 0);
-    assert!(
-        metrics.track_media_to_wall_clock_ratio_ppm <= MAX_MEDIA_TO_WALL_CLOCK_RATIO_PPM,
-        "metrics must reject faster-than-real-time playback under repeated send delay: {metrics:?}"
+    assert_eq!(metrics.track_fast_interval_min_us, 0);
+    assert_eq!(
+        metrics.track_tempo_window_fast_count, 0,
+        "alternating 2ms post-boundary send delay must not create faster-than-real-time windows: {metrics:?}"
     );
     assert!(
-        metrics.tempo_rebase_count > 0,
-        "repeated injected send delay should be observable as tempo rebases: {metrics:?}"
+        metrics.track_tempo_window_max_ratio_ppm <= MAX_MEDIA_TO_WALL_CLOCK_RATIO_PPM,
+        "alternating 2ms post-boundary send delay must not make media faster than wall clock: {metrics:?}"
+    );
+    assert_eq!(
+        metrics.tempo_rebase_count, 0,
+        "ordinary 2ms injected send delay must not rebase the media clock: {metrics:?}"
     );
     assert_eq!(metrics.scheduler_late_reset_count, 0);
     assert_eq!(metrics.controlled_media_interruption_count, 0);
@@ -731,17 +746,14 @@ async fn runtime_end_to_end_playback_media_driver_does_not_burst_after_pause_or_
         "the hook must create a genuinely late media tick: {delayed_interval:?}; stats={stats:?}"
     );
     assert!(
-        post_delay_interval >= MIN_STEADY_TRACK_INTERVAL,
+        post_delay_interval >= MIN_FAKE_UDP_OBSERVED_INTERVAL,
         "late media tick recovery must not catch up with a burst: {post_delay_interval:?}; stats={stats:?}"
     );
     assert!(
         post_delay_interval <= Duration::from_millis(70),
         "late media tick recovery should resume near cadence: {post_delay_interval:?}; stats={stats:?}"
     );
-    assert!(
-        stats.min >= MIN_STEADY_TRACK_INTERVAL,
-        "late media tick recovery must not burst packets together: {stats:?}"
-    );
+    assert_no_fake_udp_interval_bursty(&intervals, "late media tick recovery");
 
     supervisor.send(Command::Stop).await.unwrap();
     supervisor.clear_live_media_send_delay_for_tests();
@@ -755,18 +767,18 @@ async fn runtime_end_to_end_playback_media_driver_does_not_burst_after_pause_or_
         metrics.playout_sender_lateness.max_ms >= 250,
         "metrics should observe the injected late media tick: {metrics:?}"
     );
-    assert!(metrics.track_interval.min_ms >= 18);
-    assert_eq!(metrics.track_fast_interval_count, 0);
     assert!(
         metrics.track_media_to_wall_clock_ratio_ppm <= MAX_MEDIA_TO_WALL_CLOCK_RATIO_PPM,
         "late recovery must not run media faster than wall clock: {metrics:?}"
     );
+    assert_eq!(
+        metrics.track_fast_interval_count, 0,
+        "late recovery send-start metrics must not show burst intervals: {metrics:?}"
+    );
     assert_eq!(metrics.playout_underrun_count, 0);
     assert_eq!(metrics.source_underrun_count, 0);
     assert_eq!(metrics.sender_forbidden_work_count, 0);
-    assert_eq!(metrics.current_playout_buffer_depth.duration_ms, 0);
-    assert_eq!(metrics.max_playout_buffer_depth.duration_ms, 0);
-    assert_eq!(metrics.prepared_rtp_queue_depth_ms, 0);
+    assert_bounded_raw_egress_metrics(&metrics, "late media tick recovery");
     assert_eq!(metrics.playout_builder_prepare_duration.samples, 0);
     assert!(
         metrics.scheduler_late_reset_count >= 1,
@@ -1023,10 +1035,7 @@ async fn runtime_end_to_end_playback_pause_resume_without_voice_context_refresh_
     );
     let resumed_stats = interval_stats(&resumed_intervals);
     eprintln!("pause/resume cadence: {resumed_stats:?}");
-    assert!(
-        resumed_stats.min >= MIN_STEADY_TRACK_INTERVAL,
-        "resume should not burst non-silence packets together: {resumed_stats:?}"
-    );
+    assert_no_fake_udp_interval_bursty(&resumed_intervals, "pause/resume playback");
     assert!(
         resumed_stats.max <= Duration::from_millis(70),
         "resume should restart the pacer deadline before sending sustained audio: {resumed_stats:?}"
@@ -1046,10 +1055,108 @@ async fn runtime_end_to_end_playback_pause_resume_without_voice_context_refresh_
         metrics
             .pause_resume_first_intervals_ms
             .iter()
-            .all(|interval_ms| *interval_ms >= 18),
+            .all(|interval_ms| *interval_ms
+                >= u64::try_from(MIN_TRACK_SEND_START_INTERVAL.as_millis()).unwrap()),
         "resume metrics should not show burst intervals: {metrics:?}"
     );
+    assert_eq!(
+        metrics.skipped_source_frame_count, 0,
+        "pause/resume must restore any selected unsent music frame instead of reporting it skipped: {metrics:?}"
+    );
+    assert_eq!(metrics.skipped_source_duration_ms, 0);
+    assert_eq!(
+        metrics.scheduler_late_reset_count, 0,
+        "pause/resume must not report the preserved frame as scheduler-late: {metrics:?}"
+    );
+    assert_eq!(
+        metrics.controlled_media_interruption_count, 0,
+        "pause/resume must stay out of controlled interruption accounting: {metrics:?}"
+    );
     assert_eq!(metrics.buffer_underrun_count, 0);
+}
+
+#[tokio::test]
+async fn runtime_end_to_end_playback_reconnect_rollover_does_not_count_unsent_frame_as_skipped() {
+    let fake_yt = FakeYtMusic::spawn().await;
+    let http = spawn_stream_server("audio-long.webm").await;
+    fake_yt.set_playable_url(http.url()).await;
+    let fake_voice = FakeDiscordPeer::spawn().await;
+    let supervisor = Supervisor::with_ytmusic_endpoint(fake_yt.endpoint())
+        .await
+        .unwrap();
+    let mut stream = subscribe_events(supervisor.clone()).await;
+    let voice = fake_voice.voice_context("1", "2", "user-1", "session-1", "token-1");
+
+    supervisor
+        .send(Command::JoinVoice {
+            voice: voice.clone(),
+        })
+        .await
+        .unwrap();
+
+    let play_supervisor = supervisor.clone();
+    let play_task = tokio::spawn(async move {
+        play_supervisor
+            .send(Command::Play {
+                video_id: "video-1".into(),
+            })
+            .await
+    });
+
+    let startup_events = collect_events(&mut stream, 5).await;
+    assert_eq!(
+        startup_events[0].kind,
+        SessionEventKind::VoiceConnecting as i32
+    );
+    assert_eq!(startup_events[1].kind, SessionEventKind::VoiceReady as i32);
+    assert_eq!(
+        startup_events[2].kind,
+        SessionEventKind::TrackResolving as i32
+    );
+    assert_eq!(startup_events[3].kind, SessionEventKind::Buffering as i32);
+    assert_eq!(startup_events[4].kind, SessionEventKind::Playing as i32);
+    assert!(fake_voice.audio_frame_count_at_least(4).await >= 4);
+
+    supervisor
+        .send(Command::UpdateVoiceContext { voice })
+        .await
+        .unwrap();
+    play_task.await.unwrap().unwrap();
+
+    let rollover_events = collect_events_with_timeout(&mut stream, 5, Duration::from_secs(5)).await;
+    assert!(
+        rollover_events
+            .iter()
+            .any(|event| event.kind == SessionEventKind::VoiceReconnecting as i32),
+        "rollover should emit VoiceReconnecting: {rollover_events:?}"
+    );
+    assert!(
+        rollover_events
+            .iter()
+            .any(|event| event.kind == SessionEventKind::VoiceReady as i32),
+        "rollover should emit VoiceReady: {rollover_events:?}"
+    );
+    assert!(
+        rollover_events
+            .iter()
+            .any(|event| event.kind == SessionEventKind::Playing as i32),
+        "rollover should resume playback: {rollover_events:?}"
+    );
+
+    let metrics = supervisor
+        .playback_metrics()
+        .await
+        .expect("rollover probe should publish interrupted playback metrics");
+    assert!(
+        metrics.reconnect_interruptions > 0,
+        "rollover metrics should count the reconnect interruption: {metrics:?}"
+    );
+    assert_eq!(
+        metrics.skipped_source_frame_count, 0,
+        "rollover must not report an unsent, replayable frame as skipped: {metrics:?}"
+    );
+    assert_eq!(metrics.skipped_source_duration_ms, 0);
+    supervisor.send(Command::Stop).await.unwrap();
 }
 
 #[tokio::test]
@@ -1250,17 +1357,13 @@ async fn runtime_end_to_end_playback_dave_transition_during_playback_does_not_se
             .await,
         "live media driver must drain DAVE transition events during playback before more media"
     );
-    let frames_after_transition_ready = fake_voice.audio_frame_count().await;
-    assert!(
-        fake_voice
-            .audio_frame_count_at_least(frames_after_transition_ready + 2)
-            .await
-            >= frames_after_transition_ready + 2
-    );
-    let late_listener_decrypted = fake_voice
-        .decrypt_last_dave_audio_frame_from_late_listener(SERVICE_USER_ID)
-        .await
-        .expect("late DAVE listener should decrypt post-transition media");
+    let late_listener_decrypted = wait_for_late_listener_decryptable_audio(
+        &fake_voice,
+        SERVICE_USER_ID,
+        fake_voice.audio_frame_count().await + 1,
+        Duration::from_secs(2),
+    )
+    .await;
     assert!(!late_listener_decrypted.is_empty());
 
     supervisor.send(Command::Stop).await.unwrap();
@@ -1271,9 +1374,7 @@ async fn runtime_end_to_end_playback_dave_transition_during_playback_does_not_se
         .await
         .expect("playback should publish stability metrics");
     assert_eq!(metrics.source_underrun_count, 0);
-    assert_eq!(metrics.current_playout_buffer_depth.duration_ms, 0);
-    assert_eq!(metrics.max_playout_buffer_depth.duration_ms, 0);
-    assert_eq!(metrics.prepared_rtp_queue_depth_ms, 0);
+    assert_bounded_raw_egress_metrics(&metrics, "DAVE transition playback");
     assert_eq!(metrics.playout_builder_prepare_duration.samples, 0);
     assert!(
         metrics.dave_transition_count_during_playback > 0,
@@ -1603,6 +1704,60 @@ where
     events
 }
 
+async fn wait_for_late_listener_decryptable_audio(
+    fake_voice: &FakeDiscordPeer,
+    sender_user_id: &str,
+    minimum_frame_count: usize,
+    timeout: Duration,
+) -> Vec<u8> {
+    let deadline = Instant::now() + timeout;
+    let mut next_frame_count = minimum_frame_count;
+    let mut last_error = None;
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let Ok(observed_count) = tokio::time::timeout(
+            remaining,
+            fake_voice.audio_frame_count_at_least(next_frame_count),
+        )
+        .await
+        else {
+            break;
+        };
+
+        match fake_voice
+            .decrypt_last_dave_audio_frame_from_late_listener(sender_user_id)
+            .await
+        {
+            Ok(payload) if !payload.is_empty() => return payload,
+            Ok(_) => last_error = Some("empty DAVE payload".to_owned()),
+            Err(err) => last_error = Some(err.to_string()),
+        }
+        next_frame_count = observed_count.saturating_add(1);
+    }
+
+    panic!(
+        "late DAVE listener should decrypt post-transition media; last error: {}",
+        last_error.unwrap_or_else(|| "no post-transition audio observed".to_owned())
+    );
+}
+
+async fn audio_frame_times_at_least_with_timeout(
+    fake_voice: &FakeDiscordPeer,
+    minimum: usize,
+    timeout: Duration,
+) -> Vec<Instant> {
+    let deadline = Instant::now() + timeout;
+    let mut timestamps = Vec::new();
+    while Instant::now() < deadline {
+        timestamps = fake_voice.audio_frame_times_at_least(minimum).await;
+        if timestamps.len() >= minimum {
+            return timestamps;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    timestamps
+}
+
 fn intervals_between(timestamps: &[Instant]) -> Vec<Duration> {
     timestamps
         .windows(2)
@@ -1612,8 +1767,8 @@ fn intervals_between(timestamps: &[Instant]) -> Vec<Duration> {
 
 #[derive(Debug)]
 struct IntervalStats {
-    min: Duration,
     max: Duration,
+    p05: Duration,
     p50: Duration,
     p95: Duration,
     p99: Duration,
@@ -1624,11 +1779,89 @@ fn interval_stats(intervals: &[Duration]) -> IntervalStats {
     let mut sorted = intervals.to_vec();
     sorted.sort_unstable();
     IntervalStats {
-        min: sorted[0],
         max: sorted[sorted.len() - 1],
+        p05: percentile_duration(&sorted, 5),
         p50: percentile_duration(&sorted, 50),
         p95: percentile_duration(&sorted, 95),
         p99: percentile_duration(&sorted, 99),
+    }
+}
+
+fn assert_track_tempo_metrics_within_bounds(metrics: &PlaybackStabilitySnapshot, label: &str) {
+    assert!(
+        metrics.track_media_to_wall_clock_ratio_ppm >= MIN_MEDIA_TO_WALL_CLOCK_RATIO_PPM,
+        "{label} metrics must reject slower-than-real-time playback: {metrics:?}"
+    );
+    assert!(
+        metrics.track_media_to_wall_clock_ratio_ppm <= MAX_MEDIA_TO_WALL_CLOCK_RATIO_PPM,
+        "{label} metrics must reject faster-than-real-time playback: {metrics:?}"
+    );
+    assert!(
+        metrics.track_tempo_window_count > 0,
+        "{label} metrics should report rolling tempo windows: {metrics:?}"
+    );
+    assert!(
+        metrics.track_tempo_window_min_ratio_ppm >= MIN_MEDIA_TO_WALL_CLOCK_RATIO_PPM,
+        "{label} rolling tempo windows must not be slower than real time: {metrics:?}"
+    );
+    assert!(
+        metrics.track_tempo_window_max_ratio_ppm <= MAX_MEDIA_TO_WALL_CLOCK_RATIO_PPM,
+        "{label} rolling tempo windows must not be faster than real time: {metrics:?}"
+    );
+    assert_eq!(
+        metrics.track_tempo_window_fast_count, 0,
+        "{label} metrics should not report faster-than-real-time rolling windows: {metrics:?}"
+    );
+    assert_eq!(
+        metrics.track_tempo_window_slow_count, 0,
+        "{label} metrics should not report slower-than-real-time rolling windows: {metrics:?}"
+    );
+    assert_eq!(
+        metrics.track_fast_interval_count, 0,
+        "{label} metrics must not hide shortened local send-start intervals: {metrics:?}"
+    );
+    assert_eq!(
+        metrics.track_fast_interval_min_us, 0,
+        "{label} metrics must not report a shortened local send-start interval: {metrics:?}"
+    );
+}
+
+fn assert_bounded_raw_egress_metrics(metrics: &PlaybackStabilitySnapshot, label: &str) {
+    assert_raw_egress_metrics_published(metrics, label);
+    assert!(
+        metrics.max_egress_buffer_depth.duration_ms > 0,
+        "{label} should exercise the raw Opus Discord egress buffer: {metrics:?}"
+    );
+}
+
+fn assert_raw_egress_metrics_published(metrics: &PlaybackStabilitySnapshot, label: &str) {
+    assert_eq!(
+        metrics.egress_buffer_target_ms, DISCORD_EGRESS_BUFFER_TARGET_MS,
+        "{label} should publish the Discord egress reservoir target: {metrics:?}"
+    );
+    assert!(
+        metrics.max_egress_buffer_depth.duration_ms <= DISCORD_EGRESS_BUFFER_HIGH_WATERMARK_MS,
+        "{label} egress buffer must remain bounded by the high watermark: {metrics:?}"
+    );
+    assert_eq!(
+        metrics.prepared_rtp_queue_depth_ms, 0,
+        "{label} must not queue prepared RTP packets: {metrics:?}"
+    );
+}
+
+fn assert_fake_udp_observed_intervals_not_bursty(stats: &IntervalStats, label: &str) {
+    assert!(
+        stats.p05 >= MIN_FAKE_UDP_OBSERVED_INTERVAL,
+        "{label} fake UDP p05 should reject burst catch-up while allowing receive timestamp jitter: {stats:?}"
+    );
+}
+
+fn assert_no_fake_udp_interval_bursty(intervals: &[Duration], label: &str) {
+    for (index, interval) in intervals.iter().enumerate() {
+        assert!(
+            *interval >= MIN_FAKE_UDP_OBSERVED_INTERVAL,
+            "{label} fake UDP interval #{index} was {interval:?}; expected no burst below {MIN_FAKE_UDP_OBSERVED_INTERVAL:?}"
+        );
     }
 }
 

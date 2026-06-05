@@ -1,5 +1,18 @@
 use bytes::Bytes;
-use discord_voice_service_playback::media::opus_queue::{OpusFrame, OpusFrameQueue};
+use discord_voice_service_playback::media::opus_queue::{
+    OpusFrame, OpusFrameQueue, opus_packet_duration,
+};
+
+#[test]
+fn opus_packet_duration_reads_samples_from_packet_toc() {
+    let silence_20ms = [0xF8, 0xFF, 0xFE];
+    let duration = opus_packet_duration(&silence_20ms).expect("silence frame duration");
+
+    assert_eq!(duration.ms, 20);
+    assert_eq!(duration.samples, 960);
+    assert!(opus_packet_duration(&[]).is_none());
+    assert!(opus_packet_duration(&[0x03]).is_none());
+}
 
 #[test]
 fn queue_enforces_capacity_and_fifo_order() {
@@ -74,6 +87,26 @@ fn queue_tracks_duration_samples_and_bytes() {
             .is_err(),
         "duration cap should reject frames even when byte capacity remains"
     );
+}
+
+#[test]
+fn queue_can_restore_popped_frame_to_front() {
+    let mut queue = OpusFrameQueue::new(3);
+    let first = OpusFrame::new(Bytes::from_static(b"a"), 20);
+    let second = OpusFrame::new(Bytes::from_static(b"b"), 40);
+    queue.push(first.clone()).unwrap();
+    queue.push(second.clone()).unwrap();
+
+    let popped = queue.pop().unwrap();
+    assert_eq!(popped, first);
+    queue.push_front(popped).unwrap();
+
+    let depth = queue.depth();
+    assert_eq!(depth.packets, 2);
+    assert_eq!(depth.duration_ms, 60);
+    assert_eq!(depth.bytes, 2);
+    assert_eq!(queue.pop().unwrap(), first);
+    assert_eq!(queue.pop().unwrap(), second);
 }
 
 #[test]

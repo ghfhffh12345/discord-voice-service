@@ -4,7 +4,9 @@ mod contract;
 mod controller;
 mod ytmusic_probe;
 
-pub use audio::{AudioValidationStats, ObservedOpusPacket, analyze_opus_packets};
+pub use audio::{
+    AudioValidationAccumulator, AudioValidationStats, ObservedOpusPacket, analyze_opus_packets,
+};
 pub use config::StagingConfig;
 pub use contract::{
     LiveContractState, LiveValidationEvidence, PlaybackBufferDepthEvidence,

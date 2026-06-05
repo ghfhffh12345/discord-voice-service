@@ -31,7 +31,7 @@
   - `LIVE_STAGING_LONG_TRACK_MIN_PACKETS`
 
 No self-hosted runner labels, runner registration, or runner-local browser file path are required.
-For local real-Discord live staging, run `scripts/ci/run_local_live_staging.sh`; the helper loads secrets from `.env`, loads `BROWSER_JSON` from `./browser.json`, starts a disposable local `ytmusic-service` container and CPU-contention container, waits for `ytmusic-service` gRPC readiness, then starts a source-built `discord-voice-service` with the HTTP read stress profile before running observer validation.
+For local real-Discord live staging, run `scripts/ci/run_local_live_staging.sh`; the helper loads secrets from `.env`, loads `BROWSER_JSON` from `./browser.json`, starts a disposable local `ytmusic-service` container and CPU-contention container, waits for `ytmusic-service` gRPC readiness, then starts a locally built `discord-voice-service` binary inside a CPU-limited container with the HTTP read stress profile before running observer validation.
 During live staging, human listeners may remain in the channel while the staging bot validates playback against the short dedicated validation track.
 Protected live staging requires `OBSERVER_BOT_TOKEN` for the muted, non-deafened observer identity that validates receive-side audio.
 

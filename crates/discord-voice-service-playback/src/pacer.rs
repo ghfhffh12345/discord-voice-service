@@ -4,7 +4,7 @@ use tokio::time::{self, Instant};
 
 pub const FRAME_DURATION: Duration = Duration::from_millis(20);
 pub const SILENCE_FRAME: [u8; 3] = [0xF8, 0xFF, 0xFE];
-const TEMPO_JITTER_TOLERANCE: Duration = Duration::from_millis(2);
+const TIMER_WAKEUP_GUARD: Duration = Duration::from_millis(3);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PacedPacketKind {
@@ -19,7 +19,8 @@ pub struct PacerMark {
 }
 
 pub struct AudioPacer {
-    next_deadline: Instant,
+    ideal_deadline: Instant,
+    minimum_deadline: Instant,
     emitted_frames: usize,
     clock_reset_count: usize,
     tempo_rebase_count: usize,
@@ -33,8 +34,10 @@ impl Default for AudioPacer {
 
 impl AudioPacer {
     pub fn new() -> Self {
+        let deadline = Instant::now();
         Self {
-            next_deadline: Instant::now(),
+            ideal_deadline: deadline,
+            minimum_deadline: deadline,
             emitted_frames: 0,
             clock_reset_count: 0,
             tempo_rebase_count: 0,
@@ -42,8 +45,10 @@ impl AudioPacer {
     }
 
     pub fn starting_after(delay: Duration) -> Self {
+        let deadline = Instant::now() + delay;
         Self {
-            next_deadline: Instant::now() + delay,
+            ideal_deadline: deadline,
+            minimum_deadline: deadline,
             emitted_frames: 0,
             clock_reset_count: 0,
             tempo_rebase_count: 0,
@@ -60,15 +65,19 @@ impl AudioPacer {
     }
 
     pub async fn wait_until_ready(&self) {
-        time::sleep_until(self.next_deadline).await;
+        sleep_until_precise(self.ideal_deadline).await;
+        let effective_deadline = self.next_deadline();
+        if Instant::now() < effective_deadline {
+            sleep_until_precise(effective_deadline).await;
+        }
     }
 
     pub fn next_deadline(&self) -> Instant {
-        self.next_deadline
+        self.ideal_deadline.max(self.minimum_deadline)
     }
 
     pub fn mark_emitted(&mut self, duration: Duration) {
-        let scheduled_deadline = self.next_deadline;
+        let scheduled_deadline = self.next_deadline();
         self.mark_sent(
             PacedPacketKind::Track,
             scheduled_deadline,
@@ -82,41 +91,27 @@ impl AudioPacer {
         packet_kind: PacedPacketKind,
         scheduled_deadline: Instant,
         duration: Duration,
-        sent_at: Instant,
+        send_started_at: Instant,
     ) -> PacerMark {
-        let lateness = sent_at
+        let lateness = send_started_at
             .checked_duration_since(scheduled_deadline)
             .unwrap_or(Duration::ZERO);
-        if duration > Duration::ZERO && lateness >= duration {
-            self.reset_after_interruption_at(sent_at, duration);
-            self.emitted_frames += 1;
-            if packet_kind == PacedPacketKind::Track {
-                self.tempo_rebase_count += 1;
-            }
-            return PacerMark {
-                media_clock_reset: true,
-                tempo_rebased: packet_kind == PacedPacketKind::Track,
-            };
+        let media_clock_reset = duration > Duration::ZERO && lateness >= duration;
+        if media_clock_reset {
+            self.reset_after_interruption_at(send_started_at, duration);
+        } else {
+            let next_deadline = send_started_at + duration;
+            self.ideal_deadline = next_deadline;
+            self.minimum_deadline = next_deadline;
         }
 
-        let next_by_schedule = scheduled_deadline + duration;
-        let next_by_tempo = match packet_kind {
-            PacedPacketKind::Track
-                if sent_at + duration > next_by_schedule + TEMPO_JITTER_TOLERANCE =>
-            {
-                sent_at + duration
-            }
-            PacedPacketKind::Track => next_by_schedule,
-            PacedPacketKind::NonTrack => next_by_schedule,
-        };
-        let tempo_rebased = next_by_tempo > next_by_schedule;
-        self.next_deadline = next_by_schedule.max(next_by_tempo);
         self.emitted_frames += 1;
+        let tempo_rebased = media_clock_reset && packet_kind == PacedPacketKind::Track;
         if tempo_rebased {
             self.tempo_rebase_count += 1;
         }
         PacerMark {
-            media_clock_reset: false,
+            media_clock_reset,
             tempo_rebased,
         }
     }
@@ -126,7 +121,9 @@ impl AudioPacer {
     }
 
     pub fn reset_after_interruption_at(&mut self, now: Instant, next_spacing: Duration) {
-        self.next_deadline = now + next_spacing;
+        let deadline = now + next_spacing;
+        self.ideal_deadline = deadline;
+        self.minimum_deadline = deadline;
         self.clock_reset_count += 1;
     }
 
@@ -144,5 +141,26 @@ impl AudioPacer {
 
     pub fn tempo_rebase_count(&self) -> usize {
         self.tempo_rebase_count
+    }
+}
+
+async fn sleep_until_precise(deadline: Instant) {
+    let now = Instant::now();
+    if let Some(guarded_deadline) = deadline.checked_sub(TIMER_WAKEUP_GUARD)
+        && guarded_deadline > now
+    {
+        time::sleep_until(guarded_deadline).await;
+    }
+
+    let spin_budget = deadline
+        .saturating_duration_since(Instant::now())
+        .saturating_add(TIMER_WAKEUP_GUARD);
+    let spin_started_at = std::time::Instant::now();
+    while Instant::now() < deadline {
+        if spin_started_at.elapsed() >= spin_budget {
+            time::sleep_until(deadline).await;
+            break;
+        }
+        tokio::task::yield_now().await;
     }
 }

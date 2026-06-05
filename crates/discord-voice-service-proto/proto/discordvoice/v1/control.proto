@@ -140,6 +140,29 @@ message PlaybackStabilitySnapshot {
   uint64 skipped_source_frame_count = 72;
   uint64 skipped_source_duration_ms = 73;
   uint64 tempo_rebase_count = 74;
+  uint64 track_fast_interval_min_us = 75;
+  uint64 track_tempo_window_count = 76;
+  uint64 track_tempo_window_post_source_buffer_count = 77;
+  uint64 track_tempo_window_fast_count = 78;
+  uint64 track_tempo_window_fastest_ratio_ppm = 79;
+  uint64 track_tempo_window_fastest_media_ms = 80;
+  uint64 track_tempo_window_fastest_wall_clock_us = 81;
+  uint64 track_tempo_window_min_ratio_ppm = 82;
+  uint64 track_tempo_window_max_ratio_ppm = 83;
+  uint64 track_tempo_window_slow_count = 84;
+  uint64 track_tempo_window_slowest_ratio_ppm = 85;
+  uint64 track_tempo_window_slowest_media_ms = 86;
+  uint64 track_tempo_window_slowest_wall_clock_us = 87;
+  uint64 egress_buffer_target_ms = 88;
+  PlaybackBufferDepthSnapshot current_egress_buffer_depth = 89;
+  PlaybackBufferDepthSnapshot min_egress_buffer_depth = 90;
+  PlaybackBufferDepthSnapshot max_egress_buffer_depth = 91;
+  uint64 egress_underrun_count = 92;
+  uint64 egress_inserted_silence_duration_ms = 93;
+  uint64 egress_dropped_music_frame_count = 94;
+  uint64 egress_dropped_music_duration_ms = 95;
+  uint64 max_consecutive_late_egress_ticks = 96;
+  uint64 egress_clock_reset_count = 97;
 }
 
 enum SessionEventKind {

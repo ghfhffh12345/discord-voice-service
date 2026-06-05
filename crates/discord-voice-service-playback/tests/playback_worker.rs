@@ -87,6 +87,11 @@ async fn fill_queue_to_duration_ms_releases_smaller_producer_batches() {
     assert_eq!(queue.buffered_duration_ms(), 1_000);
     assert_eq!(queue.len(), 50);
     assert_eq!(source.pending_packets_mut().len(), 50);
+
+    let first_frame = queue.pop().expect("queue should preserve first frame");
+    let second_frame = queue.pop().expect("queue should preserve second frame");
+    assert_eq!(first_frame.source_position_ms, 0);
+    assert_eq!(second_frame.source_position_ms, 20);
 }
 
 #[tokio::test]
@@ -142,6 +147,15 @@ async fn fill_queue_to_duration_ms_can_fill_five_second_source_buffer() {
         source.pending_packets_mut().len(),
         TOTAL_PENDING_FRAMES - TARGET_FRAME_COUNT
     );
+
+    let first_frame = queue
+        .pop()
+        .expect("source buffer should preserve the first producer frame");
+    let second_frame = queue
+        .pop()
+        .expect("source buffer should preserve the second producer frame");
+    assert_eq!(first_frame.source_position_ms, 0);
+    assert_eq!(second_frame.source_position_ms, FRAME_DURATION_MS);
 }
 
 #[tokio::test]

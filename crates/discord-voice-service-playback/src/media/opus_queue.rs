@@ -2,11 +2,18 @@ use std::collections::VecDeque;
 
 use bytes::Bytes;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OpusPacketDuration {
+    pub ms: u64,
+    pub samples: u32,
+}
+
 #[derive(Clone, Debug)]
 pub struct OpusFrame {
     pub data: Bytes,
     pub duration_ms: u64,
     pub duration_samples: u32,
+    pub source_position_ms: u64,
     pub source_byte_position: Option<u64>,
     pub epoch: u64,
 }
@@ -18,6 +25,7 @@ impl OpusFrame {
             data,
             duration_ms,
             duration_samples,
+            source_position_ms: 0,
             source_byte_position: None,
             epoch: 0,
         }
@@ -28,12 +36,19 @@ impl OpusFrame {
             data,
             duration_ms,
             duration_samples,
+            source_position_ms: 0,
             source_byte_position: None,
             epoch: 0,
         }
     }
 
-    pub fn with_metadata(mut self, source_byte_position: Option<u64>, epoch: u64) -> Self {
+    pub fn with_metadata(
+        mut self,
+        source_position_ms: u64,
+        source_byte_position: Option<u64>,
+        epoch: u64,
+    ) -> Self {
+        self.source_position_ms = source_position_ms;
         self.source_byte_position = source_byte_position;
         self.epoch = epoch;
         self
@@ -54,6 +69,7 @@ impl PartialEq for OpusFrame {
         self.data == other.data
             && self.duration_ms == other.duration_ms
             && self.duration_samples == other.duration_samples
+            && self.source_position_ms == other.source_position_ms
             && self.source_byte_position == other.source_byte_position
             && self.epoch == other.epoch
     }
@@ -66,6 +82,40 @@ pub fn samples_from_duration_ms(duration_ms: u64) -> u32 {
         .saturating_mul(48)
         .try_into()
         .unwrap_or(u32::MAX)
+}
+
+pub fn opus_packet_duration(packet: &[u8]) -> Option<OpusPacketDuration> {
+    let toc = *packet.first()?;
+    let samples_per_frame = if (toc & 0x80) != 0 {
+        let shift = usize::from((toc >> 3) & 0x03);
+        (48_000usize << shift) / 400
+    } else if (toc & 0x60) == 0x60 {
+        if (toc & 0x08) != 0 {
+            48_000usize / 50
+        } else {
+            48_000usize / 100
+        }
+    } else {
+        let index = usize::from((toc >> 3) & 0x03);
+        if index == 3 {
+            48_000usize * 60 / 1_000
+        } else {
+            (48_000usize << index) / 100
+        }
+    };
+
+    let frames = match toc & 0x03 {
+        0 => 1usize,
+        1 | 2 => 2usize,
+        3 => usize::from(*packet.get(1)? & 0x3F),
+        _ => return None,
+    };
+
+    let samples = samples_per_frame.checked_mul(frames)?.try_into().ok()?;
+    Some(OpusPacketDuration {
+        ms: u64::from(samples) / 48,
+        samples,
+    })
 }
 
 #[derive(Debug)]
@@ -117,6 +167,26 @@ impl OpusFrameQueue {
             .saturating_add(u64::from(frame.duration_samples));
         self.bytes = self.bytes.saturating_add(frame.byte_len());
         self.inner.push_back(frame);
+        Ok(())
+    }
+
+    pub fn push_front(&mut self, frame: OpusFrame) -> Result<(), OpusFrame> {
+        if self.inner.len() >= self.capacity {
+            return Err(frame);
+        }
+        if self.bytes.saturating_add(frame.byte_len()) > self.max_bytes {
+            return Err(frame);
+        }
+        if self.duration_ms.saturating_add(frame.duration_ms) > self.max_duration_ms {
+            return Err(frame);
+        }
+
+        self.duration_ms = self.duration_ms.saturating_add(frame.duration_ms);
+        self.duration_samples = self
+            .duration_samples
+            .saturating_add(u64::from(frame.duration_samples));
+        self.bytes = self.bytes.saturating_add(frame.byte_len());
+        self.inner.push_front(frame);
         Ok(())
     }
 

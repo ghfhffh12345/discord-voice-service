@@ -557,6 +557,7 @@ dependencies = [
 name = "discord-voice-service-runtime"
 version = "0.2.0"
 dependencies = [
+ "bytes",
  "discord-voice-service-playback",
  "discord-voice-service-proto",
  "discord-voice-service-test-support",

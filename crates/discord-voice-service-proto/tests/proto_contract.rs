@@ -56,6 +56,19 @@ fn generated_control_messages_expose_expected_fields() {
         track_media_to_wall_clock_ratio_ppm: 1_000_000,
         track_fast_interval_count: 0,
         track_fast_interval_min_ms: 0,
+        track_fast_interval_min_us: 0,
+        track_tempo_window_count: 1,
+        track_tempo_window_post_source_buffer_count: 0,
+        track_tempo_window_min_ratio_ppm: 1_000_000,
+        track_tempo_window_max_ratio_ppm: 1_000_000,
+        track_tempo_window_fast_count: 0,
+        track_tempo_window_fastest_ratio_ppm: 0,
+        track_tempo_window_fastest_media_ms: 0,
+        track_tempo_window_fastest_wall_clock_us: 0,
+        track_tempo_window_slow_count: 0,
+        track_tempo_window_slowest_ratio_ppm: 0,
+        track_tempo_window_slowest_media_ms: 0,
+        track_tempo_window_slowest_wall_clock_us: 0,
         skipped_source_frame_count: 0,
         skipped_source_duration_ms: 0,
         tempo_rebase_count: 0,
@@ -111,6 +124,12 @@ fn generated_control_messages_expose_expected_fields() {
     assert_eq!(metrics.track_wall_clock_elapsed_ms, 1_000);
     assert_eq!(metrics.track_media_to_wall_clock_ratio_ppm, 1_000_000);
     assert_eq!(metrics.track_fast_interval_count, 0);
+    assert_eq!(metrics.track_fast_interval_min_us, 0);
+    assert_eq!(metrics.track_tempo_window_count, 1);
+    assert_eq!(metrics.track_tempo_window_min_ratio_ppm, 1_000_000);
+    assert_eq!(metrics.track_tempo_window_max_ratio_ppm, 1_000_000);
+    assert_eq!(metrics.track_tempo_window_fast_count, 0);
+    assert_eq!(metrics.track_tempo_window_slow_count, 0);
     assert_eq!(
         metrics
             .current_buffer_depth
@@ -211,6 +230,19 @@ fn control_proto_exposes_update_voice_context_and_reason_codes() {
     assert!(proto.contains("uint64 skipped_source_frame_count = 72;"));
     assert!(proto.contains("uint64 skipped_source_duration_ms = 73;"));
     assert!(proto.contains("uint64 tempo_rebase_count = 74;"));
+    assert!(proto.contains("uint64 track_fast_interval_min_us = 75;"));
+    assert!(proto.contains("uint64 track_tempo_window_count = 76;"));
+    assert!(proto.contains("uint64 track_tempo_window_post_source_buffer_count = 77;"));
+    assert!(proto.contains("uint64 track_tempo_window_fast_count = 78;"));
+    assert!(proto.contains("uint64 track_tempo_window_fastest_ratio_ppm = 79;"));
+    assert!(proto.contains("uint64 track_tempo_window_fastest_media_ms = 80;"));
+    assert!(proto.contains("uint64 track_tempo_window_fastest_wall_clock_us = 81;"));
+    assert!(proto.contains("uint64 track_tempo_window_min_ratio_ppm = 82;"));
+    assert!(proto.contains("uint64 track_tempo_window_max_ratio_ppm = 83;"));
+    assert!(proto.contains("uint64 track_tempo_window_slow_count = 84;"));
+    assert!(proto.contains("uint64 track_tempo_window_slowest_ratio_ppm = 85;"));
+    assert!(proto.contains("uint64 track_tempo_window_slowest_media_ms = 86;"));
+    assert!(proto.contains("uint64 track_tempo_window_slowest_wall_clock_us = 87;"));
     assert!(proto.contains("VOICE_RECONNECTING"));
     for reason in [
         "SESSION_EVENT_REASON_UNSPECIFIED",

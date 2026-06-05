@@ -8,7 +8,10 @@ use tokio::time::Instant;
 
 const FIRST_INTERVAL_SAMPLE_LIMIT: usize = 10;
 const LATE_PACKET_THRESHOLD: Duration = Duration::from_millis(5);
-const TRACK_FAST_INTERVAL_TOLERANCE: Duration = Duration::from_millis(2);
+const TRACK_TEMPO_WINDOW_PACKETS: usize = 50;
+const TRACK_POST_SOURCE_BUFFER_MEDIA_MS: u64 = 5_000;
+const MIN_MEDIA_TO_WALL_CLOCK_RATIO_PPM: u64 = 980_000;
+const MAX_MEDIA_TO_WALL_CLOCK_RATIO_PPM: u64 = 1_020_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DurationStatsSnapshot {
@@ -89,6 +92,19 @@ pub struct PlaybackStabilitySnapshot {
     pub track_media_to_wall_clock_ratio_ppm: u64,
     pub track_fast_interval_count: u64,
     pub track_fast_interval_min_ms: u64,
+    pub track_fast_interval_min_us: u64,
+    pub track_tempo_window_count: u64,
+    pub track_tempo_window_post_source_buffer_count: u64,
+    pub track_tempo_window_min_ratio_ppm: u64,
+    pub track_tempo_window_max_ratio_ppm: u64,
+    pub track_tempo_window_fast_count: u64,
+    pub track_tempo_window_fastest_ratio_ppm: u64,
+    pub track_tempo_window_fastest_media_ms: u64,
+    pub track_tempo_window_fastest_wall_clock_us: u64,
+    pub track_tempo_window_slow_count: u64,
+    pub track_tempo_window_slowest_ratio_ppm: u64,
+    pub track_tempo_window_slowest_media_ms: u64,
+    pub track_tempo_window_slowest_wall_clock_us: u64,
     pub skipped_source_frame_count: u64,
     pub skipped_source_duration_ms: u64,
     pub tempo_rebase_count: u64,
@@ -105,6 +121,10 @@ pub struct PlaybackStabilitySnapshot {
     pub current_playout_buffer_depth: PlaybackBufferDepthSnapshot,
     pub min_playout_buffer_depth: PlaybackBufferDepthSnapshot,
     pub max_playout_buffer_depth: PlaybackBufferDepthSnapshot,
+    pub egress_buffer_target_ms: u64,
+    pub current_egress_buffer_depth: PlaybackBufferDepthSnapshot,
+    pub min_egress_buffer_depth: PlaybackBufferDepthSnapshot,
+    pub max_egress_buffer_depth: PlaybackBufferDepthSnapshot,
     pub prepared_rtp_queue_depth_ms: u64,
     pub source_buffer_target_ms: u64,
     pub adaptive_buffer_target_ms: u64,
@@ -114,6 +134,10 @@ pub struct PlaybackStabilitySnapshot {
     pub playout_buffer_low_watermark_count: u64,
     pub buffer_underrun_count: u64,
     pub playout_underrun_count: u64,
+    pub egress_underrun_count: u64,
+    pub egress_inserted_silence_duration_ms: u64,
+    pub egress_dropped_music_frame_count: u64,
+    pub egress_dropped_music_duration_ms: u64,
     pub source_underrun_count: u64,
     pub rebuffer_count: u64,
     pub refill_duration: DurationStatsSnapshot,
@@ -133,6 +157,7 @@ pub struct PlaybackStabilitySnapshot {
     pub sender_send_duration: DurationStatsSnapshot,
     pub sender_loop_non_send_work_duration: DurationStatsSnapshot,
     pub max_consecutive_playout_late_packets: usize,
+    pub max_consecutive_late_egress_ticks: usize,
     pub speaking_prepare_duration: DurationStatsSnapshot,
     pub sender_forbidden_work_count: u64,
     pub gateway_event_drain_duration: DurationStatsSnapshot,
@@ -142,6 +167,7 @@ pub struct PlaybackStabilitySnapshot {
     pub stale_dave_send_prevented_count: u64,
     pub controlled_media_interruption_count: u64,
     pub media_clock_reset_count: u64,
+    pub egress_clock_reset_count: u64,
     pub scheduler_late_reset_count: u64,
     pub source_underrun_reset_count: u64,
     pub pause_resume_reset_count: u64,
@@ -154,7 +180,6 @@ pub struct PlaybackStabilitySnapshot {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MediaClockResetReason {
-    SourceUnderrun,
     PauseResume,
     SchedulerLate,
     DaveTransitionRecovery,
@@ -167,6 +192,13 @@ pub(crate) struct ProducerMetricsSample {
     pub source_buffer_depth: OpusBufferDepth,
     pub stream_metrics: HttpOpusStreamMetrics,
     pub recovery_metrics: PlaybackRecoveryMetrics,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TrackPacketTiming {
+    sent_at: Instant,
+    duration: Duration,
+    media_start_ms: u64,
 }
 
 #[derive(Debug)]
@@ -183,9 +215,10 @@ pub(crate) struct PlaybackStabilityCollector {
     sender_lateness: Vec<Duration>,
     refill_durations: Vec<Duration>,
     producer_stall_durations: Vec<Duration>,
-    first_track_send_at: Option<Instant>,
     last_track_send_at: Option<Instant>,
     last_track_duration: Option<Duration>,
+    active_track_wall_clock_elapsed: Duration,
+    track_packet_timings: Vec<TrackPacketTiming>,
     last_any_send_at: Option<Instant>,
     last_producer_sample_at: Option<Instant>,
     max_producer_lag: Duration,
@@ -238,6 +271,18 @@ pub(crate) struct PlaybackStabilityCollector {
     track_media_duration_sent_ms: u64,
     track_fast_interval_count: u64,
     track_fast_interval_min: Option<Duration>,
+    track_tempo_window_count: u64,
+    track_tempo_window_post_source_buffer_count: u64,
+    track_tempo_window_min_ratio_ppm: u64,
+    track_tempo_window_max_ratio_ppm: u64,
+    track_tempo_window_fast_count: u64,
+    track_tempo_window_fastest_ratio_ppm: u64,
+    track_tempo_window_fastest_media_ms: u64,
+    track_tempo_window_fastest_wall_clock: Option<Duration>,
+    track_tempo_window_slow_count: u64,
+    track_tempo_window_slowest_ratio_ppm: u64,
+    track_tempo_window_slowest_media_ms: u64,
+    track_tempo_window_slowest_wall_clock: Option<Duration>,
     skipped_source_frame_count: u64,
     skipped_source_duration_ms: u64,
     tempo_rebase_count: u64,
@@ -273,9 +318,10 @@ impl PlaybackStabilityCollector {
             sender_lateness: Vec::new(),
             refill_durations: Vec::new(),
             producer_stall_durations: Vec::new(),
-            first_track_send_at: None,
             last_track_send_at: None,
             last_track_duration: None,
+            active_track_wall_clock_elapsed: Duration::ZERO,
+            track_packet_timings: Vec::new(),
             last_any_send_at: None,
             last_producer_sample_at: None,
             max_producer_lag: Duration::ZERO,
@@ -328,6 +374,18 @@ impl PlaybackStabilityCollector {
             track_media_duration_sent_ms: 0,
             track_fast_interval_count: 0,
             track_fast_interval_min: None,
+            track_tempo_window_count: 0,
+            track_tempo_window_post_source_buffer_count: 0,
+            track_tempo_window_min_ratio_ppm: 0,
+            track_tempo_window_max_ratio_ppm: 0,
+            track_tempo_window_fast_count: 0,
+            track_tempo_window_fastest_ratio_ppm: 0,
+            track_tempo_window_fastest_media_ms: 0,
+            track_tempo_window_fastest_wall_clock: None,
+            track_tempo_window_slow_count: 0,
+            track_tempo_window_slowest_ratio_ppm: 0,
+            track_tempo_window_slowest_media_ms: 0,
+            track_tempo_window_slowest_wall_clock: None,
             skipped_source_frame_count: 0,
             skipped_source_duration_ms: 0,
             tempo_rebase_count: 0,
@@ -406,6 +464,11 @@ impl PlaybackStabilityCollector {
         self.record_source_buffer_depth(depth, u64::MAX);
     }
 
+    pub(crate) fn record_playout_underrun(&mut self, depth: OpusBufferDepth) {
+        self.playout_underrun_count = self.playout_underrun_count.saturating_add(1);
+        self.record_playout_buffer_depth(depth, u64::MAX);
+    }
+
     pub(crate) fn record_speaking_prepare_duration(&mut self, duration: Duration) {
         self.speaking_prepare_durations.push(duration);
     }
@@ -441,12 +504,6 @@ impl PlaybackStabilityCollector {
     pub(crate) fn record_media_clock_reset(&mut self, reason: MediaClockResetReason) {
         self.media_clock_reset_count = self.media_clock_reset_count.saturating_add(1);
         match reason {
-            MediaClockResetReason::SourceUnderrun => {
-                self.source_underrun_reset_count =
-                    self.source_underrun_reset_count.saturating_add(1);
-                self.controlled_media_interruption_count =
-                    self.controlled_media_interruption_count.saturating_add(1);
-            }
             MediaClockResetReason::PauseResume => {
                 self.pause_resume_reset_count = self.pause_resume_reset_count.saturating_add(1);
             }
@@ -467,6 +524,7 @@ impl PlaybackStabilityCollector {
     pub(crate) fn record_resumed_from_pause(&mut self) {
         self.last_track_send_at = None;
         self.last_track_duration = None;
+        self.track_packet_timings.clear();
         self.last_any_send_at = None;
         self.pause_resume_intervals_remaining = FIRST_INTERVAL_SAMPLE_LIMIT;
         self.pause_resume_first_intervals_ms.clear();
@@ -481,7 +539,7 @@ impl PlaybackStabilityCollector {
         tempo_rebased: bool,
     ) {
         let frame_duration = Duration::from_millis(duration_ms);
-        self.first_track_send_at.get_or_insert(sent_at);
+        let media_start_ms = self.track_media_duration_sent_ms;
         self.track_media_duration_sent_ms = self
             .track_media_duration_sent_ms
             .saturating_add(duration_ms);
@@ -511,11 +569,11 @@ impl PlaybackStabilityCollector {
             self.current_consecutive_playout_late_packets = 0;
         }
 
-        if let Some(previous) = self.last_track_send_at.replace(sent_at) {
-            let interval = sent_at.saturating_duration_since(previous);
+        if let Some(previous) = self.last_track_send_at.replace(send_started_at) {
+            let interval = send_started_at.saturating_duration_since(previous);
             self.track_intervals.push(interval);
             if let Some(previous_duration) = self.last_track_duration
-                && interval.saturating_add(TRACK_FAST_INTERVAL_TOLERANCE) < previous_duration
+                && interval < previous_duration
             {
                 self.track_fast_interval_count = self.track_fast_interval_count.saturating_add(1);
                 self.track_fast_interval_min = Some(
@@ -539,11 +597,84 @@ impl PlaybackStabilityCollector {
                     .push(duration_millis(interval));
                 self.post_rebuffer_intervals_remaining -= 1;
             }
+            if let Some(previous_duration) = self.last_track_duration {
+                self.active_track_wall_clock_elapsed = self
+                    .active_track_wall_clock_elapsed
+                    .saturating_sub(previous_duration)
+                    + interval
+                    + frame_duration;
+            }
+        } else {
+            self.active_track_wall_clock_elapsed += frame_duration;
         }
         self.last_track_duration = Some(frame_duration);
+        self.track_packet_timings.push(TrackPacketTiming {
+            sent_at: send_started_at,
+            duration: frame_duration,
+            media_start_ms,
+        });
+        self.record_latest_track_tempo_window();
 
         self.record_any_packet(sent_at);
         self.track_packet_count = self.track_packet_count.saturating_add(1);
+    }
+
+    fn record_latest_track_tempo_window(&mut self) {
+        if self.track_packet_timings.len() < TRACK_TEMPO_WINDOW_PACKETS {
+            return;
+        }
+
+        let start = self.track_packet_timings.len() - TRACK_TEMPO_WINDOW_PACKETS;
+        let window = &self.track_packet_timings[start..];
+        let Some(first) = window.first() else {
+            return;
+        };
+        let Some(last) = window.last() else {
+            return;
+        };
+
+        let media_duration = window
+            .iter()
+            .fold(Duration::ZERO, |total, packet| total + packet.duration);
+        let wall_clock_duration =
+            last.sent_at.saturating_duration_since(first.sent_at) + last.duration;
+
+        self.track_tempo_window_count = self.track_tempo_window_count.saturating_add(1);
+        if first.media_start_ms >= TRACK_POST_SOURCE_BUFFER_MEDIA_MS {
+            self.track_tempo_window_post_source_buffer_count = self
+                .track_tempo_window_post_source_buffer_count
+                .saturating_add(1);
+        }
+
+        let ratio = media_to_wall_clock_ratio_ppm_duration(media_duration, wall_clock_duration);
+        self.track_tempo_window_min_ratio_ppm = if self.track_tempo_window_min_ratio_ppm == 0 {
+            ratio
+        } else {
+            self.track_tempo_window_min_ratio_ppm.min(ratio)
+        };
+        self.track_tempo_window_max_ratio_ppm = self.track_tempo_window_max_ratio_ppm.max(ratio);
+
+        if ratio > MAX_MEDIA_TO_WALL_CLOCK_RATIO_PPM {
+            self.track_tempo_window_fast_count =
+                self.track_tempo_window_fast_count.saturating_add(1);
+            if ratio > self.track_tempo_window_fastest_ratio_ppm {
+                self.track_tempo_window_fastest_ratio_ppm = ratio;
+                self.track_tempo_window_fastest_media_ms = duration_millis(media_duration);
+                self.track_tempo_window_fastest_wall_clock = Some(wall_clock_duration);
+            }
+        }
+
+        if ratio < MIN_MEDIA_TO_WALL_CLOCK_RATIO_PPM {
+            self.track_tempo_window_slow_count =
+                self.track_tempo_window_slow_count.saturating_add(1);
+            if self.track_tempo_window_slowest_ratio_ppm == 0
+                || ratio < self.track_tempo_window_slowest_ratio_ppm
+            {
+                self.track_tempo_window_slowest_ratio_ppm = ratio;
+                self.track_tempo_window_slowest_media_ms = duration_millis(media_duration);
+                self.track_tempo_window_slowest_wall_clock = Some(wall_clock_duration);
+            }
+        }
     }
 
     pub(crate) fn record_continuity_silence_packet(&mut self, sent_at: Instant, duration_ms: u64) {
@@ -571,14 +702,7 @@ impl PlaybackStabilityCollector {
     }
 
     fn track_wall_clock_elapsed_ms(&self) -> u64 {
-        let Some(first_sent_at) = self.first_track_send_at else {
-            return 0;
-        };
-        let Some(last_sent_at) = self.last_track_send_at else {
-            return 0;
-        };
-        let last_duration = self.last_track_duration.unwrap_or(Duration::ZERO);
-        duration_millis(last_sent_at.saturating_duration_since(first_sent_at) + last_duration)
+        duration_millis(self.active_track_wall_clock_elapsed)
     }
 
     pub(crate) fn snapshot(
@@ -606,6 +730,24 @@ impl PlaybackStabilityCollector {
             track_media_to_wall_clock_ratio_ppm,
             track_fast_interval_count: self.track_fast_interval_count,
             track_fast_interval_min_ms: self.track_fast_interval_min.map_or(0, duration_millis),
+            track_fast_interval_min_us: self.track_fast_interval_min.map_or(0, duration_micros),
+            track_tempo_window_count: self.track_tempo_window_count,
+            track_tempo_window_post_source_buffer_count: self
+                .track_tempo_window_post_source_buffer_count,
+            track_tempo_window_min_ratio_ppm: self.track_tempo_window_min_ratio_ppm,
+            track_tempo_window_max_ratio_ppm: self.track_tempo_window_max_ratio_ppm,
+            track_tempo_window_fast_count: self.track_tempo_window_fast_count,
+            track_tempo_window_fastest_ratio_ppm: self.track_tempo_window_fastest_ratio_ppm,
+            track_tempo_window_fastest_media_ms: self.track_tempo_window_fastest_media_ms,
+            track_tempo_window_fastest_wall_clock_us: self
+                .track_tempo_window_fastest_wall_clock
+                .map_or(0, duration_micros),
+            track_tempo_window_slow_count: self.track_tempo_window_slow_count,
+            track_tempo_window_slowest_ratio_ppm: self.track_tempo_window_slowest_ratio_ppm,
+            track_tempo_window_slowest_media_ms: self.track_tempo_window_slowest_media_ms,
+            track_tempo_window_slowest_wall_clock_us: self
+                .track_tempo_window_slowest_wall_clock
+                .map_or(0, duration_micros),
             skipped_source_frame_count: self.skipped_source_frame_count,
             skipped_source_duration_ms: self.skipped_source_duration_ms,
             tempo_rebase_count: self.tempo_rebase_count,
@@ -622,7 +764,11 @@ impl PlaybackStabilityCollector {
             current_playout_buffer_depth: self.current_playout_buffer_depth,
             min_playout_buffer_depth: self.min_playout_buffer_depth,
             max_playout_buffer_depth: self.max_playout_buffer_depth,
-            prepared_rtp_queue_depth_ms: self.current_playout_buffer_depth.duration_ms,
+            egress_buffer_target_ms: 400,
+            current_egress_buffer_depth: self.current_playout_buffer_depth,
+            min_egress_buffer_depth: self.min_playout_buffer_depth,
+            max_egress_buffer_depth: self.max_playout_buffer_depth,
+            prepared_rtp_queue_depth_ms: 0,
             source_buffer_target_ms: self.source_buffer_target_ms,
             adaptive_buffer_target_ms: self.adaptive_buffer_target_ms,
             max_adaptive_buffer_target_ms: self.max_adaptive_buffer_target_ms,
@@ -631,6 +777,10 @@ impl PlaybackStabilityCollector {
             playout_buffer_low_watermark_count: self.playout_buffer_low_watermark_count,
             buffer_underrun_count: self.buffer_underrun_count,
             playout_underrun_count: self.playout_underrun_count,
+            egress_underrun_count: self.playout_underrun_count,
+            egress_inserted_silence_duration_ms: self.inserted_silence_duration_ms,
+            egress_dropped_music_frame_count: 0,
+            egress_dropped_music_duration_ms: 0,
             source_underrun_count: self.source_underrun_count,
             rebuffer_count: self.rebuffer_count,
             refill_duration: DurationStatsSnapshot::from_samples(&self.refill_durations),
@@ -660,6 +810,7 @@ impl PlaybackStabilityCollector {
                 &self.sender_loop_non_send_work_durations,
             ),
             max_consecutive_playout_late_packets: self.max_consecutive_playout_late_packets,
+            max_consecutive_late_egress_ticks: self.max_consecutive_playout_late_packets,
             speaking_prepare_duration: DurationStatsSnapshot::from_samples(
                 &self.speaking_prepare_durations,
             ),
@@ -673,6 +824,7 @@ impl PlaybackStabilityCollector {
             stale_dave_send_prevented_count: self.stale_dave_send_prevented_count,
             controlled_media_interruption_count: self.controlled_media_interruption_count,
             media_clock_reset_count: self.media_clock_reset_count,
+            egress_clock_reset_count: self.media_clock_reset_count,
             scheduler_late_reset_count: self.scheduler_late_reset_count,
             source_underrun_reset_count: self.source_underrun_reset_count,
             pause_resume_reset_count: self.pause_resume_reset_count,
@@ -716,6 +868,10 @@ fn duration_millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+fn duration_micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
 fn media_to_wall_clock_ratio_ppm(media_duration_ms: u64, wall_clock_elapsed_ms: u64) -> u64 {
     if media_duration_ms == 0 || wall_clock_elapsed_ms == 0 {
         return 0;
@@ -724,4 +880,176 @@ fn media_to_wall_clock_ratio_ppm(media_duration_ms: u64, wall_clock_elapsed_ms: 
     ((u128::from(media_duration_ms) * 1_000_000) / u128::from(wall_clock_elapsed_ms))
         .try_into()
         .unwrap_or(u64::MAX)
+}
+
+fn media_to_wall_clock_ratio_ppm_duration(
+    media_duration: Duration,
+    wall_clock_elapsed: Duration,
+) -> u64 {
+    let media_duration_us = media_duration.as_micros();
+    let wall_clock_elapsed_us = wall_clock_elapsed.as_micros();
+    if media_duration_us == 0 || wall_clock_elapsed_us == 0 {
+        return 0;
+    }
+
+    ((media_duration_us * 1_000_000) / wall_clock_elapsed_us)
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn collector() -> PlaybackStabilityCollector {
+        PlaybackStabilityCollector::new(
+            1,
+            "video".to_owned(),
+            250,
+            OpusBufferDepth::default(),
+            OpusBufferDepth::default(),
+            TRACK_POST_SOURCE_BUFFER_MEDIA_MS,
+            PlaybackRecoveryMetrics::default(),
+        )
+    }
+
+    fn snapshot_for_offsets(offsets: &[Duration]) -> PlaybackStabilitySnapshot {
+        let mut collector = collector();
+        let start = Instant::now();
+        for offset in offsets {
+            let sent_at = start + *offset;
+            collector.record_track_packet(sent_at, sent_at, sent_at, 20, false);
+        }
+        collector.snapshot(0, 0, 0, false)
+    }
+
+    fn offsets_for_window_wall_clock(wall_clock_duration: Duration) -> Vec<Duration> {
+        let packet_duration = Duration::from_millis(20);
+        let span_us = wall_clock_duration
+            .checked_sub(packet_duration)
+            .expect("window wall clock includes final packet duration")
+            .as_micros();
+        (0..TRACK_TEMPO_WINDOW_PACKETS)
+            .map(|index| {
+                Duration::from_micros(
+                    ((span_us * index as u128) / (TRACK_TEMPO_WINDOW_PACKETS - 1) as u128)
+                        .try_into()
+                        .unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn track_tempo_window_counts_fifty_packets_over_900ms_as_fast() {
+        let snapshot =
+            snapshot_for_offsets(&offsets_for_window_wall_clock(Duration::from_millis(900)));
+
+        assert_eq!(snapshot.track_tempo_window_count, 1);
+        assert_eq!(snapshot.track_tempo_window_fast_count, 1);
+        assert_eq!(snapshot.track_tempo_window_slow_count, 0);
+        assert!(snapshot.track_tempo_window_fastest_ratio_ppm > MAX_MEDIA_TO_WALL_CLOCK_RATIO_PPM);
+        assert_eq!(snapshot.track_tempo_window_fastest_media_ms, 1_000);
+        assert_eq!(snapshot.track_tempo_window_fastest_wall_clock_us, 900_000);
+    }
+
+    #[test]
+    fn track_tempo_window_counts_fifty_packets_over_1100ms_as_slow() {
+        let snapshot =
+            snapshot_for_offsets(&offsets_for_window_wall_clock(Duration::from_millis(1_100)));
+
+        assert_eq!(snapshot.track_tempo_window_count, 1);
+        assert_eq!(snapshot.track_tempo_window_fast_count, 0);
+        assert_eq!(snapshot.track_tempo_window_slow_count, 1);
+        assert!(snapshot.track_tempo_window_slowest_ratio_ppm < MIN_MEDIA_TO_WALL_CLOCK_RATIO_PPM);
+        assert_eq!(snapshot.track_tempo_window_slowest_media_ms, 1_000);
+        assert_eq!(snapshot.track_tempo_window_slowest_wall_clock_us, 1_100_000);
+    }
+
+    #[test]
+    fn track_fast_interval_counts_nineteen_ms_correction_interval() {
+        let mut offsets = Vec::with_capacity(TRACK_TEMPO_WINDOW_PACKETS);
+        let mut offset = Duration::ZERO;
+        offsets.push(offset);
+        for interval in std::iter::once(Duration::from_millis(19))
+            .chain(std::iter::once(Duration::from_millis(21)))
+            .chain(std::iter::repeat_n(
+                Duration::from_millis(20),
+                TRACK_TEMPO_WINDOW_PACKETS - 3,
+            ))
+        {
+            offset += interval;
+            offsets.push(offset);
+        }
+
+        let snapshot = snapshot_for_offsets(&offsets);
+
+        assert_eq!(snapshot.track_fast_interval_count, 1);
+        assert_eq!(snapshot.track_fast_interval_min_ms, 19);
+        assert_eq!(snapshot.track_fast_interval_min_us, 19_000);
+        assert_eq!(snapshot.track_tempo_window_count, 1);
+        assert_eq!(snapshot.track_tempo_window_fast_count, 0);
+        assert_eq!(snapshot.track_tempo_window_slow_count, 0);
+        assert_eq!(snapshot.track_tempo_window_min_ratio_ppm, 1_000_000);
+        assert_eq!(snapshot.track_tempo_window_max_ratio_ppm, 1_000_000);
+    }
+
+    #[test]
+    fn track_tempo_window_excludes_controlled_pause_from_active_tempo() {
+        let mut collector = collector();
+        let start = Instant::now();
+        let mut sent_at = start;
+
+        for index in 0..60 {
+            if index > 0 {
+                sent_at += Duration::from_millis(20);
+            }
+            collector.record_track_packet(sent_at, sent_at, sent_at, 20, false);
+        }
+
+        collector.record_resumed_from_pause();
+        sent_at += Duration::from_secs(3);
+
+        for index in 0..60 {
+            if index > 0 {
+                sent_at += Duration::from_millis(20);
+            }
+            collector.record_track_packet(sent_at, sent_at, sent_at, 20, false);
+        }
+
+        let snapshot = collector.snapshot(0, 0, 0, false);
+        assert_eq!(snapshot.track_media_duration_sent_ms, 2_400);
+        assert_eq!(snapshot.track_wall_clock_elapsed_ms, 2_400);
+        assert_eq!(snapshot.track_media_to_wall_clock_ratio_ppm, 1_000_000);
+        assert_eq!(snapshot.track_tempo_window_fast_count, 0);
+        assert_eq!(snapshot.track_tempo_window_slow_count, 0);
+        assert_eq!(snapshot.track_tempo_window_min_ratio_ppm, 1_000_000);
+        assert_eq!(snapshot.track_tempo_window_max_ratio_ppm, 1_000_000);
+    }
+
+    #[test]
+    fn track_tempo_window_counts_sustained_18ms_intervals_as_fast() {
+        let offsets = (0..TRACK_TEMPO_WINDOW_PACKETS)
+            .map(|index| Duration::from_millis((index as u64) * 18))
+            .collect::<Vec<_>>();
+
+        let snapshot = snapshot_for_offsets(&offsets);
+
+        assert_eq!(snapshot.track_tempo_window_fast_count, 1);
+        assert_eq!(snapshot.track_tempo_window_slow_count, 0);
+        assert!(snapshot.track_tempo_window_max_ratio_ppm > MAX_MEDIA_TO_WALL_CLOCK_RATIO_PPM);
+    }
+
+    #[test]
+    fn track_tempo_window_counts_sustained_22ms_intervals_as_slow() {
+        let offsets = (0..TRACK_TEMPO_WINDOW_PACKETS)
+            .map(|index| Duration::from_millis((index as u64) * 22))
+            .collect::<Vec<_>>();
+
+        let snapshot = snapshot_for_offsets(&offsets);
+
+        assert_eq!(snapshot.track_tempo_window_fast_count, 0);
+        assert_eq!(snapshot.track_tempo_window_slow_count, 1);
+        assert!(snapshot.track_tempo_window_min_ratio_ppm < MIN_MEDIA_TO_WALL_CLOCK_RATIO_PPM);
+    }
 }

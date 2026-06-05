@@ -128,7 +128,7 @@ impl VoiceUdpTransport {
             ));
         }
 
-        let (sequence, timestamp) = self.sequence.advance_by_samples(duration_samples);
+        let (sequence, timestamp) = self.sequence.current();
         let rtp_header = self.packet_builder.build_header(sequence, timestamp);
         let packet = match &self.protection {
             Some(protection) => protection.protect_packet(&rtp_header, frame.as_ref())?,
@@ -147,12 +147,13 @@ impl VoiceUdpTransport {
     }
 
     pub async fn send_prepared_packet(
-        &self,
+        &mut self,
         packet: &PreparedVoicePacket,
     ) -> Result<(), VoiceError> {
         self.socket
             .send_to(packet.bytes.as_ref(), self.server)
             .await?;
+        self.sequence.advance_by_samples(packet.duration_samples);
         Ok(())
     }
 

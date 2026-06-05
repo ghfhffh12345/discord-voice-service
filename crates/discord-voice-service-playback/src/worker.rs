@@ -123,7 +123,7 @@ impl PlaybackWorker {
             packet.duration_ms,
             packet.duration_samples,
         )
-        .with_metadata(None, 0);
+        .with_metadata(packet.timestamp_ms, None, 0);
         queue.push(frame).map_err(|_| PlaybackError::BufferFull)
     }
 }

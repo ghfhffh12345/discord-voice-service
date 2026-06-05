@@ -328,8 +328,13 @@ async fn join_voice_then_play_streams_end_to_end_playback_events_and_audio() {
     assert!(metrics.sender_lateness.unwrap().samples >= 5);
     assert_eq!(metrics.source_underrun_count, 0);
     assert_eq!(metrics.sender_forbidden_work_count, 0);
-    assert_eq!(metrics.current_playout_buffer_depth.unwrap().duration_ms, 0);
-    assert_eq!(metrics.max_playout_buffer_depth.unwrap().duration_ms, 0);
+    let max_egress_depth = metrics
+        .max_egress_buffer_depth
+        .as_ref()
+        .expect("egress max depth should be published");
+    assert_eq!(metrics.egress_buffer_target_ms, 400);
+    assert!(max_egress_depth.duration_ms > 0);
+    assert!(max_egress_depth.duration_ms <= 500);
     assert_eq!(metrics.prepared_rtp_queue_depth_ms, 0);
     assert_eq!(metrics.playout_builder_prepare_duration.unwrap().samples, 0);
     assert!(metrics.sender_send_duration.unwrap().samples >= 5);

@@ -160,7 +160,7 @@ The live validation controller contract is:
 | `LIVE_STAGING_HTTP_READ_JITTER_MS` | Deterministic per-chunk HTTP media read jitter injected during staging | `25` |
 | `LIVE_STAGING_LONG_TRACK_MIN_PACKETS` | Minimum long-track RTP packets required before the sustained probe is stopped and checked | `300` |
 
-For local real-Discord live staging, run `scripts/ci/run_local_live_staging.sh`; the helper loads secrets from `.env`, loads `BROWSER_JSON` from `./browser.json`, starts a disposable local `ytmusic-service` container and CPU-contention container, waits for `ytmusic-service` gRPC readiness, then starts a source-built `discord-voice-service` with the HTTP read stress profile before running observer validation.
+For local real-Discord live staging, run `scripts/ci/run_local_live_staging.sh`; the helper loads secrets from `.env`, loads `BROWSER_JSON` from `./browser.json`, starts a disposable local `ytmusic-service` container and CPU-contention container, waits for `ytmusic-service` gRPC readiness, then starts a locally built `discord-voice-service` binary inside a CPU-limited container with the HTTP read stress profile before running observer validation.
 
 For reproducible local live staging, optionally set `YTMUSIC_SERVICE_IMAGE_REF`; otherwise the helper defaults to `ghcr.io/ghfhffh12345/ytmusic-service:latest`.
 

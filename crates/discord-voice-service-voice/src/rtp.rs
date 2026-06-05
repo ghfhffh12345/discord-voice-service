@@ -111,6 +111,10 @@ impl RtpSequenceState {
         }
     }
 
+    pub fn current(&self) -> (u16, u32) {
+        (self.sequence, self.timestamp)
+    }
+
     pub fn advance_by_samples(&mut self, timestamp_delta: u32) -> (u16, u32) {
         let current = (self.sequence, self.timestamp);
         self.sequence = self.sequence.wrapping_add(1);

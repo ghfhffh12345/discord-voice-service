@@ -2,7 +2,7 @@ use std::fs;
 
 const OCCUPIED_LISTENER_CONTRACT: &str = "During live staging, human listeners may remain in the channel while the staging bot validates playback against the short dedicated validation track.";
 const NATURAL_END_SUCCESS_CONTRACT: &str = "Live-staging success waits for the natural end of the validation track before the run is treated as release-ready.";
-const LOCAL_LIVE_STAGING_CONTRACT: &str = "For local real-Discord live staging, run `scripts/ci/run_local_live_staging.sh`; the helper loads secrets from `.env`, loads `BROWSER_JSON` from `./browser.json`, starts a disposable local `ytmusic-service` container and CPU-contention container, waits for `ytmusic-service` gRPC readiness, then starts a source-built `discord-voice-service` with the HTTP read stress profile before running observer validation.";
+const LOCAL_LIVE_STAGING_CONTRACT: &str = "For local real-Discord live staging, run `scripts/ci/run_local_live_staging.sh`; the helper loads secrets from `.env`, loads `BROWSER_JSON` from `./browser.json`, starts a disposable local `ytmusic-service` container and CPU-contention container, waits for `ytmusic-service` gRPC readiness, then starts a locally built `discord-voice-service` binary inside a CPU-limited container with the HTTP read stress profile before running observer validation.";
 const OBSERVER_SECRET_CONTRACT: &str = "Protected live staging requires `OBSERVER_BOT_TOKEN` for the muted, non-deafened observer identity that validates receive-side audio.";
 const RECEIVE_SIDE_SUCCESS_CONTRACT: &str = "Live-staging success requires observer receive-side proof: authentic voice context, VoiceReady, Playing, pause without leaving the voice channel, no service audio or speaking state during the paused interval, resume without voice-channel rejoin, natural TrackEnded, at least 120 observed packets, at least 3000 ms decoded audio, at least 1000 ms non-silent audio, and no reconnect/interruption/fatal error during validation.";
 const PLAYBACK_METRICS_SUCCESS_CONTRACT: &str = "Live-staging success requires service-side playback stability metrics from `GetPlaybackMetrics`, including RTP interval stats, sender lateness, buffer depth, refill durations, underruns, inserted silence, and interruption counters.";
@@ -34,14 +34,14 @@ fn live_staging_workflow_uses_github_hosted_runner_and_secret_browser_json() {
     let build_service = "cargo build -p discord-voice-service --bin discord-voice-service";
     let build_validator = "cargo build -p discord-voice-service-live-validation --bin staging_live_check --bin ytmusic_ready_check";
     let source_env = "source \"${env_file}\"";
-    let local_ytmusic_probe = "ytmusic_probe_binary=\"${CARGO_TARGET_DIR:-${repo_root}/target}/debug/ytmusic_ready_check\"";
+    let local_ytmusic_probe = "ytmusic_probe_binary=\"${target_dir}/debug/ytmusic_ready_check\"";
     let local_ytmusic_image = "ytmusic_image_ref=\"${YTMUSIC_SERVICE_IMAGE_REF:-ghcr.io/ghfhffh12345/ytmusic-service:latest}\"";
     let local_ytmusic_run = "docker run -d \\\n  --name \"${ytmusic_container_name}\"";
     let local_ytmusic_pull = "docker pull \"${ytmusic_image_ref}\"";
     let local_network_create = "docker network create \"${network_name}\"";
     let local_evidence_default = "validation_evidence_path=\"${LIVE_VALIDATION_EVIDENCE_PATH:-${RUNNER_TEMP:-/tmp}/live-validation-evidence-local.json}\"";
     let local_wait_for_ytmusic = "wait_for_ytmusic_grpc \"${host_ytmusic_endpoint}\"";
-    let local_service_start = "cargo run -p discord-voice-service >\"${service_log}\" 2>&1 &";
+    let local_service_start = "docker run -d \\\n  --name \"${service_container_name}\"";
 
     assert!(workflow.contains("runs-on: ubuntu-24.04"));
     assert!(workflow.contains("environment: live-staging"));
@@ -172,7 +172,16 @@ fn live_staging_workflow_uses_github_hosted_runner_and_secret_browser_json() {
     assert!(local_helper.contains(local_wait_for_ytmusic));
     assert!(local_helper.find(local_wait_for_ytmusic) < local_helper.find(local_service_start));
     assert!(local_helper.contains(local_service_start));
-    assert!(local_helper.contains("service_pid=$!"));
+    assert!(local_helper.contains(
+        "service_container_image=\"${LOCAL_LIVE_STAGING_SERVICE_CONTAINER_IMAGE:-ubuntu:24.04}\""
+    ));
+    assert!(local_helper.contains("docker pull \"${service_container_image}\""));
+    assert!(local_helper.contains("--network host"));
+    assert!(local_helper.contains("--cpus \"${live_staging_service_cpus}\""));
+    assert!(local_helper.contains("-v \"${service_binary}:/discord-voice-service:ro\""));
+    assert!(local_helper.contains("/discord-voice-service"));
+    assert!(local_helper.contains("docker logs -f \"${service_container_name}\""));
+    assert!(local_helper.contains("service_log_pid=$!"));
     assert!(
         local_helper.contains("DISCORD_VOICE_SERVICE_YTMUSIC_ADDR=\"${service_ytmusic_addr}\"")
     );
@@ -187,7 +196,7 @@ fn live_staging_workflow_uses_github_hosted_runner_and_secret_browser_json() {
     assert!(
         !local_helper.contains("service_ytmusic_addr=\"${DISCORD_VOICE_SERVICE_YTMUSIC_ADDR:?")
     );
-    assert!(local_helper.contains("DISCORD_VOICE_SERVICE_BIND_ADDR=\"${service_bind_addr}\""));
+    assert!(local_helper.contains("DISCORD_VOICE_SERVICE_BIND_ADDR=\"0.0.0.0:${probe_port}\""));
     assert!(local_helper.contains("APPLICATION_ID=\"${application_id}\""));
     assert!(local_helper.contains("BOT_TOKEN=\"${bot_token}\""));
     assert!(local_helper.contains("OBSERVER_BOT_TOKEN=\"${observer_bot_token}\""));
@@ -228,7 +237,7 @@ fn live_staging_workflow_uses_github_hosted_runner_and_secret_browser_json() {
     assert!(local_helper.contains("probe_port=\"${BASH_REMATCH[2]}\""));
     assert!(local_helper.contains("Unsupported DISCORD_VOICE_SERVICE_URI"));
     assert!(!local_helper.contains("(?:"));
-    assert!(local_helper.contains("kill -0 \"${service_pid}\""));
+    assert!(local_helper.contains("docker inspect -f '{{.State.Running}}'"));
     assert!(local_helper.contains("discord-voice-service exited before readiness"));
     assert!(local_helper.contains("attempt=0"));
     assert!(local_helper.contains("while [[ \"${attempt}\" -lt 30 ]]"));

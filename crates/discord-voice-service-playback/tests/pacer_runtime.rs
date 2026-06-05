@@ -75,13 +75,22 @@ async fn pacer_runtime_waits_for_each_frame_duration() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn pacer_runtime_keeps_scheduled_cadence_for_jitter_inside_tolerance() {
+async fn pacer_runtime_schedules_from_actual_send_after_two_ms_late_track_send() {
     let mut pacer = AudioPacer::new();
     let start = Instant::now();
 
     pacer.wait_until_ready().await;
     advance(Duration::from_millis(2)).await;
-    pacer.mark_emitted(Duration::from_millis(20));
+    let mark = pacer.mark_sent(
+        PacedPacketKind::Track,
+        start,
+        Duration::from_millis(20),
+        Instant::now(),
+    );
+    assert!(!mark.media_clock_reset);
+    assert!(!mark.tempo_rebased);
+    assert_eq!(pacer.next_deadline(), start + Duration::from_millis(22));
+    assert_eq!(pacer.tempo_rebase_count(), 0);
 
     let next_tick = tokio::spawn(async move {
         pacer.wait_for(Duration::from_millis(20)).await;
@@ -90,7 +99,7 @@ async fn pacer_runtime_keeps_scheduled_cadence_for_jitter_inside_tolerance() {
     yield_now().await;
     assert!(!next_tick.is_finished());
 
-    advance(Duration::from_millis(15)).await;
+    advance(Duration::from_millis(19)).await;
     yield_now().await;
     assert!(!next_tick.is_finished());
 
@@ -98,8 +107,28 @@ async fn pacer_runtime_keeps_scheduled_cadence_for_jitter_inside_tolerance() {
     yield_now().await;
     let pacer = next_tick.await.unwrap();
 
-    assert_eq!(start.elapsed(), Duration::from_millis(20));
+    assert_eq!(start.elapsed(), Duration::from_millis(22));
     assert_eq!(pacer.emitted_frames(), 2);
+    assert_eq!(pacer.tempo_rebase_count(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn pacer_runtime_sub_duration_lateness_rebases_to_actual_send_start() {
+    let mut pacer = AudioPacer::new();
+    let start = Instant::now();
+
+    advance(Duration::from_millis(1)).await;
+    let mark = pacer.mark_sent(
+        PacedPacketKind::Track,
+        start,
+        Duration::from_millis(20),
+        Instant::now(),
+    );
+
+    assert!(!mark.media_clock_reset);
+    assert!(!mark.tempo_rebased);
+    assert_eq!(pacer.next_deadline(), start + Duration::from_millis(21));
+    assert_eq!(pacer.tempo_rebase_count(), 0);
 }
 
 #[tokio::test(start_paused = true)]
@@ -155,7 +184,7 @@ async fn pacer_runtime_whole_frame_lateness_records_explicit_recovery() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn pacer_runtime_rebases_track_cadence_after_material_sub_frame_late_send() {
+async fn pacer_runtime_sub_frame_lateness_does_not_fast_follow() {
     let mut pacer = AudioPacer::new();
     let start = Instant::now();
 
@@ -167,7 +196,8 @@ async fn pacer_runtime_rebases_track_cadence_after_material_sub_frame_late_send(
         Instant::now(),
     );
     assert!(!mark.media_clock_reset);
-    assert!(mark.tempo_rebased);
+    assert!(!mark.tempo_rebased);
+    assert_eq!(pacer.next_deadline(), start + Duration::from_millis(32));
 
     let next_tick = tokio::spawn(async move {
         pacer.wait_until_ready().await;
@@ -188,7 +218,7 @@ async fn pacer_runtime_rebases_track_cadence_after_material_sub_frame_late_send(
 }
 
 #[tokio::test(start_paused = true)]
-async fn pacer_runtime_very_late_sub_frame_send_waits_another_full_track_frame() {
+async fn pacer_runtime_very_late_sub_frame_send_does_not_fast_follow() {
     let mut pacer = AudioPacer::new();
     let start = Instant::now();
 
@@ -200,7 +230,8 @@ async fn pacer_runtime_very_late_sub_frame_send_waits_another_full_track_frame()
         Instant::now(),
     );
     assert!(!mark.media_clock_reset);
-    assert!(mark.tempo_rebased);
+    assert!(!mark.tempo_rebased);
+    assert_eq!(pacer.next_deadline(), start + Duration::from_millis(38));
 
     let next_tick = tokio::spawn(async move {
         pacer.wait_until_ready().await;
@@ -239,7 +270,7 @@ async fn pacer_runtime_repeated_eighteen_ms_late_sends_do_not_fast_follow() {
             sent,
         );
         assert!(!mark.media_clock_reset);
-        assert!(mark.tempo_rebased);
+        assert!(!mark.tempo_rebased);
         assert_eq!(pacer.next_deadline(), sent + Duration::from_millis(20));
     }
 
@@ -251,6 +282,51 @@ async fn pacer_runtime_repeated_eighteen_ms_late_sends_do_not_fast_follow() {
         intervals,
         vec![Duration::from_millis(38), Duration::from_millis(38)]
     );
+    assert_eq!(pacer.tempo_rebase_count(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn pacer_runtime_alternating_late_and_on_time_sends_never_compensate_with_fast_followups() {
+    let mut pacer = AudioPacer::new();
+    let start = Instant::now();
+    let mut sent_at = Vec::new();
+
+    for send_delay in [
+        Duration::from_millis(2),
+        Duration::ZERO,
+        Duration::from_millis(2),
+        Duration::ZERO,
+    ] {
+        let scheduled = pacer.next_deadline();
+        pacer.wait_until_ready().await;
+        advance(send_delay).await;
+        let sent = Instant::now();
+        sent_at.push(sent.saturating_duration_since(start));
+        let mark = pacer.mark_sent(
+            PacedPacketKind::Track,
+            scheduled,
+            Duration::from_millis(20),
+            sent,
+        );
+        assert!(!mark.media_clock_reset);
+        assert!(!mark.tempo_rebased);
+        assert_eq!(pacer.next_deadline(), sent + Duration::from_millis(20));
+    }
+
+    let intervals = sent_at
+        .windows(2)
+        .map(|window| window[1] - window[0])
+        .collect::<Vec<_>>();
+    assert_eq!(
+        intervals,
+        vec![
+            Duration::from_millis(20),
+            Duration::from_millis(22),
+            Duration::from_millis(20)
+        ],
+        "late sends must not be repaid with 19ms / 21ms compensation pairs"
+    );
+    assert_eq!(pacer.tempo_rebase_count(), 0);
 }
 
 #[tokio::test(start_paused = true)]

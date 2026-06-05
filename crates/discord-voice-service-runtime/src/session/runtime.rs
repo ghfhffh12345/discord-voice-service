@@ -3,11 +3,14 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::thread;
 use std::time::Duration;
 
+use bytes::Bytes;
 use discord_voice_service_playback::media::opus_queue::{
     OpusBufferDepth, OpusFrame, OpusFrameQueue,
 };
 use discord_voice_service_playback::media::position::SharedPlaybackPosition;
-use discord_voice_service_playback::pacer::{AudioPacer, FRAME_DURATION, PacedPacketKind};
+use discord_voice_service_playback::pacer::{
+    AudioPacer, FRAME_DURATION, PacedPacketKind, SILENCE_FRAME,
+};
 use discord_voice_service_playback::recovery::PlaybackRecoveryMetrics;
 use discord_voice_service_playback::source::PlaybackSource;
 use discord_voice_service_playback::{PlaybackError, PlaybackWorker};
@@ -35,6 +38,9 @@ const PLAYBACK_SOURCE_BUFFER_TARGET_MS: u64 = 5_000;
 const PLAYBACK_SOURCE_BUFFER_HIGH_WATERMARK_MS: u64 = 5_000;
 const PLAYBACK_SOURCE_BUFFER_LOW_WATERMARK_MS: u64 = 4_000;
 const PLAYBACK_SOURCE_BUFFER_REFILL_BATCH_MS: u64 = 1_000;
+const DISCORD_EGRESS_BUFFER_TARGET_MS: u64 = 400;
+const DISCORD_EGRESS_BUFFER_HIGH_WATERMARK_MS: u64 = 500;
+const DISCORD_EGRESS_BUFFER_LOW_WATERMARK_MS: u64 = 200;
 const PLAYBACK_PIPELINE_METRICS_CHANNEL_CAPACITY: usize = 1024;
 const PLAYBACK_MEDIA_COMMAND_CHANNEL_CAPACITY: usize = 32;
 const MEDIA_SENDER_DAVE_READY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -98,6 +104,46 @@ struct SourceBufferState {
     error: Option<PlaybackError>,
 }
 
+struct DiscordEgressBuffer {
+    queue: OpusFrameQueue,
+}
+
+impl DiscordEgressBuffer {
+    fn new() -> Self {
+        Self {
+            queue: OpusFrameQueue::with_resource_limits(
+                PLAYBACK_QUEUE_CAPACITY,
+                PLAYBACK_BUFFER_MEMORY_CAP_BYTES,
+                DISCORD_EGRESS_BUFFER_HIGH_WATERMARK_MS,
+            ),
+        }
+    }
+
+    fn push(&mut self, frame: OpusFrame) -> Result<(), OpusFrame> {
+        self.queue.push(frame)
+    }
+
+    fn push_front(&mut self, frame: OpusFrame) -> Result<(), OpusFrame> {
+        self.queue.push_front(frame)
+    }
+
+    fn pop(&mut self) -> Option<OpusFrame> {
+        self.queue.pop()
+    }
+
+    fn depth(&self) -> OpusBufferDepth {
+        self.queue.depth()
+    }
+
+    fn is_full(&self) -> bool {
+        self.queue.is_full()
+    }
+
+    fn buffered_duration_ms(&self) -> u64 {
+        self.queue.buffered_duration_ms()
+    }
+}
+
 struct PlaybackSendInput {
     video_id: String,
     playback_epoch: u64,
@@ -139,7 +185,9 @@ struct LiveMediaDriverExit {
 enum MediaCommand {
     Pause,
     Resume,
-    Stop,
+    Stop {
+        account_popped_frame_as_skipped: bool,
+    },
 }
 
 struct LiveMediaDriver {
@@ -149,7 +197,9 @@ struct LiveMediaDriver {
     source_buffer: Arc<SharedSourceBuffer>,
     command_rx: mpsc::Receiver<MediaCommand>,
     metrics_tx: mpsc::Sender<PlaybackPipelineMetric>,
+    egress_buffer: DiscordEgressBuffer,
     live_media_delay_for_tests: Option<LiveMediaDelayHook>,
+    account_popped_frame_as_skipped_on_stop: bool,
 }
 
 #[derive(Debug)]
@@ -166,19 +216,37 @@ struct SenderSentMetric {
     media_clock_reset: bool,
     tempo_rebased: bool,
     remaining_depth: OpusBufferDepth,
+    egress_depth: OpusBufferDepth,
 }
 
 #[derive(Debug)]
 enum PlaybackPipelineMetric {
     SourceProducer(ProducerMetricsSample),
     SourceDepth(OpusBufferDepth),
-    SenderStarted { source_depth: OpusBufferDepth },
+    SenderStarted {
+        source_depth: OpusBufferDepth,
+    },
+    EgressDepth(OpusBufferDepth),
     SenderSent(SenderSentMetric),
-    SenderSourceUnderrun { depth: OpusBufferDepth },
-    SenderResumedAfterSourceUnderrun { depth: OpusBufferDepth },
+    SenderEgressUnderrun {
+        depth: OpusBufferDepth,
+    },
+    SenderSkippedSourceFrames {
+        frame_count: u64,
+        duration_ms: u64,
+        remaining_depth: OpusBufferDepth,
+    },
+    SenderSourceUnderrun {
+        depth: OpusBufferDepth,
+    },
+    SenderResumedAfterSourceUnderrun {
+        depth: OpusBufferDepth,
+    },
     SenderResumedFromPause,
     SenderGatewayDrain(VoiceGatewayDrainReport),
-    SenderMediaClockReset { reason: MediaClockResetReason },
+    SenderMediaClockReset {
+        reason: MediaClockResetReason,
+    },
     SenderStaleDaveSendPrevented,
 }
 
@@ -598,6 +666,26 @@ impl VoiceSessionRuntime {
                 snapshot.track_media_to_wall_clock_ratio_ppm,
             track_fast_interval_count = snapshot.track_fast_interval_count,
             track_fast_interval_min_ms = snapshot.track_fast_interval_min_ms,
+            track_fast_interval_min_us = snapshot.track_fast_interval_min_us,
+            track_tempo_window_count = snapshot.track_tempo_window_count,
+            track_tempo_window_post_source_buffer_count =
+                snapshot.track_tempo_window_post_source_buffer_count,
+            track_tempo_window_min_ratio_ppm = snapshot.track_tempo_window_min_ratio_ppm,
+            track_tempo_window_max_ratio_ppm = snapshot.track_tempo_window_max_ratio_ppm,
+            track_tempo_window_fast_count = snapshot.track_tempo_window_fast_count,
+            track_tempo_window_fastest_ratio_ppm =
+                snapshot.track_tempo_window_fastest_ratio_ppm,
+            track_tempo_window_fastest_media_ms =
+                snapshot.track_tempo_window_fastest_media_ms,
+            track_tempo_window_fastest_wall_clock_us =
+                snapshot.track_tempo_window_fastest_wall_clock_us,
+            track_tempo_window_slow_count = snapshot.track_tempo_window_slow_count,
+            track_tempo_window_slowest_ratio_ppm =
+                snapshot.track_tempo_window_slowest_ratio_ppm,
+            track_tempo_window_slowest_media_ms =
+                snapshot.track_tempo_window_slowest_media_ms,
+            track_tempo_window_slowest_wall_clock_us =
+                snapshot.track_tempo_window_slowest_wall_clock_us,
             skipped_source_frame_count = snapshot.skipped_source_frame_count,
             skipped_source_duration_ms = snapshot.skipped_source_duration_ms,
             tempo_rebase_count = snapshot.tempo_rebase_count,
@@ -866,7 +954,9 @@ impl VoiceSessionRuntime {
         loop {
             if self.playback_interrupted(playback_epoch) {
                 source_buffer.changed.notify_waiters();
-                let _ = command_tx.try_send(MediaCommand::Stop);
+                let _ = command_tx.try_send(MediaCommand::Stop {
+                    account_popped_frame_as_skipped: true,
+                });
             }
 
             tokio::select! {
@@ -911,6 +1001,15 @@ impl VoiceSessionRuntime {
                                 PLAYBACK_SOURCE_BUFFER_LOW_WATERMARK_MS,
                             );
                         }
+                        PlaybackPipelineMetric::EgressDepth(depth) => {
+                            metrics.record_playout_buffer_depth(
+                                depth,
+                                DISCORD_EGRESS_BUFFER_LOW_WATERMARK_MS,
+                            );
+                        }
+                        PlaybackPipelineMetric::SenderEgressUnderrun { depth } => {
+                            metrics.record_playout_underrun(depth);
+                        }
                         PlaybackPipelineMetric::SenderSent(sent) => {
                             tracing::trace!(
                                 playback_epoch,
@@ -931,6 +1030,10 @@ impl VoiceSessionRuntime {
                             metrics.record_source_buffer_depth(
                                 sent.remaining_depth,
                                 PLAYBACK_SOURCE_BUFFER_LOW_WATERMARK_MS,
+                            );
+                            metrics.record_playout_buffer_depth(
+                                sent.egress_depth,
+                                DISCORD_EGRESS_BUFFER_LOW_WATERMARK_MS,
                             );
                             if sent.is_track {
                                 metrics.record_track_packet(
@@ -960,6 +1063,28 @@ impl VoiceSessionRuntime {
                                 );
                             }
 
+                            let mut state = self.state.write().await;
+                            if !self.playback_interrupted(playback_epoch) {
+                                state.queue_depth = latest_source_depth.packets;
+                                state.position_ms = position_ms;
+                            }
+                        }
+                        PlaybackPipelineMetric::SenderSkippedSourceFrames {
+                            frame_count,
+                            duration_ms,
+                            remaining_depth,
+                        } => {
+                            latest_source_depth = remaining_depth;
+                            metrics.record_skipped_source_frames(frame_count, duration_ms);
+                            metrics.record_source_buffer_depth(
+                                remaining_depth,
+                                PLAYBACK_SOURCE_BUFFER_LOW_WATERMARK_MS,
+                            );
+                            shared_position
+                                .lock()
+                                .unwrap()
+                                .record_sent_packet(duration_ms);
+                            position_ms = position_ms.saturating_add(duration_ms);
                             let mut state = self.state.write().await;
                             if !self.playback_interrupted(playback_epoch) {
                                 state.queue_depth = latest_source_depth.packets;
@@ -1039,7 +1164,11 @@ impl VoiceSessionRuntime {
         self.clear_media_commands_if_current(&command_tx).await;
 
         if !driver_done {
-            let _ = command_tx.send(MediaCommand::Stop).await;
+            let _ = command_tx
+                .send(MediaCommand::Stop {
+                    account_popped_frame_as_skipped: true,
+                })
+                .await;
             match driver_result_rx.await {
                 Ok(exit) => {
                     ended_naturally = ended_naturally || exit.ended_naturally;
@@ -1188,11 +1317,24 @@ impl VoiceSessionRuntime {
         }
         let media_owner_was_active = self.media_owner_is_active().await;
         let voice_transport_generation = self.voice_transport_generation.load(Ordering::SeqCst);
+        if media_owner_was_active {
+            self.send_media_command(MediaCommand::Stop {
+                account_popped_frame_as_skipped: false,
+            })
+            .await;
+            self.wait_for_media_owner_session(voice_transport_generation)
+                .await?;
+        }
         self.invalidate_playback();
         self.defer_playback_reset();
-        self.send_media_command(MediaCommand::Stop).await;
-        self.wait_for_media_owner_session(voice_transport_generation)
-            .await?;
+        if !media_owner_was_active {
+            self.send_media_command(MediaCommand::Stop {
+                account_popped_frame_as_skipped: true,
+            })
+            .await;
+            self.wait_for_media_owner_session(voice_transport_generation)
+                .await?;
+        }
         let mut voice = self.voice.lock().await;
         if let Some(session) = voice.as_mut()
             && session.is_connected()
@@ -1224,7 +1366,10 @@ impl VoiceSessionRuntime {
         let media_owner_return_count = self.media_owner_return_count();
         self.voice_transport_generation
             .fetch_add(1, Ordering::SeqCst);
-        self.send_media_command(MediaCommand::Stop).await;
+        self.send_media_command(MediaCommand::Stop {
+            account_popped_frame_as_skipped: true,
+        })
+        .await;
         if media_owner_was_active {
             self.wait_for_media_owner_stopped_after(media_owner_return_count)
                 .await?;
@@ -1252,10 +1397,13 @@ impl VoiceSessionRuntime {
         }
         if self.media_owner_is_active().await {
             let voice_transport_generation = self.voice_transport_generation.load(Ordering::SeqCst);
-            self.invalidate_playback();
-            self.send_media_command(MediaCommand::Stop).await;
+            self.send_media_command(MediaCommand::Stop {
+                account_popped_frame_as_skipped: false,
+            })
+            .await;
             self.wait_for_media_owner_session(voice_transport_generation)
                 .await?;
+            self.invalidate_playback();
         }
         if self.current_voice_context_matches(&new_voice).await {
             return self
@@ -1265,7 +1413,10 @@ impl VoiceSessionRuntime {
         self.voice_transport_generation
             .fetch_add(1, Ordering::SeqCst);
         self.invalidate_playback();
-        self.send_media_command(MediaCommand::Stop).await;
+        self.send_media_command(MediaCommand::Stop {
+            account_popped_frame_as_skipped: false,
+        })
+        .await;
         self.clear_media_commands().await;
         let resume_playback_epoch = self.playback_epoch.load(Ordering::SeqCst);
 
@@ -1412,7 +1563,10 @@ impl VoiceSessionRuntime {
     ) -> Result<(), RuntimeError> {
         self.invalidate_playback();
         let resume_playback_epoch = self.playback_epoch.load(Ordering::SeqCst);
-        self.send_media_command(MediaCommand::Stop).await;
+        self.send_media_command(MediaCommand::Stop {
+            account_popped_frame_as_skipped: false,
+        })
+        .await;
 
         let reconnecting_event = {
             let mut state = self.state.write().await;
@@ -1588,7 +1742,10 @@ impl VoiceSessionRuntime {
     }
 
     async fn quiesce_current_transport(&self) {
-        self.send_media_command(MediaCommand::Stop).await;
+        self.send_media_command(MediaCommand::Stop {
+            account_popped_frame_as_skipped: true,
+        })
+        .await;
         let mut voice = self.voice.lock().await;
         if let Some(session) = voice.as_mut()
             && session.is_connected()
@@ -1779,7 +1936,9 @@ impl From<LiveMediaDriverInput> for LiveMediaDriver {
             source_buffer: input.source_buffer,
             command_rx: input.command_rx,
             metrics_tx: input.metrics_tx,
+            egress_buffer: DiscordEgressBuffer::new(),
             live_media_delay_for_tests: input.live_media_delay_for_tests,
+            account_popped_frame_as_skipped_on_stop: false,
         }
     }
 }
@@ -1804,14 +1963,21 @@ impl LiveMediaDriver {
         let mut pacer = AudioPacer::starting_after(FRAME_DURATION);
         let mut packet_index = 0u64;
         let mut paused = false;
+        let mut source_ended = false;
         let mut source_underrun_active = false;
         let source_depth = current_source_depth(&self.source_buffer).await?;
         let _ = self
             .metrics_tx
             .try_send(PlaybackPipelineMetric::SenderStarted { source_depth });
+        let _ = self
+            .metrics_tx
+            .try_send(PlaybackPipelineMetric::EgressDepth(
+                self.egress_buffer.depth(),
+            ));
 
-        loop {
+        'egress: loop {
             if !self.playback_is_current() {
+                self.flush_egress_buffer_for_interruption().await;
                 return Ok(false);
             }
             if let Some(ended) = self.drain_commands(&mut paused, &mut pacer).await {
@@ -1824,7 +1990,7 @@ impl LiveMediaDriver {
                 continue;
             }
 
-            let expected_deadline = pacer.next_deadline();
+            let mut expected_deadline = pacer.next_deadline();
             let non_send_work_started_at = Instant::now();
             let gateway_drain = match self
                 .session
@@ -1854,61 +2020,84 @@ impl LiveMediaDriver {
                 }
                 Err(err) => return Err(RuntimeError::from(err)),
             };
-            let source_poll =
-                pop_live_source_frame(&self.source_buffer, self.playback_epoch, &self.metrics_tx)
-                    .await?;
-            let Some((frame, remaining_depth)) = source_poll.frame else {
-                if source_poll.ended {
-                    return Ok(true);
-                }
-                if !source_underrun_active {
-                    source_underrun_active = true;
+
+            let latest_source_depth = self
+                .refill_egress_buffer(&mut source_ended, &mut source_underrun_active)
+                .await?;
+            let mut selected_frame = self.egress_buffer.pop();
+            let egress_depth_after_pop = self.egress_buffer.depth();
+            let _ = self
+                .metrics_tx
+                .try_send(PlaybackPipelineMetric::EgressDepth(egress_depth_after_pop));
+
+            let (is_track, frame_data, frame_duration_ms, duration_samples) =
+                if let Some(frame) = selected_frame.as_ref() {
+                    (
+                        true,
+                        frame.data.clone(),
+                        frame.duration_ms,
+                        frame.duration_samples,
+                    )
+                } else {
+                    if source_ended {
+                        return Ok(true);
+                    }
                     let _ =
                         self.metrics_tx
-                            .try_send(PlaybackPipelineMetric::SenderSourceUnderrun {
-                                depth: source_poll.depth,
+                            .try_send(PlaybackPipelineMetric::SenderEgressUnderrun {
+                                depth: egress_depth_after_pop,
                             });
-                }
-                if let Some(ended) = self
-                    .wait_for_source_or_control(
-                        &mut paused,
-                        &mut pacer,
-                        &mut source_underrun_active,
-                    )
-                    .await?
-                {
-                    return Ok(ended);
-                }
-                continue;
-            };
+                    if !source_underrun_active {
+                        source_underrun_active = true;
+                        let _ = self.metrics_tx.try_send(
+                            PlaybackPipelineMetric::SenderSourceUnderrun {
+                                depth: latest_source_depth,
+                            },
+                        );
+                    }
+                    (false, Bytes::from_static(&SILENCE_FRAME), 20, 960)
+                };
 
-            if source_underrun_active {
-                source_underrun_active = false;
-                pacer.reset_deadline();
-                let _ = self
-                    .metrics_tx
-                    .try_send(PlaybackPipelineMetric::SenderMediaClockReset {
-                        reason: MediaClockResetReason::SourceUnderrun,
-                    });
-                let _ = self.metrics_tx.try_send(
-                    PlaybackPipelineMetric::SenderResumedAfterSourceUnderrun {
-                        depth: remaining_depth,
-                    },
-                );
-                continue;
-            }
-
-            let frame_duration = frame_duration_from_samples(frame.duration_samples);
+            let frame_duration = frame_duration_from_samples(duration_samples);
             self.session.prepare_speaking_before_media().await?;
             let packet = self
                 .session
-                .prepare_current_slot_audio_packet(frame.data, frame.duration_samples)?;
+                .prepare_current_slot_audio_packet(frame_data, duration_samples)?;
             let non_send_work_duration = non_send_work_started_at.elapsed();
 
-            pacer.wait_until_ready().await;
+            loop {
+                pacer.wait_until_ready().await;
 
-            if !self.playback_is_current() {
-                return Ok(false);
+                if !self.playback_is_current() {
+                    if let Some(frame) = selected_frame.take() {
+                        self.account_unsent_egress_frame(frame, latest_source_depth)
+                            .await;
+                    }
+                    self.flush_egress_buffer_for_interruption().await;
+                    return Ok(false);
+                }
+                if let Some(ended) = self.drain_commands(&mut paused, &mut pacer).await {
+                    if let Some(frame) = selected_frame.take() {
+                        self.account_unsent_egress_frame(frame, latest_source_depth)
+                            .await;
+                    }
+                    return Ok(ended);
+                }
+                let current_deadline = pacer.next_deadline();
+                if current_deadline != expected_deadline {
+                    expected_deadline = current_deadline;
+                }
+                if paused {
+                    if let Some(frame) = selected_frame.take() {
+                        self.account_unsent_egress_frame(frame, latest_source_depth)
+                            .await;
+                    }
+                    if let Some(ended) = self.wait_while_paused(&mut paused, &mut pacer).await {
+                        return Ok(ended);
+                    }
+                    continue 'egress;
+                }
+                break;
             }
             if let Some(delay) = self
                 .live_media_delay_for_tests
@@ -1922,18 +2111,22 @@ impl LiveMediaDriver {
             let sent_at = Instant::now();
             let send_duration = sent_at.saturating_duration_since(send_started_at);
             let pacer_mark = pacer.mark_sent(
-                PacedPacketKind::Track,
+                if is_track {
+                    PacedPacketKind::Track
+                } else {
+                    PacedPacketKind::NonTrack
+                },
                 expected_deadline,
                 frame_duration,
-                sent_at,
+                send_started_at,
             );
 
             let _ =
                 self.metrics_tx
                     .try_send(PlaybackPipelineMetric::SenderSent(SenderSentMetric {
                         packet_index,
-                        duration_ms: frame.duration_ms,
-                        is_track: true,
+                        duration_ms: frame_duration_ms,
+                        is_track,
                         expected_deadline,
                         send_started_at,
                         sent_at,
@@ -1942,7 +2135,8 @@ impl LiveMediaDriver {
                         gateway_drain,
                         media_clock_reset: pacer_mark.media_clock_reset,
                         tempo_rebased: pacer_mark.tempo_rebased,
-                        remaining_depth,
+                        remaining_depth: latest_source_depth,
+                        egress_depth: self.egress_buffer.depth(),
                     }));
             packet_index = packet_index.saturating_add(1);
         }
@@ -1959,6 +2153,113 @@ impl LiveMediaDriver {
             }
         }
         None
+    }
+
+    async fn account_unsent_egress_frame(
+        &mut self,
+        frame: OpusFrame,
+        remaining_source_depth: OpusBufferDepth,
+    ) {
+        if self.account_popped_frame_as_skipped_on_stop {
+            let _ = self
+                .metrics_tx
+                .try_send(PlaybackPipelineMetric::SenderSkippedSourceFrames {
+                    frame_count: 1,
+                    duration_ms: frame.duration_ms,
+                    remaining_depth: remaining_source_depth,
+                });
+            return;
+        }
+
+        if let Err(frame) = self.egress_buffer.push_front(frame) {
+            if let Err(frame) =
+                restore_live_source_frame(&self.source_buffer, frame, &self.metrics_tx).await
+            {
+                let _ =
+                    self.metrics_tx
+                        .try_send(PlaybackPipelineMetric::SenderSkippedSourceFrames {
+                            frame_count: 1,
+                            duration_ms: frame.duration_ms,
+                            remaining_depth: remaining_source_depth,
+                        });
+            }
+        }
+        let _ = self
+            .metrics_tx
+            .try_send(PlaybackPipelineMetric::EgressDepth(
+                self.egress_buffer.depth(),
+            ));
+    }
+
+    async fn flush_egress_buffer_for_interruption(&mut self) {
+        let frames = self.drain_egress_frames();
+        if frames.is_empty() {
+            let _ = self
+                .metrics_tx
+                .try_send(PlaybackPipelineMetric::EgressDepth(
+                    self.egress_buffer.depth(),
+                ));
+            return;
+        }
+
+        if self.account_popped_frame_as_skipped_on_stop {
+            let duration_ms = frames
+                .iter()
+                .fold(0u64, |total, frame| total.saturating_add(frame.duration_ms));
+            let remaining_depth = current_source_depth(&self.source_buffer)
+                .await
+                .unwrap_or_default();
+            let _ = self
+                .metrics_tx
+                .try_send(PlaybackPipelineMetric::SenderSkippedSourceFrames {
+                    frame_count: u64::try_from(frames.len()).unwrap_or(u64::MAX),
+                    duration_ms,
+                    remaining_depth,
+                });
+            let _ = self
+                .metrics_tx
+                .try_send(PlaybackPipelineMetric::EgressDepth(
+                    self.egress_buffer.depth(),
+                ));
+            return;
+        }
+
+        let mut skipped_count = 0u64;
+        let mut skipped_duration_ms = 0u64;
+        let mut remaining_depth = current_source_depth(&self.source_buffer)
+            .await
+            .unwrap_or_default();
+        for frame in frames.into_iter().rev() {
+            match restore_live_source_frame(&self.source_buffer, frame, &self.metrics_tx).await {
+                Ok(depth) => remaining_depth = depth,
+                Err(frame) => {
+                    skipped_count = skipped_count.saturating_add(1);
+                    skipped_duration_ms = skipped_duration_ms.saturating_add(frame.duration_ms);
+                }
+            }
+        }
+        if skipped_count > 0 {
+            let _ = self
+                .metrics_tx
+                .try_send(PlaybackPipelineMetric::SenderSkippedSourceFrames {
+                    frame_count: skipped_count,
+                    duration_ms: skipped_duration_ms,
+                    remaining_depth,
+                });
+        }
+        let _ = self
+            .metrics_tx
+            .try_send(PlaybackPipelineMetric::EgressDepth(
+                self.egress_buffer.depth(),
+            ));
+    }
+
+    fn drain_egress_frames(&mut self) -> Vec<OpusFrame> {
+        let mut frames = Vec::new();
+        while let Some(frame) = self.egress_buffer.pop() {
+            frames.push(frame);
+        }
+        frames
     }
 
     async fn wait_while_paused(
@@ -1985,56 +2286,62 @@ impl LiveMediaDriver {
         None
     }
 
-    async fn wait_for_source_or_control(
+    async fn refill_egress_buffer(
         &mut self,
-        paused: &mut bool,
-        pacer: &mut AudioPacer,
+        source_ended: &mut bool,
         source_underrun_active: &mut bool,
-    ) -> Result<Option<bool>, RuntimeError> {
-        loop {
-            if !self.playback_is_current() {
-                return Ok(Some(false));
-            }
-            if let Some(ended) = self.drain_commands(paused, pacer).await {
-                return Ok(Some(ended));
-            }
-            if *paused {
-                if let Some(ended) = self.wait_while_paused(paused, pacer).await {
-                    return Ok(Some(ended));
+    ) -> Result<OpusBufferDepth, RuntimeError> {
+        let mut latest_source_depth = current_source_depth(&self.source_buffer).await?;
+
+        while !*source_ended
+            && self.egress_buffer.buffered_duration_ms() < DISCORD_EGRESS_BUFFER_TARGET_MS
+            && !self.egress_buffer.is_full()
+        {
+            let source_poll =
+                pop_live_source_frame(&self.source_buffer, self.playback_epoch, &self.metrics_tx)
+                    .await?;
+            latest_source_depth = source_poll.depth;
+            let Some((frame, remaining_depth)) = source_poll.frame else {
+                if source_poll.ended {
+                    *source_ended = true;
                 }
-                continue;
+                break;
+            };
+
+            if *source_underrun_active {
+                *source_underrun_active = false;
+                let _ = self.metrics_tx.try_send(
+                    PlaybackPipelineMetric::SenderResumedAfterSourceUnderrun {
+                        depth: remaining_depth,
+                    },
+                );
             }
 
-            let depth = current_source_depth(&self.source_buffer).await?;
-            if depth.packets > 0 {
-                if *source_underrun_active {
-                    *source_underrun_active = false;
-                    pacer.reset_deadline();
-                    let _ =
-                        self.metrics_tx
-                            .try_send(PlaybackPipelineMetric::SenderMediaClockReset {
-                                reason: MediaClockResetReason::SourceUnderrun,
-                            });
-                    let _ = self.metrics_tx.try_send(
-                        PlaybackPipelineMetric::SenderResumedAfterSourceUnderrun { depth },
-                    );
-                }
-                return Ok(None);
-            }
-
-            tokio::select! {
-                () = self.source_buffer.changed.notified() => {}
-                command = self.command_rx.recv() => {
-                    let Some(command) = command else {
-                        return Ok(Some(false));
-                    };
-                    if self.apply_command(command, paused, pacer).await {
-                        return Ok(Some(false));
+            if let Err(frame) = self.egress_buffer.push(frame) {
+                match restore_live_source_frame(&self.source_buffer, frame, &self.metrics_tx).await
+                {
+                    Ok(depth) => latest_source_depth = depth,
+                    Err(frame) => {
+                        let _ = self.metrics_tx.try_send(
+                            PlaybackPipelineMetric::SenderSkippedSourceFrames {
+                                frame_count: 1,
+                                duration_ms: frame.duration_ms,
+                                remaining_depth,
+                            },
+                        );
                     }
                 }
-                _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+                break;
             }
+            latest_source_depth = remaining_depth;
         }
+
+        let _ = self
+            .metrics_tx
+            .try_send(PlaybackPipelineMetric::EgressDepth(
+                self.egress_buffer.depth(),
+            ));
+        Ok(latest_source_depth)
     }
 
     async fn apply_command(
@@ -2069,7 +2376,13 @@ impl LiveMediaDriver {
                 }
                 false
             }
-            MediaCommand::Stop => true,
+            MediaCommand::Stop {
+                account_popped_frame_as_skipped,
+            } => {
+                self.account_popped_frame_as_skipped_on_stop = account_popped_frame_as_skipped;
+                self.flush_egress_buffer_for_interruption().await;
+                true
+            }
         }
     }
 }
@@ -2107,6 +2420,21 @@ async fn pop_live_source_frame(
         depth,
         ended,
     })
+}
+
+async fn restore_live_source_frame(
+    source_buffer: &Arc<SharedSourceBuffer>,
+    frame: OpusFrame,
+    metrics_tx: &mpsc::Sender<PlaybackPipelineMetric>,
+) -> Result<OpusBufferDepth, OpusFrame> {
+    let depth = {
+        let mut source_state = source_buffer.state.lock().await;
+        source_state.queue.push_front(frame)?;
+        source_state.queue.depth()
+    };
+    source_buffer.changed.notify_waiters();
+    let _ = metrics_tx.try_send(PlaybackPipelineMetric::SourceDepth(depth));
+    Ok(depth)
 }
 
 async fn current_source_depth(
@@ -2218,7 +2546,7 @@ mod tests {
     fn live_driver_prepares_current_packet_before_send_boundary() {
         let source = include_str!("runtime.rs");
         assert!(
-            !source.contains(".send_audio_frame_with_duration_samples(frame.data"),
+            !source.contains(&[".send_audio_frame", "_with_duration_samples(frame.data"].concat()),
             "live driver must not call the combined voice send path after the RTP boundary"
         );
 
@@ -2226,7 +2554,7 @@ mod tests {
             .find("prepare_media_state_before_slot(expected_deadline)")
             .expect("live loop should prepare media state before the slot");
         let prepare_packet = source
-            .find("prepare_current_slot_audio_packet(frame.data")
+            .find("prepare_current_slot_audio_packet(frame_data")
             .expect("live loop should prepare one current-slot packet");
         let wait_boundary = source
             .find("pacer.wait_until_ready().await")
@@ -2238,6 +2566,74 @@ mod tests {
         assert!(prepare_state < wait_boundary);
         assert!(prepare_packet < wait_boundary);
         assert!(wait_boundary < hot_send);
+    }
+
+    #[test]
+    fn egress_refill_resumes_source_underrun_before_buffering_frame() {
+        let source = include_str!("runtime.rs");
+        let refill = source
+            .find("async fn refill_egress_buffer")
+            .expect("live driver should refill a Discord egress buffer");
+        let refill_body = &source[refill..];
+        let resumed = refill_body
+            .find("if *source_underrun_active")
+            .expect("refill should report source underrun recovery");
+        let push = refill_body
+            .find("self.egress_buffer.push(frame)")
+            .expect("refill should move raw source frames into egress");
+
+        assert!(
+            resumed < push,
+            "source underrun recovery should be reported before the resumed frame enters egress"
+        );
+        assert!(
+            !source.contains(&["async fn ", "wait_for_source_or_control"].concat()),
+            "egress underrun should be handled by the clocked egress loop, not a source-blocking sender loop"
+        );
+    }
+
+    #[test]
+    fn discord_egress_buffer_is_bounded_raw_opus_fifo() {
+        let mut buffer = DiscordEgressBuffer::new();
+
+        for index in 0..25u8 {
+            buffer
+                .push(
+                    OpusFrame::with_duration_samples(Bytes::from(vec![index]), 20, 960)
+                        .with_metadata(u64::from(index) * 20, Some(u64::from(index)), 11),
+                )
+                .expect("500ms egress buffer should accept twenty-five 20ms frames");
+        }
+
+        let depth = buffer.depth();
+        assert_eq!(DISCORD_EGRESS_BUFFER_TARGET_MS, 400);
+        assert_eq!(DISCORD_EGRESS_BUFFER_HIGH_WATERMARK_MS, 500);
+        assert_eq!(DISCORD_EGRESS_BUFFER_LOW_WATERMARK_MS, 200);
+        assert_eq!(depth.duration_ms, DISCORD_EGRESS_BUFFER_HIGH_WATERMARK_MS);
+        assert_eq!(depth.duration_samples, 24_000);
+        assert!(
+            buffer
+                .push(OpusFrame::with_duration_samples(
+                    Bytes::from_static(b"overflow"),
+                    20,
+                    960
+                ))
+                .is_err(),
+            "egress overflow must backpressure instead of silently dropping frames"
+        );
+
+        let first = buffer.pop().expect("egress should preserve FIFO order");
+        assert_eq!(first.data.as_ref(), &[0]);
+        assert_eq!(first.duration_samples, 960);
+        assert_eq!(first.source_position_ms, 0);
+        assert_eq!(first.source_byte_position, Some(0));
+        assert_eq!(first.epoch, 11);
+
+        let second = buffer.pop().expect("egress should preserve frame metadata");
+        assert_eq!(second.data.as_ref(), &[1]);
+        assert_eq!(second.source_position_ms, 20);
+        assert_eq!(second.source_byte_position, Some(1));
+        assert_eq!(second.epoch, 11);
     }
 
     #[tokio::test]
@@ -2259,8 +2655,21 @@ mod tests {
         let (frame, remaining_depth) = poll.frame.expect("source buffer should provide raw frame");
         assert_eq!(frame.duration_ms, 20);
         assert_eq!(frame.duration_samples, 960);
+        assert_eq!(frame.source_position_ms, 0);
+        assert_eq!(frame.epoch, 7);
         assert_eq!(frame.data.len(), 8);
         assert_eq!(remaining_depth.duration_ms, 4_980);
+
+        let poll = pop_live_source_frame(&source_buffer, 7, &metrics_tx)
+            .await
+            .expect("live source pop should preserve following raw frame");
+        let (frame, remaining_depth) = poll.frame.expect("source buffer should provide raw frame");
+        assert_eq!(frame.duration_ms, 20);
+        assert_eq!(frame.duration_samples, 960);
+        assert_eq!(frame.source_position_ms, 20);
+        assert_eq!(frame.epoch, 7);
+        assert_eq!(frame.data.len(), 8);
+        assert_eq!(remaining_depth.duration_ms, 4_960);
     }
 
     #[tokio::test]
@@ -2316,6 +2725,8 @@ mod tests {
         );
         assert_eq!(metrics.current_source_buffer_depth.duration_ms, 5_000);
         assert_eq!(metrics.max_source_buffer_depth.duration_samples, 240_000);
+        assert_eq!(metrics.egress_buffer_target_ms, 400);
+        assert_eq!(metrics.current_egress_buffer_depth.duration_ms, 0);
         assert_eq!(metrics.current_playout_buffer_depth.duration_ms, 0);
         assert_eq!(metrics.max_playout_buffer_depth.duration_ms, 0);
     }
@@ -2360,11 +2771,10 @@ mod tests {
         );
         for index in 0..count {
             queue
-                .push(OpusFrame::with_duration_samples(
-                    vec![index as u8; 8].into(),
-                    20,
-                    960,
-                ))
+                .push(
+                    OpusFrame::with_duration_samples(vec![index as u8; 8].into(), 20, 960)
+                        .with_metadata(index as u64 * 20, None, 0),
+                )
                 .expect("test source buffer should accept frame");
         }
         Arc::new(SharedSourceBuffer::new(queue, end_of_stream))

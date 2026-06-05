@@ -391,7 +391,7 @@ impl ConnectedVoiceSession {
     ) -> Result<(), VoiceError> {
         let transport = self
             .transport
-            .as_ref()
+            .as_mut()
             .ok_or(VoiceError::InvalidState("voice transport unavailable"))?;
         transport.send_prepared_packet(&packet).await?;
         self.speaking_started = true;
