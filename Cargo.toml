@@ -58,4 +58,4 @@ openmls = "0.8.1"
 openmls_basic_credential = "0.5.0"
 openmls_rust_crypto = "0.5.1"
 opus-rs = "=0.1.17"
-ytmusic-service-client = { git = "https://github.com/ghfhffh12345/ytmusic-service", tag = "v0.2.0" }
+ytmusic-service-client = { git = "https://github.com/ghfhffh12345/ytmusic-service", tag = "v0.2.1" }
