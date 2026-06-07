@@ -8,7 +8,8 @@ use discord_voice_service_voice::VoiceError;
 use discord_voice_service_voice::crypto::{EncryptionMode, PREFERRED_MODE, REQUIRED_MODE};
 use discord_voice_service_voice::dave::{DaveExternalSender, DaveMediaType, DaveSession};
 use discord_voice_service_voice::test_support::{
-    OPUS_SILENCE_FRAME, ProtectionContext, RtpPacketBuilder, split_dave_mls_commit_welcome_payload,
+    OPUS_SILENCE_FRAME, ProtectionContext, RtpPacketBuilder, parse_rtp_header,
+    split_dave_mls_commit_welcome_payload,
 };
 use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
@@ -54,6 +55,13 @@ enum PreSessionDescriptionEvent {
     ClientDisconnect(String),
     Speaking { user_id: String, ssrc: u32 },
     HeartbeatAck(Option<u64>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObservedAudioPacket {
+    pub sequence: u16,
+    pub timestamp: u32,
+    pub is_stop_silence: bool,
 }
 
 enum FakeDiscordControl {
@@ -123,6 +131,7 @@ pub struct FakeDiscordPeer {
     discovery_count: Arc<Mutex<usize>>,
     speaking_observed: Arc<Notify>,
     speaking_states: Arc<Mutex<Vec<u64>>>,
+    speaking_state_times: Arc<Mutex<Vec<(u64, Instant)>>>,
     audio_frame_count: Arc<Mutex<usize>>,
     audio_frame_times: Arc<Mutex<Vec<Instant>>>,
     non_silence_audio_frame_count: Arc<Mutex<usize>>,
@@ -473,6 +482,7 @@ impl FakeDiscordPeer {
         let discovery_count = Arc::new(Mutex::new(0usize));
         let speaking_observed = Arc::new(Notify::new());
         let speaking_states = Arc::new(Mutex::new(Vec::new()));
+        let speaking_state_times = Arc::new(Mutex::new(Vec::new()));
         let audio_frame_count = Arc::new(Mutex::new(0usize));
         let audio_frame_times = Arc::new(Mutex::new(Vec::new()));
         let non_silence_audio_frame_count = Arc::new(Mutex::new(0usize));
@@ -559,6 +569,7 @@ impl FakeDiscordPeer {
         let gateway_path_state = Arc::clone(&gateway_path);
         let speaking_observed_state = Arc::clone(&speaking_observed);
         let speaking_states_state = Arc::clone(&speaking_states);
+        let speaking_state_times_state = Arc::clone(&speaking_state_times);
         let heartbeat_count_state = Arc::clone(&heartbeat_count);
         let saw_identify_state = Arc::clone(&saw_identify);
         let saw_resume_state = Arc::clone(&saw_resume);
@@ -737,7 +748,12 @@ impl FakeDiscordPeer {
                                     .and_then(|data| data.get("speaking"))
                                     .and_then(Value::as_u64)
                                 {
+                                    let observed_at = Instant::now();
                                     speaking_states_state.lock().await.push(speaking);
+                                    speaking_state_times_state
+                                        .lock()
+                                        .await
+                                        .push((speaking, observed_at));
                                 }
                                 speaking_observed_state.notify_one();
                             }
@@ -1717,7 +1733,12 @@ impl FakeDiscordPeer {
                                 .and_then(|data| data.get("speaking"))
                                 .and_then(Value::as_u64)
                             {
+                                let observed_at = Instant::now();
                                 speaking_states_state.lock().await.push(speaking);
+                                speaking_state_times_state
+                                    .lock()
+                                    .await
+                                    .push((speaking, observed_at));
                             }
                             speaking_observed_state.notify_one();
                         }
@@ -2204,6 +2225,7 @@ impl FakeDiscordPeer {
             discovery_count,
             speaking_observed,
             speaking_states,
+            speaking_state_times,
             audio_frame_count,
             audio_frame_times,
             non_silence_audio_frame_count,
@@ -2650,6 +2672,24 @@ impl FakeDiscordPeer {
             .count()
     }
 
+    pub async fn speaking_state_times_at_least(
+        &self,
+        speaking: u64,
+        minimum: usize,
+    ) -> Vec<Instant> {
+        wait_for_value(&self.speaking_state_times, |states| {
+            states
+                .iter()
+                .filter(|(state, _observed_at)| *state == speaking)
+                .count()
+                >= minimum
+        })
+        .await
+        .into_iter()
+        .filter_map(|(state, observed_at)| (state == speaking).then_some(observed_at))
+        .collect()
+    }
+
     pub async fn audio_frame_count_at_least(&self, minimum: usize) -> usize {
         wait_for_value(&self.audio_frame_count, |count| *count >= minimum).await
     }
@@ -2660,6 +2700,37 @@ impl FakeDiscordPeer {
 
     pub async fn audio_packets_at_least(&self, minimum: usize) -> Vec<Vec<u8>> {
         wait_for_value(&self.audio_packets, |packets| packets.len() >= minimum).await
+    }
+
+    pub async fn observed_audio_packets(&self) -> Vec<ObservedAudioPacket> {
+        let packets = self.audio_packets.lock().await.clone();
+        self.describe_audio_packets(&packets)
+    }
+
+    pub async fn observed_audio_packets_at_least(
+        &self,
+        minimum: usize,
+    ) -> Vec<ObservedAudioPacket> {
+        let packets = wait_for_value(&self.audio_packets, |packets| packets.len() >= minimum).await;
+        self.describe_audio_packets(&packets)
+    }
+
+    fn describe_audio_packets(&self, packets: &[Vec<u8>]) -> Vec<ObservedAudioPacket> {
+        packets
+            .iter()
+            .map(|packet| {
+                let header = parse_rtp_header(packet).expect("fake captured valid RTP packet");
+                ObservedAudioPacket {
+                    sequence: header.sequence,
+                    timestamp: header.timestamp,
+                    is_stop_silence: is_stop_silence_packet(
+                        packet,
+                        &self.encryption_mode,
+                        &self.secret_key,
+                    ),
+                }
+            })
+            .collect()
     }
 
     pub async fn audio_frame_times_at_least(&self, minimum: usize) -> Vec<Instant> {

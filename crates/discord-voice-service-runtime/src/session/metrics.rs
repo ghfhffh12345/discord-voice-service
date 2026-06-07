@@ -78,6 +78,131 @@ impl From<OpusBufferDepth> for PlaybackBufferDepthSnapshot {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PlaybackQueueDepthStatsSnapshot {
+    pub sample_count: usize,
+    pub empty_count: u64,
+    pub current_depth: PlaybackBufferDepthSnapshot,
+    pub min_depth: PlaybackBufferDepthSnapshot,
+    pub p5_depth: PlaybackBufferDepthSnapshot,
+    pub p50_depth: PlaybackBufferDepthSnapshot,
+    pub p95_depth: PlaybackBufferDepthSnapshot,
+    pub max_depth: PlaybackBufferDepthSnapshot,
+}
+
+impl PlaybackQueueDepthStatsSnapshot {
+    fn from_samples(samples: &[PlaybackBufferDepthSnapshot], empty_count: u64) -> Self {
+        if samples.is_empty() {
+            return Self::default();
+        }
+
+        let mut sorted = samples.to_vec();
+        sorted.sort_unstable_by_key(|depth| depth.duration_ms);
+        Self {
+            sample_count: samples.len(),
+            empty_count,
+            current_depth: samples[samples.len() - 1],
+            min_depth: sorted[0],
+            p5_depth: percentile_depth(&sorted, 5),
+            p50_depth: percentile_depth(&sorted, 50),
+            p95_depth: percentile_depth(&sorted, 95),
+            max_depth: sorted[sorted.len() - 1],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaybackSendCommandKind {
+    Track,
+    ScheduledSilence,
+    BoundarySilence,
+    OtherBoundary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreparedTrackQueueSamplePhase {
+    ActivePrePause,
+    ActivePostResume,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlaybackSendEventSnapshot {
+    pub packet_index: u64,
+    pub command_kind: PlaybackSendCommandKind,
+    pub expected_deadline_offset_us: u64,
+    pub send_started_offset_us: u64,
+    pub sent_offset_us: u64,
+    pub media_duration_ms: u64,
+    pub media_duration_samples: u32,
+    pub rtp_sequence: u16,
+    pub rtp_timestamp: u32,
+    pub protection_nonce: Option<u32>,
+    pub source_frame_epoch: Option<u64>,
+    pub source_media_position_ms: Option<u64>,
+    pub source_media_byte_position: Option<u64>,
+    pub committed_heard_media: bool,
+}
+
+impl Default for PlaybackSendCommandKind {
+    fn default() -> Self {
+        Self::OtherBoundary
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PreparedTrackQueueDepthSampleSnapshot {
+    pub sample_index: u64,
+    pub phase: PreparedTrackQueueSamplePhase,
+    pub depth: PlaybackBufferDepthSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PreparedPlayoutQueueEventKind {
+    #[default]
+    Unknown,
+    Enqueued,
+    DequeuedToDeadlineSender,
+    DroppedBeforeSend,
+    Rebuilt,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PreparedPlayoutQueueEventReason {
+    #[default]
+    Unspecified,
+    SteadyPlayback,
+    Pause,
+    Stop,
+    DaveTransitionRecovery,
+    Reconnect,
+    SourceUnderrun,
+    NaturalEnd,
+    Interruption,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedPlayoutQueueEventSnapshot {
+    pub event_index: u64,
+    pub event_kind: PreparedPlayoutQueueEventKind,
+    pub reason: PreparedPlayoutQueueEventReason,
+    pub command_kind: PlaybackSendCommandKind,
+    pub media_duration_ms: u64,
+    pub media_duration_samples: u32,
+    pub rtp_sequence: u32,
+    pub rtp_timestamp: u32,
+    pub protection_nonce: Option<u32>,
+    pub source_frame_epoch: Option<u64>,
+    pub source_media_position_ms: Option<u64>,
+    pub source_media_byte_position: Option<u64>,
+    pub queue_depth_after: PlaybackBufferDepthSnapshot,
+}
+
+impl Default for PreparedTrackQueueSamplePhase {
+    fn default() -> Self {
+        Self::ActivePrePause
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlaybackStabilitySnapshot {
     pub playback_epoch: u64,
@@ -118,6 +243,7 @@ pub struct PlaybackStabilitySnapshot {
     pub current_source_buffer_depth: PlaybackBufferDepthSnapshot,
     pub min_source_buffer_depth: PlaybackBufferDepthSnapshot,
     pub max_source_buffer_depth: PlaybackBufferDepthSnapshot,
+    pub source_buffer_depth: PlaybackQueueDepthStatsSnapshot,
     pub current_playout_buffer_depth: PlaybackBufferDepthSnapshot,
     pub min_playout_buffer_depth: PlaybackBufferDepthSnapshot,
     pub max_playout_buffer_depth: PlaybackBufferDepthSnapshot,
@@ -126,6 +252,40 @@ pub struct PlaybackStabilitySnapshot {
     pub min_egress_buffer_depth: PlaybackBufferDepthSnapshot,
     pub max_egress_buffer_depth: PlaybackBufferDepthSnapshot,
     pub prepared_rtp_queue_depth_ms: u64,
+    pub prepared_track_queue_target_ms: u64,
+    pub prepared_track_queue_low_watermark_ms: u64,
+    pub prepared_track_queue_high_watermark_ms: u64,
+    pub active_pre_pause_prepared_track_queue_depth: PlaybackQueueDepthStatsSnapshot,
+    pub active_post_resume_prepared_track_queue_depth: PlaybackQueueDepthStatsSnapshot,
+    pub prepared_track_queue_depth_sample_count: usize,
+    pub prepared_track_queue_empty_count: u64,
+    pub raw_send_events: Vec<PlaybackSendEventSnapshot>,
+    pub raw_prepared_track_queue_samples: Vec<PreparedTrackQueueDepthSampleSnapshot>,
+    pub raw_prepared_playout_queue_events: Vec<PreparedPlayoutQueueEventSnapshot>,
+    pub current_scheduled_silence_queue_depth: PlaybackBufferDepthSnapshot,
+    pub max_scheduled_silence_queue_depth: PlaybackBufferDepthSnapshot,
+    pub current_boundary_queue_depth: PlaybackBufferDepthSnapshot,
+    pub max_boundary_queue_depth: PlaybackBufferDepthSnapshot,
+    pub prepared_track_packet_drop_count: u64,
+    pub prepared_silence_packet_drop_count: u64,
+    pub prepared_packet_rebuild_count: u64,
+    pub scheduled_silence_packet_count: u64,
+    pub pause_media_boundary_count: u64,
+    pub stop_media_boundary_count: u64,
+    pub recovery_media_boundary_count: u64,
+    pub natural_end_media_boundary_count: u64,
+    pub dave_transition_recovery_reached_builder_count: u64,
+    pub dave_transition_recovery_reached_deadline_sender_count: u64,
+    pub source_underrun_reached_builder_count: u64,
+    pub source_underrun_reached_deadline_sender_count: u64,
+    pub discarded_source_frame_count: u64,
+    pub discarded_source_duration_ms: u64,
+    pub stop_discarded_source_frame_count: u64,
+    pub stop_discarded_source_duration_ms: u64,
+    pub interruption_discarded_source_frame_count: u64,
+    pub interruption_discarded_source_duration_ms: u64,
+    pub restored_source_frame_count: u64,
+    pub restored_source_duration_ms: u64,
     pub source_buffer_target_ms: u64,
     pub adaptive_buffer_target_ms: u64,
     pub max_adaptive_buffer_target_ms: u64,
@@ -201,6 +361,58 @@ struct TrackPacketTiming {
     media_start_ms: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PlaybackSendEventRecord {
+    pub(crate) packet_index: u64,
+    pub(crate) command_kind: PlaybackSendCommandKind,
+    pub(crate) expected_deadline: Instant,
+    pub(crate) send_started_at: Instant,
+    pub(crate) sent_at: Instant,
+    pub(crate) media_duration_ms: u64,
+    pub(crate) media_duration_samples: u32,
+    pub(crate) rtp_sequence: u16,
+    pub(crate) rtp_timestamp: u32,
+    pub(crate) protection_nonce: Option<u32>,
+    pub(crate) source_frame_epoch: Option<u64>,
+    pub(crate) source_media_position_ms: Option<u64>,
+    pub(crate) source_media_byte_position: Option<u64>,
+    pub(crate) committed_heard_media: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreparedTrackQueuePhase {
+    PrePause,
+    PostResume,
+}
+
+#[derive(Debug, Default)]
+struct PreparedTrackQueueDepthCollector {
+    warmed: bool,
+    samples: Vec<PlaybackBufferDepthSnapshot>,
+    empty_count: u64,
+}
+
+impl PreparedTrackQueueDepthCollector {
+    fn record(&mut self, depth: PlaybackBufferDepthSnapshot, target_ms: u64) -> bool {
+        if !self.warmed {
+            if depth.duration_ms < target_ms {
+                return false;
+            }
+            self.warmed = true;
+        }
+
+        if depth.duration_ms == 0 {
+            self.empty_count = self.empty_count.saturating_add(1);
+        }
+        self.samples.push(depth);
+        true
+    }
+
+    fn snapshot(&self) -> PlaybackQueueDepthStatsSnapshot {
+        PlaybackQueueDepthStatsSnapshot::from_samples(&self.samples, self.empty_count)
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct PlaybackStabilityCollector {
     playback_epoch: u64,
@@ -228,9 +440,44 @@ pub(crate) struct PlaybackStabilityCollector {
     current_source_buffer_depth: PlaybackBufferDepthSnapshot,
     min_source_buffer_depth: PlaybackBufferDepthSnapshot,
     max_source_buffer_depth: PlaybackBufferDepthSnapshot,
+    source_buffer_depth_samples: Vec<PlaybackBufferDepthSnapshot>,
+    source_buffer_empty_count: u64,
     current_playout_buffer_depth: PlaybackBufferDepthSnapshot,
     min_playout_buffer_depth: PlaybackBufferDepthSnapshot,
     max_playout_buffer_depth: PlaybackBufferDepthSnapshot,
+    prepared_track_queue_target_ms: u64,
+    prepared_track_queue_low_watermark_ms: u64,
+    prepared_track_queue_high_watermark_ms: u64,
+    prepared_track_queue_phase: PreparedTrackQueuePhase,
+    active_pre_pause_prepared_track_queue_depth: PreparedTrackQueueDepthCollector,
+    active_post_resume_prepared_track_queue_depth: PreparedTrackQueueDepthCollector,
+    raw_send_events: Vec<PlaybackSendEventRecord>,
+    raw_prepared_track_queue_samples: Vec<PreparedTrackQueueDepthSampleSnapshot>,
+    raw_prepared_playout_queue_events: Vec<PreparedPlayoutQueueEventSnapshot>,
+    current_scheduled_silence_queue_depth: PlaybackBufferDepthSnapshot,
+    max_scheduled_silence_queue_depth: PlaybackBufferDepthSnapshot,
+    current_boundary_queue_depth: PlaybackBufferDepthSnapshot,
+    max_boundary_queue_depth: PlaybackBufferDepthSnapshot,
+    prepared_track_packet_drop_count: u64,
+    prepared_silence_packet_drop_count: u64,
+    prepared_packet_rebuild_count: u64,
+    scheduled_silence_packet_count: u64,
+    pause_media_boundary_count: u64,
+    stop_media_boundary_count: u64,
+    recovery_media_boundary_count: u64,
+    natural_end_media_boundary_count: u64,
+    dave_transition_recovery_reached_builder_count: u64,
+    dave_transition_recovery_reached_deadline_sender_count: u64,
+    source_underrun_reached_builder_count: u64,
+    source_underrun_reached_deadline_sender_count: u64,
+    discarded_source_frame_count: u64,
+    discarded_source_duration_ms: u64,
+    stop_discarded_source_frame_count: u64,
+    stop_discarded_source_duration_ms: u64,
+    interruption_discarded_source_frame_count: u64,
+    interruption_discarded_source_duration_ms: u64,
+    restored_source_frame_count: u64,
+    restored_source_duration_ms: u64,
     source_buffer_target_ms: u64,
     adaptive_buffer_target_ms: u64,
     max_adaptive_buffer_target_ms: u64,
@@ -301,6 +548,9 @@ impl PlaybackStabilityCollector {
         initial_depth: OpusBufferDepth,
         initial_source_depth: OpusBufferDepth,
         source_buffer_target_ms: u64,
+        prepared_track_queue_target_ms: u64,
+        prepared_track_queue_low_watermark_ms: u64,
+        prepared_track_queue_high_watermark_ms: u64,
         recovery_baseline: PlaybackRecoveryMetrics,
     ) -> Self {
         let initial_depth = PlaybackBufferDepthSnapshot::from(initial_depth);
@@ -331,9 +581,46 @@ impl PlaybackStabilityCollector {
             current_source_buffer_depth: initial_source_depth,
             min_source_buffer_depth: initial_source_depth,
             max_source_buffer_depth: initial_source_depth,
+            source_buffer_depth_samples: vec![initial_source_depth],
+            source_buffer_empty_count: u64::from(initial_source_depth.duration_ms == 0),
             current_playout_buffer_depth: PlaybackBufferDepthSnapshot::default(),
             min_playout_buffer_depth: PlaybackBufferDepthSnapshot::default(),
             max_playout_buffer_depth: PlaybackBufferDepthSnapshot::default(),
+            prepared_track_queue_target_ms,
+            prepared_track_queue_low_watermark_ms,
+            prepared_track_queue_high_watermark_ms,
+            prepared_track_queue_phase: PreparedTrackQueuePhase::PrePause,
+            active_pre_pause_prepared_track_queue_depth: PreparedTrackQueueDepthCollector::default(
+            ),
+            active_post_resume_prepared_track_queue_depth:
+                PreparedTrackQueueDepthCollector::default(),
+            raw_send_events: Vec::new(),
+            raw_prepared_track_queue_samples: Vec::new(),
+            raw_prepared_playout_queue_events: Vec::new(),
+            current_scheduled_silence_queue_depth: PlaybackBufferDepthSnapshot::default(),
+            max_scheduled_silence_queue_depth: PlaybackBufferDepthSnapshot::default(),
+            current_boundary_queue_depth: PlaybackBufferDepthSnapshot::default(),
+            max_boundary_queue_depth: PlaybackBufferDepthSnapshot::default(),
+            prepared_track_packet_drop_count: 0,
+            prepared_silence_packet_drop_count: 0,
+            prepared_packet_rebuild_count: 0,
+            scheduled_silence_packet_count: 0,
+            pause_media_boundary_count: 0,
+            stop_media_boundary_count: 0,
+            recovery_media_boundary_count: 0,
+            natural_end_media_boundary_count: 0,
+            dave_transition_recovery_reached_builder_count: 0,
+            dave_transition_recovery_reached_deadline_sender_count: 0,
+            source_underrun_reached_builder_count: 0,
+            source_underrun_reached_deadline_sender_count: 0,
+            discarded_source_frame_count: 0,
+            discarded_source_duration_ms: 0,
+            stop_discarded_source_frame_count: 0,
+            stop_discarded_source_duration_ms: 0,
+            interruption_discarded_source_frame_count: 0,
+            interruption_discarded_source_duration_ms: 0,
+            restored_source_frame_count: 0,
+            restored_source_duration_ms: 0,
             source_buffer_target_ms,
             adaptive_buffer_target_ms: 0,
             max_adaptive_buffer_target_ms: 0,
@@ -433,6 +720,10 @@ impl PlaybackStabilityCollector {
         self.current_source_buffer_depth = depth;
         self.min_source_buffer_depth = min_depth(self.min_source_buffer_depth, depth);
         self.max_source_buffer_depth = max_depth(self.max_source_buffer_depth, depth);
+        self.source_buffer_depth_samples.push(depth);
+        if depth.duration_ms == 0 {
+            self.source_buffer_empty_count = self.source_buffer_empty_count.saturating_add(1);
+        }
         if low_watermark_ms != u64::MAX && depth.duration_ms <= low_watermark_ms {
             self.source_buffer_low_watermark_count =
                 self.source_buffer_low_watermark_count.saturating_add(1);
@@ -454,6 +745,168 @@ impl PlaybackStabilityCollector {
         }
     }
 
+    pub(crate) fn record_prepared_track_queue_depth(&mut self, depth: OpusBufferDepth) {
+        let depth = PlaybackBufferDepthSnapshot::from(depth);
+        let (phase, recorded) = match self.prepared_track_queue_phase {
+            PreparedTrackQueuePhase::PrePause => (
+                PreparedTrackQueueSamplePhase::ActivePrePause,
+                self.active_pre_pause_prepared_track_queue_depth
+                    .record(depth, self.prepared_track_queue_target_ms),
+            ),
+            PreparedTrackQueuePhase::PostResume => (
+                PreparedTrackQueueSamplePhase::ActivePostResume,
+                self.active_post_resume_prepared_track_queue_depth
+                    .record(depth, self.prepared_track_queue_target_ms),
+            ),
+        };
+        if recorded {
+            self.raw_prepared_track_queue_samples
+                .push(PreparedTrackQueueDepthSampleSnapshot {
+                    sample_index: self.raw_prepared_track_queue_samples.len() as u64,
+                    phase,
+                    depth,
+                });
+        }
+    }
+
+    pub(crate) fn record_prepared_playout_queue_event(
+        &mut self,
+        mut event: PreparedPlayoutQueueEventSnapshot,
+    ) {
+        event.event_index = self.raw_prepared_playout_queue_events.len() as u64;
+        if event.event_kind == PreparedPlayoutQueueEventKind::DroppedBeforeSend {
+            match event.command_kind {
+                PlaybackSendCommandKind::Track => {
+                    self.prepared_track_packet_drop_count =
+                        self.prepared_track_packet_drop_count.saturating_add(1);
+                }
+                PlaybackSendCommandKind::ScheduledSilence
+                | PlaybackSendCommandKind::BoundarySilence
+                | PlaybackSendCommandKind::OtherBoundary => {
+                    self.prepared_silence_packet_drop_count =
+                        self.prepared_silence_packet_drop_count.saturating_add(1);
+                }
+            }
+        }
+        if event.event_kind == PreparedPlayoutQueueEventKind::Rebuilt {
+            self.prepared_packet_rebuild_count =
+                self.prepared_packet_rebuild_count.saturating_add(1);
+        }
+        self.raw_prepared_playout_queue_events.push(event);
+    }
+
+    pub(crate) fn record_non_track_playout_queue_depth(
+        &mut self,
+        command_kind: PlaybackSendCommandKind,
+        depth: OpusBufferDepth,
+    ) {
+        let depth = PlaybackBufferDepthSnapshot::from(depth);
+        match command_kind {
+            PlaybackSendCommandKind::ScheduledSilence => {
+                self.current_scheduled_silence_queue_depth = depth;
+                self.max_scheduled_silence_queue_depth =
+                    max_depth(self.max_scheduled_silence_queue_depth, depth);
+            }
+            PlaybackSendCommandKind::BoundarySilence | PlaybackSendCommandKind::OtherBoundary => {
+                self.current_boundary_queue_depth = depth;
+                self.max_boundary_queue_depth = max_depth(self.max_boundary_queue_depth, depth);
+            }
+            PlaybackSendCommandKind::Track => {}
+        }
+    }
+
+    pub(crate) fn record_explicit_media_boundary(
+        &mut self,
+        reason: PreparedPlayoutQueueEventReason,
+    ) {
+        match reason {
+            PreparedPlayoutQueueEventReason::Pause => {
+                self.pause_media_boundary_count = self.pause_media_boundary_count.saturating_add(1);
+            }
+            PreparedPlayoutQueueEventReason::Stop
+            | PreparedPlayoutQueueEventReason::Interruption => {
+                self.stop_media_boundary_count = self.stop_media_boundary_count.saturating_add(1);
+            }
+            PreparedPlayoutQueueEventReason::DaveTransitionRecovery
+            | PreparedPlayoutQueueEventReason::Reconnect
+            | PreparedPlayoutQueueEventReason::SourceUnderrun => {
+                self.recovery_media_boundary_count =
+                    self.recovery_media_boundary_count.saturating_add(1);
+            }
+            PreparedPlayoutQueueEventReason::NaturalEnd => {
+                self.natural_end_media_boundary_count =
+                    self.natural_end_media_boundary_count.saturating_add(1);
+            }
+            PreparedPlayoutQueueEventReason::Unspecified
+            | PreparedPlayoutQueueEventReason::SteadyPlayback => {}
+        }
+    }
+
+    pub(crate) fn record_dave_transition_reached_builder(&mut self) {
+        self.dave_transition_recovery_reached_builder_count = self
+            .dave_transition_recovery_reached_builder_count
+            .saturating_add(1);
+        self.dave_transition_count = self.dave_transition_count.saturating_add(1);
+        self.dave_transition_count_during_playback =
+            self.dave_transition_count_during_playback.saturating_add(1);
+    }
+
+    pub(crate) fn record_source_underrun_reached_builder(&mut self) {
+        self.source_underrun_reached_builder_count =
+            self.source_underrun_reached_builder_count.saturating_add(1);
+    }
+
+    pub(crate) fn record_source_underrun_reached_deadline_sender(&mut self) {
+        self.source_underrun_reached_deadline_sender_count = self
+            .source_underrun_reached_deadline_sender_count
+            .saturating_add(1);
+    }
+
+    pub(crate) fn record_restored_source_frames(&mut self, frame_count: u64, duration_ms: u64) {
+        self.restored_source_frame_count =
+            self.restored_source_frame_count.saturating_add(frame_count);
+        self.restored_source_duration_ms =
+            self.restored_source_duration_ms.saturating_add(duration_ms);
+    }
+
+    pub(crate) fn record_discarded_source_frames(
+        &mut self,
+        reason: PreparedPlayoutQueueEventReason,
+        frame_count: u64,
+        duration_ms: u64,
+    ) {
+        self.discarded_source_frame_count = self
+            .discarded_source_frame_count
+            .saturating_add(frame_count);
+        self.discarded_source_duration_ms = self
+            .discarded_source_duration_ms
+            .saturating_add(duration_ms);
+        match reason {
+            PreparedPlayoutQueueEventReason::Stop | PreparedPlayoutQueueEventReason::NaturalEnd => {
+                self.stop_discarded_source_frame_count = self
+                    .stop_discarded_source_frame_count
+                    .saturating_add(frame_count);
+                self.stop_discarded_source_duration_ms = self
+                    .stop_discarded_source_duration_ms
+                    .saturating_add(duration_ms);
+            }
+            PreparedPlayoutQueueEventReason::Interruption
+            | PreparedPlayoutQueueEventReason::Reconnect
+            | PreparedPlayoutQueueEventReason::DaveTransitionRecovery
+            | PreparedPlayoutQueueEventReason::SourceUnderrun => {
+                self.interruption_discarded_source_frame_count = self
+                    .interruption_discarded_source_frame_count
+                    .saturating_add(frame_count);
+                self.interruption_discarded_source_duration_ms = self
+                    .interruption_discarded_source_duration_ms
+                    .saturating_add(duration_ms);
+            }
+            PreparedPlayoutQueueEventReason::Unspecified
+            | PreparedPlayoutQueueEventReason::SteadyPlayback
+            | PreparedPlayoutQueueEventReason::Pause => {}
+        }
+    }
+
     pub(crate) fn record_adaptive_buffer_target(&mut self, target_ms: u64, max_target_ms: u64) {
         self.adaptive_buffer_target_ms = target_ms;
         self.max_adaptive_buffer_target_ms = self.max_adaptive_buffer_target_ms.max(max_target_ms);
@@ -471,6 +924,10 @@ impl PlaybackStabilityCollector {
 
     pub(crate) fn record_speaking_prepare_duration(&mut self, duration: Duration) {
         self.speaking_prepare_durations.push(duration);
+    }
+
+    pub(crate) fn record_playout_builder_prepare_duration(&mut self, duration: Duration) {
+        self.playout_builder_prepare_durations.push(duration);
     }
 
     pub(crate) fn record_sender_send_duration(&mut self, duration: Duration) {
@@ -517,17 +974,31 @@ impl PlaybackStabilityCollector {
                     self.dave_transition_recovery_reset_count.saturating_add(1);
                 self.controlled_media_interruption_count =
                     self.controlled_media_interruption_count.saturating_add(1);
+                self.reset_active_track_tempo_window();
             }
         }
     }
 
-    pub(crate) fn record_resumed_from_pause(&mut self) {
+    fn reset_active_track_tempo_window(&mut self) {
         self.last_track_send_at = None;
         self.last_track_duration = None;
         self.track_packet_timings.clear();
         self.last_any_send_at = None;
+    }
+
+    pub(crate) fn record_resumed_from_pause(&mut self) {
+        self.reset_active_track_tempo_window();
         self.pause_resume_intervals_remaining = FIRST_INTERVAL_SAMPLE_LIMIT;
         self.pause_resume_first_intervals_ms.clear();
+        self.prepared_track_queue_phase = PreparedTrackQueuePhase::PostResume;
+    }
+
+    pub(crate) fn record_send_event(&mut self, event: PlaybackSendEventRecord) {
+        if event.command_kind == PlaybackSendCommandKind::ScheduledSilence {
+            self.scheduled_silence_packet_count =
+                self.scheduled_silence_packet_count.saturating_add(1);
+        }
+        self.raw_send_events.push(event);
     }
 
     pub(crate) fn record_track_packet(
@@ -569,8 +1040,8 @@ impl PlaybackStabilityCollector {
             self.current_consecutive_playout_late_packets = 0;
         }
 
-        if let Some(previous) = self.last_track_send_at.replace(send_started_at) {
-            let interval = send_started_at.saturating_duration_since(previous);
+        if let Some(previous) = self.last_track_send_at.replace(sent_at) {
+            let interval = sent_at.saturating_duration_since(previous);
             self.track_intervals.push(interval);
             if let Some(previous_duration) = self.last_track_duration
                 && interval < previous_duration
@@ -609,7 +1080,7 @@ impl PlaybackStabilityCollector {
         }
         self.last_track_duration = Some(frame_duration);
         self.track_packet_timings.push(TrackPacketTiming {
-            sent_at: send_started_at,
+            sent_at,
             duration: frame_duration,
             media_start_ms,
         });
@@ -717,6 +1188,17 @@ impl PlaybackStabilityCollector {
             self.track_media_duration_sent_ms,
             track_wall_clock_elapsed_ms,
         );
+        let active_pre_pause_prepared_track_queue_depth =
+            self.active_pre_pause_prepared_track_queue_depth.snapshot();
+        let active_post_resume_prepared_track_queue_depth = self
+            .active_post_resume_prepared_track_queue_depth
+            .snapshot();
+        let prepared_track_queue_depth_sample_count = active_pre_pause_prepared_track_queue_depth
+            .sample_count
+            .saturating_add(active_post_resume_prepared_track_queue_depth.sample_count);
+        let prepared_track_queue_empty_count = active_pre_pause_prepared_track_queue_depth
+            .empty_count
+            .saturating_add(active_post_resume_prepared_track_queue_depth.empty_count);
         PlaybackStabilitySnapshot {
             playback_epoch: self.playback_epoch,
             video_id: Some(self.video_id.clone()),
@@ -761,6 +1243,10 @@ impl PlaybackStabilityCollector {
             current_source_buffer_depth: self.current_source_buffer_depth,
             min_source_buffer_depth: self.min_source_buffer_depth,
             max_source_buffer_depth: self.max_source_buffer_depth,
+            source_buffer_depth: PlaybackQueueDepthStatsSnapshot::from_samples(
+                &self.source_buffer_depth_samples,
+                self.source_buffer_empty_count,
+            ),
             current_playout_buffer_depth: self.current_playout_buffer_depth,
             min_playout_buffer_depth: self.min_playout_buffer_depth,
             max_playout_buffer_depth: self.max_playout_buffer_depth,
@@ -768,7 +1254,46 @@ impl PlaybackStabilityCollector {
             current_egress_buffer_depth: self.current_playout_buffer_depth,
             min_egress_buffer_depth: self.min_playout_buffer_depth,
             max_egress_buffer_depth: self.max_playout_buffer_depth,
-            prepared_rtp_queue_depth_ms: 0,
+            prepared_rtp_queue_depth_ms: self.current_playout_buffer_depth.duration_ms,
+            prepared_track_queue_target_ms: self.prepared_track_queue_target_ms,
+            prepared_track_queue_low_watermark_ms: self.prepared_track_queue_low_watermark_ms,
+            prepared_track_queue_high_watermark_ms: self.prepared_track_queue_high_watermark_ms,
+            active_pre_pause_prepared_track_queue_depth,
+            active_post_resume_prepared_track_queue_depth,
+            prepared_track_queue_depth_sample_count,
+            prepared_track_queue_empty_count,
+            raw_send_events: playback_send_event_snapshots(&self.raw_send_events),
+            raw_prepared_track_queue_samples: self.raw_prepared_track_queue_samples.clone(),
+            raw_prepared_playout_queue_events: self.raw_prepared_playout_queue_events.clone(),
+            current_scheduled_silence_queue_depth: self.current_scheduled_silence_queue_depth,
+            max_scheduled_silence_queue_depth: self.max_scheduled_silence_queue_depth,
+            current_boundary_queue_depth: self.current_boundary_queue_depth,
+            max_boundary_queue_depth: self.max_boundary_queue_depth,
+            prepared_track_packet_drop_count: self.prepared_track_packet_drop_count,
+            prepared_silence_packet_drop_count: self.prepared_silence_packet_drop_count,
+            prepared_packet_rebuild_count: self.prepared_packet_rebuild_count,
+            scheduled_silence_packet_count: self.scheduled_silence_packet_count,
+            pause_media_boundary_count: self.pause_media_boundary_count,
+            stop_media_boundary_count: self.stop_media_boundary_count,
+            recovery_media_boundary_count: self.recovery_media_boundary_count,
+            natural_end_media_boundary_count: self.natural_end_media_boundary_count,
+            dave_transition_recovery_reached_builder_count: self
+                .dave_transition_recovery_reached_builder_count,
+            dave_transition_recovery_reached_deadline_sender_count: self
+                .dave_transition_recovery_reached_deadline_sender_count,
+            source_underrun_reached_builder_count: self.source_underrun_reached_builder_count,
+            source_underrun_reached_deadline_sender_count: self
+                .source_underrun_reached_deadline_sender_count,
+            discarded_source_frame_count: self.discarded_source_frame_count,
+            discarded_source_duration_ms: self.discarded_source_duration_ms,
+            stop_discarded_source_frame_count: self.stop_discarded_source_frame_count,
+            stop_discarded_source_duration_ms: self.stop_discarded_source_duration_ms,
+            interruption_discarded_source_frame_count: self
+                .interruption_discarded_source_frame_count,
+            interruption_discarded_source_duration_ms: self
+                .interruption_discarded_source_duration_ms,
+            restored_source_frame_count: self.restored_source_frame_count,
+            restored_source_duration_ms: self.restored_source_duration_ms,
             source_buffer_target_ms: self.source_buffer_target_ms,
             adaptive_buffer_target_ms: self.adaptive_buffer_target_ms,
             max_adaptive_buffer_target_ms: self.max_adaptive_buffer_target_ms,
@@ -837,6 +1362,41 @@ impl PlaybackStabilityCollector {
     }
 }
 
+fn playback_send_event_snapshots(
+    events: &[PlaybackSendEventRecord],
+) -> Vec<PlaybackSendEventSnapshot> {
+    let Some(base_deadline) = events.first().map(|event| event.expected_deadline) else {
+        return Vec::new();
+    };
+
+    events
+        .iter()
+        .map(|event| PlaybackSendEventSnapshot {
+            packet_index: event.packet_index,
+            command_kind: event.command_kind,
+            expected_deadline_offset_us: instant_offset_micros(
+                base_deadline,
+                event.expected_deadline,
+            ),
+            send_started_offset_us: instant_offset_micros(base_deadline, event.send_started_at),
+            sent_offset_us: instant_offset_micros(base_deadline, event.sent_at),
+            media_duration_ms: event.media_duration_ms,
+            media_duration_samples: event.media_duration_samples,
+            rtp_sequence: event.rtp_sequence,
+            rtp_timestamp: event.rtp_timestamp,
+            protection_nonce: event.protection_nonce,
+            source_frame_epoch: event.source_frame_epoch,
+            source_media_position_ms: event.source_media_position_ms,
+            source_media_byte_position: event.source_media_byte_position,
+            committed_heard_media: event.committed_heard_media,
+        })
+        .collect()
+}
+
+fn instant_offset_micros(base: Instant, instant: Instant) -> u64 {
+    duration_micros(instant.saturating_duration_since(base))
+}
+
 fn min_depth(
     current: PlaybackBufferDepthSnapshot,
     observed: PlaybackBufferDepthSnapshot,
@@ -860,6 +1420,14 @@ fn max_depth(
 }
 
 fn percentile_duration(sorted: &[Duration], percentile: usize) -> Duration {
+    let index = ((sorted.len() - 1) * percentile).div_ceil(100);
+    sorted[index]
+}
+
+fn percentile_depth(
+    sorted: &[PlaybackBufferDepthSnapshot],
+    percentile: usize,
+) -> PlaybackBufferDepthSnapshot {
     let index = ((sorted.len() - 1) * percentile).div_ceil(100);
     sorted[index]
 }
@@ -909,6 +1477,9 @@ mod tests {
             OpusBufferDepth::default(),
             OpusBufferDepth::default(),
             TRACK_POST_SOURCE_BUFFER_MEDIA_MS,
+            400,
+            300,
+            500,
             PlaybackRecoveryMetrics::default(),
         )
     }
@@ -1025,6 +1596,43 @@ mod tests {
         assert_eq!(snapshot.track_tempo_window_slow_count, 0);
         assert_eq!(snapshot.track_tempo_window_min_ratio_ppm, 1_000_000);
         assert_eq!(snapshot.track_tempo_window_max_ratio_ppm, 1_000_000);
+    }
+
+    #[test]
+    fn track_tempo_window_excludes_dave_recovery_silence_from_active_tempo() {
+        let mut collector = collector();
+        let start = Instant::now();
+        let mut sent_at = start;
+
+        for index in 0..60 {
+            if index > 0 {
+                sent_at += Duration::from_millis(20);
+            }
+            collector.record_track_packet(sent_at, sent_at, sent_at, 20, false);
+        }
+
+        collector.record_media_clock_reset(MediaClockResetReason::DaveTransitionRecovery);
+        for _ in 0..8 {
+            sent_at += Duration::from_millis(20);
+            collector.record_continuity_silence_packet(sent_at, 20);
+        }
+
+        for _ in 0..60 {
+            sent_at += Duration::from_millis(20);
+            collector.record_track_packet(sent_at, sent_at, sent_at, 20, false);
+        }
+
+        let snapshot = collector.snapshot(0, 0, 0, false);
+        assert_eq!(snapshot.track_media_duration_sent_ms, 2_400);
+        assert_eq!(snapshot.track_wall_clock_elapsed_ms, 2_400);
+        assert_eq!(snapshot.track_media_to_wall_clock_ratio_ppm, 1_000_000);
+        assert_eq!(snapshot.track_tempo_window_fast_count, 0);
+        assert_eq!(snapshot.track_tempo_window_slow_count, 0);
+        assert_eq!(snapshot.track_tempo_window_min_ratio_ppm, 1_000_000);
+        assert_eq!(snapshot.track_tempo_window_max_ratio_ppm, 1_000_000);
+        assert_eq!(snapshot.continuity_silence_packet_count, 8);
+        assert_eq!(snapshot.dave_transition_recovery_reset_count, 1);
+        assert_eq!(snapshot.controlled_media_interruption_count, 1);
     }
 
     #[test]

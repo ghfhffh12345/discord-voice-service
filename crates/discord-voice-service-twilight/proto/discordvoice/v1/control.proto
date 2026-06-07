@@ -65,6 +65,90 @@ message PlaybackBufferDepthSnapshot {
   uint64 duration_samples = 4;
 }
 
+message PlaybackQueueDepthStatsSnapshot {
+  uint64 sample_count = 1;
+  uint64 empty_count = 2;
+  PlaybackBufferDepthSnapshot current_depth = 3;
+  PlaybackBufferDepthSnapshot min_depth = 4;
+  PlaybackBufferDepthSnapshot p5_depth = 5;
+  PlaybackBufferDepthSnapshot p50_depth = 6;
+  PlaybackBufferDepthSnapshot p95_depth = 7;
+  PlaybackBufferDepthSnapshot max_depth = 8;
+}
+
+enum PlaybackSendCommandKind {
+  PLAYBACK_SEND_COMMAND_KIND_UNSPECIFIED = 0;
+  PLAYBACK_SEND_COMMAND_KIND_TRACK = 1;
+  PLAYBACK_SEND_COMMAND_KIND_SCHEDULED_SILENCE = 2;
+  PLAYBACK_SEND_COMMAND_KIND_BOUNDARY_SILENCE = 3;
+  PLAYBACK_SEND_COMMAND_KIND_OTHER_BOUNDARY = 4;
+}
+
+enum PreparedTrackQueueSamplePhase {
+  PREPARED_TRACK_QUEUE_SAMPLE_PHASE_UNSPECIFIED = 0;
+  PREPARED_TRACK_QUEUE_SAMPLE_PHASE_ACTIVE_PRE_PAUSE = 1;
+  PREPARED_TRACK_QUEUE_SAMPLE_PHASE_ACTIVE_POST_RESUME = 2;
+}
+
+message PlaybackSendEventSnapshot {
+  uint64 packet_index = 1;
+  PlaybackSendCommandKind command_kind = 2;
+  uint64 expected_deadline_offset_us = 3;
+  uint64 send_started_offset_us = 4;
+  uint64 sent_offset_us = 5;
+  uint64 media_duration_ms = 6;
+  uint32 media_duration_samples = 7;
+  uint32 rtp_sequence = 8;
+  uint32 rtp_timestamp = 9;
+  optional uint32 protection_nonce = 10;
+  optional uint64 source_frame_epoch = 11;
+  optional uint64 source_media_position_ms = 12;
+  optional uint64 source_media_byte_position = 13;
+  bool committed_heard_media = 14;
+}
+
+message PreparedTrackQueueDepthSampleSnapshot {
+  uint64 sample_index = 1;
+  PreparedTrackQueueSamplePhase phase = 2;
+  PlaybackBufferDepthSnapshot depth = 3;
+}
+
+enum PreparedPlayoutQueueEventKind {
+  PREPARED_PLAYOUT_QUEUE_EVENT_KIND_UNSPECIFIED = 0;
+  PREPARED_PLAYOUT_QUEUE_EVENT_KIND_ENQUEUED = 1;
+  PREPARED_PLAYOUT_QUEUE_EVENT_KIND_DEQUEUED_TO_DEADLINE_SENDER = 2;
+  PREPARED_PLAYOUT_QUEUE_EVENT_KIND_DROPPED_BEFORE_SEND = 3;
+  PREPARED_PLAYOUT_QUEUE_EVENT_KIND_REBUILT = 4;
+}
+
+enum PreparedPlayoutQueueEventReason {
+  PREPARED_PLAYOUT_QUEUE_EVENT_REASON_UNSPECIFIED = 0;
+  PREPARED_PLAYOUT_QUEUE_EVENT_REASON_STEADY_PLAYBACK = 1;
+  PREPARED_PLAYOUT_QUEUE_EVENT_REASON_PAUSE = 2;
+  PREPARED_PLAYOUT_QUEUE_EVENT_REASON_STOP = 3;
+  PREPARED_PLAYOUT_QUEUE_EVENT_REASON_DAVE_TRANSITION_RECOVERY = 4;
+  PREPARED_PLAYOUT_QUEUE_EVENT_REASON_RECONNECT = 5;
+  PREPARED_PLAYOUT_QUEUE_EVENT_REASON_SOURCE_UNDERRUN = 6;
+  PREPARED_PLAYOUT_QUEUE_EVENT_REASON_NATURAL_END = 7;
+  PREPARED_PLAYOUT_QUEUE_EVENT_REASON_INTERRUPTION = 8;
+}
+
+message PreparedPlayoutQueueEventSnapshot {
+  uint64 event_index = 1;
+  PreparedPlayoutQueueEventKind event_kind = 2;
+  PreparedPlayoutQueueEventReason reason = 3;
+  PlaybackSendCommandKind command_kind = 4;
+  uint64 media_duration_ms = 5;
+  uint32 media_duration_samples = 6;
+  uint32 rtp_sequence = 7;
+  uint32 rtp_timestamp = 8;
+  optional uint32 protection_nonce = 9;
+  optional uint64 source_frame_epoch = 10;
+  optional uint64 source_media_position_ms = 11;
+  optional uint64 source_media_byte_position = 12;
+  PlaybackBufferDepthSnapshot queue_depth_after = 13;
+}
+
 message PlaybackStabilitySnapshot {
   bool available = 1;
   uint64 playback_epoch = 2;
@@ -163,6 +247,41 @@ message PlaybackStabilitySnapshot {
   uint64 egress_dropped_music_duration_ms = 95;
   uint64 max_consecutive_late_egress_ticks = 96;
   uint64 egress_clock_reset_count = 97;
+  uint64 prepared_track_queue_target_ms = 98;
+  uint64 prepared_track_queue_low_watermark_ms = 99;
+  uint64 prepared_track_queue_high_watermark_ms = 100;
+  PlaybackQueueDepthStatsSnapshot active_pre_pause_prepared_track_queue_depth = 101;
+  PlaybackQueueDepthStatsSnapshot active_post_resume_prepared_track_queue_depth = 102;
+  uint64 prepared_track_queue_depth_sample_count = 103;
+  uint64 prepared_track_queue_empty_count = 104;
+  repeated PlaybackSendEventSnapshot raw_send_events = 105;
+  repeated PreparedTrackQueueDepthSampleSnapshot raw_prepared_track_queue_samples = 106;
+  repeated PreparedPlayoutQueueEventSnapshot raw_prepared_playout_queue_events = 107;
+  PlaybackBufferDepthSnapshot current_scheduled_silence_queue_depth = 108;
+  PlaybackBufferDepthSnapshot max_scheduled_silence_queue_depth = 109;
+  PlaybackBufferDepthSnapshot current_boundary_queue_depth = 110;
+  PlaybackBufferDepthSnapshot max_boundary_queue_depth = 111;
+  uint64 prepared_track_packet_drop_count = 112;
+  uint64 prepared_silence_packet_drop_count = 113;
+  uint64 prepared_packet_rebuild_count = 114;
+  uint64 scheduled_silence_packet_count = 115;
+  uint64 pause_media_boundary_count = 116;
+  uint64 stop_media_boundary_count = 117;
+  uint64 recovery_media_boundary_count = 118;
+  uint64 natural_end_media_boundary_count = 119;
+  uint64 dave_transition_recovery_reached_builder_count = 120;
+  uint64 dave_transition_recovery_reached_deadline_sender_count = 121;
+  uint64 source_underrun_reached_builder_count = 122;
+  uint64 source_underrun_reached_deadline_sender_count = 123;
+  uint64 discarded_source_frame_count = 124;
+  uint64 discarded_source_duration_ms = 125;
+  uint64 stop_discarded_source_frame_count = 126;
+  uint64 stop_discarded_source_duration_ms = 127;
+  uint64 interruption_discarded_source_frame_count = 128;
+  uint64 interruption_discarded_source_duration_ms = 129;
+  uint64 restored_source_frame_count = 130;
+  uint64 restored_source_duration_ms = 131;
+  PlaybackQueueDepthStatsSnapshot source_buffer_depth = 132;
 }
 
 enum SessionEventKind {

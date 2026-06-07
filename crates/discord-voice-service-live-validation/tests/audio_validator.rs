@@ -104,6 +104,39 @@ fn audio_validator_rejects_rtp_timestamp_delta_that_disagrees_with_decoded_sampl
 }
 
 #[test]
+fn audio_validator_rejects_rtp_sequence_gap() {
+    let mut demux = WebmOpusDemux::default();
+    demux.push_bytes(load_fixture_bytes("audio-itag250.webm"));
+    let packets = demux.drain_packets().expect("fixture should demux");
+    assert!(
+        packets.len() >= 2,
+        "fixture should yield at least two packets"
+    );
+
+    let mut accumulator = AudioValidationAccumulator::new();
+    accumulator
+        .observe_packet(ObservedOpusPacket {
+            sequence: 41,
+            timestamp: 0,
+            payload: packets[0].data.as_ref(),
+        })
+        .expect("first fixture packet should decode");
+
+    let error = accumulator
+        .observe_packet(ObservedOpusPacket {
+            sequence: 43,
+            timestamp: packets[0].duration_samples,
+            payload: packets[1].data.as_ref(),
+        })
+        .expect_err("RTP sequence gap should fail validation");
+
+    assert!(
+        error.to_string().contains("rtp sequence jumped"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
 fn audio_validator_reports_non_silence_for_generated_opus_packet() {
     let mut encoder =
         OpusEncoder::new(48_000, 1, Application::RestrictedLowDelay).expect("create opus encoder");
@@ -204,7 +237,7 @@ fn audio_validator_excludes_controlled_pause_from_active_tempo_windows() {
         rtp_timestamp = rtp_timestamp.wrapping_add(packet.duration_samples);
     }
 
-    accumulator.reset_inter_arrival_baseline();
+    accumulator.reset_wall_clock_baseline_after_controlled_pause();
     observed_at += Duration::from_secs(3);
 
     for (index, packet) in packets.iter().cycle().take(260).enumerate() {

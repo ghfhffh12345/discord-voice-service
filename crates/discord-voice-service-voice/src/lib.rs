@@ -21,7 +21,7 @@ pub use receive::{
     ObservedVoiceSession, PendingObservedVoiceSession,
 };
 pub use session::{ConnectedVoiceSession, VoiceContext, VoiceGatewayDrainReport};
-pub use udp::PreparedVoicePacket;
+pub use udp::{PreparedVoicePacket, VoicePreparedPacketSender};
 
 #[doc(hidden)]
 pub mod test_support {

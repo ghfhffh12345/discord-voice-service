@@ -116,6 +116,92 @@ async fn prepared_packet_protection_matches_legacy_send() {
 }
 
 #[tokio::test]
+async fn protected_prepared_packets_reserve_unique_rtp_and_nonce_before_send() {
+    let fake = FakeUdpPeer::spawn().await;
+    let mut transport =
+        VoiceUdpTransport::connect_protected(fake.server_addr(), 7, xchacha_test_context())
+            .await
+            .unwrap();
+
+    let packets = [
+        b"opus-a".as_slice(),
+        b"opus-b".as_slice(),
+        b"opus-c".as_slice(),
+    ]
+    .into_iter()
+    .map(|payload| {
+        transport
+            .prepare_audio_packet_with_duration_samples(
+                Bytes::copy_from_slice(payload),
+                20,
+                960,
+                true,
+            )
+            .unwrap()
+    })
+    .collect::<Vec<_>>();
+
+    assert_eq!(
+        packets
+            .iter()
+            .map(|packet| packet.rtp_sequence)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+    assert_eq!(
+        packets
+            .iter()
+            .map(|packet| packet.rtp_timestamp)
+            .collect::<Vec<_>>(),
+        vec![0, 960, 1_920]
+    );
+    assert_eq!(
+        packets
+            .iter()
+            .map(|packet| packet.protection_nonce)
+            .collect::<Vec<_>>(),
+        vec![Some(0), Some(1), Some(2)]
+    );
+
+    for packet in &packets {
+        transport.send_prepared_packet(packet).await.unwrap();
+    }
+    assert_eq!(fake.next_audio_packet().await, packets[0].bytes.as_ref());
+}
+
+#[tokio::test]
+async fn discarded_protected_prepared_packets_do_not_reuse_nonce_after_rebuild() {
+    let fake = FakeUdpPeer::spawn().await;
+    let mut transport =
+        VoiceUdpTransport::connect_protected(fake.server_addr(), 7, xchacha_test_context())
+            .await
+            .unwrap();
+
+    let first = transport
+        .prepare_audio_packet_with_duration_samples(Bytes::from_static(b"opus-a"), 20, 960, true)
+        .unwrap();
+    transport.send_prepared_packet(&first).await.unwrap();
+
+    let discarded = transport
+        .prepare_audio_packet_with_duration_samples(Bytes::from_static(b"discarded"), 20, 960, true)
+        .unwrap();
+    transport.discard_unsent_prepared_packets();
+    let rebuilt = transport
+        .prepare_audio_packet_with_duration_samples(Bytes::from_static(b"rebuilt"), 20, 960, true)
+        .unwrap();
+
+    assert_eq!(discarded.rtp_sequence, rebuilt.rtp_sequence);
+    assert_eq!(discarded.rtp_timestamp, rebuilt.rtp_timestamp);
+    assert_ne!(discarded.protection_nonce, rebuilt.protection_nonce);
+
+    transport.send_prepared_packet(&rebuilt).await.unwrap();
+    let first_sent = fake.next_audio_packet().await;
+    let rebuilt_sent = fake.next_audio_packet().await;
+    assert_eq!(first_sent, first.bytes.as_ref());
+    assert_eq!(rebuilt_sent, rebuilt.bytes.as_ref());
+}
+
+#[tokio::test]
 async fn voice_udp_transport_round_trips_xchacha_packet_protection() {
     let fake = FakeUdpPeer::spawn().await;
     let protection = xchacha_test_context();

@@ -3,9 +3,9 @@
 use anyhow::Result;
 use discord_voice_service_live_validation::{
     LiveContractState, LiveValidationEvidence, PlaybackBufferDepthEvidence,
-    PlaybackDurationStatsEvidence, PlaybackStabilityEvidence, StagingConfig, combine_results,
-    current_user_absent_from_guild_voice, finalize_success_evidence,
-    leave_confirmed_by_rest_voice_state, user_absent_from_guild_voice,
+    PlaybackDurationStatsEvidence, PlaybackQueueDepthStatsEvidence, PlaybackStabilityEvidence,
+    StagingConfig, combine_results, current_user_absent_from_guild_voice,
+    finalize_success_evidence, leave_confirmed_by_rest_voice_state, user_absent_from_guild_voice,
     wait_for_play_and_live_contract,
 };
 use discord_voice_service_twilight::{SessionEvent, SessionEventKind};
@@ -44,7 +44,6 @@ fn staging_controller_rejects_empty_required_values() {
         ("TEST_GUILD_ID".to_owned(), "2".to_owned()),
         ("TEST_VOICE_CHANNEL_ID".to_owned(), "3".to_owned()),
         ("TEST_VIDEO_ID".to_owned(), "video".to_owned()),
-        ("TEST_LONG_VIDEO_ID".to_owned(), "long-video".to_owned()),
         (
             "DISCORD_VOICE_SERVICE_URI".to_owned(),
             "http://127.0.0.1:55051".to_owned(),
@@ -67,10 +66,6 @@ fn staging_controller_rejects_empty_required_values() {
             "LIVE_STAGING_HTTP_READ_JITTER_MS".to_owned(),
             "25".to_owned(),
         ),
-        (
-            "LIVE_STAGING_LONG_TRACK_MIN_PACKETS".to_owned(),
-            "300".to_owned(),
-        ),
     ]))
     .expect_err("config should fail");
 
@@ -87,6 +82,83 @@ fn staging_controller_requires_service_uri() {
     assert!(
         error.to_string().contains("DISCORD_VOICE_SERVICE_URI"),
         "expected DISCORD_VOICE_SERVICE_URI in error, got: {error}",
+    );
+}
+
+#[test]
+fn staging_controller_rejects_renamed_constrained_profile() {
+    let mut env = valid_env();
+    env.insert(
+        "LIVE_STAGING_PROFILE".to_owned(),
+        "relaxed-local".to_owned(),
+    );
+
+    let error = StagingConfig::from_env_map(env).expect_err("config should fail");
+
+    assert!(
+        error.to_string().contains("LIVE_STAGING_PROFILE"),
+        "expected profile validation failure, got: {error}",
+    );
+}
+
+#[test]
+fn staging_controller_rejects_increased_service_cpu_allocation() {
+    let mut env = valid_env();
+    env.insert("LIVE_STAGING_SERVICE_CPUS".to_owned(), "1.5".to_owned());
+
+    let error = StagingConfig::from_env_map(env).expect_err("config should fail");
+
+    assert!(
+        error.to_string().contains("LIVE_STAGING_SERVICE_CPUS"),
+        "expected service CPU validation failure, got: {error}",
+    );
+}
+
+#[test]
+fn staging_controller_rejects_disabled_cpu_contention() {
+    let mut env = valid_env();
+    env.insert(
+        "LIVE_STAGING_CPU_CONTENTION_WORKERS".to_owned(),
+        "1".to_owned(),
+    );
+
+    let error = StagingConfig::from_env_map(env).expect_err("config should fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("LIVE_STAGING_CPU_CONTENTION_WORKERS"),
+        "expected CPU contention validation failure, got: {error}",
+    );
+}
+
+#[test]
+fn staging_controller_rejects_weakened_http_read_stress() {
+    let mut env = valid_env();
+    env.insert("LIVE_STAGING_HTTP_READ_DELAY_MS".to_owned(), "4".to_owned());
+
+    let error = StagingConfig::from_env_map(env).expect_err("config should fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("LIVE_STAGING_HTTP_READ_DELAY_MS"),
+        "expected HTTP delay validation failure, got: {error}",
+    );
+
+    let mut env = valid_env();
+    env.insert(
+        "LIVE_STAGING_HTTP_READ_JITTER_MS".to_owned(),
+        "24".to_owned(),
+    );
+
+    let error = StagingConfig::from_env_map(env).expect_err("config should fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("LIVE_STAGING_HTTP_READ_JITTER_MS"),
+        "expected HTTP jitter validation failure, got: {error}",
     );
 }
 
@@ -126,6 +198,11 @@ fn evidence_json_captures_receive_side_success_contract() {
         outcome: "success".to_owned(),
         service_uri: "http://127.0.0.1:55051".to_owned(),
         ytmusic_addr: "http://127.0.0.1:50051".to_owned(),
+        test_video_id: "video".to_owned(),
+        expected_track_duration_ms: 180_000,
+        active_validation_duration_after_resume_ms: 150_000,
+        pause_silence_packet_count: 5,
+        pause_silence_spacing_ms: vec![20, 20, 20, 20],
         live_staging_profile: "constrained-github-hosted".to_owned(),
         live_staging_service_cpus: "1.0".to_owned(),
         live_staging_cpu_contention_workers: 2,
@@ -142,6 +219,7 @@ fn evidence_json_captures_receive_side_success_contract() {
         observer_proved_resume: true,
         observer_pause_self_mute_observed: false,
         observer_pause_speaking_stopped: true,
+        observer_pause_rtp_silence_observed: true,
         observer_resume_speaking_started: true,
         observer_pause_silence_ms: 600,
         observer_resume_packet_count: 4,
@@ -185,8 +263,6 @@ fn evidence_json_captures_receive_side_success_contract() {
         reconnect_probe_metrics: Some(sample_reconnect_probe_metrics()),
         validated_constrained_profile: true,
         validated_slow_jittery_http: true,
-        validated_long_track_playback: true,
-        long_track_metrics: Some(sample_long_track_metrics()),
         failure_reason: None,
     };
 
@@ -195,8 +271,6 @@ fn evidence_json_captures_receive_side_success_contract() {
         serde_json::to_value(sample_playback_metrics()).expect("metrics should serialize");
     let reconnect_probe_metrics =
         serde_json::to_value(sample_reconnect_probe_metrics()).expect("metrics should serialize");
-    let long_track_metrics =
-        serde_json::to_value(sample_long_track_metrics()).expect("metrics should serialize");
 
     assert_eq!(
         json,
@@ -204,6 +278,11 @@ fn evidence_json_captures_receive_side_success_contract() {
             "outcome": "success",
             "service_uri": "http://127.0.0.1:55051",
             "ytmusic_addr": "http://127.0.0.1:50051",
+            "test_video_id": "video",
+            "expected_track_duration_ms": 180_000,
+            "active_validation_duration_after_resume_ms": 150_000,
+            "pause_silence_packet_count": 5,
+            "pause_silence_spacing_ms": [20, 20, 20, 20],
             "live_staging_profile": "constrained-github-hosted",
             "live_staging_service_cpus": "1.0",
             "live_staging_cpu_contention_workers": 2,
@@ -220,6 +299,7 @@ fn evidence_json_captures_receive_side_success_contract() {
             "observer_proved_resume": true,
             "observer_pause_self_mute_observed": false,
             "observer_pause_speaking_stopped": true,
+            "observer_pause_rtp_silence_observed": true,
             "observer_resume_speaking_started": true,
             "observer_pause_silence_ms": 600,
             "observer_resume_packet_count": 4,
@@ -270,8 +350,6 @@ fn evidence_json_captures_receive_side_success_contract() {
             "reconnect_probe_metrics": reconnect_probe_metrics,
             "validated_constrained_profile": true,
             "validated_slow_jittery_http": true,
-            "validated_long_track_playback": true,
-            "long_track_metrics": long_track_metrics,
             "failure_reason": null,
         })
     );
@@ -438,6 +516,11 @@ fn success_evidence_is_emitted_even_when_cleanup_confirmation_lags() {
                 outcome: "success".to_owned(),
                 service_uri: "http://127.0.0.1:55051".to_owned(),
                 ytmusic_addr: "http://127.0.0.1:50051".to_owned(),
+                test_video_id: "video".to_owned(),
+                expected_track_duration_ms: 180_000,
+                active_validation_duration_after_resume_ms: 150_000,
+                pause_silence_packet_count: 5,
+                pause_silence_spacing_ms: vec![20, 20, 20, 20],
                 live_staging_profile: "constrained-github-hosted".to_owned(),
                 live_staging_service_cpus: "1.0".to_owned(),
                 live_staging_cpu_contention_workers: 2,
@@ -454,6 +537,7 @@ fn success_evidence_is_emitted_even_when_cleanup_confirmation_lags() {
                 observer_proved_resume: false,
                 observer_pause_self_mute_observed: false,
                 observer_pause_speaking_stopped: false,
+                observer_pause_rtp_silence_observed: false,
                 observer_resume_speaking_started: false,
                 observer_pause_silence_ms: 0,
                 observer_resume_packet_count: 0,
@@ -497,8 +581,6 @@ fn success_evidence_is_emitted_even_when_cleanup_confirmation_lags() {
                 reconnect_probe_metrics: None,
                 validated_constrained_profile: false,
                 validated_slow_jittery_http: false,
-                validated_long_track_playback: false,
-                long_track_metrics: None,
                 failure_reason: None,
             }
         },
@@ -644,7 +726,6 @@ fn valid_env() -> HashMap<String, String> {
         ("TEST_GUILD_ID".to_owned(), "2".to_owned()),
         ("TEST_VOICE_CHANNEL_ID".to_owned(), "3".to_owned()),
         ("TEST_VIDEO_ID".to_owned(), "video".to_owned()),
-        ("TEST_LONG_VIDEO_ID".to_owned(), "long-video".to_owned()),
         (
             "DISCORD_VOICE_SERVICE_URI".to_owned(),
             "http://127.0.0.1:55051".to_owned(),
@@ -666,10 +747,6 @@ fn valid_env() -> HashMap<String, String> {
         (
             "LIVE_STAGING_HTTP_READ_JITTER_MS".to_owned(),
             "25".to_owned(),
-        ),
-        (
-            "LIVE_STAGING_LONG_TRACK_MIN_PACKETS".to_owned(),
-            "300".to_owned(),
         ),
     ])
 }
@@ -714,6 +791,7 @@ fn sample_playback_metrics() -> PlaybackStabilityEvidence {
         current_source_buffer_depth: playback_depth(240, 122880, 4800, 230400),
         min_source_buffer_depth: playback_depth(50, 25600, 1000, 48000),
         max_source_buffer_depth: playback_depth(250, 128000, 5000, 240000),
+        source_buffer_depth: Some(source_buffer_depth_stats()),
         current_playout_buffer_depth: playback_depth(19, 9728, 380, 18_240),
         min_playout_buffer_depth: playback_depth(0, 0, 0, 0),
         max_playout_buffer_depth: playback_depth(20, 10240, 400, 19_200),
@@ -721,7 +799,44 @@ fn sample_playback_metrics() -> PlaybackStabilityEvidence {
         current_egress_buffer_depth: playback_depth(19, 9728, 380, 18_240),
         min_egress_buffer_depth: playback_depth(0, 0, 0, 0),
         max_egress_buffer_depth: playback_depth(20, 10240, 400, 19_200),
-        prepared_rtp_queue_depth_ms: 0,
+        prepared_rtp_queue_depth_ms: 380,
+        prepared_track_queue_target_ms: 400,
+        prepared_track_queue_low_watermark_ms: 300,
+        prepared_track_queue_high_watermark_ms: 500,
+        active_pre_pause_prepared_track_queue_depth: Some(playback_queue_depth_stats()),
+        active_post_resume_prepared_track_queue_depth: Some(playback_queue_depth_stats()),
+        prepared_track_queue_depth_sample_count: 100,
+        prepared_track_queue_empty_count: 0,
+        raw_send_event_count: 0,
+        raw_prepared_track_queue_sample_count: 0,
+        raw_prepared_playout_queue_event_count: 0,
+        raw_send_events: Vec::new(),
+        raw_prepared_track_queue_samples: Vec::new(),
+        raw_prepared_playout_queue_events: Vec::new(),
+        current_scheduled_silence_queue_depth: playback_depth(0, 0, 0, 0),
+        max_scheduled_silence_queue_depth: playback_depth(0, 0, 0, 0),
+        current_boundary_queue_depth: playback_depth(0, 0, 0, 0),
+        max_boundary_queue_depth: playback_depth(1, 3, 20, 960),
+        prepared_track_packet_drop_count: 0,
+        prepared_silence_packet_drop_count: 0,
+        prepared_packet_rebuild_count: 0,
+        scheduled_silence_packet_count: 0,
+        pause_media_boundary_count: 1,
+        stop_media_boundary_count: 0,
+        recovery_media_boundary_count: 0,
+        natural_end_media_boundary_count: 0,
+        dave_transition_recovery_reached_builder_count: 0,
+        dave_transition_recovery_reached_deadline_sender_count: 0,
+        source_underrun_reached_builder_count: 0,
+        source_underrun_reached_deadline_sender_count: 0,
+        discarded_source_frame_count: 0,
+        discarded_source_duration_ms: 0,
+        stop_discarded_source_frame_count: 0,
+        stop_discarded_source_duration_ms: 0,
+        interruption_discarded_source_frame_count: 0,
+        interruption_discarded_source_duration_ms: 0,
+        restored_source_frame_count: 0,
+        restored_source_duration_ms: 0,
         source_buffer_target_ms: 5000,
         adaptive_buffer_target_ms: 5000,
         max_adaptive_buffer_target_ms: 5000,
@@ -749,7 +864,7 @@ fn sample_playback_metrics() -> PlaybackStabilityEvidence {
         post_stall_first_intervals_ms: Vec::new(),
         post_rebuffer_first_intervals_ms: Vec::new(),
         playout_sender_lateness: playback_stats(144, 0, 2, 4, 0, 5),
-        playout_builder_prepare_duration: playback_stats(0, 0, 0, 0, 0, 0),
+        playout_builder_prepare_duration: playback_stats(144, 0, 1, 1, 0, 1),
         sender_send_duration: playback_stats(144, 0, 1, 2, 0, 2),
         sender_loop_non_send_work_duration: playback_stats(144, 0, 1, 1, 0, 1),
         max_consecutive_playout_late_packets: 2,
@@ -785,16 +900,6 @@ fn sample_reconnect_probe_metrics() -> PlaybackStabilityEvidence {
     }
 }
 
-fn sample_long_track_metrics() -> PlaybackStabilityEvidence {
-    PlaybackStabilityEvidence {
-        playback_epoch: 9,
-        video_id: Some("long-video".to_owned()),
-        track_packet_count: 300,
-        ended: false,
-        ..sample_playback_metrics()
-    }
-}
-
 fn playback_stats(
     samples: u64,
     p50_ms: u64,
@@ -824,6 +929,32 @@ fn playback_depth(
         bytes,
         duration_ms,
         duration_samples,
+    }
+}
+
+fn playback_queue_depth_stats() -> PlaybackQueueDepthStatsEvidence {
+    PlaybackQueueDepthStatsEvidence {
+        sample_count: 50,
+        empty_count: 0,
+        current_depth: playback_depth(20, 10_240, 400, 19_200),
+        min_depth: playback_depth(16, 8_192, 320, 15_360),
+        p5_depth: playback_depth(16, 8_192, 320, 15_360),
+        p50_depth: playback_depth(20, 10_240, 400, 19_200),
+        p95_depth: playback_depth(24, 12_288, 480, 23_040),
+        max_depth: playback_depth(25, 12_800, 500, 24_000),
+    }
+}
+
+fn source_buffer_depth_stats() -> PlaybackQueueDepthStatsEvidence {
+    PlaybackQueueDepthStatsEvidence {
+        sample_count: 50,
+        empty_count: 0,
+        current_depth: playback_depth(240, 122_880, 4_800, 230_400),
+        min_depth: playback_depth(50, 25_600, 1_000, 48_000),
+        p5_depth: playback_depth(200, 102_400, 4_000, 192_000),
+        p50_depth: playback_depth(240, 122_880, 4_800, 230_400),
+        p95_depth: playback_depth(250, 128_000, 5_000, 240_000),
+        max_depth: playback_depth(250, 128_000, 5_000, 240_000),
     }
 }
 

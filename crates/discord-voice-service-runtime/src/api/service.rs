@@ -8,9 +8,18 @@ use discord_voice_service_proto::discordvoice::v1::{
     GetStateRequest, JoinVoiceRequest, JoinVoiceResponse, LeaveVoiceRequest, LeaveVoiceResponse,
     PauseRequest, PauseResponse, PlayRequest, PlayResponse,
     PlaybackBufferDepthSnapshot as ProtoPlaybackBufferDepthSnapshot,
-    PlaybackStabilitySnapshot as ProtoPlaybackStabilitySnapshot, ResumeRequest, ResumeResponse,
-    SessionEvent, SessionState as ProtoSessionState, SessionStateSnapshot, StopRequest,
-    StopResponse, SubscribeEventsRequest, UpdateVoiceContextRequest, UpdateVoiceContextResponse,
+    PlaybackQueueDepthStatsSnapshot as ProtoPlaybackQueueDepthStatsSnapshot,
+    PlaybackSendCommandKind as ProtoPlaybackSendCommandKind,
+    PlaybackSendEventSnapshot as ProtoPlaybackSendEventSnapshot,
+    PlaybackStabilitySnapshot as ProtoPlaybackStabilitySnapshot,
+    PreparedPlayoutQueueEventKind as ProtoPreparedPlayoutQueueEventKind,
+    PreparedPlayoutQueueEventReason as ProtoPreparedPlayoutQueueEventReason,
+    PreparedPlayoutQueueEventSnapshot as ProtoPreparedPlayoutQueueEventSnapshot,
+    PreparedTrackQueueDepthSampleSnapshot as ProtoPreparedTrackQueueDepthSampleSnapshot,
+    PreparedTrackQueueSamplePhase as ProtoPreparedTrackQueueSamplePhase, ResumeRequest,
+    ResumeResponse, SessionEvent, SessionState as ProtoSessionState, SessionStateSnapshot,
+    StopRequest, StopResponse, SubscribeEventsRequest, UpdateVoiceContextRequest,
+    UpdateVoiceContextResponse,
 };
 use discord_voice_service_voice::VoiceContext;
 use futures::{Stream, stream};
@@ -20,7 +29,15 @@ use crate::session::events::{SessionEventKind, SessionEventRecord};
 use crate::{
     Command, DurationStatsSnapshot as RuntimeDurationStatsSnapshot,
     PlaybackBufferDepthSnapshot as RuntimePlaybackBufferDepthSnapshot,
-    PlaybackStabilitySnapshot as RuntimePlaybackStabilitySnapshot, Readiness, SessionState,
+    PlaybackQueueDepthStatsSnapshot as RuntimePlaybackQueueDepthStatsSnapshot,
+    PlaybackSendCommandKind as RuntimePlaybackSendCommandKind,
+    PlaybackSendEventSnapshot as RuntimePlaybackSendEventSnapshot,
+    PlaybackStabilitySnapshot as RuntimePlaybackStabilitySnapshot,
+    PreparedPlayoutQueueEventKind as RuntimePreparedPlayoutQueueEventKind,
+    PreparedPlayoutQueueEventReason as RuntimePreparedPlayoutQueueEventReason,
+    PreparedPlayoutQueueEventSnapshot as RuntimePreparedPlayoutQueueEventSnapshot,
+    PreparedTrackQueueDepthSampleSnapshot as RuntimePreparedTrackQueueDepthSampleSnapshot,
+    PreparedTrackQueueSamplePhase as RuntimePreparedTrackQueueSamplePhase, Readiness, SessionState,
     Supervisor, observability,
 };
 
@@ -246,6 +263,7 @@ fn map_playback_stability_snapshot(
         current_source_buffer_depth: Some(map_buffer_depth(snapshot.current_source_buffer_depth)),
         min_source_buffer_depth: Some(map_buffer_depth(snapshot.min_source_buffer_depth)),
         max_source_buffer_depth: Some(map_buffer_depth(snapshot.max_source_buffer_depth)),
+        source_buffer_depth: Some(map_queue_depth_stats(snapshot.source_buffer_depth)),
         current_playout_buffer_depth: Some(map_buffer_depth(snapshot.current_playout_buffer_depth)),
         min_playout_buffer_depth: Some(map_buffer_depth(snapshot.min_playout_buffer_depth)),
         max_playout_buffer_depth: Some(map_buffer_depth(snapshot.max_playout_buffer_depth)),
@@ -254,6 +272,67 @@ fn map_playback_stability_snapshot(
         min_egress_buffer_depth: Some(map_buffer_depth(snapshot.min_egress_buffer_depth)),
         max_egress_buffer_depth: Some(map_buffer_depth(snapshot.max_egress_buffer_depth)),
         prepared_rtp_queue_depth_ms: snapshot.prepared_rtp_queue_depth_ms,
+        prepared_track_queue_target_ms: snapshot.prepared_track_queue_target_ms,
+        prepared_track_queue_low_watermark_ms: snapshot.prepared_track_queue_low_watermark_ms,
+        prepared_track_queue_high_watermark_ms: snapshot.prepared_track_queue_high_watermark_ms,
+        active_pre_pause_prepared_track_queue_depth: Some(map_queue_depth_stats(
+            snapshot.active_pre_pause_prepared_track_queue_depth,
+        )),
+        active_post_resume_prepared_track_queue_depth: Some(map_queue_depth_stats(
+            snapshot.active_post_resume_prepared_track_queue_depth,
+        )),
+        prepared_track_queue_depth_sample_count: usize_to_u64(
+            snapshot.prepared_track_queue_depth_sample_count,
+        ),
+        prepared_track_queue_empty_count: snapshot.prepared_track_queue_empty_count,
+        raw_send_events: snapshot
+            .raw_send_events
+            .into_iter()
+            .map(map_raw_send_event)
+            .collect(),
+        raw_prepared_track_queue_samples: snapshot
+            .raw_prepared_track_queue_samples
+            .into_iter()
+            .map(map_raw_prepared_track_queue_sample)
+            .collect(),
+        raw_prepared_playout_queue_events: snapshot
+            .raw_prepared_playout_queue_events
+            .into_iter()
+            .map(map_raw_prepared_playout_queue_event)
+            .collect(),
+        current_scheduled_silence_queue_depth: Some(map_buffer_depth(
+            snapshot.current_scheduled_silence_queue_depth,
+        )),
+        max_scheduled_silence_queue_depth: Some(map_buffer_depth(
+            snapshot.max_scheduled_silence_queue_depth,
+        )),
+        current_boundary_queue_depth: Some(map_buffer_depth(snapshot.current_boundary_queue_depth)),
+        max_boundary_queue_depth: Some(map_buffer_depth(snapshot.max_boundary_queue_depth)),
+        prepared_track_packet_drop_count: snapshot.prepared_track_packet_drop_count,
+        prepared_silence_packet_drop_count: snapshot.prepared_silence_packet_drop_count,
+        prepared_packet_rebuild_count: snapshot.prepared_packet_rebuild_count,
+        scheduled_silence_packet_count: snapshot.scheduled_silence_packet_count,
+        pause_media_boundary_count: snapshot.pause_media_boundary_count,
+        stop_media_boundary_count: snapshot.stop_media_boundary_count,
+        recovery_media_boundary_count: snapshot.recovery_media_boundary_count,
+        natural_end_media_boundary_count: snapshot.natural_end_media_boundary_count,
+        dave_transition_recovery_reached_builder_count: snapshot
+            .dave_transition_recovery_reached_builder_count,
+        dave_transition_recovery_reached_deadline_sender_count: snapshot
+            .dave_transition_recovery_reached_deadline_sender_count,
+        source_underrun_reached_builder_count: snapshot.source_underrun_reached_builder_count,
+        source_underrun_reached_deadline_sender_count: snapshot
+            .source_underrun_reached_deadline_sender_count,
+        discarded_source_frame_count: snapshot.discarded_source_frame_count,
+        discarded_source_duration_ms: snapshot.discarded_source_duration_ms,
+        stop_discarded_source_frame_count: snapshot.stop_discarded_source_frame_count,
+        stop_discarded_source_duration_ms: snapshot.stop_discarded_source_duration_ms,
+        interruption_discarded_source_frame_count: snapshot
+            .interruption_discarded_source_frame_count,
+        interruption_discarded_source_duration_ms: snapshot
+            .interruption_discarded_source_duration_ms,
+        restored_source_frame_count: snapshot.restored_source_frame_count,
+        restored_source_duration_ms: snapshot.restored_source_duration_ms,
         source_buffer_target_ms: snapshot.source_buffer_target_ms,
         adaptive_buffer_target_ms: snapshot.adaptive_buffer_target_ms,
         max_adaptive_buffer_target_ms: snapshot.max_adaptive_buffer_target_ms,
@@ -336,6 +415,152 @@ fn map_buffer_depth(
         bytes: usize_to_u64(snapshot.bytes),
         duration_ms: snapshot.duration_ms,
         duration_samples: snapshot.duration_samples,
+    }
+}
+
+fn map_queue_depth_stats(
+    snapshot: RuntimePlaybackQueueDepthStatsSnapshot,
+) -> ProtoPlaybackQueueDepthStatsSnapshot {
+    ProtoPlaybackQueueDepthStatsSnapshot {
+        sample_count: usize_to_u64(snapshot.sample_count),
+        empty_count: snapshot.empty_count,
+        current_depth: Some(map_buffer_depth(snapshot.current_depth)),
+        min_depth: Some(map_buffer_depth(snapshot.min_depth)),
+        p5_depth: Some(map_buffer_depth(snapshot.p5_depth)),
+        p50_depth: Some(map_buffer_depth(snapshot.p50_depth)),
+        p95_depth: Some(map_buffer_depth(snapshot.p95_depth)),
+        max_depth: Some(map_buffer_depth(snapshot.max_depth)),
+    }
+}
+
+fn map_raw_send_event(event: RuntimePlaybackSendEventSnapshot) -> ProtoPlaybackSendEventSnapshot {
+    ProtoPlaybackSendEventSnapshot {
+        packet_index: event.packet_index,
+        command_kind: map_send_command_kind(event.command_kind) as i32,
+        expected_deadline_offset_us: event.expected_deadline_offset_us,
+        send_started_offset_us: event.send_started_offset_us,
+        sent_offset_us: event.sent_offset_us,
+        media_duration_ms: event.media_duration_ms,
+        media_duration_samples: event.media_duration_samples,
+        rtp_sequence: u32::from(event.rtp_sequence),
+        rtp_timestamp: event.rtp_timestamp,
+        protection_nonce: event.protection_nonce,
+        source_frame_epoch: event.source_frame_epoch,
+        source_media_position_ms: event.source_media_position_ms,
+        source_media_byte_position: event.source_media_byte_position,
+        committed_heard_media: event.committed_heard_media,
+    }
+}
+
+fn map_send_command_kind(kind: RuntimePlaybackSendCommandKind) -> ProtoPlaybackSendCommandKind {
+    match kind {
+        RuntimePlaybackSendCommandKind::Track => ProtoPlaybackSendCommandKind::Track,
+        RuntimePlaybackSendCommandKind::ScheduledSilence => {
+            ProtoPlaybackSendCommandKind::ScheduledSilence
+        }
+        RuntimePlaybackSendCommandKind::BoundarySilence => {
+            ProtoPlaybackSendCommandKind::BoundarySilence
+        }
+        RuntimePlaybackSendCommandKind::OtherBoundary => {
+            ProtoPlaybackSendCommandKind::OtherBoundary
+        }
+    }
+}
+
+fn map_raw_prepared_track_queue_sample(
+    sample: RuntimePreparedTrackQueueDepthSampleSnapshot,
+) -> ProtoPreparedTrackQueueDepthSampleSnapshot {
+    ProtoPreparedTrackQueueDepthSampleSnapshot {
+        sample_index: sample.sample_index,
+        phase: map_prepared_track_queue_sample_phase(sample.phase) as i32,
+        depth: Some(map_buffer_depth(sample.depth)),
+    }
+}
+
+fn map_raw_prepared_playout_queue_event(
+    event: RuntimePreparedPlayoutQueueEventSnapshot,
+) -> ProtoPreparedPlayoutQueueEventSnapshot {
+    ProtoPreparedPlayoutQueueEventSnapshot {
+        event_index: event.event_index,
+        event_kind: map_prepared_playout_queue_event_kind(event.event_kind) as i32,
+        reason: map_prepared_playout_queue_event_reason(event.reason) as i32,
+        command_kind: map_send_command_kind(event.command_kind) as i32,
+        media_duration_ms: event.media_duration_ms,
+        media_duration_samples: event.media_duration_samples,
+        rtp_sequence: event.rtp_sequence,
+        rtp_timestamp: event.rtp_timestamp,
+        protection_nonce: event.protection_nonce,
+        source_frame_epoch: event.source_frame_epoch,
+        source_media_position_ms: event.source_media_position_ms,
+        source_media_byte_position: event.source_media_byte_position,
+        queue_depth_after: Some(map_buffer_depth(event.queue_depth_after)),
+    }
+}
+
+fn map_prepared_playout_queue_event_kind(
+    event_kind: RuntimePreparedPlayoutQueueEventKind,
+) -> ProtoPreparedPlayoutQueueEventKind {
+    match event_kind {
+        RuntimePreparedPlayoutQueueEventKind::Unknown => {
+            ProtoPreparedPlayoutQueueEventKind::Unspecified
+        }
+        RuntimePreparedPlayoutQueueEventKind::Enqueued => {
+            ProtoPreparedPlayoutQueueEventKind::Enqueued
+        }
+        RuntimePreparedPlayoutQueueEventKind::DequeuedToDeadlineSender => {
+            ProtoPreparedPlayoutQueueEventKind::DequeuedToDeadlineSender
+        }
+        RuntimePreparedPlayoutQueueEventKind::DroppedBeforeSend => {
+            ProtoPreparedPlayoutQueueEventKind::DroppedBeforeSend
+        }
+        RuntimePreparedPlayoutQueueEventKind::Rebuilt => {
+            ProtoPreparedPlayoutQueueEventKind::Rebuilt
+        }
+    }
+}
+
+fn map_prepared_playout_queue_event_reason(
+    reason: RuntimePreparedPlayoutQueueEventReason,
+) -> ProtoPreparedPlayoutQueueEventReason {
+    match reason {
+        RuntimePreparedPlayoutQueueEventReason::Unspecified => {
+            ProtoPreparedPlayoutQueueEventReason::Unspecified
+        }
+        RuntimePreparedPlayoutQueueEventReason::SteadyPlayback => {
+            ProtoPreparedPlayoutQueueEventReason::SteadyPlayback
+        }
+        RuntimePreparedPlayoutQueueEventReason::Pause => {
+            ProtoPreparedPlayoutQueueEventReason::Pause
+        }
+        RuntimePreparedPlayoutQueueEventReason::Stop => ProtoPreparedPlayoutQueueEventReason::Stop,
+        RuntimePreparedPlayoutQueueEventReason::DaveTransitionRecovery => {
+            ProtoPreparedPlayoutQueueEventReason::DaveTransitionRecovery
+        }
+        RuntimePreparedPlayoutQueueEventReason::Reconnect => {
+            ProtoPreparedPlayoutQueueEventReason::Reconnect
+        }
+        RuntimePreparedPlayoutQueueEventReason::SourceUnderrun => {
+            ProtoPreparedPlayoutQueueEventReason::SourceUnderrun
+        }
+        RuntimePreparedPlayoutQueueEventReason::NaturalEnd => {
+            ProtoPreparedPlayoutQueueEventReason::NaturalEnd
+        }
+        RuntimePreparedPlayoutQueueEventReason::Interruption => {
+            ProtoPreparedPlayoutQueueEventReason::Interruption
+        }
+    }
+}
+
+fn map_prepared_track_queue_sample_phase(
+    phase: RuntimePreparedTrackQueueSamplePhase,
+) -> ProtoPreparedTrackQueueSamplePhase {
+    match phase {
+        RuntimePreparedTrackQueueSamplePhase::ActivePrePause => {
+            ProtoPreparedTrackQueueSamplePhase::ActivePrePause
+        }
+        RuntimePreparedTrackQueueSamplePhase::ActivePostResume => {
+            ProtoPreparedTrackQueueSamplePhase::ActivePostResume
+        }
     }
 }
 

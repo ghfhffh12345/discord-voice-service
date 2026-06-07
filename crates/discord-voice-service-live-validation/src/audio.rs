@@ -80,6 +80,7 @@ pub struct AudioValidationAccumulator {
     last_packet_duration: Option<Duration>,
     last_packet_duration_samples: Option<u32>,
     last_packet_timestamp: Option<u32>,
+    last_packet_sequence: Option<u16>,
     inter_arrivals: Vec<Duration>,
     observed_packet_timings: Vec<ObservedPacketTiming>,
 }
@@ -104,6 +105,7 @@ impl AudioValidationAccumulator {
             last_packet_duration: None,
             last_packet_duration_samples: None,
             last_packet_timestamp: None,
+            last_packet_sequence: None,
             inter_arrivals: Vec::new(),
             observed_packet_timings: Vec::new(),
         }
@@ -177,7 +179,7 @@ impl AudioValidationAccumulator {
                 frame_samples
             );
         }
-        self.validate_rtp_timestamp_delta(packet.timestamp)?;
+        self.validate_rtp_continuity(packet.sequence, packet.timestamp)?;
 
         let packet_peak = pcm
             .iter()
@@ -203,6 +205,7 @@ impl AudioValidationAccumulator {
         self.last_packet_duration = Some(packet_duration);
         self.last_packet_duration_samples = Some(declared_duration.samples);
         self.last_packet_timestamp = Some(packet.timestamp);
+        self.last_packet_sequence = Some(packet.sequence);
         self.observed_packet_timings.push(ObservedPacketTiming {
             observed_at,
             duration: packet_duration,
@@ -254,15 +257,25 @@ impl AudioValidationAccumulator {
         }
     }
 
-    fn validate_rtp_timestamp_delta(&self, timestamp: u32) -> Result<()> {
-        if let (Some(previous_timestamp), Some(previous_samples)) = (
+    fn validate_rtp_continuity(&self, sequence: u16, timestamp: u32) -> Result<()> {
+        if let Some(previous_sequence) = self.last_packet_sequence {
+            let expected_sequence = previous_sequence.wrapping_add(1);
+            if sequence != expected_sequence {
+                bail!(
+                    "rtp sequence jumped from {previous_sequence} to {sequence}; expected {expected_sequence}"
+                );
+            }
+        }
+
+        if let (Some(previous_timestamp), Some(previous_samples), Some(previous_sequence)) = (
             self.last_packet_timestamp,
             self.last_packet_duration_samples,
+            self.last_packet_sequence,
         ) {
             let delta = timestamp.wrapping_sub(previous_timestamp);
             if delta != previous_samples {
                 bail!(
-                    "rtp timestamp delta was {delta} samples; expected previous opus duration {previous_samples} samples"
+                    "rtp timestamp delta was {delta} samples after sequence {previous_sequence}; expected previous opus duration {previous_samples} samples"
                 );
             }
         }
@@ -369,6 +382,12 @@ impl AudioValidationAccumulator {
         self.last_packet_duration = None;
         self.last_packet_duration_samples = None;
         self.last_packet_timestamp = None;
+        self.observed_packet_timings.clear();
+    }
+
+    pub fn reset_wall_clock_baseline_after_controlled_pause(&mut self) {
+        self.last_observed_at = None;
+        self.last_packet_duration = None;
         self.observed_packet_timings.clear();
     }
 

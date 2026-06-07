@@ -15,7 +15,7 @@ use crate::protocol::{
 };
 use crate::rollover::VoiceSessionRollover;
 use crate::speaking::{OPUS_SILENCE_FRAME, send_not_speaking, send_speaking};
-use crate::udp::{PreparedVoicePacket, VoiceUdpTransport};
+use crate::udp::{PreparedVoicePacket, VoicePreparedPacketSender, VoiceUdpTransport};
 
 const DAVE_GATEWAY_EVENT_DRAIN_LIMIT: usize = 256;
 const DAVE_GATEWAY_IDLE_POLL: Duration = Duration::from_millis(1);
@@ -24,6 +24,8 @@ const DAVE_GATEWAY_EXECUTE_POLL: Duration = Duration::from_secs(15);
 const DAVE_PROTOCOL_INIT_TRANSITION_ID: u16 = 0;
 const START_SPEAKING_GATEWAY_REPEAT_COUNT: usize = 3;
 const START_SPEAKING_GATEWAY_REPEAT_DELAY: Duration = Duration::from_millis(50);
+const STOP_AUDIO_SILENCE_FRAME_COUNT: usize = 5;
+const STOP_AUDIO_SILENCE_FRAME_DELAY: Duration = Duration::from_millis(20);
 const STOP_SPEAKING_GATEWAY_REPEAT_COUNT: usize = 3;
 const STOP_SPEAKING_GATEWAY_REPEAT_DELAY: Duration = Duration::from_millis(100);
 const SUSPEND_STOP_SPEAKING_SETTLE_DELAY: Duration = Duration::from_millis(250);
@@ -398,6 +400,28 @@ impl ConnectedVoiceSession {
         Ok(())
     }
 
+    pub fn prepared_packet_sender(&mut self) -> Result<&mut VoicePreparedPacketSender, VoiceError> {
+        Ok(self
+            .transport
+            .as_mut()
+            .ok_or(VoiceError::InvalidState("voice transport unavailable"))?
+            .prepared_packet_sender())
+    }
+
+    pub fn cloned_prepared_packet_sender(&self) -> Result<VoicePreparedPacketSender, VoiceError> {
+        Ok(self
+            .transport
+            .as_ref()
+            .ok_or(VoiceError::InvalidState("voice transport unavailable"))?
+            .cloned_prepared_packet_sender())
+    }
+
+    pub fn discard_unsent_prepared_packets(&mut self) {
+        if let Some(transport) = self.transport.as_mut() {
+            transport.discard_unsent_prepared_packets();
+        }
+    }
+
     async fn process_pending_gateway_events(
         &mut self,
     ) -> Result<VoiceGatewayDrainReport, VoiceError> {
@@ -545,6 +569,14 @@ impl ConnectedVoiceSession {
             );
             if let Err(err) = self.process_gateway_event_for_dave(&gateway, event).await {
                 return Err(self.fail_dave_closed(err));
+            }
+            if deadline.is_some()
+                && (self.pending_dave_transition.is_some()
+                    || self.pending_dave_local_commit_transition.is_some()
+                    || !self.pending_dave_prepared_transitions.is_empty())
+            {
+                reached_drain_limit = false;
+                break;
             }
         }
 
@@ -1504,7 +1536,7 @@ impl ConnectedVoiceSession {
     }
 
     pub async fn stop_audio(&mut self) -> Result<(), VoiceError> {
-        for silence_frame_index in 0..5 {
+        for silence_frame_index in 0..STOP_AUDIO_SILENCE_FRAME_COUNT {
             if let Err(err) = self
                 .send_audio_frame(Bytes::copy_from_slice(&OPUS_SILENCE_FRAME))
                 .await
@@ -1516,6 +1548,7 @@ impl ConnectedVoiceSession {
                 );
                 return Err(err);
             }
+            tokio::time::sleep(STOP_AUDIO_SILENCE_FRAME_DELAY).await;
         }
         self.stop_speaking().await?;
         Ok(())
@@ -1640,6 +1673,7 @@ mod tests {
     struct FakeUdpPeer {
         addr: SocketAddr,
         silence_frame_count: Arc<Mutex<usize>>,
+        silence_frame_times: Arc<Mutex<Vec<Instant>>>,
     }
 
     impl FakeUdpPeer {
@@ -1648,6 +1682,8 @@ mod tests {
             let addr = socket.local_addr().unwrap();
             let silence_frame_count = Arc::new(Mutex::new(0usize));
             let silence_frame_count_state = Arc::clone(&silence_frame_count);
+            let silence_frame_times = Arc::new(Mutex::new(Vec::new()));
+            let silence_frame_times_state = Arc::clone(&silence_frame_times);
 
             tokio::spawn(async move {
                 let mut buf = [0u8; 512];
@@ -1670,6 +1706,7 @@ mod tests {
 
                     if packet.ends_with(&OPUS_SILENCE_FRAME) {
                         *silence_frame_count_state.lock().await += 1;
+                        silence_frame_times_state.lock().await.push(Instant::now());
                     }
                 }
             });
@@ -1677,6 +1714,7 @@ mod tests {
             Self {
                 addr,
                 silence_frame_count,
+                silence_frame_times,
             }
         }
 
@@ -1690,6 +1728,13 @@ mod tests {
 
         async fn silence_frame_count_now(&self) -> usize {
             *self.silence_frame_count.lock().await
+        }
+
+        async fn silence_frame_times(&self) -> Vec<Instant> {
+            wait_for_value(&self.silence_frame_times, |times| {
+                times.len() >= STOP_AUDIO_SILENCE_FRAME_COUNT
+            })
+            .await
         }
     }
 
@@ -1919,6 +1964,15 @@ mod tests {
             .await
             .expect("speaking should be observed");
         assert_eq!(udp.silence_frame_count().await, 5);
+        let silence_frame_times = udp.silence_frame_times().await;
+        assert_eq!(silence_frame_times.len(), STOP_AUDIO_SILENCE_FRAME_COUNT);
+        for window in silence_frame_times.windows(2) {
+            let gap = window[1].saturating_duration_since(window[0]);
+            assert!(
+                gap >= Duration::from_millis(15),
+                "stop_audio silence tail should be paced near 20ms, got {gap:?}"
+            );
+        }
         assert!(
             gateway
                 .speaking_state_count_at_least(0, STOP_SPEAKING_GATEWAY_REPEAT_COUNT)

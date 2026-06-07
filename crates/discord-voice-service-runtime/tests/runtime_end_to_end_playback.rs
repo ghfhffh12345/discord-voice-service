@@ -13,9 +13,10 @@ use discord_voice_service_proto::discordvoice::v1::{
     SessionEvent, SessionEventKind, SubscribeEventsRequest,
 };
 use discord_voice_service_runtime::{
-    Command, ControlService, PlaybackStabilitySnapshot, Readiness, SessionState, Supervisor,
+    Command, ControlService, PlaybackSendCommandKind, PlaybackStabilitySnapshot, Readiness,
+    SessionState, Supervisor,
 };
-use discord_voice_service_test_support::fake_discord::FakeDiscordPeer;
+use discord_voice_service_test_support::fake_discord::{FakeDiscordPeer, ObservedAudioPacket};
 use discord_voice_service_test_support::fake_ytmusic::FakeYtMusic;
 use discord_voice_service_test_support::fixtures::{
     spawn_stream_server, spawn_stream_server_with_chunk_jitter,
@@ -30,6 +31,7 @@ const LATE_LISTENER_USER_ID: &str = "7777777777777777";
 const TRACK_FRAME_DURATION: Duration = Duration::from_millis(20);
 const MIN_TRACK_SEND_START_INTERVAL: Duration = Duration::from_millis(20);
 const MIN_FAKE_UDP_OBSERVED_INTERVAL: Duration = Duration::from_millis(18);
+const STOP_SPEAKING_GATEWAY_REPEAT_COUNT: usize = 3;
 const MIN_MEDIA_TO_WALL_CLOCK_RATIO_PPM: u64 = 980_000;
 const MAX_MEDIA_TO_WALL_CLOCK_RATIO_PPM: u64 = 1_020_000;
 const DISCORD_EGRESS_BUFFER_TARGET_MS: u64 = 400;
@@ -181,7 +183,6 @@ async fn runtime_end_to_end_playback_play_prebuffers_five_seconds_before_playing
         "Playing must follow the five-second source prebuffer: {metrics:?}"
     );
     assert_raw_egress_metrics_published(&metrics, "Playing prebuffer");
-    assert_eq!(metrics.playout_builder_prepare_duration.samples, 0);
     assert_eq!(metrics.continuity_silence_packet_count, 0);
     assert_eq!(metrics.buffer_underrun_count, 0);
     assert_eq!(metrics.playout_underrun_count, 0);
@@ -425,7 +426,7 @@ async fn runtime_end_to_end_playback_packets_hold_near_20ms_cadence_without_refi
     );
     assert_bounded_raw_egress_metrics(&metrics, "normal playback");
     assert!(metrics.source_producer_fill_duration.samples >= 1);
-    assert_eq!(metrics.playout_builder_prepare_duration.samples, 0);
+    assert!(metrics.playout_builder_prepare_duration.samples > 0);
     assert!(metrics.sender_send_duration.samples >= 50);
     assert!(
         metrics.sender_loop_non_send_work_duration.max_ms <= 2,
@@ -572,7 +573,7 @@ async fn runtime_end_to_end_playback_does_not_burst_under_jittery_http_and_cpu_c
     );
     assert_bounded_raw_egress_metrics(&metrics, "stress playback");
     assert!(metrics.source_producer_fill_duration.samples >= 1);
-    assert_eq!(metrics.playout_builder_prepare_duration.samples, 0);
+    assert!(metrics.playout_builder_prepare_duration.samples > 0);
     assert!(metrics.sender_send_duration.samples >= 80);
     assert!(
         metrics.sender_loop_non_send_work_duration.max_ms <= 2,
@@ -683,7 +684,7 @@ async fn runtime_end_to_end_playback_alternating_two_ms_send_delay_keeps_twenty_
 }
 
 #[tokio::test]
-async fn runtime_end_to_end_playback_media_driver_does_not_burst_after_pause_or_late_tick() {
+async fn runtime_end_to_end_playback_media_driver_delay_does_not_perturb_deadline_sender() {
     let fake_yt = FakeYtMusic::spawn().await;
     let http = spawn_stream_server("audio-long.webm").await;
     fake_yt.set_playable_url(http.url()).await;
@@ -735,25 +736,29 @@ async fn runtime_end_to_end_playback_media_driver_does_not_burst_after_pause_or_
     let timestamps = fake_voice.non_silence_audio_frame_times_at_least(45).await;
     assert!(
         delay_used.load(Ordering::SeqCst),
-        "test hook should have delayed one live media send"
+        "test hook should have delayed the live media driver"
     );
     let intervals = intervals_between(&timestamps[..45]);
     let stats = interval_stats(&intervals);
     let delayed_interval = intervals[19];
     let post_delay_interval = intervals[20];
     assert!(
-        delayed_interval >= Duration::from_millis(250),
-        "the hook must create a genuinely late media tick: {delayed_interval:?}; stats={stats:?}"
+        delayed_interval <= Duration::from_millis(30),
+        "driver-side delay must not create a late RTP sender tick: {delayed_interval:?}; stats={stats:?}"
     );
     assert!(
         post_delay_interval >= MIN_FAKE_UDP_OBSERVED_INTERVAL,
-        "late media tick recovery must not catch up with a burst: {post_delay_interval:?}; stats={stats:?}"
+        "driver-side delay recovery must not catch up with a burst: {post_delay_interval:?}; stats={stats:?}"
     );
     assert!(
-        post_delay_interval <= Duration::from_millis(70),
-        "late media tick recovery should resume near cadence: {post_delay_interval:?}; stats={stats:?}"
+        post_delay_interval <= Duration::from_millis(30),
+        "driver-side delay should leave sender cadence near 20ms: {post_delay_interval:?}; stats={stats:?}"
     );
-    assert_no_fake_udp_interval_bursty(&intervals, "late media tick recovery");
+    assert!(
+        stats.p95 <= Duration::from_millis(22),
+        "driver-side delay must be absorbed by the prepared sender reservoir: {stats:?}"
+    );
+    assert_no_fake_udp_interval_bursty(&intervals, "driver-side delay recovery");
 
     supervisor.send(Command::Stop).await.unwrap();
     supervisor.clear_live_media_send_delay_for_tests();
@@ -764,12 +769,16 @@ async fn runtime_end_to_end_playback_media_driver_does_not_burst_after_pause_or_
         .await
         .expect("playback should publish stability metrics");
     assert!(
-        metrics.playout_sender_lateness.max_ms >= 250,
-        "metrics should observe the injected late media tick: {metrics:?}"
+        metrics.playout_sender_lateness.max_ms <= 5,
+        "driver-side delay must not appear as RTP sender lateness: {metrics:?}"
+    );
+    assert!(
+        metrics.track_media_to_wall_clock_ratio_ppm >= MIN_MEDIA_TO_WALL_CLOCK_RATIO_PPM,
+        "driver-side delay must not slow heard media below real time: {metrics:?}"
     );
     assert!(
         metrics.track_media_to_wall_clock_ratio_ppm <= MAX_MEDIA_TO_WALL_CLOCK_RATIO_PPM,
-        "late recovery must not run media faster than wall clock: {metrics:?}"
+        "driver-side delay must not run media faster than wall clock: {metrics:?}"
     );
     assert_eq!(
         metrics.track_fast_interval_count, 0,
@@ -778,20 +787,11 @@ async fn runtime_end_to_end_playback_media_driver_does_not_burst_after_pause_or_
     assert_eq!(metrics.playout_underrun_count, 0);
     assert_eq!(metrics.source_underrun_count, 0);
     assert_eq!(metrics.sender_forbidden_work_count, 0);
-    assert_bounded_raw_egress_metrics(&metrics, "late media tick recovery");
-    assert_eq!(metrics.playout_builder_prepare_duration.samples, 0);
-    assert!(
-        metrics.scheduler_late_reset_count >= 1,
-        "late tick should be reported as an explicit scheduler reset: {metrics:?}"
-    );
-    assert!(
-        metrics.media_clock_reset_count >= 1,
-        "late tick should rebase the media clock explicitly: {metrics:?}"
-    );
-    assert!(
-        metrics.controlled_media_interruption_count >= 1,
-        "late tick should be an explicit interruption, not hidden normal playback: {metrics:?}"
-    );
+    assert_bounded_raw_egress_metrics(&metrics, "driver-side delay recovery");
+    assert!(metrics.playout_builder_prepare_duration.samples > 0);
+    assert_eq!(metrics.scheduler_late_reset_count, 0);
+    assert_eq!(metrics.media_clock_reset_count, 0);
+    assert_eq!(metrics.controlled_media_interruption_count, 0);
 }
 
 #[tokio::test]
@@ -855,16 +855,32 @@ async fn runtime_end_to_end_playback_pause_stops_audio_until_resume_without_burs
         "Resume while already playing must leave playback running normally"
     );
 
+    let packets_before_pause = fake_voice.observed_audio_packets().await;
     let speaking_zeros_before_pause = fake_voice.speaking_state_count(0).await;
     supervisor.send(Command::Pause).await.unwrap();
     let pause_events = collect_events(&mut stream, 1).await;
     assert_eq!(pause_events[0].kind, SessionEventKind::Paused as i32);
-    tokio::time::sleep(Duration::from_millis(80)).await;
-    assert_eq!(
-        fake_voice.speaking_state_count(0).await,
-        speaking_zeros_before_pause,
-        "pause must not stop Speaking for transient playback suspension"
+    assert!(
+        fake_voice
+            .speaking_state_count_at_least(0, speaking_zeros_before_pause + 1)
+            .await
+            >= speaking_zeros_before_pause + 1,
+        "pause must send Speaking 0 after its silence tail"
     );
+    assert!(
+        fake_voice
+            .speaking_state_count_at_least(
+                0,
+                speaking_zeros_before_pause + STOP_SPEAKING_GATEWAY_REPEAT_COUNT,
+            )
+            .await
+            >= speaking_zeros_before_pause + STOP_SPEAKING_GATEWAY_REPEAT_COUNT,
+        "pause should complete the stop-speaking gateway repeat sequence"
+    );
+    let packets_after_pause = fake_voice.observed_audio_packets().await;
+    let silence_tail_start =
+        find_five_packet_silence_tail(&packets_after_pause, packets_before_pause.len());
+    assert_five_packet_silence_tail(&packets_after_pause, silence_tail_start);
 
     supervisor.send(Command::Pause).await.unwrap();
     tokio::time::timeout(Duration::from_millis(80), stream.next())
@@ -876,7 +892,6 @@ async fn runtime_end_to_end_playback_pause_stops_audio_until_resume_without_burs
         "redundant Pause while already paused must not reconnect voice media"
     );
 
-    tokio::time::sleep(Duration::from_millis(80)).await;
     let paused_count = fake_voice.audio_frame_count().await;
     tokio::time::sleep(Duration::from_millis(140)).await;
     assert_eq!(
@@ -904,6 +919,7 @@ async fn runtime_end_to_end_playback_pause_stops_audio_until_resume_without_burs
     );
 
     let speaking_ones_before_resume = fake_voice.speaking_state_count(1).await;
+    let non_silence_frames_before_resume = fake_voice.non_silence_audio_frame_count().await;
     supervisor.send(Command::Resume).await.unwrap();
     let resume_events = collect_events(&mut stream, 1).await;
     assert_eq!(resume_events[0].kind, SessionEventKind::Playing as i32);
@@ -912,11 +928,23 @@ async fn runtime_end_to_end_playback_pause_stops_audio_until_resume_without_burs
         1,
         "resume should not rebuild voice media for a transient pause"
     );
-    tokio::time::sleep(Duration::from_millis(140)).await;
-    assert_eq!(
-        fake_voice.speaking_state_count(1).await,
-        speaking_ones_before_resume,
-        "resume must not restart Speaking when the transport was not rebuilt"
+    assert!(
+        fake_voice
+            .speaking_state_count_at_least(1, speaking_ones_before_resume + 1)
+            .await
+            >= speaking_ones_before_resume + 1,
+        "resume must send Speaking 1 before resumed media"
+    );
+    let speaking_one_times = fake_voice
+        .speaking_state_times_at_least(1, speaking_ones_before_resume + 1)
+        .await;
+    let resumed_non_silence_times = fake_voice
+        .non_silence_audio_frame_times_at_least(non_silence_frames_before_resume + 1)
+        .await;
+    assert!(
+        speaking_one_times[speaking_ones_before_resume]
+            <= resumed_non_silence_times[non_silence_frames_before_resume],
+        "resume Speaking 1 must be observed before the first resumed non-silence RTP packet"
     );
 
     let resumed_target = paused_count + 4;
@@ -974,18 +1002,39 @@ async fn runtime_end_to_end_playback_pause_resume_without_voice_context_refresh_
     assert!(fake_voice.audio_frame_count_at_least(4).await >= 4);
     assert_eq!(fake_voice.discovery_count().await, 1);
 
+    let packets_before_pause = fake_voice.observed_audio_packets().await;
     let speaking_zeros_before_pause = fake_voice.speaking_state_count(0).await;
     supervisor.send(Command::Pause).await.unwrap();
     let pause_events = collect_events(&mut stream, 1).await;
     assert_eq!(pause_events[0].kind, SessionEventKind::Paused as i32);
-    tokio::time::sleep(Duration::from_millis(80)).await;
-    assert_eq!(
-        fake_voice.speaking_state_count(0).await,
-        speaking_zeros_before_pause,
-        "pause must keep Speaking active for transient suspension"
+    assert!(
+        fake_voice
+            .speaking_state_count_at_least(0, speaking_zeros_before_pause + 1)
+            .await
+            >= speaking_zeros_before_pause + 1,
+        "pause must send Speaking 0 after its silence tail"
     );
+    assert!(
+        fake_voice
+            .speaking_state_count_at_least(
+                0,
+                speaking_zeros_before_pause + STOP_SPEAKING_GATEWAY_REPEAT_COUNT,
+            )
+            .await
+            >= speaking_zeros_before_pause + STOP_SPEAKING_GATEWAY_REPEAT_COUNT,
+        "pause should complete the stop-speaking gateway repeat sequence"
+    );
+    let packets_after_pause = fake_voice.observed_audio_packets().await;
+    let silence_tail_start =
+        find_five_packet_silence_tail(&packets_after_pause, packets_before_pause.len());
+    assert_five_packet_silence_tail(&packets_after_pause, silence_tail_start);
+    let silence_tail_end = silence_tail_start + 5;
 
     let paused_count = fake_voice.audio_frame_count().await;
+    assert_eq!(
+        paused_count, silence_tail_end,
+        "pause should stop RTP immediately after the five-packet silence tail"
+    );
     tokio::time::sleep(Duration::from_millis(140)).await;
     assert_eq!(
         fake_voice.audio_frame_count().await,
@@ -997,18 +1046,22 @@ async fn runtime_end_to_end_playback_pause_resume_without_voice_context_refresh_
 
     supervisor.send(Command::Resume).await.unwrap();
     let resume_events = collect_events(&mut stream, 1).await;
-    let playing_observed_at = Instant::now();
     assert_eq!(resume_events[0].kind, SessionEventKind::Playing as i32);
     assert_eq!(
         fake_voice.discovery_count().await,
         1,
         "resume without a paused voice context refresh must not reconnect voice media"
     );
-    assert_eq!(
-        fake_voice.speaking_state_count(1).await,
-        speaking_ones_before_resume,
-        "resume without transport rebuild must not prepare Speaking again"
+    assert!(
+        fake_voice
+            .speaking_state_count_at_least(1, speaking_ones_before_resume + 1)
+            .await
+            >= speaking_ones_before_resume + 1,
+        "resume without transport rebuild must still prepare a fresh Speaking 1"
     );
+    let speaking_one_times = fake_voice
+        .speaking_state_times_at_least(1, speaking_ones_before_resume + 1)
+        .await;
 
     let resumed_target = paused_count + 4;
     assert!(fake_voice.audio_frame_count_at_least(resumed_target).await >= resumed_target);
@@ -1017,11 +1070,34 @@ async fn runtime_end_to_end_playback_pause_resume_without_voice_context_refresh_
         .non_silence_audio_frame_times_at_least(resumed_non_silence_target)
         .await;
     let first_resumed_interval = resumed_non_silence_times[non_silence_frames_before_resume]
-        .checked_duration_since(playing_observed_at)
+        .checked_duration_since(speaking_one_times[speaking_ones_before_resume])
         .unwrap_or(Duration::ZERO);
     assert!(
-        first_resumed_interval <= Duration::from_millis(40),
-        "first resumed non-silence frame should arrive promptly after Playing: {first_resumed_interval:?}"
+        first_resumed_interval <= Duration::from_millis(140),
+        "first resumed non-silence frame should arrive promptly after resumed Speaking 1: {first_resumed_interval:?}"
+    );
+    assert!(
+        speaking_one_times[speaking_ones_before_resume]
+            <= resumed_non_silence_times[non_silence_frames_before_resume],
+        "resume Speaking 1 must be observed before the first resumed non-silence RTP packet"
+    );
+    let packets_after_resume = fake_voice
+        .observed_audio_packets_at_least(silence_tail_end + 1)
+        .await;
+    let first_resumed_packet_index = packets_after_resume
+        .iter()
+        .enumerate()
+        .skip(silence_tail_end)
+        .find_map(|(index, packet)| (!packet.is_stop_silence).then_some(index))
+        .expect("resume should send a non-silence music packet after the pause tail");
+    assert_eq!(
+        first_resumed_packet_index, silence_tail_end,
+        "resume must not send extra RTP packets before the first resumed music packet"
+    );
+    assert_rtp_packet_follows(
+        &packets_after_resume[silence_tail_end - 1],
+        &packets_after_resume[first_resumed_packet_index],
+        "first resumed music packet",
     );
     let speaking_ones_after_first_resumed_frame = fake_voice.speaking_state_count(1).await;
     tokio::time::sleep(Duration::from_millis(140)).await;
@@ -1375,24 +1451,40 @@ async fn runtime_end_to_end_playback_dave_transition_during_playback_does_not_se
         .expect("playback should publish stability metrics");
     assert_eq!(metrics.source_underrun_count, 0);
     assert_bounded_raw_egress_metrics(&metrics, "DAVE transition playback");
-    assert_eq!(metrics.playout_builder_prepare_duration.samples, 0);
+    assert!(metrics.playout_builder_prepare_duration.samples > 0);
     assert!(
         metrics.dave_transition_count_during_playback > 0,
         "metrics should count the injected DAVE transition during playback: {metrics:?}"
     );
-    if metrics.stale_dave_send_prevented_count > 0 {
-        assert!(
-            metrics.dave_transition_recovery_reset_count > 0,
-            "stale DAVE prevention must be paired with DAVE recovery reset evidence: {metrics:?}"
-        );
-        assert!(
-            metrics.controlled_media_interruption_count > 0,
-            "stale DAVE prevention must be reported as a controlled interruption: {metrics:?}"
-        );
-    } else {
-        assert_eq!(metrics.dave_transition_recovery_reset_count, 0);
-        assert_eq!(metrics.controlled_media_interruption_count, 0);
-    }
+    assert!(
+        metrics.stale_dave_send_prevented_count > 0,
+        "late DAVE transition should force stale prepared media prevention: {metrics:?}"
+    );
+    assert!(
+        metrics.dave_transition_recovery_reset_count > 0,
+        "stale DAVE prevention must be paired with DAVE recovery reset evidence: {metrics:?}"
+    );
+    assert!(
+        metrics.controlled_media_interruption_count > 0,
+        "stale DAVE prevention must be reported as a controlled interruption: {metrics:?}"
+    );
+    assert!(
+        metrics.recovery_media_boundary_count > 0,
+        "DAVE recovery must publish an explicit recovery media boundary: {metrics:?}"
+    );
+    assert!(
+        metrics.scheduled_silence_packet_count > 0,
+        "DAVE recovery must emit real-time scheduled silence instead of blocking the sender: {metrics:?}"
+    );
+    assert_eq!(
+        metrics.track_tempo_window_slow_count, 0,
+        "DAVE recovery silence must segment active music tempo windows: {metrics:?}"
+    );
+    assert!(
+        metrics.all_packet_interval.max_ms <= 70,
+        "DAVE recovery must keep RTP cadence bounded with scheduled silence: {metrics:?}"
+    );
+    assert_dave_recovery_silence_cadence(&metrics);
 }
 
 #[tokio::test]
@@ -1758,6 +1850,50 @@ async fn audio_frame_times_at_least_with_timeout(
     timestamps
 }
 
+fn find_five_packet_silence_tail(packets: &[ObservedAudioPacket], start: usize) -> usize {
+    packets
+        .windows(5)
+        .enumerate()
+        .skip(start)
+        .find_map(|(index, window)| {
+            window
+                .iter()
+                .all(|packet| packet.is_stop_silence)
+                .then_some(index)
+        })
+        .expect("pause should emit five consecutive Opus silence RTP packets")
+}
+
+fn assert_five_packet_silence_tail(packets: &[ObservedAudioPacket], start: usize) {
+    let tail = packets
+        .get(start..start + 5)
+        .expect("silence tail should contain five packets");
+    assert!(
+        tail.iter().all(|packet| packet.is_stop_silence),
+        "pause tail packets must all be Opus silence frames: {tail:?}"
+    );
+    for pair in tail.windows(2) {
+        assert_rtp_packet_follows(&pair[0], &pair[1], "pause silence tail packet");
+    }
+}
+
+fn assert_rtp_packet_follows(
+    previous: &ObservedAudioPacket,
+    next: &ObservedAudioPacket,
+    label: &str,
+) {
+    assert_eq!(
+        next.sequence.wrapping_sub(previous.sequence),
+        1,
+        "{label} must advance the RTP sequence by one"
+    );
+    assert_eq!(
+        next.timestamp.wrapping_sub(previous.timestamp),
+        960,
+        "{label} must advance the RTP timestamp by one 20ms Opus frame"
+    );
+}
+
 fn intervals_between(timestamps: &[Instant]) -> Vec<Duration> {
     timestamps
         .windows(2)
@@ -1830,7 +1966,62 @@ fn assert_bounded_raw_egress_metrics(metrics: &PlaybackStabilitySnapshot, label:
     assert_raw_egress_metrics_published(metrics, label);
     assert!(
         metrics.max_egress_buffer_depth.duration_ms > 0,
-        "{label} should exercise the raw Opus Discord egress buffer: {metrics:?}"
+        "{label} should exercise the prepared Discord playout buffer: {metrics:?}"
+    );
+    assert!(
+        metrics
+            .active_pre_pause_prepared_track_queue_depth
+            .sample_count
+            > 0,
+        "{label} should expose active pre-pause prepared track queue samples: {metrics:?}"
+    );
+    assert_eq!(
+        metrics
+            .active_pre_pause_prepared_track_queue_depth
+            .empty_count,
+        0,
+        "{label} should not report empty active pre-pause prepared track queue samples: {metrics:?}"
+    );
+    assert!(
+        (340..=460).contains(
+            &metrics
+                .active_pre_pause_prepared_track_queue_depth
+                .p50_depth
+                .duration_ms
+        ),
+        "{label} should keep the active pre-pause prepared track queue centered near 400ms: {metrics:?}"
+    );
+}
+
+fn assert_dave_recovery_silence_cadence(metrics: &PlaybackStabilitySnapshot) {
+    assert!(
+        metrics.scheduled_silence_packet_count > 0,
+        "DAVE recovery should send scheduled silence while media is encrypted by a stale DAVE state: {metrics:?}"
+    );
+
+    let mut checked_recovery_intervals = 0usize;
+    for pair in metrics.raw_send_events.windows(2) {
+        let previous = &pair[0];
+        let current = &pair[1];
+        if previous.command_kind != PlaybackSendCommandKind::ScheduledSilence
+            && current.command_kind != PlaybackSendCommandKind::ScheduledSilence
+        {
+            continue;
+        }
+
+        checked_recovery_intervals += 1;
+        let interval_us = current
+            .sent_offset_us
+            .saturating_sub(previous.sent_offset_us);
+        assert!(
+            interval_us <= 35_000,
+            "DAVE recovery scheduled silence must keep the RTP cadence near 20ms; interval_us={interval_us} previous={previous:?} current={current:?} metrics={metrics:?}"
+        );
+    }
+
+    assert!(
+        checked_recovery_intervals > 0,
+        "DAVE recovery should expose raw scheduled-silence send intervals: {metrics:?}"
     );
 }
 
@@ -1843,9 +2034,21 @@ fn assert_raw_egress_metrics_published(metrics: &PlaybackStabilitySnapshot, labe
         metrics.max_egress_buffer_depth.duration_ms <= DISCORD_EGRESS_BUFFER_HIGH_WATERMARK_MS,
         "{label} egress buffer must remain bounded by the high watermark: {metrics:?}"
     );
+    assert!(
+        metrics.prepared_rtp_queue_depth_ms <= DISCORD_EGRESS_BUFFER_HIGH_WATERMARK_MS,
+        "{label} prepared RTP queue must remain bounded by the high watermark: {metrics:?}"
+    );
     assert_eq!(
-        metrics.prepared_rtp_queue_depth_ms, 0,
-        "{label} must not queue prepared RTP packets: {metrics:?}"
+        metrics.prepared_track_queue_target_ms, DISCORD_EGRESS_BUFFER_TARGET_MS,
+        "{label} should publish the prepared track queue target: {metrics:?}"
+    );
+    assert!(
+        metrics.prepared_track_queue_low_watermark_ms >= 300,
+        "{label} should publish a strict prepared track queue low watermark: {metrics:?}"
+    );
+    assert!(
+        metrics.prepared_track_queue_high_watermark_ms <= DISCORD_EGRESS_BUFFER_HIGH_WATERMARK_MS,
+        "{label} prepared track queue high watermark must not exceed the hard cap: {metrics:?}"
     );
 }
 

@@ -4307,8 +4307,8 @@ dependencies = [
 
 [[package]]
 name = "ytmusic-service-client"
-version = "0.2.0"
-source = "git+https://github.com/ghfhffh12345/ytmusic-service?tag=v0.2.0#c89f302e4e3a0876ab61518892d2732d84c8bc87"
+version = "0.2.1"
+source = "git+https://github.com/ghfhffh12345/ytmusic-service?tag=v0.2.1#71f61ac1fde0ab9fbf97031948a29d7efedee26b"
 dependencies = [
  "thiserror 2.0.18",
  "tonic",
@@ -4317,8 +4317,8 @@ dependencies = [
 
 [[package]]
 name = "ytmusic-service-proto"
-version = "0.2.0"
-source = "git+https://github.com/ghfhffh12345/ytmusic-service?tag=v0.2.0#c89f302e4e3a0876ab61518892d2732d84c8bc87"
+version = "0.2.1"
+source = "git+https://github.com/ghfhffh12345/ytmusic-service?tag=v0.2.1#71f61ac1fde0ab9fbf97031948a29d7efedee26b"
 dependencies = [
  "prost",
  "protoc-bin-vendored",

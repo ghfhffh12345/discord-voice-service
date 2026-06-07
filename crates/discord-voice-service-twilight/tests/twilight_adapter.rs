@@ -1,7 +1,8 @@
 use discord_voice_service_twilight::{
-    PlaybackStabilitySnapshot, SessionEvent, SessionEventKind, SessionEventReason, SessionState,
-    StateSnapshot, VoiceContext, VoiceContextTracker, join_voice_channel, leave_voice_channel,
-    proto,
+    PlaybackSendCommandKind, PlaybackStabilitySnapshot, PreparedPlayoutQueueEventKind,
+    PreparedPlayoutQueueEventReason, PreparedTrackQueueSamplePhase, SessionEvent, SessionEventKind,
+    SessionEventReason, SessionState, StateSnapshot, VoiceContext, VoiceContextTracker,
+    join_voice_channel, leave_voice_channel, proto,
 };
 use twilight_gateway::Event;
 use twilight_model::{
@@ -190,6 +191,47 @@ fn proto_state_snapshot_converts_to_typed_state() {
 
 #[test]
 fn proto_playback_metrics_convert_to_typed_snapshot() {
+    let prepared_track_queue_depth = || proto::PlaybackQueueDepthStatsSnapshot {
+        sample_count: 50,
+        empty_count: 0,
+        current_depth: Some(proto::PlaybackBufferDepthSnapshot {
+            packets: 20,
+            bytes: 10_240,
+            duration_ms: 400,
+            duration_samples: 19_200,
+        }),
+        min_depth: Some(proto::PlaybackBufferDepthSnapshot {
+            packets: 16,
+            bytes: 8_192,
+            duration_ms: 320,
+            duration_samples: 15_360,
+        }),
+        p5_depth: Some(proto::PlaybackBufferDepthSnapshot {
+            packets: 16,
+            bytes: 8_192,
+            duration_ms: 320,
+            duration_samples: 15_360,
+        }),
+        p50_depth: Some(proto::PlaybackBufferDepthSnapshot {
+            packets: 20,
+            bytes: 10_240,
+            duration_ms: 400,
+            duration_samples: 19_200,
+        }),
+        p95_depth: Some(proto::PlaybackBufferDepthSnapshot {
+            packets: 24,
+            bytes: 12_288,
+            duration_ms: 480,
+            duration_samples: 23_040,
+        }),
+        max_depth: Some(proto::PlaybackBufferDepthSnapshot {
+            packets: 25,
+            bytes: 12_800,
+            duration_ms: 500,
+            duration_samples: 24_000,
+        }),
+    };
+
     let snapshot = PlaybackStabilitySnapshot::from(proto::PlaybackStabilitySnapshot {
         available: true,
         playback_epoch: 9,
@@ -279,6 +321,46 @@ fn proto_playback_metrics_convert_to_typed_snapshot() {
             duration_ms: 5000,
             duration_samples: 240000,
         }),
+        source_buffer_depth: Some(proto::PlaybackQueueDepthStatsSnapshot {
+            sample_count: 50,
+            empty_count: 0,
+            current_depth: Some(proto::PlaybackBufferDepthSnapshot {
+                packets: 240,
+                bytes: 122880,
+                duration_ms: 4800,
+                duration_samples: 230400,
+            }),
+            min_depth: Some(proto::PlaybackBufferDepthSnapshot {
+                packets: 50,
+                bytes: 25600,
+                duration_ms: 1000,
+                duration_samples: 48000,
+            }),
+            p5_depth: Some(proto::PlaybackBufferDepthSnapshot {
+                packets: 200,
+                bytes: 102400,
+                duration_ms: 4000,
+                duration_samples: 192000,
+            }),
+            p50_depth: Some(proto::PlaybackBufferDepthSnapshot {
+                packets: 240,
+                bytes: 122880,
+                duration_ms: 4800,
+                duration_samples: 230400,
+            }),
+            p95_depth: Some(proto::PlaybackBufferDepthSnapshot {
+                packets: 250,
+                bytes: 128000,
+                duration_ms: 5000,
+                duration_samples: 240000,
+            }),
+            max_depth: Some(proto::PlaybackBufferDepthSnapshot {
+                packets: 250,
+                bytes: 128000,
+                duration_ms: 5000,
+                duration_samples: 240000,
+            }),
+        }),
         current_playout_buffer_depth: Some(proto::PlaybackBufferDepthSnapshot {
             packets: 12,
             bytes: 6144,
@@ -343,7 +425,89 @@ fn proto_playback_metrics_convert_to_typed_snapshot() {
             max_ms: 1,
         }),
         sender_forbidden_work_count: 0,
-        prepared_rtp_queue_depth_ms: 0,
+        prepared_rtp_queue_depth_ms: 380,
+        prepared_track_queue_target_ms: 400,
+        prepared_track_queue_low_watermark_ms: 300,
+        prepared_track_queue_high_watermark_ms: 500,
+        active_pre_pause_prepared_track_queue_depth: Some(prepared_track_queue_depth()),
+        active_post_resume_prepared_track_queue_depth: Some(prepared_track_queue_depth()),
+        prepared_track_queue_depth_sample_count: 100,
+        prepared_track_queue_empty_count: 0,
+        raw_send_events: vec![proto::PlaybackSendEventSnapshot {
+            packet_index: 0,
+            command_kind: proto::PlaybackSendCommandKind::Track as i32,
+            expected_deadline_offset_us: 0,
+            send_started_offset_us: 1,
+            sent_offset_us: 2,
+            media_duration_ms: 20,
+            media_duration_samples: 960,
+            rtp_sequence: 7,
+            rtp_timestamp: 13_440,
+            protection_nonce: Some(42),
+            source_frame_epoch: Some(1),
+            source_media_position_ms: Some(5_000),
+            source_media_byte_position: Some(123_456),
+            committed_heard_media: true,
+        }],
+        raw_prepared_track_queue_samples: vec![proto::PreparedTrackQueueDepthSampleSnapshot {
+            sample_index: 0,
+            phase: proto::PreparedTrackQueueSamplePhase::ActivePostResume as i32,
+            depth: Some(proto::PlaybackBufferDepthSnapshot {
+                packets: 20,
+                bytes: 10_240,
+                duration_ms: 400,
+                duration_samples: 19_200,
+            }),
+        }],
+        raw_prepared_playout_queue_events: vec![proto::PreparedPlayoutQueueEventSnapshot {
+            event_index: 0,
+            event_kind: proto::PreparedPlayoutQueueEventKind::Rebuilt as i32,
+            reason: proto::PreparedPlayoutQueueEventReason::Pause as i32,
+            command_kind: proto::PlaybackSendCommandKind::Track as i32,
+            media_duration_ms: 20,
+            media_duration_samples: 960,
+            rtp_sequence: 8,
+            rtp_timestamp: 14_400,
+            protection_nonce: Some(43),
+            source_frame_epoch: Some(1),
+            source_media_position_ms: Some(5_020),
+            source_media_byte_position: Some(124_000),
+            queue_depth_after: Some(proto::PlaybackBufferDepthSnapshot {
+                packets: 20,
+                bytes: 10_240,
+                duration_ms: 400,
+                duration_samples: 19_200,
+            }),
+        }],
+        current_scheduled_silence_queue_depth: Some(proto::PlaybackBufferDepthSnapshot::default()),
+        max_scheduled_silence_queue_depth: Some(proto::PlaybackBufferDepthSnapshot::default()),
+        current_boundary_queue_depth: Some(proto::PlaybackBufferDepthSnapshot::default()),
+        max_boundary_queue_depth: Some(proto::PlaybackBufferDepthSnapshot {
+            packets: 1,
+            bytes: 3,
+            duration_ms: 20,
+            duration_samples: 960,
+        }),
+        prepared_track_packet_drop_count: 2,
+        prepared_silence_packet_drop_count: 0,
+        prepared_packet_rebuild_count: 1,
+        scheduled_silence_packet_count: 0,
+        pause_media_boundary_count: 1,
+        stop_media_boundary_count: 0,
+        recovery_media_boundary_count: 0,
+        natural_end_media_boundary_count: 0,
+        dave_transition_recovery_reached_builder_count: 1,
+        dave_transition_recovery_reached_deadline_sender_count: 0,
+        source_underrun_reached_builder_count: 0,
+        source_underrun_reached_deadline_sender_count: 0,
+        discarded_source_frame_count: 0,
+        discarded_source_duration_ms: 0,
+        stop_discarded_source_frame_count: 0,
+        stop_discarded_source_duration_ms: 0,
+        interruption_discarded_source_frame_count: 0,
+        interruption_discarded_source_duration_ms: 0,
+        restored_source_frame_count: 2,
+        restored_source_duration_ms: 40,
         gateway_event_drain_duration: Some(proto::DurationStatsSnapshot {
             samples: 60,
             p50_ms: 0,
@@ -411,6 +575,15 @@ fn proto_playback_metrics_convert_to_typed_snapshot() {
     assert_eq!(snapshot.current_source_buffer_depth.duration_ms, 4800);
     assert_eq!(snapshot.min_source_buffer_depth.duration_ms, 1000);
     assert_eq!(snapshot.max_source_buffer_depth.duration_ms, 5000);
+    assert_eq!(
+        snapshot
+            .source_buffer_depth
+            .as_ref()
+            .expect("source reservoir depth percentiles should be preserved")
+            .p50_depth
+            .duration_ms,
+        4800
+    );
     assert_eq!(snapshot.current_playout_buffer_depth.duration_ms, 240);
     assert_eq!(snapshot.min_playout_buffer_depth.duration_ms, 120);
     assert_eq!(snapshot.max_playout_buffer_depth.duration_ms, 400);
@@ -425,7 +598,59 @@ fn proto_playback_metrics_convert_to_typed_snapshot() {
     assert_eq!(snapshot.sender_send_duration.max_ms, 2);
     assert_eq!(snapshot.sender_loop_non_send_work_duration.max_ms, 1);
     assert_eq!(snapshot.sender_forbidden_work_count, 0);
-    assert_eq!(snapshot.prepared_rtp_queue_depth_ms, 0);
+    assert_eq!(snapshot.prepared_rtp_queue_depth_ms, 380);
+    assert_eq!(snapshot.prepared_track_queue_target_ms, 400);
+    assert_eq!(snapshot.prepared_track_queue_low_watermark_ms, 300);
+    assert_eq!(snapshot.prepared_track_queue_high_watermark_ms, 500);
+    let pre_pause_queue = snapshot
+        .active_pre_pause_prepared_track_queue_depth
+        .as_ref()
+        .expect("pre-pause prepared track queue depth should be preserved");
+    assert_eq!(pre_pause_queue.sample_count, 50);
+    assert_eq!(pre_pause_queue.empty_count, 0);
+    assert_eq!(pre_pause_queue.p50_depth.duration_ms, 400);
+    assert_eq!(pre_pause_queue.p95_depth.duration_ms, 480);
+    let post_resume_queue = snapshot
+        .active_post_resume_prepared_track_queue_depth
+        .as_ref()
+        .expect("post-resume prepared track queue depth should be preserved");
+    assert_eq!(post_resume_queue.sample_count, 50);
+    assert_eq!(snapshot.prepared_track_queue_depth_sample_count, 100);
+    assert_eq!(snapshot.prepared_track_queue_empty_count, 0);
+    assert_eq!(snapshot.raw_send_events.len(), 1);
+    let raw_send = &snapshot.raw_send_events[0];
+    assert_eq!(raw_send.command_kind, PlaybackSendCommandKind::Track);
+    assert_eq!(raw_send.protection_nonce, Some(42));
+    assert_eq!(raw_send.source_media_position_ms, Some(5_000));
+    assert!(raw_send.committed_heard_media);
+    assert_eq!(snapshot.raw_prepared_track_queue_samples.len(), 1);
+    let raw_queue_sample = &snapshot.raw_prepared_track_queue_samples[0];
+    assert_eq!(
+        raw_queue_sample.phase,
+        PreparedTrackQueueSamplePhase::ActivePostResume
+    );
+    assert_eq!(raw_queue_sample.depth.duration_ms, 400);
+    assert_eq!(snapshot.raw_prepared_playout_queue_events.len(), 1);
+    let raw_playout_event = &snapshot.raw_prepared_playout_queue_events[0];
+    assert_eq!(
+        raw_playout_event.event_kind,
+        PreparedPlayoutQueueEventKind::Rebuilt
+    );
+    assert_eq!(
+        raw_playout_event.reason,
+        PreparedPlayoutQueueEventReason::Pause
+    );
+    assert_eq!(
+        raw_playout_event.command_kind,
+        PlaybackSendCommandKind::Track
+    );
+    assert_eq!(raw_playout_event.protection_nonce, Some(43));
+    assert_eq!(raw_playout_event.queue_depth_after.duration_ms, 400);
+    assert_eq!(snapshot.prepared_track_packet_drop_count, 2);
+    assert_eq!(snapshot.prepared_packet_rebuild_count, 1);
+    assert_eq!(snapshot.pause_media_boundary_count, 1);
+    assert_eq!(snapshot.restored_source_frame_count, 2);
+    assert_eq!(snapshot.restored_source_duration_ms, 40);
     assert_eq!(snapshot.gateway_event_drain_duration.max_ms, 2);
     assert_eq!(snapshot.gateway_event_drain_count, 4);
     assert_eq!(snapshot.dave_transition_count, 3);

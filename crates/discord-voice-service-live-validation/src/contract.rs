@@ -5,7 +5,16 @@ use std::fs;
 use discord_voice_service_twilight::{
     DurationStatsSnapshot as TwilightDurationStatsSnapshot,
     PlaybackBufferDepthSnapshot as TwilightPlaybackBufferDepthSnapshot,
-    PlaybackStabilitySnapshot as TwilightPlaybackStabilitySnapshot, SessionEvent, SessionEventKind,
+    PlaybackQueueDepthStatsSnapshot as TwilightPlaybackQueueDepthStatsSnapshot,
+    PlaybackSendCommandKind as TwilightPlaybackSendCommandKind,
+    PlaybackSendEventSnapshot as TwilightPlaybackSendEventSnapshot,
+    PlaybackStabilitySnapshot as TwilightPlaybackStabilitySnapshot,
+    PreparedPlayoutQueueEventKind as TwilightPreparedPlayoutQueueEventKind,
+    PreparedPlayoutQueueEventReason as TwilightPreparedPlayoutQueueEventReason,
+    PreparedPlayoutQueueEventSnapshot as TwilightPreparedPlayoutQueueEventSnapshot,
+    PreparedTrackQueueDepthSampleSnapshot as TwilightPreparedTrackQueueDepthSampleSnapshot,
+    PreparedTrackQueueSamplePhase as TwilightPreparedTrackQueueSamplePhase, SessionEvent,
+    SessionEventKind,
 };
 
 use crate::audio::AudioIntervalStats;
@@ -41,6 +50,11 @@ pub struct LiveValidationEvidence {
     pub outcome: String,
     pub service_uri: String,
     pub ytmusic_addr: String,
+    pub test_video_id: String,
+    pub expected_track_duration_ms: u64,
+    pub active_validation_duration_after_resume_ms: u64,
+    pub pause_silence_packet_count: u64,
+    pub pause_silence_spacing_ms: Vec<u64>,
     pub live_staging_profile: String,
     pub live_staging_service_cpus: String,
     pub live_staging_cpu_contention_workers: u64,
@@ -57,6 +71,7 @@ pub struct LiveValidationEvidence {
     pub observer_proved_resume: bool,
     pub observer_pause_self_mute_observed: bool,
     pub observer_pause_speaking_stopped: bool,
+    pub observer_pause_rtp_silence_observed: bool,
     pub observer_resume_speaking_started: bool,
     pub observer_pause_silence_ms: u64,
     pub observer_resume_packet_count: u64,
@@ -100,8 +115,6 @@ pub struct LiveValidationEvidence {
     pub reconnect_probe_metrics: Option<PlaybackStabilityEvidence>,
     pub validated_constrained_profile: bool,
     pub validated_slow_jittery_http: bool,
-    pub validated_long_track_playback: bool,
-    pub long_track_metrics: Option<PlaybackStabilityEvidence>,
     pub failure_reason: Option<String>,
 }
 
@@ -121,6 +134,60 @@ pub struct PlaybackBufferDepthEvidence {
     pub bytes: u64,
     pub duration_ms: u64,
     pub duration_samples: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct PlaybackQueueDepthStatsEvidence {
+    pub sample_count: u64,
+    pub empty_count: u64,
+    pub current_depth: PlaybackBufferDepthEvidence,
+    pub min_depth: PlaybackBufferDepthEvidence,
+    pub p5_depth: PlaybackBufferDepthEvidence,
+    pub p50_depth: PlaybackBufferDepthEvidence,
+    pub p95_depth: PlaybackBufferDepthEvidence,
+    pub max_depth: PlaybackBufferDepthEvidence,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct PlaybackSendEventEvidence {
+    pub packet_index: u64,
+    pub command_kind: String,
+    pub expected_deadline_offset_us: u64,
+    pub send_started_offset_us: u64,
+    pub sent_offset_us: u64,
+    pub media_duration_ms: u64,
+    pub media_duration_samples: u32,
+    pub rtp_sequence: u32,
+    pub rtp_timestamp: u32,
+    pub protection_nonce: Option<u32>,
+    pub source_frame_epoch: Option<u64>,
+    pub source_media_position_ms: Option<u64>,
+    pub source_media_byte_position: Option<u64>,
+    pub committed_heard_media: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct PreparedTrackQueueDepthSampleEvidence {
+    pub sample_index: u64,
+    pub phase: String,
+    pub depth: PlaybackBufferDepthEvidence,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct PreparedPlayoutQueueEventEvidence {
+    pub event_index: u64,
+    pub event_kind: String,
+    pub reason: String,
+    pub command_kind: String,
+    pub media_duration_ms: u64,
+    pub media_duration_samples: u32,
+    pub rtp_sequence: u32,
+    pub rtp_timestamp: u32,
+    pub protection_nonce: Option<u32>,
+    pub source_frame_epoch: Option<u64>,
+    pub source_media_position_ms: Option<u64>,
+    pub source_media_byte_position: Option<u64>,
+    pub queue_depth_after: PlaybackBufferDepthEvidence,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -163,6 +230,7 @@ pub struct PlaybackStabilityEvidence {
     pub current_source_buffer_depth: PlaybackBufferDepthEvidence,
     pub min_source_buffer_depth: PlaybackBufferDepthEvidence,
     pub max_source_buffer_depth: PlaybackBufferDepthEvidence,
+    pub source_buffer_depth: Option<PlaybackQueueDepthStatsEvidence>,
     pub current_playout_buffer_depth: PlaybackBufferDepthEvidence,
     pub min_playout_buffer_depth: PlaybackBufferDepthEvidence,
     pub max_playout_buffer_depth: PlaybackBufferDepthEvidence,
@@ -171,6 +239,43 @@ pub struct PlaybackStabilityEvidence {
     pub min_egress_buffer_depth: PlaybackBufferDepthEvidence,
     pub max_egress_buffer_depth: PlaybackBufferDepthEvidence,
     pub prepared_rtp_queue_depth_ms: u64,
+    pub prepared_track_queue_target_ms: u64,
+    pub prepared_track_queue_low_watermark_ms: u64,
+    pub prepared_track_queue_high_watermark_ms: u64,
+    pub active_pre_pause_prepared_track_queue_depth: Option<PlaybackQueueDepthStatsEvidence>,
+    pub active_post_resume_prepared_track_queue_depth: Option<PlaybackQueueDepthStatsEvidence>,
+    pub prepared_track_queue_depth_sample_count: u64,
+    pub prepared_track_queue_empty_count: u64,
+    pub raw_send_event_count: u64,
+    pub raw_prepared_track_queue_sample_count: u64,
+    pub raw_prepared_playout_queue_event_count: u64,
+    pub raw_send_events: Vec<PlaybackSendEventEvidence>,
+    pub raw_prepared_track_queue_samples: Vec<PreparedTrackQueueDepthSampleEvidence>,
+    pub raw_prepared_playout_queue_events: Vec<PreparedPlayoutQueueEventEvidence>,
+    pub current_scheduled_silence_queue_depth: PlaybackBufferDepthEvidence,
+    pub max_scheduled_silence_queue_depth: PlaybackBufferDepthEvidence,
+    pub current_boundary_queue_depth: PlaybackBufferDepthEvidence,
+    pub max_boundary_queue_depth: PlaybackBufferDepthEvidence,
+    pub prepared_track_packet_drop_count: u64,
+    pub prepared_silence_packet_drop_count: u64,
+    pub prepared_packet_rebuild_count: u64,
+    pub scheduled_silence_packet_count: u64,
+    pub pause_media_boundary_count: u64,
+    pub stop_media_boundary_count: u64,
+    pub recovery_media_boundary_count: u64,
+    pub natural_end_media_boundary_count: u64,
+    pub dave_transition_recovery_reached_builder_count: u64,
+    pub dave_transition_recovery_reached_deadline_sender_count: u64,
+    pub source_underrun_reached_builder_count: u64,
+    pub source_underrun_reached_deadline_sender_count: u64,
+    pub discarded_source_frame_count: u64,
+    pub discarded_source_duration_ms: u64,
+    pub stop_discarded_source_frame_count: u64,
+    pub stop_discarded_source_duration_ms: u64,
+    pub interruption_discarded_source_frame_count: u64,
+    pub interruption_discarded_source_duration_ms: u64,
+    pub restored_source_frame_count: u64,
+    pub restored_source_duration_ms: u64,
     pub source_buffer_target_ms: u64,
     pub adaptive_buffer_target_ms: u64,
     pub max_adaptive_buffer_target_ms: u64,
@@ -247,6 +352,74 @@ impl From<&TwilightPlaybackBufferDepthSnapshot> for PlaybackBufferDepthEvidence 
     }
 }
 
+impl From<&TwilightPlaybackQueueDepthStatsSnapshot> for PlaybackQueueDepthStatsEvidence {
+    fn from(value: &TwilightPlaybackQueueDepthStatsSnapshot) -> Self {
+        Self {
+            sample_count: value.sample_count,
+            empty_count: value.empty_count,
+            current_depth: (&value.current_depth).into(),
+            min_depth: (&value.min_depth).into(),
+            p5_depth: (&value.p5_depth).into(),
+            p50_depth: (&value.p50_depth).into(),
+            p95_depth: (&value.p95_depth).into(),
+            max_depth: (&value.max_depth).into(),
+        }
+    }
+}
+
+impl From<&TwilightPlaybackSendEventSnapshot> for PlaybackSendEventEvidence {
+    fn from(value: &TwilightPlaybackSendEventSnapshot) -> Self {
+        Self {
+            packet_index: value.packet_index,
+            command_kind: playback_send_command_kind_label(value.command_kind).to_owned(),
+            expected_deadline_offset_us: value.expected_deadline_offset_us,
+            send_started_offset_us: value.send_started_offset_us,
+            sent_offset_us: value.sent_offset_us,
+            media_duration_ms: value.media_duration_ms,
+            media_duration_samples: value.media_duration_samples,
+            rtp_sequence: value.rtp_sequence,
+            rtp_timestamp: value.rtp_timestamp,
+            protection_nonce: value.protection_nonce,
+            source_frame_epoch: value.source_frame_epoch,
+            source_media_position_ms: value.source_media_position_ms,
+            source_media_byte_position: value.source_media_byte_position,
+            committed_heard_media: value.committed_heard_media,
+        }
+    }
+}
+
+impl From<&TwilightPreparedTrackQueueDepthSampleSnapshot>
+    for PreparedTrackQueueDepthSampleEvidence
+{
+    fn from(value: &TwilightPreparedTrackQueueDepthSampleSnapshot) -> Self {
+        Self {
+            sample_index: value.sample_index,
+            phase: prepared_track_queue_sample_phase_label(value.phase).to_owned(),
+            depth: (&value.depth).into(),
+        }
+    }
+}
+
+impl From<&TwilightPreparedPlayoutQueueEventSnapshot> for PreparedPlayoutQueueEventEvidence {
+    fn from(value: &TwilightPreparedPlayoutQueueEventSnapshot) -> Self {
+        Self {
+            event_index: value.event_index,
+            event_kind: prepared_playout_queue_event_kind_label(value.event_kind).to_owned(),
+            reason: prepared_playout_queue_event_reason_label(value.reason).to_owned(),
+            command_kind: playback_send_command_kind_label(value.command_kind).to_owned(),
+            media_duration_ms: value.media_duration_ms,
+            media_duration_samples: value.media_duration_samples,
+            rtp_sequence: value.rtp_sequence,
+            rtp_timestamp: value.rtp_timestamp,
+            protection_nonce: value.protection_nonce,
+            source_frame_epoch: value.source_frame_epoch,
+            source_media_position_ms: value.source_media_position_ms,
+            source_media_byte_position: value.source_media_byte_position,
+            queue_depth_after: (&value.queue_depth_after).into(),
+        }
+    }
+}
+
 impl From<&AudioIntervalStats> for PlaybackDurationStatsEvidence {
     fn from(value: &AudioIntervalStats) -> Self {
         Self {
@@ -304,6 +477,7 @@ impl From<&TwilightPlaybackStabilitySnapshot> for PlaybackStabilityEvidence {
             current_source_buffer_depth: (&value.current_source_buffer_depth).into(),
             min_source_buffer_depth: (&value.min_source_buffer_depth).into(),
             max_source_buffer_depth: (&value.max_source_buffer_depth).into(),
+            source_buffer_depth: value.source_buffer_depth.as_ref().map(Into::into),
             current_playout_buffer_depth: (&value.current_playout_buffer_depth).into(),
             min_playout_buffer_depth: (&value.min_playout_buffer_depth).into(),
             max_playout_buffer_depth: (&value.max_playout_buffer_depth).into(),
@@ -312,6 +486,65 @@ impl From<&TwilightPlaybackStabilitySnapshot> for PlaybackStabilityEvidence {
             min_egress_buffer_depth: (&value.min_egress_buffer_depth).into(),
             max_egress_buffer_depth: (&value.max_egress_buffer_depth).into(),
             prepared_rtp_queue_depth_ms: value.prepared_rtp_queue_depth_ms,
+            prepared_track_queue_target_ms: value.prepared_track_queue_target_ms,
+            prepared_track_queue_low_watermark_ms: value.prepared_track_queue_low_watermark_ms,
+            prepared_track_queue_high_watermark_ms: value.prepared_track_queue_high_watermark_ms,
+            active_pre_pause_prepared_track_queue_depth: value
+                .active_pre_pause_prepared_track_queue_depth
+                .as_ref()
+                .map(Into::into),
+            active_post_resume_prepared_track_queue_depth: value
+                .active_post_resume_prepared_track_queue_depth
+                .as_ref()
+                .map(Into::into),
+            prepared_track_queue_depth_sample_count: value.prepared_track_queue_depth_sample_count,
+            prepared_track_queue_empty_count: value.prepared_track_queue_empty_count,
+            raw_send_event_count: value.raw_send_events.len() as u64,
+            raw_prepared_track_queue_sample_count: value.raw_prepared_track_queue_samples.len()
+                as u64,
+            raw_prepared_playout_queue_event_count: value.raw_prepared_playout_queue_events.len()
+                as u64,
+            raw_send_events: value.raw_send_events.iter().map(Into::into).collect(),
+            raw_prepared_track_queue_samples: value
+                .raw_prepared_track_queue_samples
+                .iter()
+                .map(Into::into)
+                .collect(),
+            raw_prepared_playout_queue_events: value
+                .raw_prepared_playout_queue_events
+                .iter()
+                .map(Into::into)
+                .collect(),
+            current_scheduled_silence_queue_depth: (&value.current_scheduled_silence_queue_depth)
+                .into(),
+            max_scheduled_silence_queue_depth: (&value.max_scheduled_silence_queue_depth).into(),
+            current_boundary_queue_depth: (&value.current_boundary_queue_depth).into(),
+            max_boundary_queue_depth: (&value.max_boundary_queue_depth).into(),
+            prepared_track_packet_drop_count: value.prepared_track_packet_drop_count,
+            prepared_silence_packet_drop_count: value.prepared_silence_packet_drop_count,
+            prepared_packet_rebuild_count: value.prepared_packet_rebuild_count,
+            scheduled_silence_packet_count: value.scheduled_silence_packet_count,
+            pause_media_boundary_count: value.pause_media_boundary_count,
+            stop_media_boundary_count: value.stop_media_boundary_count,
+            recovery_media_boundary_count: value.recovery_media_boundary_count,
+            natural_end_media_boundary_count: value.natural_end_media_boundary_count,
+            dave_transition_recovery_reached_builder_count: value
+                .dave_transition_recovery_reached_builder_count,
+            dave_transition_recovery_reached_deadline_sender_count: value
+                .dave_transition_recovery_reached_deadline_sender_count,
+            source_underrun_reached_builder_count: value.source_underrun_reached_builder_count,
+            source_underrun_reached_deadline_sender_count: value
+                .source_underrun_reached_deadline_sender_count,
+            discarded_source_frame_count: value.discarded_source_frame_count,
+            discarded_source_duration_ms: value.discarded_source_duration_ms,
+            stop_discarded_source_frame_count: value.stop_discarded_source_frame_count,
+            stop_discarded_source_duration_ms: value.stop_discarded_source_duration_ms,
+            interruption_discarded_source_frame_count: value
+                .interruption_discarded_source_frame_count,
+            interruption_discarded_source_duration_ms: value
+                .interruption_discarded_source_duration_ms,
+            restored_source_frame_count: value.restored_source_frame_count,
+            restored_source_duration_ms: value.restored_source_duration_ms,
             source_buffer_target_ms: value.source_buffer_target_ms,
             adaptive_buffer_target_ms: value.adaptive_buffer_target_ms,
             max_adaptive_buffer_target_ms: value.max_adaptive_buffer_target_ms,
@@ -652,5 +885,57 @@ fn display_event_message(event: &SessionEvent) -> String {
         "no message".to_owned()
     } else {
         event.message.as_ref().unwrap().clone()
+    }
+}
+
+fn playback_send_command_kind_label(kind: TwilightPlaybackSendCommandKind) -> &'static str {
+    match kind {
+        TwilightPlaybackSendCommandKind::Track => "track",
+        TwilightPlaybackSendCommandKind::ScheduledSilence => "scheduled_silence",
+        TwilightPlaybackSendCommandKind::BoundarySilence => "boundary_silence",
+        TwilightPlaybackSendCommandKind::OtherBoundary => "other_boundary",
+        TwilightPlaybackSendCommandKind::Unspecified => "unspecified",
+    }
+}
+
+fn prepared_track_queue_sample_phase_label(
+    phase: TwilightPreparedTrackQueueSamplePhase,
+) -> &'static str {
+    match phase {
+        TwilightPreparedTrackQueueSamplePhase::ActivePrePause => "active_pre_pause",
+        TwilightPreparedTrackQueueSamplePhase::ActivePostResume => "active_post_resume",
+        TwilightPreparedTrackQueueSamplePhase::Unspecified => "unspecified",
+    }
+}
+
+fn prepared_playout_queue_event_kind_label(
+    kind: TwilightPreparedPlayoutQueueEventKind,
+) -> &'static str {
+    match kind {
+        TwilightPreparedPlayoutQueueEventKind::Enqueued => "enqueued",
+        TwilightPreparedPlayoutQueueEventKind::DequeuedToDeadlineSender => {
+            "dequeued_to_deadline_sender"
+        }
+        TwilightPreparedPlayoutQueueEventKind::DroppedBeforeSend => "dropped_before_send",
+        TwilightPreparedPlayoutQueueEventKind::Rebuilt => "rebuilt",
+        TwilightPreparedPlayoutQueueEventKind::Unspecified => "unspecified",
+    }
+}
+
+fn prepared_playout_queue_event_reason_label(
+    reason: TwilightPreparedPlayoutQueueEventReason,
+) -> &'static str {
+    match reason {
+        TwilightPreparedPlayoutQueueEventReason::SteadyPlayback => "steady_playback",
+        TwilightPreparedPlayoutQueueEventReason::Pause => "pause",
+        TwilightPreparedPlayoutQueueEventReason::Stop => "stop",
+        TwilightPreparedPlayoutQueueEventReason::DaveTransitionRecovery => {
+            "dave_transition_recovery"
+        }
+        TwilightPreparedPlayoutQueueEventReason::Reconnect => "reconnect",
+        TwilightPreparedPlayoutQueueEventReason::SourceUnderrun => "source_underrun",
+        TwilightPreparedPlayoutQueueEventReason::NaturalEnd => "natural_end",
+        TwilightPreparedPlayoutQueueEventReason::Interruption => "interruption",
+        TwilightPreparedPlayoutQueueEventReason::Unspecified => "unspecified",
     }
 }

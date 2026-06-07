@@ -6,9 +6,9 @@ const OBSERVER_SECRET_CONTRACT: &str = "Protected live staging requires `OBSERVE
 const RECEIVE_SIDE_SUCCESS_CONTRACT: &str = "Live-staging success requires observer receive-side proof: authentic voice context, VoiceReady, Playing, pause without leaving the voice channel, no service audio or speaking state during the paused interval, resume without voice-channel rejoin, natural TrackEnded, at least 120 observed packets, at least 3000 ms decoded audio, at least 1000 ms non-silent audio, and no reconnect/interruption/fatal error during validation.";
 const PLAYBACK_METRICS_SUCCESS_CONTRACT: &str = "Live-staging success requires service-side playback stability metrics from `GetPlaybackMetrics`, including RTP interval stats, sender lateness, buffer depth, refill durations, underruns, inserted silence, and interruption counters.";
 const CONSTRAINED_PROFILE_SUCCESS_CONTRACT: &str = "Live-staging success runs a constrained profile with CPU contention, a service CPU limit, and slow/jittery HTTP media reads configured by the `LIVE_STAGING_*` variables.";
-const LONG_TRACK_SUCCESS_CONTRACT: &str = "Live-staging success requires a distinct long-track staging probe using `TEST_LONG_VIDEO_ID`; the probe must reach at least `LIVE_STAGING_LONG_TRACK_MIN_PACKETS` RTP packets before Stop and must satisfy the same RTP interval, sender lateness, and underrun budgets.";
+const SINGLE_TRACK_SUCCESS_CONTRACT: &str = "Live-staging success waits for the natural end of the single `TEST_VIDEO_ID` session before the run is treated as release-ready.";
 const ACTIVE_INTERRUPT_SUCCESS_CONTRACT: &str = "After natural playback metrics are captured, live-staging success also starts fresh probe playbacks and validates active `UpdateVoiceContext` reconnect rollover, `Stop`, and `LeaveVoice` while those probes are actively Playing.";
-const EVIDENCE_ARTIFACT_CONTRACT: &str = "Live-staging always uploads a structured evidence artifact summarizing the constrained profile, slow/jittery HTTP read settings, ignored invalid Resume, ignored redundant Pause, pause silence, resume packets, active reconnect rollover, active Stop, active LeaveVoice, observed packets, decoded audio, non-silent audio, natural playback stability metrics, reconnect probe metrics, long-track metrics, and failure_reason.";
+const EVIDENCE_ARTIFACT_CONTRACT: &str = "Live-staging always uploads a structured evidence artifact summarizing the constrained profile, slow/jittery HTTP read settings, ignored invalid Resume, ignored redundant Pause, pause silence, resume packets, active reconnect rollover, active Stop, active LeaveVoice, observed packets, decoded audio, non-silent audio, natural playback stability metrics, reconnect probe metrics, and failure_reason.";
 
 #[test]
 fn readme_publishes_the_hosted_live_staging_contract() {
@@ -20,7 +20,9 @@ fn readme_publishes_the_hosted_live_staging_contract() {
     assert!(readme.contains("GitHub-hosted"));
     assert!(readme.contains("BROWSER_JSON"));
     assert!(readme.contains("OBSERVER_BOT_TOKEN"));
-    assert!(readme.contains("TEST_LONG_VIDEO_ID"));
+    assert!(readme.contains("single `TEST_VIDEO_ID` session"));
+    assert!(!readme.contains(&["TEST_LONG", "_VIDEO_ID"].concat()));
+    assert!(!readme.contains(&["LIVE_STAGING", "_LONG_TRACK", "_MIN_PACKETS"].concat()));
     assert!(readme.contains("LIVE_STAGING_HTTP_READ_DELAY_MS"));
     assert!(readme.contains("LIVE_STAGING_HTTP_READ_JITTER_MS"));
     assert!(readme.contains(LOCAL_LIVE_STAGING_CONTRACT));
@@ -29,14 +31,14 @@ fn readme_publishes_the_hosted_live_staging_contract() {
     assert!(readme.contains(RECEIVE_SIDE_SUCCESS_CONTRACT));
     assert!(readme.contains(PLAYBACK_METRICS_SUCCESS_CONTRACT));
     assert!(readme.contains(CONSTRAINED_PROFILE_SUCCESS_CONTRACT));
-    assert!(readme.contains(LONG_TRACK_SUCCESS_CONTRACT));
+    assert!(readme.contains(SINGLE_TRACK_SUCCESS_CONTRACT));
     assert!(readme.contains(ACTIVE_INTERRUPT_SUCCESS_CONTRACT));
     assert!(readme.contains(EVIDENCE_ARTIFACT_CONTRACT));
     assert!(readme.contains("scripts/ci/run_local_live_staging.sh"));
     assert!(readme.contains("protected `live-staging` environment"));
     assert!(readme.contains("candidate manifest digest"));
     assert!(readme.contains("rollback"));
-    assert!(readme.contains("short dedicated validation track"));
+    assert!(readme.contains("dedicated validation track"));
     assert!(!readme.contains("For a manual or local staging run"));
     assert!(!readme.contains("DISCORD_VOICE_SERVICE_ADDR"));
     assert!(!readme.contains("self-hosted runner profile"));

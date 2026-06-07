@@ -1,4 +1,9 @@
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::{
+    collections::{BTreeSet, HashMap, VecDeque},
+    future::Future,
+    pin::Pin,
+    time::Instant as StdInstant,
+};
 
 use bytes::Bytes;
 use tokio::sync::oneshot;
@@ -21,12 +26,16 @@ use crate::udp::VoiceUdpTransport;
 
 const MAX_UDP_PACKET_LEN: usize = 2048;
 
+type GatewayReceiveFuture =
+    Pin<Box<dyn Future<Output = Result<VoiceGatewayPayload, VoiceError>> + Send + 'static>>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObservedAudioFrame {
     pub user_id: String,
     pub ssrc: u32,
     pub sequence: u16,
     pub timestamp: u32,
+    pub received_at: StdInstant,
     pub payload: Bytes,
 }
 
@@ -43,6 +52,7 @@ pub struct ObservedRtpPacket {
     pub ssrc: u32,
     pub sequence: u16,
     pub timestamp: u32,
+    pub received_at: StdInstant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +94,7 @@ pub struct ObservedVoiceSession {
     completed_dave_transition_ids: BTreeSet<u16>,
     heartbeat_shutdown: Option<oneshot::Sender<()>>,
     gateway_receive_closed: bool,
+    gateway_receive: Option<GatewayReceiveFuture>,
     pending_dave_proposals: Vec<(DaveMlsProposalsOperation, Vec<u8>)>,
     speaker_ssrcs: HashMap<u32, String>,
     pending_speaking_states: VecDeque<ObservedSpeakingState>,
@@ -95,6 +106,7 @@ pub struct ObservedVoiceSession {
 struct PendingPacket {
     header: RtpHeader,
     packet: Vec<u8>,
+    received_at: StdInstant,
 }
 
 enum DecodeAudioPacketError {
@@ -207,6 +219,7 @@ impl PendingObservedVoiceSession {
             completed_dave_transition_ids: std::mem::take(&mut self.completed_dave_transition_ids),
             heartbeat_shutdown: self.heartbeat_shutdown.take(),
             gateway_receive_closed: false,
+            gateway_receive: None,
             pending_dave_proposals: Vec::new(),
             speaker_ssrcs: std::mem::take(&mut self.speaker_ssrcs),
             pending_speaking_states: std::mem::take(&mut self.pending_speaking_states),
@@ -234,6 +247,35 @@ impl ObservedVoiceSession {
 
     pub fn record_speaker_ssrc(&mut self, user_id: impl Into<String>, ssrc: u32) {
         self.speaker_ssrcs.insert(ssrc, user_id.into());
+    }
+
+    fn ensure_gateway_receive(&mut self) -> Result<bool, VoiceError> {
+        if self.gateway_receive_closed {
+            return Ok(false);
+        }
+        if self.gateway_receive.is_none() {
+            let gateway = self
+                .gateway
+                .clone()
+                .ok_or(VoiceError::InvalidState("voice gateway unavailable"))?;
+            self.gateway_receive = Some(Box::pin(async move { gateway.receive_event().await }));
+        }
+        Ok(true)
+    }
+
+    fn finish_gateway_receive(
+        &mut self,
+        result: Result<VoiceGatewayPayload, VoiceError>,
+    ) -> Result<Option<VoiceGatewayPayload>, VoiceError> {
+        self.gateway_receive = None;
+        match result {
+            Ok(payload) => Ok(Some(payload)),
+            Err(err) if err.is_gateway_closed_during_receive() => {
+                self.mark_gateway_receive_closed();
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     pub async fn receive_audio_frame(
@@ -296,32 +338,23 @@ impl ObservedVoiceSession {
             let remaining = deadline
                 .checked_duration_since(Instant::now())
                 .ok_or(VoiceError::InvalidState("voice receive timed out"))?;
-            let gateway = if self.gateway_receive_closed {
-                None
-            } else {
-                Some(
-                    self.gateway
-                        .clone()
-                        .ok_or(VoiceError::InvalidState("voice gateway unavailable"))?,
-                )
-            };
+            let has_gateway = self.ensure_gateway_receive()?;
             let transport = self
                 .transport
                 .as_ref()
                 .ok_or(VoiceError::InvalidState("voice transport unavailable"))?;
 
-            if let Some(gateway) = gateway {
+            if has_gateway {
+                let gateway_receive = self
+                    .gateway_receive
+                    .as_mut()
+                    .ok_or(VoiceError::InvalidState("voice gateway unavailable"))?;
                 tokio::select! {
-                    gateway_event = tokio::time::timeout(remaining, gateway.receive_event()) => {
-                        let gateway_event = match gateway_event
-                            .map_err(|_| VoiceError::InvalidState("voice receive timed out"))?
-                        {
-                            Ok(gateway_event) => gateway_event,
-                            Err(err) if err.is_gateway_closed_during_receive() => {
-                                self.mark_gateway_receive_closed();
-                                continue;
-                            }
-                            Err(err) => return Err(err),
+                    biased;
+
+                    gateway_event = gateway_receive.as_mut() => {
+                        let Some(gateway_event) = self.finish_gateway_receive(gateway_event)? else {
+                            continue;
                         };
                         let remaining = deadline
                             .checked_duration_since(Instant::now())
@@ -331,7 +364,8 @@ impl ObservedVoiceSession {
                     packet = tokio::time::timeout(remaining, transport.receive_packet(MAX_UDP_PACKET_LEN)) => {
                         let packet = packet
                             .map_err(|_| VoiceError::InvalidState("voice receive timed out"))??;
-                        if let Some(activity) = self.process_activity_packet(packet, expected_user_id)? {
+                        let received_at = StdInstant::now();
+                        if let Some(activity) = self.process_activity_packet(packet, received_at, expected_user_id)? {
                             return Ok(activity);
                         }
                     }
@@ -341,7 +375,10 @@ impl ObservedVoiceSession {
                     tokio::time::timeout(remaining, transport.receive_packet(MAX_UDP_PACKET_LEN))
                         .await
                         .map_err(|_| VoiceError::InvalidState("voice receive timed out"))??;
-                if let Some(activity) = self.process_activity_packet(packet, expected_user_id)? {
+                let received_at = StdInstant::now();
+                if let Some(activity) =
+                    self.process_activity_packet(packet, received_at, expected_user_id)?
+                {
                     return Ok(activity);
                 }
             }
@@ -351,6 +388,7 @@ impl ObservedVoiceSession {
     fn process_activity_packet(
         &mut self,
         packet: Vec<u8>,
+        received_at: StdInstant,
         expected_user_id: &str,
     ) -> Result<Option<ObservedVoiceActivity>, VoiceError> {
         if is_rtcp_packet(&packet) {
@@ -368,7 +406,12 @@ impl ObservedVoiceSession {
 
         if !self.speaker_ssrcs.contains_key(&header.ssrc) {
             if self.dave.is_some() {
-                match self.decode_audio_packet(&packet, header, expected_user_id.to_owned()) {
+                match self.decode_audio_packet(
+                    &packet,
+                    header,
+                    received_at,
+                    expected_user_id.to_owned(),
+                ) {
                     Ok(frame) => {
                         debug!(
                             user_id = %expected_user_id,
@@ -405,8 +448,14 @@ impl ObservedVoiceSession {
                     ssrc = header.ssrc,
                     "voice receive buffered packet for unknown ssrc"
                 );
-                self.pending_packets
-                    .insert(header.ssrc, PendingPacket { header, packet });
+                self.pending_packets.insert(
+                    header.ssrc,
+                    PendingPacket {
+                        header,
+                        packet,
+                        received_at,
+                    },
+                );
                 return Ok(None);
             }
         }
@@ -432,8 +481,9 @@ impl ObservedVoiceSession {
             ssrc: header.ssrc,
             sequence: header.sequence,
             timestamp: header.timestamp,
+            received_at,
         };
-        let frame = match self.decode_audio_packet(&packet, header, user_id) {
+        let frame = match self.decode_audio_packet(&packet, header, received_at, user_id) {
             Ok(frame) => frame,
             Err(DecodeAudioPacketError::NotReady) => {
                 debug!(
@@ -441,8 +491,14 @@ impl ObservedVoiceSession {
                     sequence = header.sequence,
                     "voice receive observed packet before dave decrypt material arrives"
                 );
-                self.pending_packets
-                    .insert(header.ssrc, PendingPacket { header, packet });
+                self.pending_packets.insert(
+                    header.ssrc,
+                    PendingPacket {
+                        header,
+                        packet,
+                        received_at,
+                    },
+                );
                 return Ok(Some(ObservedVoiceActivity::RtpPacket(observed_packet)));
             }
             Err(DecodeAudioPacketError::Fatal(err)) => return Err(err),
@@ -483,13 +539,25 @@ impl ObservedVoiceSession {
             let remaining = deadline
                 .checked_duration_since(Instant::now())
                 .ok_or(VoiceError::InvalidState("voice speaking state timed out"))?;
-            let gateway = self
-                .gateway
-                .clone()
+            if !self.ensure_gateway_receive()? {
+                return Err(VoiceError::InvalidState("voice gateway unavailable"));
+            }
+            let gateway_receive = self
+                .gateway_receive
+                .as_mut()
                 .ok_or(VoiceError::InvalidState("voice gateway unavailable"))?;
-            let gateway_event = tokio::time::timeout(remaining, gateway.receive_event())
-                .await
-                .map_err(|_| VoiceError::InvalidState("voice speaking state timed out"))??;
+            let gateway_event =
+                match tokio::time::timeout(remaining, gateway_receive.as_mut()).await {
+                    Ok(result) => {
+                        let Some(gateway_event) = self.finish_gateway_receive(result)? else {
+                            continue;
+                        };
+                        gateway_event
+                    }
+                    Err(_) => {
+                        return Err(VoiceError::InvalidState("voice speaking state timed out"));
+                    }
+                };
             let remaining = deadline
                 .checked_duration_since(Instant::now())
                 .ok_or(VoiceError::InvalidState("voice speaking state timed out"))?;
@@ -543,32 +611,23 @@ impl ObservedVoiceSession {
             let remaining = deadline
                 .checked_duration_since(Instant::now())
                 .ok_or(VoiceError::InvalidState("voice receive timed out"))?;
-            let gateway = if self.gateway_receive_closed {
-                None
-            } else {
-                Some(
-                    self.gateway
-                        .clone()
-                        .ok_or(VoiceError::InvalidState("voice gateway unavailable"))?,
-                )
-            };
+            let has_gateway = self.ensure_gateway_receive()?;
             let transport = self
                 .transport
                 .as_ref()
                 .ok_or(VoiceError::InvalidState("voice transport unavailable"))?;
 
-            if let Some(gateway) = gateway {
+            if has_gateway {
+                let gateway_receive = self
+                    .gateway_receive
+                    .as_mut()
+                    .ok_or(VoiceError::InvalidState("voice gateway unavailable"))?;
                 tokio::select! {
-                    gateway_event = tokio::time::timeout(remaining, gateway.receive_event()) => {
-                        let gateway_event = match gateway_event
-                            .map_err(|_| VoiceError::InvalidState("voice receive timed out"))?
-                        {
-                            Ok(gateway_event) => gateway_event,
-                            Err(err) if err.is_gateway_closed_during_receive() => {
-                                self.mark_gateway_receive_closed();
-                                continue;
-                            }
-                            Err(err) => return Err(err),
+                    biased;
+
+                    gateway_event = gateway_receive.as_mut() => {
+                        let Some(gateway_event) = self.finish_gateway_receive(gateway_event)? else {
+                            continue;
                         };
                         let remaining = deadline
                             .checked_duration_since(Instant::now())
@@ -588,7 +647,8 @@ impl ObservedVoiceSession {
                     packet = tokio::time::timeout(remaining, transport.receive_packet(MAX_UDP_PACKET_LEN)) => {
                         let packet = packet
                             .map_err(|_| VoiceError::InvalidState("voice receive timed out"))??;
-                        if let Some(frame) = self.process_audio_packet(packet, expected_user_id)? {
+                        let received_at = StdInstant::now();
+                        if let Some(frame) = self.process_audio_packet(packet, received_at, expected_user_id)? {
                             return Ok(frame);
                         }
                     }
@@ -598,7 +658,10 @@ impl ObservedVoiceSession {
                     tokio::time::timeout(remaining, transport.receive_packet(MAX_UDP_PACKET_LEN))
                         .await
                         .map_err(|_| VoiceError::InvalidState("voice receive timed out"))??;
-                if let Some(frame) = self.process_audio_packet(packet, expected_user_id)? {
+                let received_at = StdInstant::now();
+                if let Some(frame) =
+                    self.process_audio_packet(packet, received_at, expected_user_id)?
+                {
                     return Ok(frame);
                 }
             }
@@ -608,6 +671,7 @@ impl ObservedVoiceSession {
     fn process_audio_packet(
         &mut self,
         packet: Vec<u8>,
+        received_at: StdInstant,
         expected_user_id: Option<&str>,
     ) -> Result<Option<ObservedAudioFrame>, VoiceError> {
         if is_rtcp_packet(&packet) {
@@ -624,7 +688,12 @@ impl ObservedVoiceSession {
         );
         if !self.speaker_ssrcs.contains_key(&header.ssrc) {
             if let (Some(expected_user_id), true) = (expected_user_id, self.dave.is_some()) {
-                match self.decode_audio_packet(&packet, header, expected_user_id.to_owned()) {
+                match self.decode_audio_packet(
+                    &packet,
+                    header,
+                    received_at,
+                    expected_user_id.to_owned(),
+                ) {
                     Ok(frame) => {
                         debug!(
                             user_id = %expected_user_id,
@@ -661,8 +730,14 @@ impl ObservedVoiceSession {
                     ssrc = header.ssrc,
                     "voice receive buffered packet for unknown ssrc"
                 );
-                self.pending_packets
-                    .insert(header.ssrc, PendingPacket { header, packet });
+                self.pending_packets.insert(
+                    header.ssrc,
+                    PendingPacket {
+                        header,
+                        packet,
+                        received_at,
+                    },
+                );
                 return Ok(None);
             }
         }
@@ -681,7 +756,7 @@ impl ObservedVoiceSession {
             );
             return Ok(None);
         }
-        let frame = match self.decode_audio_packet(&packet, header, user_id) {
+        let frame = match self.decode_audio_packet(&packet, header, received_at, user_id) {
             Ok(frame) => frame,
             Err(DecodeAudioPacketError::NotReady) => {
                 debug!(
@@ -689,8 +764,14 @@ impl ObservedVoiceSession {
                     sequence = header.sequence,
                     "voice receive buffered packet until dave decrypt material arrives"
                 );
-                self.pending_packets
-                    .insert(header.ssrc, PendingPacket { header, packet });
+                self.pending_packets.insert(
+                    header.ssrc,
+                    PendingPacket {
+                        header,
+                        packet,
+                        received_at,
+                    },
+                );
                 return Ok(None);
             }
             Err(DecodeAudioPacketError::Fatal(err)) => return Err(err),
@@ -707,6 +788,7 @@ impl ObservedVoiceSession {
 
     fn mark_gateway_receive_closed(&mut self) {
         debug!("voice receive marking gateway receive closed during observation");
+        self.gateway_receive = None;
         if let Some(shutdown) = self.heartbeat_shutdown.take() {
             let _ = shutdown.send(());
         }
@@ -1136,7 +1218,12 @@ impl ObservedVoiceSession {
                 );
                 continue;
             }
-            match self.decode_audio_packet(&pending.packet, pending.header, user_id) {
+            match self.decode_audio_packet(
+                &pending.packet,
+                pending.header,
+                pending.received_at,
+                user_id,
+            ) {
                 Ok(frame) => return Ok(Some(frame)),
                 Err(DecodeAudioPacketError::NotReady) => {
                     debug!(
@@ -1156,6 +1243,7 @@ impl ObservedVoiceSession {
         &mut self,
         packet: &[u8],
         header: RtpHeader,
+        received_at: StdInstant,
         user_id: String,
     ) -> Result<ObservedAudioFrame, DecodeAudioPacketError> {
         let protection = self
@@ -1173,6 +1261,7 @@ impl ObservedVoiceSession {
             ssrc: header.ssrc,
             sequence: header.sequence,
             timestamp: header.timestamp,
+            received_at,
             payload,
         })
     }

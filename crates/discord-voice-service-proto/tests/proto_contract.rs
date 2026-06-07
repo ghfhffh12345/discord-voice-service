@@ -1,7 +1,10 @@
 use discord_voice_service_proto::discordvoice::v1::join_voice_request::VoiceContext;
 use discord_voice_service_proto::discordvoice::v1::{
     DurationStatsSnapshot, GetPlaybackMetricsRequest, PlayRequest, PlaybackBufferDepthSnapshot,
-    PlaybackStabilitySnapshot, SessionEvent, SessionEventKind, SessionEventReason,
+    PlaybackQueueDepthStatsSnapshot, PlaybackSendCommandKind, PlaybackSendEventSnapshot,
+    PlaybackStabilitySnapshot, PreparedPlayoutQueueEventKind, PreparedPlayoutQueueEventReason,
+    PreparedPlayoutQueueEventSnapshot, PreparedTrackQueueDepthSampleSnapshot,
+    PreparedTrackQueueSamplePhase, SessionEvent, SessionEventKind, SessionEventReason,
     UpdateVoiceContextRequest,
 };
 
@@ -84,6 +87,46 @@ fn generated_control_messages_expose_expected_fields() {
             duration_ms: 5_000,
             duration_samples: 240_000,
         }),
+        source_buffer_depth: Some(PlaybackQueueDepthStatsSnapshot {
+            sample_count: 50,
+            empty_count: 0,
+            current_depth: Some(PlaybackBufferDepthSnapshot {
+                packets: 240,
+                bytes: 122_880,
+                duration_ms: 4_800,
+                duration_samples: 230_400,
+            }),
+            min_depth: Some(PlaybackBufferDepthSnapshot {
+                packets: 50,
+                bytes: 25_600,
+                duration_ms: 1_000,
+                duration_samples: 48_000,
+            }),
+            p5_depth: Some(PlaybackBufferDepthSnapshot {
+                packets: 200,
+                bytes: 102_400,
+                duration_ms: 4_000,
+                duration_samples: 192_000,
+            }),
+            p50_depth: Some(PlaybackBufferDepthSnapshot {
+                packets: 240,
+                bytes: 122_880,
+                duration_ms: 4_800,
+                duration_samples: 230_400,
+            }),
+            p95_depth: Some(PlaybackBufferDepthSnapshot {
+                packets: 250,
+                bytes: 128_000,
+                duration_ms: 5_000,
+                duration_samples: 240_000,
+            }),
+            max_depth: Some(PlaybackBufferDepthSnapshot {
+                packets: 250,
+                bytes: 128_000,
+                duration_ms: 5_000,
+                duration_samples: 240_000,
+            }),
+        }),
         current_playout_buffer_depth: Some(PlaybackBufferDepthSnapshot {
             packets: 20,
             bytes: 10_240,
@@ -93,7 +136,167 @@ fn generated_control_messages_expose_expected_fields() {
         playout_underrun_count: 0,
         source_underrun_count: 0,
         sender_forbidden_work_count: 0,
-        prepared_rtp_queue_depth_ms: 0,
+        prepared_rtp_queue_depth_ms: 380,
+        prepared_track_queue_target_ms: 400,
+        prepared_track_queue_low_watermark_ms: 300,
+        prepared_track_queue_high_watermark_ms: 500,
+        active_pre_pause_prepared_track_queue_depth: Some(PlaybackQueueDepthStatsSnapshot {
+            sample_count: 50,
+            empty_count: 0,
+            current_depth: Some(PlaybackBufferDepthSnapshot {
+                packets: 20,
+                bytes: 10_240,
+                duration_ms: 400,
+                duration_samples: 19_200,
+            }),
+            min_depth: Some(PlaybackBufferDepthSnapshot {
+                packets: 20,
+                bytes: 10_240,
+                duration_ms: 400,
+                duration_samples: 19_200,
+            }),
+            p5_depth: Some(PlaybackBufferDepthSnapshot {
+                packets: 20,
+                bytes: 10_240,
+                duration_ms: 400,
+                duration_samples: 19_200,
+            }),
+            p50_depth: Some(PlaybackBufferDepthSnapshot {
+                packets: 20,
+                bytes: 10_240,
+                duration_ms: 400,
+                duration_samples: 19_200,
+            }),
+            p95_depth: Some(PlaybackBufferDepthSnapshot {
+                packets: 20,
+                bytes: 10_240,
+                duration_ms: 400,
+                duration_samples: 19_200,
+            }),
+            max_depth: Some(PlaybackBufferDepthSnapshot {
+                packets: 20,
+                bytes: 10_240,
+                duration_ms: 400,
+                duration_samples: 19_200,
+            }),
+        }),
+        active_post_resume_prepared_track_queue_depth: Some(PlaybackQueueDepthStatsSnapshot {
+            sample_count: 50,
+            empty_count: 0,
+            current_depth: Some(PlaybackBufferDepthSnapshot {
+                packets: 20,
+                bytes: 10_240,
+                duration_ms: 400,
+                duration_samples: 19_200,
+            }),
+            min_depth: Some(PlaybackBufferDepthSnapshot {
+                packets: 20,
+                bytes: 10_240,
+                duration_ms: 400,
+                duration_samples: 19_200,
+            }),
+            p5_depth: Some(PlaybackBufferDepthSnapshot {
+                packets: 20,
+                bytes: 10_240,
+                duration_ms: 400,
+                duration_samples: 19_200,
+            }),
+            p50_depth: Some(PlaybackBufferDepthSnapshot {
+                packets: 20,
+                bytes: 10_240,
+                duration_ms: 400,
+                duration_samples: 19_200,
+            }),
+            p95_depth: Some(PlaybackBufferDepthSnapshot {
+                packets: 20,
+                bytes: 10_240,
+                duration_ms: 400,
+                duration_samples: 19_200,
+            }),
+            max_depth: Some(PlaybackBufferDepthSnapshot {
+                packets: 20,
+                bytes: 10_240,
+                duration_ms: 400,
+                duration_samples: 19_200,
+            }),
+        }),
+        prepared_track_queue_depth_sample_count: 100,
+        prepared_track_queue_empty_count: 0,
+        raw_send_events: vec![PlaybackSendEventSnapshot {
+            packet_index: 0,
+            command_kind: PlaybackSendCommandKind::Track as i32,
+            expected_deadline_offset_us: 0,
+            send_started_offset_us: 1,
+            sent_offset_us: 2,
+            media_duration_ms: 20,
+            media_duration_samples: 960,
+            rtp_sequence: 7,
+            rtp_timestamp: 13_440,
+            protection_nonce: Some(42),
+            source_frame_epoch: Some(1),
+            source_media_position_ms: Some(5_000),
+            source_media_byte_position: Some(123_456),
+            committed_heard_media: true,
+        }],
+        raw_prepared_track_queue_samples: vec![PreparedTrackQueueDepthSampleSnapshot {
+            sample_index: 0,
+            phase: PreparedTrackQueueSamplePhase::ActivePrePause as i32,
+            depth: Some(PlaybackBufferDepthSnapshot {
+                packets: 20,
+                bytes: 10_240,
+                duration_ms: 400,
+                duration_samples: 19_200,
+            }),
+        }],
+        raw_prepared_playout_queue_events: vec![PreparedPlayoutQueueEventSnapshot {
+            event_index: 0,
+            event_kind: PreparedPlayoutQueueEventKind::Enqueued as i32,
+            reason: PreparedPlayoutQueueEventReason::SteadyPlayback as i32,
+            command_kind: PlaybackSendCommandKind::Track as i32,
+            media_duration_ms: 20,
+            media_duration_samples: 960,
+            rtp_sequence: 7,
+            rtp_timestamp: 13_440,
+            protection_nonce: Some(42),
+            source_frame_epoch: Some(1),
+            source_media_position_ms: Some(5_000),
+            source_media_byte_position: Some(123_456),
+            queue_depth_after: Some(PlaybackBufferDepthSnapshot {
+                packets: 20,
+                bytes: 10_240,
+                duration_ms: 400,
+                duration_samples: 19_200,
+            }),
+        }],
+        current_scheduled_silence_queue_depth: Some(PlaybackBufferDepthSnapshot::default()),
+        max_scheduled_silence_queue_depth: Some(PlaybackBufferDepthSnapshot::default()),
+        current_boundary_queue_depth: Some(PlaybackBufferDepthSnapshot::default()),
+        max_boundary_queue_depth: Some(PlaybackBufferDepthSnapshot {
+            packets: 1,
+            bytes: 3,
+            duration_ms: 20,
+            duration_samples: 960,
+        }),
+        prepared_track_packet_drop_count: 1,
+        prepared_silence_packet_drop_count: 0,
+        prepared_packet_rebuild_count: 1,
+        scheduled_silence_packet_count: 0,
+        pause_media_boundary_count: 1,
+        stop_media_boundary_count: 0,
+        recovery_media_boundary_count: 0,
+        natural_end_media_boundary_count: 0,
+        dave_transition_recovery_reached_builder_count: 1,
+        dave_transition_recovery_reached_deadline_sender_count: 0,
+        source_underrun_reached_builder_count: 0,
+        source_underrun_reached_deadline_sender_count: 0,
+        discarded_source_frame_count: 0,
+        discarded_source_duration_ms: 0,
+        stop_discarded_source_frame_count: 0,
+        stop_discarded_source_duration_ms: 0,
+        interruption_discarded_source_frame_count: 0,
+        interruption_discarded_source_duration_ms: 0,
+        restored_source_frame_count: 1,
+        restored_source_duration_ms: 20,
         gateway_event_drain_duration: Some(DurationStatsSnapshot {
             samples: 50,
             p50_ms: 0,
@@ -149,6 +352,17 @@ fn generated_control_messages_expose_expected_fields() {
     assert_eq!(metrics.source_buffer_target_ms, 5_000);
     assert_eq!(
         metrics
+            .source_buffer_depth
+            .as_ref()
+            .unwrap()
+            .p50_depth
+            .as_ref()
+            .unwrap()
+            .duration_ms,
+        4_800
+    );
+    assert_eq!(
+        metrics
             .current_playout_buffer_depth
             .as_ref()
             .unwrap()
@@ -158,7 +372,43 @@ fn generated_control_messages_expose_expected_fields() {
     assert_eq!(metrics.playout_underrun_count, 0);
     assert_eq!(metrics.source_underrun_count, 0);
     assert_eq!(metrics.sender_forbidden_work_count, 0);
-    assert_eq!(metrics.prepared_rtp_queue_depth_ms, 0);
+    assert_eq!(metrics.prepared_rtp_queue_depth_ms, 380);
+    assert_eq!(metrics.prepared_track_queue_target_ms, 400);
+    assert_eq!(metrics.prepared_track_queue_low_watermark_ms, 300);
+    assert_eq!(metrics.prepared_track_queue_high_watermark_ms, 500);
+    assert_eq!(
+        metrics
+            .active_pre_pause_prepared_track_queue_depth
+            .as_ref()
+            .unwrap()
+            .p50_depth
+            .as_ref()
+            .unwrap()
+            .duration_ms,
+        400
+    );
+    assert_eq!(metrics.prepared_track_queue_depth_sample_count, 100);
+    assert_eq!(metrics.prepared_track_queue_empty_count, 0);
+    assert_eq!(metrics.raw_send_events.len(), 1);
+    assert_eq!(
+        metrics.raw_send_events[0].command_kind,
+        PlaybackSendCommandKind::Track as i32
+    );
+    assert_eq!(metrics.raw_send_events[0].protection_nonce, Some(42));
+    assert_eq!(metrics.raw_prepared_track_queue_samples.len(), 1);
+    assert_eq!(
+        metrics.raw_prepared_track_queue_samples[0].phase,
+        PreparedTrackQueueSamplePhase::ActivePrePause as i32
+    );
+    assert_eq!(metrics.raw_prepared_playout_queue_events.len(), 1);
+    assert_eq!(
+        metrics.raw_prepared_playout_queue_events[0].event_kind,
+        PreparedPlayoutQueueEventKind::Enqueued as i32
+    );
+    assert_eq!(metrics.prepared_track_packet_drop_count, 1);
+    assert_eq!(metrics.prepared_packet_rebuild_count, 1);
+    assert_eq!(metrics.pause_media_boundary_count, 1);
+    assert_eq!(metrics.restored_source_frame_count, 1);
     assert_eq!(
         metrics
             .gateway_event_drain_duration
@@ -194,12 +444,14 @@ fn control_proto_exposes_update_voice_context_and_reason_codes() {
     assert!(proto.contains("enum SessionEventReason"));
     assert!(proto.contains("SessionEventReason reason = 8;"));
     assert!(proto.contains("message PlaybackStabilitySnapshot"));
+    assert!(proto.contains("message PlaybackQueueDepthStatsSnapshot"));
     assert!(proto.contains("DurationStatsSnapshot track_interval = 8;"));
     assert!(proto.contains("PlaybackBufferDepthSnapshot current_buffer_depth = 13;"));
     assert!(proto.contains("uint64 adaptive_buffer_target_ms = 32;"));
     assert!(proto.contains("uint64 max_adaptive_buffer_target_ms = 33;"));
     assert!(proto.contains("PlaybackBufferDepthSnapshot current_source_buffer_depth = 34;"));
     assert!(proto.contains("uint64 source_buffer_target_ms = 37;"));
+    assert!(proto.contains("PlaybackQueueDepthStatsSnapshot source_buffer_depth = 132;"));
     assert!(proto.contains("uint64 rebuffer_count = 39;"));
     assert!(proto.contains("PlaybackBufferDepthSnapshot current_playout_buffer_depth = 40;"));
     assert!(proto.contains("uint64 playout_underrun_count = 44;"));
@@ -243,6 +495,44 @@ fn control_proto_exposes_update_voice_context_and_reason_codes() {
     assert!(proto.contains("uint64 track_tempo_window_slowest_ratio_ppm = 85;"));
     assert!(proto.contains("uint64 track_tempo_window_slowest_media_ms = 86;"));
     assert!(proto.contains("uint64 track_tempo_window_slowest_wall_clock_us = 87;"));
+    assert!(proto.contains("uint64 egress_buffer_target_ms = 88;"));
+    assert!(proto.contains("PlaybackBufferDepthSnapshot current_egress_buffer_depth = 89;"));
+    assert!(proto.contains("PlaybackBufferDepthSnapshot min_egress_buffer_depth = 90;"));
+    assert!(proto.contains("PlaybackBufferDepthSnapshot max_egress_buffer_depth = 91;"));
+    assert!(proto.contains("uint64 max_consecutive_late_egress_ticks = 96;"));
+    assert!(proto.contains("uint64 egress_clock_reset_count = 97;"));
+    assert!(proto.contains("uint64 prepared_track_queue_target_ms = 98;"));
+    assert!(proto.contains("uint64 prepared_track_queue_low_watermark_ms = 99;"));
+    assert!(proto.contains("uint64 prepared_track_queue_high_watermark_ms = 100;"));
+    assert!(proto.contains(
+        "PlaybackQueueDepthStatsSnapshot active_pre_pause_prepared_track_queue_depth = 101;"
+    ));
+    assert!(proto.contains(
+        "PlaybackQueueDepthStatsSnapshot active_post_resume_prepared_track_queue_depth = 102;"
+    ));
+    assert!(proto.contains("uint64 prepared_track_queue_depth_sample_count = 103;"));
+    assert!(proto.contains("uint64 prepared_track_queue_empty_count = 104;"));
+    assert!(proto.contains("message PlaybackSendEventSnapshot"));
+    assert!(proto.contains("enum PlaybackSendCommandKind"));
+    assert!(proto.contains("enum PreparedTrackQueueSamplePhase"));
+    assert!(proto.contains("repeated PlaybackSendEventSnapshot raw_send_events = 105;"));
+    assert!(proto.contains(
+        "repeated PreparedTrackQueueDepthSampleSnapshot raw_prepared_track_queue_samples = 106;"
+    ));
+    assert!(proto.contains("message PreparedPlayoutQueueEventSnapshot"));
+    assert!(proto.contains("enum PreparedPlayoutQueueEventKind"));
+    assert!(proto.contains("enum PreparedPlayoutQueueEventReason"));
+    assert!(proto.contains(
+        "repeated PreparedPlayoutQueueEventSnapshot raw_prepared_playout_queue_events = 107;"
+    ));
+    assert!(
+        proto.contains("PlaybackBufferDepthSnapshot current_scheduled_silence_queue_depth = 108;")
+    );
+    assert!(proto.contains("uint64 prepared_track_packet_drop_count = 112;"));
+    assert!(proto.contains("uint64 prepared_packet_rebuild_count = 114;"));
+    assert!(proto.contains("uint64 pause_media_boundary_count = 116;"));
+    assert!(proto.contains("uint64 dave_transition_recovery_reached_deadline_sender_count = 121;"));
+    assert!(proto.contains("uint64 restored_source_frame_count = 130;"));
     assert!(proto.contains("VOICE_RECONNECTING"));
     for reason in [
         "SESSION_EVENT_REASON_UNSPECIFIED",

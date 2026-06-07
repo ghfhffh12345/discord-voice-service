@@ -6,6 +6,13 @@ use twilight_model::id::{
     marker::{ChannelMarker, GuildMarker},
 };
 
+pub const LIVE_STAGING_PROFILE_CONSTRAINED_GITHUB: &str = "constrained-github-hosted";
+pub const LIVE_STAGING_PROFILE_CONSTRAINED_LOCAL: &str = "constrained-local";
+pub const MAX_LIVE_STAGING_SERVICE_CPUS: f64 = 1.0;
+pub const MIN_LIVE_STAGING_CPU_CONTENTION_WORKERS: u64 = 2;
+pub const MIN_LIVE_STAGING_HTTP_READ_DELAY_MS: u64 = 5;
+pub const MIN_LIVE_STAGING_HTTP_READ_JITTER_MS: u64 = 25;
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct StagingConfig {
     pub application_id: String,
@@ -14,7 +21,6 @@ pub struct StagingConfig {
     pub test_guild_id: String,
     pub test_voice_channel_id: String,
     pub test_video_id: String,
-    pub test_long_video_id: String,
     pub discord_voice_service_uri: String,
     pub discord_voice_service_ytmusic_addr: String,
     pub live_staging_profile: String,
@@ -22,7 +28,6 @@ pub struct StagingConfig {
     pub live_staging_cpu_contention_workers: u64,
     pub live_staging_http_read_delay_ms: u64,
     pub live_staging_http_read_jitter_ms: u64,
-    pub live_staging_long_track_min_packets: u64,
 }
 
 impl StagingConfig {
@@ -38,7 +43,6 @@ impl StagingConfig {
             test_guild_id: required_env(&env, "TEST_GUILD_ID")?,
             test_voice_channel_id: required_env(&env, "TEST_VOICE_CHANNEL_ID")?,
             test_video_id: required_env(&env, "TEST_VIDEO_ID")?,
-            test_long_video_id: required_env(&env, "TEST_LONG_VIDEO_ID")?,
             discord_voice_service_uri: required_env(&env, "DISCORD_VOICE_SERVICE_URI")?,
             discord_voice_service_ytmusic_addr: required_env(
                 &env,
@@ -58,10 +62,6 @@ impl StagingConfig {
                 &env,
                 "LIVE_STAGING_HTTP_READ_JITTER_MS",
             )?,
-            live_staging_long_track_min_packets: required_u64_env(
-                &env,
-                "LIVE_STAGING_LONG_TRACK_MIN_PACKETS",
-            )?,
         };
         config.validate()?;
         Ok(config)
@@ -76,20 +76,48 @@ impl StagingConfig {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.test_long_video_id == self.test_video_id {
-            bail!("TEST_LONG_VIDEO_ID must be distinct from TEST_VIDEO_ID");
+        if !matches!(
+            self.live_staging_profile.as_str(),
+            LIVE_STAGING_PROFILE_CONSTRAINED_GITHUB | LIVE_STAGING_PROFILE_CONSTRAINED_LOCAL
+        ) {
+            bail!(
+                "LIVE_STAGING_PROFILE must be `{LIVE_STAGING_PROFILE_CONSTRAINED_GITHUB}` or `{LIVE_STAGING_PROFILE_CONSTRAINED_LOCAL}`; got `{}`",
+                self.live_staging_profile
+            );
         }
-        if self.live_staging_cpu_contention_workers == 0 {
-            bail!("LIVE_STAGING_CPU_CONTENTION_WORKERS must be greater than 0");
+
+        let service_cpus: f64 = self.live_staging_service_cpus.parse().with_context(|| {
+            format!(
+                "LIVE_STAGING_SERVICE_CPUS must be a positive decimal no greater than {MAX_LIVE_STAGING_SERVICE_CPUS}"
+            )
+        })?;
+        if !service_cpus.is_finite()
+            || service_cpus <= 0.0
+            || service_cpus > MAX_LIVE_STAGING_SERVICE_CPUS
+        {
+            bail!(
+                "LIVE_STAGING_SERVICE_CPUS must be > 0 and <= {MAX_LIVE_STAGING_SERVICE_CPUS}; got `{}`",
+                self.live_staging_service_cpus
+            );
         }
-        if self.live_staging_http_read_delay_ms == 0 {
-            bail!("LIVE_STAGING_HTTP_READ_DELAY_MS must be greater than 0");
+
+        if self.live_staging_cpu_contention_workers < MIN_LIVE_STAGING_CPU_CONTENTION_WORKERS {
+            bail!(
+                "LIVE_STAGING_CPU_CONTENTION_WORKERS must be at least {MIN_LIVE_STAGING_CPU_CONTENTION_WORKERS}; got {}",
+                self.live_staging_cpu_contention_workers
+            );
         }
-        if self.live_staging_http_read_jitter_ms == 0 {
-            bail!("LIVE_STAGING_HTTP_READ_JITTER_MS must be greater than 0");
+        if self.live_staging_http_read_delay_ms < MIN_LIVE_STAGING_HTTP_READ_DELAY_MS {
+            bail!(
+                "LIVE_STAGING_HTTP_READ_DELAY_MS must be at least {MIN_LIVE_STAGING_HTTP_READ_DELAY_MS}; got {}",
+                self.live_staging_http_read_delay_ms
+            );
         }
-        if self.live_staging_long_track_min_packets < 50 {
-            bail!("LIVE_STAGING_LONG_TRACK_MIN_PACKETS must be at least 50");
+        if self.live_staging_http_read_jitter_ms < MIN_LIVE_STAGING_HTTP_READ_JITTER_MS {
+            bail!(
+                "LIVE_STAGING_HTTP_READ_JITTER_MS must be at least {MIN_LIVE_STAGING_HTTP_READ_JITTER_MS}; got {}",
+                self.live_staging_http_read_jitter_ms
+            );
         }
         Ok(())
     }
@@ -104,7 +132,6 @@ impl std::fmt::Debug for StagingConfig {
             .field("test_guild_id", &self.test_guild_id)
             .field("test_voice_channel_id", &self.test_voice_channel_id)
             .field("test_video_id", &self.test_video_id)
-            .field("test_long_video_id", &self.test_long_video_id)
             .field("discord_voice_service_uri", &self.discord_voice_service_uri)
             .field(
                 "discord_voice_service_ytmusic_addr",
@@ -123,10 +150,6 @@ impl std::fmt::Debug for StagingConfig {
             .field(
                 "live_staging_http_read_jitter_ms",
                 &self.live_staging_http_read_jitter_ms,
-            )
-            .field(
-                "live_staging_long_track_min_packets",
-                &self.live_staging_long_track_min_packets,
             )
             .finish()
     }

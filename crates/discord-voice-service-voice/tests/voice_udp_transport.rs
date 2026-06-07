@@ -371,6 +371,171 @@ async fn prepared_packets_preserve_rtp_duration_timestamps() {
 }
 
 #[tokio::test]
+async fn prepared_packets_reserve_unique_rtp_identity_before_send() {
+    let fake = FakeUdpPeer::spawn().await;
+    let mut transport = VoiceUdpTransport::connect(fake.addr(), 77).await.unwrap();
+
+    let packets = [
+        (Bytes::from_static(b"opus-a"), 20, 960),
+        (Bytes::from_static(b"opus-b"), 40, 1_920),
+        (Bytes::from_static(b"opus-c"), 60, 2_880),
+    ]
+    .into_iter()
+    .map(|(payload, duration_ms, duration_samples)| {
+        transport
+            .prepare_audio_packet_with_duration_samples(
+                payload,
+                duration_ms,
+                duration_samples,
+                true,
+            )
+            .unwrap()
+    })
+    .collect::<Vec<_>>();
+
+    assert_eq!(
+        packets
+            .iter()
+            .map(|packet| packet.rtp_sequence)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+    assert_eq!(
+        packets
+            .iter()
+            .map(|packet| packet.rtp_timestamp)
+            .collect::<Vec<_>>(),
+        vec![0, 960, 2_880]
+    );
+    assert_eq!(
+        packets
+            .iter()
+            .map(|packet| parse_rtp_header(&packet.bytes).unwrap().sequence)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(fake.audio_packet_count_now().await, 0);
+    for packet in &packets {
+        transport.send_prepared_packet(packet).await.unwrap();
+    }
+    assert_eq!(fake.audio_packets(3).await.len(), 3);
+}
+
+#[tokio::test]
+async fn prepared_packets_must_be_sent_in_reserved_order() {
+    let fake = FakeUdpPeer::spawn().await;
+    let mut transport = VoiceUdpTransport::connect(fake.addr(), 77).await.unwrap();
+    let first = transport
+        .prepare_audio_packet_with_duration_samples(Bytes::from_static(b"opus-a"), 20, 960, true)
+        .unwrap();
+    let second = transport
+        .prepare_audio_packet_with_duration_samples(Bytes::from_static(b"opus-b"), 20, 960, true)
+        .unwrap();
+
+    let error = transport
+        .send_prepared_packet(&second)
+        .await
+        .expect_err("out-of-order prepared send should fail");
+    assert!(
+        error
+            .to_string()
+            .contains("prepared packet rtp cursor is not next send")
+    );
+    transport.send_prepared_packet(&first).await.unwrap();
+    transport.send_prepared_packet(&second).await.unwrap();
+}
+
+#[tokio::test]
+async fn discarding_unsent_prepared_packets_rebases_future_reservations_to_last_sent() {
+    let fake = FakeUdpPeer::spawn().await;
+    let mut transport = VoiceUdpTransport::connect(fake.addr(), 77).await.unwrap();
+    let first = transport
+        .prepare_audio_packet_with_duration_samples(Bytes::from_static(b"opus-a"), 20, 960, true)
+        .unwrap();
+    transport.send_prepared_packet(&first).await.unwrap();
+
+    let discarded = transport
+        .prepare_audio_packet_with_duration_samples(Bytes::from_static(b"discarded"), 20, 960, true)
+        .unwrap();
+    assert_eq!(discarded.rtp_sequence, 1);
+    transport.discard_unsent_prepared_packets();
+
+    let rebuilt = transport
+        .prepare_audio_packet_with_duration_samples(Bytes::from_static(b"rebuilt"), 20, 960, true)
+        .unwrap();
+    assert_eq!(rebuilt.rtp_sequence, 1);
+    assert_eq!(rebuilt.rtp_timestamp, 960);
+    transport.send_prepared_packet(&rebuilt).await.unwrap();
+
+    let packets = fake.audio_packets(2).await;
+    let headers = packets
+        .iter()
+        .map(|packet| parse_rtp_header(packet).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        headers
+            .iter()
+            .map(|header| header.sequence)
+            .collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+    assert_eq!(
+        headers
+            .iter()
+            .map(|header| header.timestamp)
+            .collect::<Vec<_>>(),
+        vec![0, 960]
+    );
+}
+
+#[tokio::test]
+async fn cloned_prepared_packet_sender_shares_send_cursor_for_rebase() {
+    let fake = FakeUdpPeer::spawn().await;
+    let mut transport = VoiceUdpTransport::connect(fake.addr(), 77).await.unwrap();
+    let mut cloned_sender = transport.cloned_prepared_packet_sender();
+
+    let first = transport
+        .prepare_audio_packet_with_duration_samples(Bytes::from_static(b"opus-a"), 20, 960, true)
+        .unwrap();
+    cloned_sender.send_prepared_packet(&first).await.unwrap();
+
+    let discarded = transport
+        .prepare_audio_packet_with_duration_samples(Bytes::from_static(b"discarded"), 20, 960, true)
+        .unwrap();
+    assert_eq!(discarded.rtp_sequence, 1);
+    transport.discard_unsent_prepared_packets();
+
+    let rebuilt = transport
+        .prepare_audio_packet_with_duration_samples(Bytes::from_static(b"rebuilt"), 20, 960, true)
+        .unwrap();
+    assert_eq!(rebuilt.rtp_sequence, 1);
+    assert_eq!(rebuilt.rtp_timestamp, 960);
+    cloned_sender.send_prepared_packet(&rebuilt).await.unwrap();
+
+    let packets = fake.audio_packets(2).await;
+    let headers = packets
+        .iter()
+        .map(|packet| parse_rtp_header(packet).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        headers
+            .iter()
+            .map(|header| header.sequence)
+            .collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+    assert_eq!(
+        headers
+            .iter()
+            .map(|header| header.timestamp)
+            .collect::<Vec<_>>(),
+        vec![0, 960]
+    );
+}
+
+#[tokio::test]
 async fn voice_udp_transport_stop_sends_five_opus_silence_frames() {
     let fake = FakeUdpPeer::spawn().await;
     let mut transport = VoiceUdpTransport::connect(fake.addr(), 77).await.unwrap();

@@ -54,21 +54,25 @@ observer_bot_token="${OBSERVER_BOT_TOKEN:?OBSERVER_BOT_TOKEN must be set in ${en
 test_guild_id="${TEST_GUILD_ID:?TEST_GUILD_ID must be set in ${env_file}}"
 test_voice_channel_id="${TEST_VOICE_CHANNEL_ID:?TEST_VOICE_CHANNEL_ID must be set in ${env_file}}"
 test_video_id="${TEST_VIDEO_ID:?TEST_VIDEO_ID must be set in ${env_file}}"
-test_long_video_id="${TEST_LONG_VIDEO_ID:?TEST_LONG_VIDEO_ID must be set in ${env_file}}"
 service_uri="${DISCORD_VOICE_SERVICE_URI:-http://127.0.0.1:55051}"
 live_staging_profile="${LIVE_STAGING_PROFILE:-constrained-local}"
 live_staging_service_cpus="${LIVE_STAGING_SERVICE_CPUS:-1.0}"
 live_staging_cpu_contention_workers="${LIVE_STAGING_CPU_CONTENTION_WORKERS:-2}"
 live_staging_http_read_delay_ms="${LIVE_STAGING_HTTP_READ_DELAY_MS:-5}"
 live_staging_http_read_jitter_ms="${LIVE_STAGING_HTTP_READ_JITTER_MS:-25}"
-live_staging_long_track_min_packets="${LIVE_STAGING_LONG_TRACK_MIN_PACKETS:-300}"
 
-unset APPLICATION_ID BOT_TOKEN OBSERVER_BOT_TOKEN TEST_GUILD_ID TEST_VOICE_CHANNEL_ID TEST_VIDEO_ID TEST_LONG_VIDEO_ID
+if [[ "${live_staging_profile}" != "constrained-local" ]]; then
+  echo "LIVE_STAGING_PROFILE must be constrained-local for run_local_live_staging.sh; got ${live_staging_profile}" >&2
+  exit 1
+fi
+
+unset APPLICATION_ID BOT_TOKEN OBSERVER_BOT_TOKEN TEST_GUILD_ID TEST_VOICE_CHANNEL_ID TEST_VIDEO_ID
 unset DISCORD_VOICE_SERVICE_BIND_ADDR DISCORD_VOICE_SERVICE_URI DISCORD_VOICE_SERVICE_YTMUSIC_ADDR
 
-printf '{"outcome":"failure","service_uri":"%s","ytmusic_addr":"%s","live_staging_profile":"%s","live_staging_service_cpus":"%s","live_staging_cpu_contention_workers":%s,"live_staging_http_read_delay_ms":%s,"live_staging_http_read_jitter_ms":%s,"validated_join_voice":false,"validated_update_voice_context":false,"validated_play":false,"validated_pause":false,"validated_resume":false,"validated_invalid_resume_ignored":false,"validated_redundant_pause_ignored":false,"observer_proved_pause":false,"observer_proved_resume":false,"observer_pause_self_mute_observed":false,"observer_pause_speaking_stopped":false,"observer_resume_speaking_started":false,"observer_pause_silence_ms":0,"observer_resume_packet_count":0,"validated_reconnect_rollover_during_playback":false,"validated_stop":false,"validated_stop_during_playback":false,"validated_leave_voice":false,"validated_leave_voice_during_playback":false,"validated_get_state":false,"validated_get_playback_metrics":false,"validated_subscribe_events":false,"saw_voice_connecting":false,"saw_voice_ready":false,"saw_track_resolving":false,"saw_playing":false,"saw_track_ended":false,"observed_packet_count":0,"decoded_audio_ms":0,"observer_wall_clock_elapsed_ms":0,"observer_decoded_audio_to_wall_clock_ratio_ppm":0,"non_silent_audio_ms":0,"observer_rtp_inter_arrival":{"samples":0,"p50_ms":0,"p95_ms":0,"p99_ms":0,"min_ms":0,"max_ms":0},"observer_rtp_gap_count_gte_100ms":0,"observer_rtp_fast_interval_count":0,"observer_rtp_fast_interval_min_ms":0,"observer_rtp_fast_interval_min_us":0,"observer_decoded_audio_tempo_window_count":0,"observer_decoded_audio_tempo_window_post_source_buffer_count":0,"observer_decoded_audio_tempo_window_fast_count":0,"observer_decoded_audio_tempo_window_fastest_ratio_ppm":0,"observer_decoded_audio_tempo_window_fastest_media_ms":0,"observer_decoded_audio_tempo_window_fastest_wall_clock_us":0,"dave_transition_count_during_playback":0,"playback_metrics":null,"reconnect_probe_metrics":null,"validated_constrained_profile":false,"validated_slow_jittery_http":false,"validated_long_track_playback":false,"long_track_metrics":null,"failure_reason":"controller_not_started"}\n' \
+printf '{"outcome":"failure","service_uri":"%s","ytmusic_addr":"%s","test_video_id":"%s","expected_track_duration_ms":0,"active_validation_duration_after_resume_ms":0,"pause_silence_packet_count":0,"pause_silence_spacing_ms":[],"live_staging_profile":"%s","live_staging_service_cpus":"%s","live_staging_cpu_contention_workers":%s,"live_staging_http_read_delay_ms":%s,"live_staging_http_read_jitter_ms":%s,"validated_join_voice":false,"validated_update_voice_context":false,"validated_play":false,"validated_pause":false,"validated_resume":false,"validated_invalid_resume_ignored":false,"validated_redundant_pause_ignored":false,"observer_proved_pause":false,"observer_proved_resume":false,"observer_pause_self_mute_observed":false,"observer_pause_speaking_stopped":false,"observer_pause_rtp_silence_observed":false,"observer_resume_speaking_started":false,"observer_pause_silence_ms":0,"observer_resume_packet_count":0,"validated_reconnect_rollover_during_playback":false,"validated_stop":false,"validated_stop_during_playback":false,"validated_leave_voice":false,"validated_leave_voice_during_playback":false,"validated_get_state":false,"validated_get_playback_metrics":false,"validated_subscribe_events":false,"saw_voice_connecting":false,"saw_voice_ready":false,"saw_track_resolving":false,"saw_playing":false,"saw_track_ended":false,"observed_packet_count":0,"decoded_audio_ms":0,"observer_wall_clock_elapsed_ms":0,"observer_decoded_audio_to_wall_clock_ratio_ppm":0,"non_silent_audio_ms":0,"observer_rtp_inter_arrival":{"samples":0,"p50_ms":0,"p95_ms":0,"p99_ms":0,"min_ms":0,"max_ms":0},"observer_rtp_gap_count_gte_100ms":0,"observer_rtp_fast_interval_count":0,"observer_rtp_fast_interval_min_ms":0,"observer_rtp_fast_interval_min_us":0,"observer_decoded_audio_tempo_window_count":0,"observer_decoded_audio_tempo_window_post_source_buffer_count":0,"observer_decoded_audio_tempo_window_fast_count":0,"observer_decoded_audio_tempo_window_fastest_ratio_ppm":0,"observer_decoded_audio_tempo_window_fastest_media_ms":0,"observer_decoded_audio_tempo_window_fastest_wall_clock_us":0,"dave_transition_count_during_playback":0,"playback_metrics":null,"reconnect_probe_metrics":null,"validated_constrained_profile":false,"validated_slow_jittery_http":false,"failure_reason":"controller_not_started"}\n' \
   "${service_uri}" \
   "${service_ytmusic_addr}" \
+  "${test_video_id}" \
   "${live_staging_profile}" \
   "${live_staging_service_cpus}" \
   "${live_staging_cpu_contention_workers}" \
@@ -90,6 +94,13 @@ if [[ -n "${RUST_LOG:-}" ]]; then
 fi
 if [[ -n "${RUST_BACKTRACE:-}" ]]; then
   runtime_env+=(RUST_BACKTRACE="${RUST_BACKTRACE}")
+fi
+service_runtime_env=()
+if [[ -n "${RUST_LOG:-}" ]]; then
+  service_runtime_env+=(-e RUST_LOG="${RUST_LOG}")
+fi
+if [[ -n "${RUST_BACKTRACE:-}" ]]; then
+  service_runtime_env+=(-e RUST_BACKTRACE="${RUST_BACKTRACE}")
 fi
 
 wait_for_ytmusic_grpc() {
@@ -182,6 +193,7 @@ docker run -d \
   --name "${service_container_name}" \
   --network host \
   --cpus "${live_staging_service_cpus}" \
+  "${service_runtime_env[@]}" \
   -e DISCORD_VOICE_SERVICE_BIND_ADDR="0.0.0.0:${probe_port}" \
   -e DISCORD_VOICE_SERVICE_YTMUSIC_ADDR="${service_ytmusic_addr}" \
   -e DISCORD_VOICE_SERVICE_HTTP_READ_DELAY_MS="${live_staging_http_read_delay_ms}" \
@@ -210,7 +222,6 @@ while [[ "${attempt}" -lt 30 ]]; do
     TEST_GUILD_ID="${test_guild_id}" \
     TEST_VOICE_CHANNEL_ID="${test_voice_channel_id}" \
     TEST_VIDEO_ID="${test_video_id}" \
-    TEST_LONG_VIDEO_ID="${test_long_video_id}" \
     DISCORD_VOICE_SERVICE_URI="${service_uri}" \
     DISCORD_VOICE_SERVICE_YTMUSIC_ADDR="${service_ytmusic_addr}" \
     LIVE_STAGING_PROFILE="${live_staging_profile}" \
@@ -218,7 +229,6 @@ while [[ "${attempt}" -lt 30 ]]; do
     LIVE_STAGING_CPU_CONTENTION_WORKERS="${live_staging_cpu_contention_workers}" \
     LIVE_STAGING_HTTP_READ_DELAY_MS="${live_staging_http_read_delay_ms}" \
     LIVE_STAGING_HTTP_READ_JITTER_MS="${live_staging_http_read_jitter_ms}" \
-    LIVE_STAGING_LONG_TRACK_MIN_PACKETS="${live_staging_long_track_min_packets}" \
     LIVE_VALIDATION_EVIDENCE_PATH="${validation_evidence_path}" \
     cargo run -p discord-voice-service-live-validation --bin staging_live_check >"${controller_log}" 2>&1
     exit 0

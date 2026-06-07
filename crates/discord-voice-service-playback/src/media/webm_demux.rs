@@ -20,7 +20,7 @@ pub struct DemuxedPacket {
 #[derive(Default)]
 pub struct WebmOpusDemux {
     pending: BytesMut,
-    emitted_packets: usize,
+    state: WebmDemuxState,
 }
 
 impl WebmOpusDemux {
@@ -33,19 +33,23 @@ impl WebmOpusDemux {
             return Ok(Vec::new());
         }
 
-        match WebmDemuxState::parse(self.pending.as_ref())? {
-            Some(packets) => {
-                if self.emitted_packets > packets.len() {
-                    return Err(PlaybackError::MediaParse(
-                        "demux packet cursor exceeded parsed packet count",
-                    ));
-                }
-
-                let new_packets = packets[self.emitted_packets..].to_vec();
-                self.emitted_packets = packets.len();
-                Ok(new_packets)
+        match self.state.parse_available(self.pending.as_ref())? {
+            ParseOutcome::Complete { state, packets } => {
+                self.state = state;
+                self.pending.clear();
+                Ok(packets)
             }
-            None => Ok(Vec::new()),
+            ParseOutcome::Incomplete {
+                state,
+                packets,
+                tail_start,
+            } if tail_start > 0 && !packets.is_empty() => {
+                self.state = state;
+                let tail_start = tail_start.min(self.pending.len());
+                let _ = self.pending.split_to(tail_start);
+                Ok(packets)
+            }
+            ParseOutcome::Incomplete { .. } | ParseOutcome::Stalled => Ok(Vec::new()),
         }
     }
 }
@@ -55,11 +59,25 @@ struct TrackState {
     number: u64,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct WebmDemuxState {
     timestamp_scale_ns: u64,
     cluster_timestamp: u64,
     opus_track: Option<TrackState>,
+}
+
+#[derive(Debug)]
+enum ParseOutcome {
+    Complete {
+        state: WebmDemuxState,
+        packets: Vec<DemuxedPacket>,
+    },
+    Incomplete {
+        state: WebmDemuxState,
+        packets: Vec<DemuxedPacket>,
+        tail_start: usize,
+    },
+    Stalled,
 }
 
 impl Default for WebmDemuxState {
@@ -73,29 +91,32 @@ impl Default for WebmDemuxState {
 }
 
 impl WebmDemuxState {
-    fn parse(input: &[u8]) -> Result<Option<Vec<DemuxedPacket>>, PlaybackError> {
-        let tags_to_buffer = [
-            MatroskaSpec::TrackEntry(Master::Start),
-            MatroskaSpec::BlockGroup(Master::Start),
-        ];
-        let iterator = WebmIterator::new(Cursor::new(input), &tags_to_buffer);
-        let mut state = Self::default();
+    fn parse_available(&self, input: &[u8]) -> Result<ParseOutcome, PlaybackError> {
+        let tags_to_buffer = [MatroskaSpec::TrackEntry(Master::Start)];
+        let mut iterator = WebmIterator::new(Cursor::new(input), &tags_to_buffer);
+        iterator.emit_master_end_when_eof(false);
+
+        let mut state = self.clone();
         let mut packets = Vec::new();
 
         for tag in iterator {
             let tag = match tag {
                 Ok(tag) => tag,
-                Err(TagIteratorError::UnexpectedEOF { .. })
-                | Err(TagIteratorError::CorruptedFileData(_))
+                Err(TagIteratorError::UnexpectedEOF { tag_start, .. }) => {
+                    return Ok(ParseOutcome::Incomplete {
+                        state,
+                        packets,
+                        tail_start: tag_start,
+                    });
+                }
+                Err(TagIteratorError::CorruptedFileData(_))
                 | Err(TagIteratorError::CorruptedTagData { .. })
-                | Err(TagIteratorError::ReadError { .. }) => return Ok(None),
+                | Err(TagIteratorError::ReadError { .. }) => return Ok(ParseOutcome::Stalled),
             };
-            if state.process_tag(tag, &mut packets).is_err() {
-                return Ok(None);
-            }
+            state.process_tag(tag, &mut packets)?;
         }
 
-        Ok(Some(packets))
+        Ok(ParseOutcome::Complete { state, packets })
     }
 
     fn process_tag(
@@ -117,6 +138,10 @@ impl WebmDemuxState {
                 let block =
                     SimpleBlock::try_from(data.as_slice()).map_err(map_webm_coercion_error)?;
                 packets.extend(self.extract_simple_block(block)?);
+            }
+            MatroskaSpec::Block(data) => {
+                let block = Block::try_from(data.as_slice()).map_err(map_webm_coercion_error)?;
+                packets.extend(self.extract_block(block)?);
             }
             MatroskaSpec::BlockGroup(Master::Full(children)) => {
                 packets.extend(self.extract_block_group(children)?);
@@ -177,7 +202,10 @@ impl WebmDemuxState {
             return Ok(Vec::new());
         };
         let block = Block::try_from(block_data.as_slice()).map_err(map_webm_coercion_error)?;
+        self.extract_block(block)
+    }
 
+    fn extract_block(&self, block: Block<'_>) -> Result<Vec<DemuxedPacket>, PlaybackError> {
         if !self.is_target_track(block.track) {
             return Ok(Vec::new());
         }
@@ -247,4 +275,39 @@ fn opus_frame_durations(frames: &[Frame<'_>]) -> Option<Vec<OpusPacketDuration>>
 
 fn map_webm_coercion_error(error: WebmCoercionError) -> PlaybackError {
     PlaybackError::MediaParseDetail(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use discord_voice_service_test_support::fixtures::load_fixture_bytes;
+
+    #[test]
+    fn demux_does_not_retain_completed_audio_prefix() {
+        let fixture = load_fixture_bytes("audio-long.webm");
+        let mut one_shot_demux = WebmOpusDemux::default();
+        one_shot_demux.push_bytes(Bytes::copy_from_slice(&fixture));
+        let expected_packet_count = one_shot_demux.drain_packets().unwrap().len();
+
+        let mut demux = WebmOpusDemux::default();
+        let mut packet_count = 0usize;
+        let mut max_pending_after_audio = 0usize;
+
+        for chunk in fixture.chunks(256) {
+            demux.push_bytes(Bytes::copy_from_slice(chunk));
+            packet_count += demux.drain_packets().unwrap().len();
+
+            if packet_count > 0 {
+                max_pending_after_audio = max_pending_after_audio.max(demux.pending.len());
+            }
+        }
+
+        assert!(packet_count > 1_000, "fixture produced too few packets");
+        assert_eq!(packet_count, expected_packet_count);
+        assert!(
+            max_pending_after_audio < 16 * 1024,
+            "demux retained {max_pending_after_audio} bytes after audio packets started"
+        );
+    }
 }

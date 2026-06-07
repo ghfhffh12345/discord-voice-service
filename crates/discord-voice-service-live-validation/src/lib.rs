@@ -10,8 +10,8 @@ pub use audio::{
 pub use config::StagingConfig;
 pub use contract::{
     LiveContractState, LiveValidationEvidence, PlaybackBufferDepthEvidence,
-    PlaybackDurationStatsEvidence, PlaybackStabilityEvidence, emit_validation_evidence,
-    finalize_success_evidence,
+    PlaybackDurationStatsEvidence, PlaybackQueueDepthStatsEvidence, PlaybackStabilityEvidence,
+    emit_validation_evidence, finalize_success_evidence,
 };
 pub use controller::{
     combine_results, current_user_absent_from_guild_voice, leave_confirmed_by_rest_voice_state,

@@ -111,6 +111,13 @@ impl RtpSequenceState {
         }
     }
 
+    pub(crate) fn from_parts(sequence: u16, timestamp: u32) -> Self {
+        Self {
+            sequence,
+            timestamp,
+        }
+    }
+
     pub fn current(&self) -> (u16, u32) {
         (self.sequence, self.timestamp)
     }

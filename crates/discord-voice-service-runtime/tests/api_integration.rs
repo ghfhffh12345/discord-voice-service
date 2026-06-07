@@ -335,8 +335,24 @@ async fn join_voice_then_play_streams_end_to_end_playback_events_and_audio() {
     assert_eq!(metrics.egress_buffer_target_ms, 400);
     assert!(max_egress_depth.duration_ms > 0);
     assert!(max_egress_depth.duration_ms <= 500);
-    assert_eq!(metrics.prepared_rtp_queue_depth_ms, 0);
-    assert_eq!(metrics.playout_builder_prepare_duration.unwrap().samples, 0);
+    assert!(metrics.prepared_rtp_queue_depth_ms <= 500);
+    assert_eq!(metrics.prepared_track_queue_target_ms, 400);
+    assert!(metrics.prepared_track_queue_low_watermark_ms >= 300);
+    assert!(metrics.prepared_track_queue_high_watermark_ms <= 500);
+    let pre_pause_depth = metrics
+        .active_pre_pause_prepared_track_queue_depth
+        .as_ref()
+        .expect("active pre-pause prepared track queue depth should be published");
+    assert!(pre_pause_depth.sample_count > 0);
+    assert_eq!(pre_pause_depth.empty_count, 0);
+    assert!(pre_pause_depth.p50_depth.as_ref().unwrap().duration_ms >= 340);
+    assert!(pre_pause_depth.p50_depth.as_ref().unwrap().duration_ms <= 460);
+    assert_eq!(
+        metrics.prepared_track_queue_depth_sample_count,
+        pre_pause_depth.sample_count
+    );
+    assert_eq!(metrics.prepared_track_queue_empty_count, 0);
+    assert!(metrics.playout_builder_prepare_duration.unwrap().samples > 0);
     assert!(metrics.sender_send_duration.unwrap().samples >= 5);
     assert!(metrics.sender_loop_non_send_work_duration.unwrap().max_ms <= 2);
     assert!(metrics.gateway_event_drain_duration.unwrap().samples >= 5);

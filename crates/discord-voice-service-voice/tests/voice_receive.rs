@@ -6,7 +6,9 @@ use discord_voice_service_test_support::fake_discord::FakeDiscordPeer;
 use discord_voice_service_voice::dave::{
     DaveExternalSender, DaveMediaType, DaveRuntimeContext, DaveSession,
 };
-use discord_voice_service_voice::test_support::RtpPacketBuilder;
+use discord_voice_service_voice::test_support::{
+    OPUS_SILENCE_FRAME, ProtectionContext, RtpPacketBuilder,
+};
 use discord_voice_service_voice::{
     ObservedVoiceActivity, ObservedVoiceSession, PendingObservedVoiceSession,
 };
@@ -146,6 +148,70 @@ async fn observed_voice_session_activity_reports_speaking_and_audio() {
             panic!("expected audio frame after speaking state, got disconnect for {user_id}");
         }
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn observed_voice_session_activity_reports_speaking_stop_after_silence_packets() {
+    let fake = FakeDiscordPeer::spawn_real_shape().await;
+    let voice = fake.voice_context("1", "2", "observer-1", "session-1", "token-1");
+
+    let mut session = ObservedVoiceSession::connect(voice).await.unwrap();
+    fake.send_speaking("speaker-1", 42).await.unwrap();
+    let started = session
+        .receive_activity_from("speaker-1", Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert!(matches!(
+        started,
+        ObservedVoiceActivity::Speaking(state) if state.speaking == 1
+    ));
+
+    let mode = fake.encryption_mode().await.unwrap();
+    let secret_key = fake.secret_key().await.unwrap();
+    let protection = ProtectionContext::new(mode, secret_key).unwrap();
+    let rtp = RtpPacketBuilder::new(42);
+
+    let receive_stop = async {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut silence_packets = 0;
+        loop {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .expect("speaking stop deadline");
+            match session
+                .receive_activity_from("speaker-1", remaining)
+                .await
+                .unwrap()
+            {
+                ObservedVoiceActivity::Audio(frame) => {
+                    assert_eq!(frame.payload.as_ref(), OPUS_SILENCE_FRAME.as_slice());
+                    silence_packets += 1;
+                }
+                ObservedVoiceActivity::Speaking(state) if state.speaking == 0 => {
+                    assert_eq!(state.user_id, "speaker-1");
+                    assert_eq!(state.ssrc, 42);
+                    assert!(silence_packets > 0);
+                    return silence_packets;
+                }
+                activity => panic!("expected silence packets then Speaking 0, got {activity:?}"),
+            }
+        }
+    };
+
+    let send_stop = async {
+        for index in 0u16..5 {
+            let header = rtp.build_header(index, u32::from(index) * 960);
+            let packet = protection
+                .protect_packet(&header, &OPUS_SILENCE_FRAME)
+                .unwrap();
+            fake.send_raw_udp_packet(&packet).await.unwrap();
+            sleep(Duration::from_millis(5)).await;
+        }
+        fake.send_speaking_state_without_user(0, 42).await.unwrap();
+    };
+
+    let (silence_packets, ()) = tokio::join!(receive_stop, send_stop);
+    assert!(silence_packets <= 5);
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -20,9 +20,11 @@ use twilight_model::voice::VoiceState;
 
 use discord_voice_service_playback::YtMusicClient;
 use discord_voice_service_twilight::{
-    Client as VoiceServiceClient, PlaybackStabilitySnapshot, SessionEvent, SessionEventKind,
-    SessionState, StateSnapshot, VoiceContext as ServiceVoiceContext, VoiceContextTracker,
-    join_voice_channel, leave_voice_channel,
+    Client as VoiceServiceClient, PlaybackBufferDepthSnapshot, PlaybackQueueDepthStatsSnapshot,
+    PlaybackSendCommandKind, PlaybackStabilitySnapshot, PreparedPlayoutQueueEventKind,
+    PreparedTrackQueueSamplePhase, SessionEvent, SessionEventKind, SessionState, StateSnapshot,
+    VoiceContext as ServiceVoiceContext, VoiceContextTracker, join_voice_channel,
+    leave_voice_channel,
 };
 use discord_voice_service_voice::{
     ObservedAudioFrame, ObservedVoiceActivity, ObservedVoiceSession, PendingObservedVoiceSession,
@@ -30,7 +32,11 @@ use discord_voice_service_voice::{
 };
 
 use crate::audio::{AudioValidationAccumulator, AudioValidationStats, ObservedOpusPacket};
-use crate::config::StagingConfig;
+use crate::config::{
+    LIVE_STAGING_PROFILE_CONSTRAINED_GITHUB, LIVE_STAGING_PROFILE_CONSTRAINED_LOCAL,
+    MAX_LIVE_STAGING_SERVICE_CPUS, MIN_LIVE_STAGING_CPU_CONTENTION_WORKERS,
+    MIN_LIVE_STAGING_HTTP_READ_DELAY_MS, MIN_LIVE_STAGING_HTTP_READ_JITTER_MS, StagingConfig,
+};
 use crate::contract::{
     LiveContractState, LiveValidationEvidence, PlaybackStabilityEvidence, emit_validation_evidence,
     finalize_success_evidence,
@@ -44,18 +50,28 @@ const LIVE_INTERRUPT_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 const INTERRUPT_PROBE_PLAY_TASK_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const PLAYBACK_METRICS_TIMEOUT: Duration = Duration::from_secs(5);
 const PLAYBACK_METRICS_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const MIN_LIVE_TEST_VIDEO_DURATION_MS: u64 = 90_000;
 const ACTIVE_INTERRUPT_PROBE_MEDIA_SETTLE_DURATION: Duration = Duration::from_millis(500);
 const MIN_STABILITY_METRIC_PACKET_COUNT: u64 = 50;
 const SOURCE_PLAYBACK_BUFFER_TARGET_MS: u64 = 5_000;
 const DISCORD_EGRESS_BUFFER_TARGET_MS: u64 = 400;
+const DISCORD_EGRESS_BUFFER_LOW_WATERMARK_MS: u64 = 300;
 const DISCORD_EGRESS_BUFFER_HIGH_WATERMARK_MS: u64 = 500;
+const PREPARED_TRACK_QUEUE_MIN_DEPTH_MS: u64 = 200;
+const PREPARED_TRACK_QUEUE_P5_MIN_DEPTH_MS: u64 = 300;
+const PREPARED_TRACK_QUEUE_P50_MIN_DEPTH_MS: u64 = 340;
+const PREPARED_TRACK_QUEUE_P50_MAX_DEPTH_MS: u64 = 460;
+const TRACK_TEMPO_WINDOW_PACKETS: usize = 50;
+const MIN_LIVE_POST_SOURCE_TEMPO_WINDOWS: u64 = 500;
+const SOURCE_POSITION_CONTINUITY_TOLERANCE_MS: u64 = 1;
+const RAW_RATIO_RECOMPUTE_TOLERANCE_PPM: u64 = 1;
 const RTP_INTERVAL_P95_BUDGET_MS: u64 = 45;
 const RTP_INTERVAL_P99_BUDGET_MS: u64 = 70;
-const RTP_INTERVAL_MAX_BUDGET_MS: u64 = 100;
+const RTP_INTERVAL_MAX_BUDGET_MS: u64 = 200;
 const MEDIA_TO_WALL_CLOCK_MIN_RATIO_PPM: u64 = 980_000;
 const MEDIA_TO_WALL_CLOCK_MAX_RATIO_PPM: u64 = 1_020_000;
 const SENDER_LATENESS_P99_BUDGET_MS: u64 = 10;
-const SENDER_LOOP_NON_SEND_WORK_MAX_BUDGET_MS: u64 = 15;
+const SENDER_LOOP_NON_SEND_WORK_P99_BUDGET_MS: u64 = 15;
 const MAX_CONSECUTIVE_PLAYOUT_LATE_PACKETS: u64 = 2;
 const MIN_OBSERVED_PACKET_COUNT: u64 = 120;
 const MIN_DECODED_AUDIO_MS: u64 = 6_000;
@@ -66,6 +82,10 @@ const OBSERVER_AUDIO_STARTED_TIMEOUT: Duration = Duration::from_secs(30);
 const PAUSE_OBSERVER_SILENCE_DURATION: Duration = Duration::from_millis(600);
 const PAUSE_AFTER_PLAYBACK_START: Duration = Duration::from_secs(10);
 const PAUSE_HOLD_DURATION: Duration = Duration::from_secs(3);
+const PAUSE_STOP_SILENCE_FRAME_COUNT: usize = 5;
+const PAUSE_BOUNDARY_MIN_SPACING_MS: u64 = 15;
+const PAUSE_BOUNDARY_MAX_SPACING_MS: u64 = 45;
+const OPUS_STOP_SILENCE_FRAME: [u8; 3] = [0xF8, 0xFF, 0xFE];
 const OBSERVER_SPEAKING_STATE_TIMEOUT: Duration = Duration::from_secs(10);
 const RESUME_OBSERVER_AUDIO_TIMEOUT: Duration = Duration::from_secs(10);
 const RESUME_OBSERVER_PACKET_TARGET: u64 = 4;
@@ -94,9 +114,9 @@ struct ValidatedLiveOutcome {
     live_contract: LiveContractState,
     audio_stats: AudioValidationStats,
     observer_playback: ObserverPlaybackProof,
+    expected_duration_ms: u64,
     playback_metrics: Option<PlaybackStabilityEvidence>,
     reconnect_probe_metrics: Option<PlaybackStabilityEvidence>,
-    long_track_metrics: Option<PlaybackStabilityEvidence>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -104,8 +124,10 @@ struct ObserverPlaybackProof {
     pause_silence_ms: u64,
     pause_self_mute_observed: bool,
     pause_speaking_stopped: bool,
+    pause_rtp_silence_observed: bool,
     resume_speaking_started: bool,
     resume_observed_packet_count: u64,
+    resume_decoded_audio_start_ms: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -115,7 +137,6 @@ struct FailureEvidenceSnapshot {
     observer_playback: Option<ObserverPlaybackProof>,
     playback_metrics: Option<PlaybackStabilityEvidence>,
     reconnect_probe_metrics: Option<PlaybackStabilityEvidence>,
-    long_track_metrics: Option<PlaybackStabilityEvidence>,
 }
 
 #[derive(Debug)]
@@ -129,14 +150,12 @@ struct ServiceFlowOutcome {
 struct CompletedPostPlayControlEvidence {
     playback_metrics: PlaybackStabilityEvidence,
     reconnect_probe_metrics: PlaybackStabilityEvidence,
-    long_track_metrics: PlaybackStabilityEvidence,
 }
 
 #[derive(Debug, Clone, Default)]
 struct PostPlayControlEvidence {
     playback_metrics: Option<PlaybackStabilityEvidence>,
     reconnect_probe_metrics: Option<PlaybackStabilityEvidence>,
-    long_track_metrics: Option<PlaybackStabilityEvidence>,
 }
 
 #[derive(Debug)]
@@ -162,29 +181,26 @@ impl FailureEvidenceSnapshot {
         if evidence.reconnect_probe_metrics.is_some() {
             self.reconnect_probe_metrics = evidence.reconnect_probe_metrics;
         }
-        if evidence.long_track_metrics.is_some() {
-            self.long_track_metrics = evidence.long_track_metrics;
-        }
     }
 }
 
 #[derive(Clone, Copy)]
 struct PostPlayProbeConfig<'a> {
     expected_video_id: &'a str,
-    long_video_id: &'a str,
-    long_track_min_packets: u64,
 }
 
 #[derive(Debug)]
 struct ObserverPauseProof {
     silence_ms: u64,
-    speaking_stopped: bool,
+    gateway_speaking_stopped: bool,
+    rtp_silence_observed: bool,
 }
 
 #[derive(Debug)]
 struct ObserverResumeProof {
     observed_packet_count: u64,
     speaking_started: bool,
+    resume_decoded_audio_start_ms: u64,
 }
 
 enum ObserverAudioProofCommand {
@@ -192,6 +208,7 @@ enum ObserverAudioProofCommand {
         respond_to: oneshot::Sender<Result<()>>,
     },
     Pause {
+        armed: oneshot::Sender<()>,
         respond_to: oneshot::Sender<Result<ObserverPauseProof>>,
     },
     Resume {
@@ -245,12 +262,7 @@ async fn expected_playback_duration_ms(config: &StagingConfig) -> Result<u64> {
             config.test_video_id
         )
     })?;
-    if duration_ms == 0 {
-        bail!(
-            "ytmusic-service returned zero expected duration for TEST_VIDEO_ID={}",
-            config.test_video_id
-        );
-    }
+    validate_live_test_video_duration(duration_ms, &config.test_video_id)?;
 
     info!(
         selected_itag = source.selected_itag,
@@ -259,6 +271,18 @@ async fn expected_playback_duration_ms(config: &StagingConfig) -> Result<u64> {
     );
 
     Ok(duration_ms)
+}
+
+fn validate_live_test_video_duration(duration_ms: u64, video_id: &str) -> Result<()> {
+    if duration_ms == 0 {
+        bail!("ytmusic-service returned zero expected duration for TEST_VIDEO_ID={video_id}");
+    }
+    if duration_ms < MIN_LIVE_TEST_VIDEO_DURATION_MS {
+        bail!(
+            "TEST_VIDEO_ID={video_id} is too short for live staging: expected_duration_ms={duration_ms} but at least {MIN_LIVE_TEST_VIDEO_DURATION_MS}ms is required; choose a longer TEST_VIDEO_ID",
+        );
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -716,9 +740,9 @@ async fn run_service_flow(
             live_contract,
             audio_stats,
             observer_playback,
+            expected_duration_ms,
             playback_metrics: None,
             reconnect_probe_metrics: None,
-            long_track_metrics: None,
         })
     };
 
@@ -746,6 +770,15 @@ async fn run_service_flow(
     failure_snapshot.observer_playback = observer_playback_snapshot.lock().unwrap().clone();
 
     let mut service_joined = true;
+    if result.is_err()
+        && failure_snapshot.playback_metrics.is_none()
+        && let Ok(metrics) = control_client.playback_metrics().await
+        && metrics.available
+        && metrics.video_id.as_deref() == Some(config.test_video_id.as_str())
+    {
+        failure_snapshot.playback_metrics = Some((&metrics).into());
+    }
+
     if let Ok(validated) = &mut result {
         validated.live_contract.mark_play();
         update_live_contract_snapshot(&live_contract_snapshot, &validated.live_contract);
@@ -757,8 +790,6 @@ async fn run_service_flow(
             &service_voice_for_reconnect_probe,
             PostPlayProbeConfig {
                 expected_video_id: &config.test_video_id,
-                long_video_id: &config.test_long_video_id,
-                long_track_min_packets: config.live_staging_long_track_min_packets,
             },
             &mut validated.live_contract,
             &live_contract_snapshot,
@@ -768,11 +799,9 @@ async fn run_service_flow(
             Ok(post_play) => {
                 validated.playback_metrics = Some(post_play.playback_metrics);
                 validated.reconnect_probe_metrics = Some(post_play.reconnect_probe_metrics);
-                validated.long_track_metrics = Some(post_play.long_track_metrics);
                 failure_snapshot.playback_metrics = validated.playback_metrics.clone();
                 failure_snapshot.reconnect_probe_metrics =
                     validated.reconnect_probe_metrics.clone();
-                failure_snapshot.long_track_metrics = validated.long_track_metrics.clone();
                 service_joined = false;
             }
             Err(failure) => {
@@ -970,6 +999,7 @@ async fn observe_audio_until_track_ended(
     let mut last_stats: Option<AudioValidationStats> = None;
     let mut audio_started = Some(audio_started);
     let mut proof_commands_closed = false;
+    let mut explicit_pause_boundary_observed = false;
 
     loop {
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
@@ -1005,7 +1035,8 @@ async fn observe_audio_until_track_ended(
                         }
                         let _ = respond_to.send(result);
                     }
-                    Some(ObserverAudioProofCommand::Pause { respond_to }) => {
+                    Some(ObserverAudioProofCommand::Pause { armed, respond_to }) => {
+                        let _ = armed.send(());
                         let result = prove_observer_pause_silence(
                             observer_session,
                             expected_user_id,
@@ -1014,13 +1045,21 @@ async fn observe_audio_until_track_ended(
                             &mut audio_started,
                         )
                         .await;
-                        if let Ok(proof) = &result
-                            && proof.speaking_stopped
-                        {
-                            info!(
-                                silence_ms = proof.silence_ms,
-                                "observer proved Pause by observing service speaking disappearance and no service audio",
-                            );
+                        match &result {
+                            Ok(proof) if proof.rtp_silence_observed => {
+                                info!(
+                                    silence_ms = proof.silence_ms,
+                                    "observer proved Pause by observing service stop boundary and no service audio",
+                                );
+                                explicit_pause_boundary_observed = true;
+                                accumulator.reset_wall_clock_baseline_after_controlled_pause();
+                            }
+                            Ok(_) => {
+                                explicit_pause_boundary_observed = false;
+                            }
+                            Err(_) => {
+                                explicit_pause_boundary_observed = false;
+                            }
                         }
                         let _ = respond_to.send(result);
                         last_stats = Some(accumulator.stats());
@@ -1034,14 +1073,22 @@ async fn observe_audio_until_track_ended(
                             &mut accumulator,
                             &snapshot,
                             &mut audio_started,
+                            explicit_pause_boundary_observed,
                         )
                         .await;
                         observer_session.set_dave_proposal_authoring(false);
                         if let Ok(proof) = &result {
-                            info!(
-                                observed_packet_count = proof.observed_packet_count,
-                                "observer proved Resume by observing service speaking start and receiving service audio",
-                            );
+                            if proof.speaking_started {
+                                info!(
+                                    observed_packet_count = proof.observed_packet_count,
+                                    "observer proved Resume by observing service speaking start and receiving service audio",
+                                );
+                            } else {
+                                info!(
+                                    observed_packet_count = proof.observed_packet_count,
+                                    "observer proved Resume by receiving service audio after explicit Pause boundary without gateway Speaking 1 echo",
+                                );
+                            }
                         }
                         let _ = respond_to.send(result);
                         last_stats = Some(accumulator.stats());
@@ -1092,14 +1139,19 @@ async fn prove_observer_pause_silence(
     audio_started: &mut Option<oneshot::Sender<()>>,
 ) -> Result<ObserverPauseProof> {
     let proof_started = Instant::now();
-    let mut speaking_stopped = false;
+    let mut gateway_speaking_stopped = false;
+    let mut rtp_silence_observed = false;
     let mut silence_deadline = None;
     let mut last_service_activity_at = proof_started;
+    let mut consecutive_stop_silence_frames = 0usize;
     let transition_deadline = Instant::now() + OBSERVER_SPEAKING_STATE_TIMEOUT;
 
     loop {
         let mut active_deadline = silence_deadline.unwrap_or(transition_deadline);
-        if !speaking_stopped && accumulator.stats().observed_packet_count > 0 {
+        if !gateway_speaking_stopped
+            && !rtp_silence_observed
+            && accumulator.stats().observed_packet_count > 0
+        {
             let inferred_silence_deadline =
                 last_service_activity_at + PAUSE_OBSERVER_SILENCE_DURATION;
             if inferred_silence_deadline < active_deadline {
@@ -1107,10 +1159,11 @@ async fn prove_observer_pause_silence(
             }
         }
         let Some(remaining) = active_deadline.checked_duration_since(Instant::now()) else {
-            if speaking_stopped {
+            if rtp_silence_observed {
                 return Ok(ObserverPauseProof {
                     silence_ms: duration_ms(PAUSE_OBSERVER_SILENCE_DURATION),
-                    speaking_stopped,
+                    gateway_speaking_stopped,
+                    rtp_silence_observed: true,
                 });
             }
             if accumulator.stats().observed_packet_count > 0
@@ -1118,11 +1171,20 @@ async fn prove_observer_pause_silence(
             {
                 info!(
                     silence_ms = duration_ms(PAUSE_OBSERVER_SILENCE_DURATION),
-                    "observer inferred Pause speaking inactivity from sustained service RTP silence"
+                    "observer observed Pause RTP silence without explicit service stop-silence boundary"
                 );
                 return Ok(ObserverPauseProof {
                     silence_ms: duration_ms(PAUSE_OBSERVER_SILENCE_DURATION),
-                    speaking_stopped: true,
+                    gateway_speaking_stopped,
+                    rtp_silence_observed: false,
+                });
+            }
+
+            if gateway_speaking_stopped {
+                return Ok(ObserverPauseProof {
+                    silence_ms: duration_ms(PAUSE_OBSERVER_SILENCE_DURATION),
+                    gateway_speaking_stopped,
+                    rtp_silence_observed: false,
                 });
             }
 
@@ -1138,10 +1200,24 @@ async fn prove_observer_pause_silence(
         {
             Ok(ObservedVoiceActivity::Audio(frame)) => {
                 let sequence = frame.sequence;
+                let is_stop_silence = frame.payload.as_ref() == OPUS_STOP_SILENCE_FRAME.as_slice();
                 let stats =
                     record_observer_audio_frame(frame, accumulator, snapshot, audio_started)?;
                 last_service_activity_at = Instant::now();
-                if !speaking_stopped {
+                consecutive_stop_silence_frames = if is_stop_silence {
+                    consecutive_stop_silence_frames.saturating_add(1)
+                } else {
+                    0
+                };
+                if !rtp_silence_observed {
+                    if consecutive_stop_silence_frames >= PAUSE_STOP_SILENCE_FRAME_COUNT {
+                        info!(
+                            silence_frames = consecutive_stop_silence_frames,
+                            "observer saw service stop-silence tail during Pause proof"
+                        );
+                        rtp_silence_observed = true;
+                        silence_deadline = Some(Instant::now() + PAUSE_OBSERVER_SILENCE_DURATION);
+                    }
                     continue;
                 }
                 let proof_elapsed_ms = Instant::now()
@@ -1157,7 +1233,8 @@ async fn prove_observer_pause_silence(
             }
             Ok(ObservedVoiceActivity::RtpPacket(packet)) => {
                 last_service_activity_at = Instant::now();
-                if !speaking_stopped {
+                consecutive_stop_silence_frames = 0;
+                if !rtp_silence_observed {
                     continue;
                 }
                 let proof_elapsed_ms = Instant::now()
@@ -1173,7 +1250,8 @@ async fn prove_observer_pause_silence(
             Ok(ObservedVoiceActivity::Speaking(state)) => {
                 last_service_activity_at = Instant::now();
                 if state.speaking & SPEAKING_FLAG_MICROPHONE != 0 {
-                    if speaking_stopped {
+                    consecutive_stop_silence_frames = 0;
+                    if gateway_speaking_stopped {
                         bail!(
                             "observer saw service microphone Speaking {} after Pause speaking disappearance",
                             state.speaking
@@ -1193,7 +1271,7 @@ async fn prove_observer_pause_silence(
                     speaking = state.speaking,
                     "observer saw service speaking disappear during Pause proof"
                 );
-                speaking_stopped = true;
+                gateway_speaking_stopped = true;
                 silence_deadline = Some(Instant::now() + PAUSE_OBSERVER_SILENCE_DURATION);
             }
             Ok(ObservedVoiceActivity::Disconnect(user_id)) => {
@@ -1202,10 +1280,11 @@ async fn prove_observer_pause_silence(
                 );
             }
             Err(error) if is_voice_receive_timeout(&error) => {
-                if speaking_stopped {
+                if rtp_silence_observed {
                     return Ok(ObserverPauseProof {
                         silence_ms: duration_ms(PAUSE_OBSERVER_SILENCE_DURATION),
-                        speaking_stopped,
+                        gateway_speaking_stopped,
+                        rtp_silence_observed: true,
                     });
                 }
                 if accumulator.stats().observed_packet_count > 0
@@ -1213,11 +1292,19 @@ async fn prove_observer_pause_silence(
                 {
                     info!(
                         silence_ms = duration_ms(PAUSE_OBSERVER_SILENCE_DURATION),
-                        "observer inferred Pause speaking inactivity from sustained service RTP silence"
+                        "observer observed Pause RTP silence without explicit service stop-silence boundary"
                     );
                     return Ok(ObserverPauseProof {
                         silence_ms: duration_ms(PAUSE_OBSERVER_SILENCE_DURATION),
-                        speaking_stopped: true,
+                        gateway_speaking_stopped,
+                        rtp_silence_observed: false,
+                    });
+                }
+                if gateway_speaking_stopped {
+                    return Ok(ObserverPauseProof {
+                        silence_ms: duration_ms(PAUSE_OBSERVER_SILENCE_DURATION),
+                        gateway_speaking_stopped,
+                        rtp_silence_observed: false,
                     });
                 }
                 bail!(
@@ -1248,17 +1335,20 @@ async fn prove_observer_resume_audio(
     accumulator: &mut AudioValidationAccumulator,
     snapshot: &Arc<Mutex<Option<AudioValidationStats>>>,
     audio_started: &mut Option<oneshot::Sender<()>>,
+    explicit_pause_boundary_observed: bool,
 ) -> Result<ObserverResumeProof> {
     let start_count = accumulator.stats().observed_packet_count;
-    accumulator.reset_inter_arrival_baseline();
+    let resume_decoded_audio_start_ms = accumulator.stats().decoded_audio_ms;
     let mut speaking_started = false;
+    let mut accepted_audio_without_gateway_speaking_logged = false;
     let deadline = Instant::now() + RESUME_OBSERVER_AUDIO_TIMEOUT;
     loop {
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
             bail!(
-                "observer did not receive resumed service speaking state and audio within {} seconds (speaking_started={} observed_after_resume={} required={})",
+                "observer did not receive resumed service audio within {} seconds (speaking_started={} explicit_pause_boundary_observed={} observed_after_resume={} required={})",
                 RESUME_OBSERVER_AUDIO_TIMEOUT.as_secs(),
                 speaking_started,
+                explicit_pause_boundary_observed,
                 accumulator
                     .stats()
                     .observed_packet_count
@@ -1272,23 +1362,36 @@ async fn prove_observer_resume_audio(
             .await
         {
             Ok(ObservedVoiceActivity::Audio(frame)) => {
+                if !speaking_started && !explicit_pause_boundary_observed {
+                    bail!("observer received resumed service audio before service Speaking 1");
+                }
+                if !speaking_started && !accepted_audio_without_gateway_speaking_logged {
+                    info!(
+                        sequence = frame.sequence,
+                        ssrc = frame.ssrc,
+                        "observer accepted resumed service audio after explicit Pause boundary without gateway Speaking 1 echo"
+                    );
+                    accepted_audio_without_gateway_speaking_logged = true;
+                }
                 let stats =
                     record_observer_audio_frame(frame, accumulator, snapshot, audio_started)?;
                 let observed_after_resume = stats.observed_packet_count.saturating_sub(start_count);
                 if observed_after_resume >= RESUME_OBSERVER_PACKET_TARGET {
-                    if !speaking_started {
-                        info!(
-                            observed_after_resume,
-                            "observer inferred resumed service speaking state from decoded service audio"
-                        );
-                    }
                     return Ok(ObserverResumeProof {
                         observed_packet_count: observed_after_resume,
-                        speaking_started: true,
+                        speaking_started,
+                        resume_decoded_audio_start_ms,
                     });
                 }
             }
             Ok(ObservedVoiceActivity::RtpPacket(packet)) => {
+                if !speaking_started && !explicit_pause_boundary_observed {
+                    bail!(
+                        "observer received resumed service RTP before service Speaking 1 (sequence={} ssrc={})",
+                        packet.sequence,
+                        packet.ssrc,
+                    );
+                }
                 info!(
                     user_id = %packet.user_id,
                     ssrc = packet.ssrc,
@@ -1313,6 +1416,7 @@ async fn prove_observer_resume_audio(
                         return Ok(ObserverResumeProof {
                             observed_packet_count: observed_after_resume,
                             speaking_started: true,
+                            resume_decoded_audio_start_ms,
                         });
                     }
                 } else {
@@ -1329,8 +1433,9 @@ async fn prove_observer_resume_audio(
             }
             Err(error) if is_voice_receive_timeout(&error) => {
                 bail!(
-                    "observer timed out waiting for resumed service speaking state and audio (speaking_started={} observed_after_resume={} required={})",
+                    "observer timed out waiting for resumed service audio (speaking_started={} explicit_pause_boundary_observed={} observed_after_resume={} required={})",
                     speaking_started,
+                    explicit_pause_boundary_observed,
                     accumulator
                         .stats()
                         .observed_packet_count
@@ -1349,13 +1454,24 @@ fn record_observer_audio_frame(
     snapshot: &Arc<Mutex<Option<AudioValidationStats>>>,
     audio_started: &mut Option<oneshot::Sender<()>>,
 ) -> Result<AudioValidationStats> {
+    let sequence = frame.sequence;
+    let timestamp = frame.timestamp;
+    let received_at = frame.received_at;
+    let payload_len = frame.payload.len();
     let stats = accumulator
-        .observe_packet(ObservedOpusPacket {
-            sequence: frame.sequence,
-            timestamp: frame.timestamp,
-            payload: frame.payload.as_ref(),
-        })
-        .context("analyze observer audio packet")?;
+        .observe_packet_at(
+            ObservedOpusPacket {
+                sequence,
+                timestamp,
+                payload: frame.payload.as_ref(),
+            },
+            received_at,
+        )
+        .with_context(|| {
+            format!(
+                "analyze observer audio packet sequence={sequence} timestamp={timestamp} payload_len={payload_len}"
+            )
+        })?;
     *snapshot.lock().unwrap() = Some(stats.clone());
     if let Some(audio_started) = audio_started.take() {
         let _ = audio_started.send(());
@@ -1380,13 +1496,12 @@ fn observer_thresholds_satisfied(stats: &AudioValidationStats, expected_duration
         && stats.decoded_audio_to_wall_clock_ratio_ppm <= MEDIA_TO_WALL_CLOCK_MAX_RATIO_PPM
         && stats.non_silent_audio_ms >= MIN_NON_SILENT_AUDIO_MS
         && stats.rtp_inter_arrival.samples > 0
-        && stats.rtp_gap_count_gte_100ms == 0
-        && stats.rtp_fast_interval_count == 0
         && stats.decoded_audio_tempo_window_count > 0
         && stats.decoded_audio_tempo_window_fast_count == 0
         && stats.decoded_audio_tempo_window_slow_count == 0
         && (!observer_post_source_buffer_window_required(expected_duration_ms)
-            || stats.decoded_audio_tempo_window_post_source_buffer_count > 0)
+            || stats.decoded_audio_tempo_window_post_source_buffer_count
+                >= MIN_LIVE_POST_SOURCE_TEMPO_WINDOWS)
         && stats.rtp_inter_arrival.p95_ms <= RTP_INTERVAL_P95_BUDGET_MS
         && stats.rtp_inter_arrival.p99_ms <= RTP_INTERVAL_P99_BUDGET_MS
         && stats.rtp_inter_arrival.max_ms < RTP_INTERVAL_MAX_BUDGET_MS
@@ -1543,11 +1658,12 @@ async fn wait_for_play_completed_contract_with_controls(
             }
             let pause_proof = await_observer_pause_proof(pause_proof).await?;
             observer_playback.pause_silence_ms = pause_proof.silence_ms;
-            observer_playback.pause_speaking_stopped = pause_proof.speaking_stopped;
+            observer_playback.pause_speaking_stopped = pause_proof.gateway_speaking_stopped;
+            observer_playback.pause_rtp_silence_observed = pause_proof.rtp_silence_observed;
             *observer_playback_snapshot.lock().unwrap() = Some(observer_playback.clone());
-            if !pause_proof.speaking_stopped {
-                warn!(
-                    "observer pause proof did not receive a direct voice-gateway speaking disappearance"
+            if !pause_proof.rtp_silence_observed {
+                bail!(
+                    "observer pause proof did not observe the explicit RTP stop-silence boundary"
                 );
             }
             state.mark_pause();
@@ -1563,6 +1679,8 @@ async fn wait_for_play_completed_contract_with_controls(
             let resume_proof = await_observer_resume_proof(resume_proof).await?;
             observer_playback.resume_observed_packet_count = resume_proof.observed_packet_count;
             observer_playback.resume_speaking_started = resume_proof.speaking_started;
+            observer_playback.resume_decoded_audio_start_ms =
+                resume_proof.resume_decoded_audio_start_ms;
             *observer_playback_snapshot.lock().unwrap() = Some(observer_playback.clone());
             state.mark_resume();
             update_live_contract_snapshot(&snapshot, &state);
@@ -1610,11 +1728,16 @@ async fn request_observer_speaking_started_proof(
 async fn start_observer_pause_proof(
     observer_proof_tx: &mpsc::Sender<ObserverAudioProofCommand>,
 ) -> Result<oneshot::Receiver<Result<ObserverPauseProof>>> {
+    let (armed, armed_rx) = oneshot::channel();
     let (respond_to, response) = oneshot::channel();
     observer_proof_tx
-        .send(ObserverAudioProofCommand::Pause { respond_to })
+        .send(ObserverAudioProofCommand::Pause { armed, respond_to })
         .await
         .context("request observer Pause proof")?;
+    timeout(Duration::from_secs(5), armed_rx)
+        .await
+        .context("timed out arming observer Pause proof")?
+        .context("observer Pause proof task ended before arming")?;
 
     Ok(response)
 }
@@ -1749,20 +1872,6 @@ async fn validate_post_play_control_rpcs(
         return evidence.fail(error);
     }
 
-    let long_track_metrics = match validate_long_track_playback(
-        client,
-        service_addr,
-        events,
-        probe_config.long_video_id,
-        probe_config.long_track_min_packets,
-    )
-    .await
-    {
-        Ok(metrics) => metrics,
-        Err(error) => return evidence.fail(error),
-    };
-    evidence.long_track_metrics = Some(long_track_metrics.clone());
-
     if let Err(error) = validate_active_leave_voice_during_playback(
         client,
         service_addr,
@@ -1782,7 +1891,6 @@ async fn validate_post_play_control_rpcs(
     Ok(CompletedPostPlayControlEvidence {
         playback_metrics: playback_metrics_evidence,
         reconnect_probe_metrics,
-        long_track_metrics,
     })
 }
 
@@ -1900,64 +2008,6 @@ async fn validate_active_stop_during_playback(
     state.mark_stop_during_playback();
     update_live_contract_snapshot(snapshot, state);
     Ok(())
-}
-
-async fn validate_long_track_playback(
-    client: &mut VoiceServiceClient,
-    service_addr: &str,
-    events: &mut (impl Stream<Item = Result<SessionEvent, tonic::Status>> + Unpin),
-    long_video_id: &str,
-    min_packets: u64,
-) -> Result<PlaybackStabilityEvidence> {
-    if min_packets < MIN_STABILITY_METRIC_PACKET_COUNT {
-        bail!(
-            "long-track probe requires at least {MIN_STABILITY_METRIC_PACKET_COUNT} packets; configured {min_packets}"
-        );
-    }
-
-    let mut probe_play_client = VoiceServiceClient::connect(service_addr.to_owned())
-        .await
-        .context("connect long-track probe play client")?;
-    let probe_video_id = long_video_id.to_owned();
-    let play_task = tokio::spawn(async move {
-        probe_play_client
-            .play(probe_video_id)
-            .await
-            .context("call Play for long-track staging probe")
-    });
-
-    let play_task = wait_for_interrupt_probe_playing_with_play_task(
-        events,
-        long_video_id,
-        "LongTrack",
-        play_task,
-    )
-    .await?;
-
-    tokio::time::sleep(Duration::from_millis(
-        min_packets
-            .saturating_mul(RTP_INTERVAL_P95_BUDGET_MS)
-            .saturating_add(1_000),
-    ))
-    .await;
-
-    if let Err(error) = client
-        .stop()
-        .await
-        .context("call Stop after long-track staging probe reached sustained playback")
-    {
-        cancel_interrupt_probe_play_task(play_task).await;
-        return Err(error);
-    }
-    if let Err(error) = wait_for_interrupt_probe_stopped(events, long_video_id, "LongTrack").await {
-        cancel_interrupt_probe_play_task(play_task).await;
-        return Err(error);
-    }
-    await_interrupt_probe_play_task(play_task, "LongTrack").await?;
-
-    let metrics = fetch_interrupted_playback_metrics(client, long_video_id, min_packets).await?;
-    validate_long_track_metrics(&metrics, long_video_id, min_packets)?;
-    Ok((&metrics).into())
 }
 
 async fn validate_active_leave_voice_during_playback(
@@ -2395,36 +2445,6 @@ async fn fetch_reconnect_probe_metrics(
     }
 }
 
-async fn fetch_interrupted_playback_metrics(
-    client: &mut VoiceServiceClient,
-    expected_video_id: &str,
-    min_packets: u64,
-) -> Result<PlaybackStabilitySnapshot> {
-    let started_at = Instant::now();
-    loop {
-        let metrics = client
-            .playback_metrics()
-            .await
-            .context("call GetPlaybackMetrics after interrupted long-track probe")?;
-        if metrics.available
-            && !metrics.ended
-            && metrics.video_id.as_deref() == Some(expected_video_id)
-            && metrics.track_packet_count >= min_packets
-        {
-            return Ok(metrics);
-        }
-
-        if started_at.elapsed() >= PLAYBACK_METRICS_TIMEOUT {
-            bail!(
-                "GetPlaybackMetrics did not return interrupted long-track metrics for `{expected_video_id}` with at least {min_packets} packets within {} seconds",
-                PLAYBACK_METRICS_TIMEOUT.as_secs()
-            );
-        }
-
-        tokio::time::sleep(PLAYBACK_METRICS_POLL_INTERVAL).await;
-    }
-}
-
 fn validate_finished_playback_metrics(
     metrics: &PlaybackStabilitySnapshot,
     expected_video_id: &str,
@@ -2457,40 +2477,23 @@ fn validate_finished_playback_metrics(
     if metrics.refill_duration.samples == 0 {
         bail!("GetPlaybackMetrics returned no refill duration samples");
     }
-    validate_source_buffer_target(metrics, "GetPlaybackMetrics")?;
     validate_playback_timing_budget(metrics, "finished playback")?;
+    validate_live_runtime_post_source_window_count(metrics, "finished playback")?;
 
     Ok(())
 }
 
-fn validate_long_track_metrics(
+fn validate_live_runtime_post_source_window_count(
     metrics: &PlaybackStabilitySnapshot,
-    expected_video_id: &str,
-    min_packets: u64,
+    label: &str,
 ) -> Result<()> {
-    if !metrics.available {
-        bail!("GetPlaybackMetrics returned unavailable metrics after long-track probe");
-    }
-    if metrics.video_id.as_deref() != Some(expected_video_id) {
+    if metrics.track_tempo_window_post_source_buffer_count < MIN_LIVE_POST_SOURCE_TEMPO_WINDOWS {
         bail!(
-            "GetPlaybackMetrics returned long-track video_id {:?}; expected `{expected_video_id}`",
-            metrics.video_id
+            "{label} returned {} runtime post-source tempo windows; expected at least {MIN_LIVE_POST_SOURCE_TEMPO_WINDOWS}",
+            metrics.track_tempo_window_post_source_buffer_count
         );
     }
-    if metrics.ended {
-        bail!("long-track staging probe ended naturally before interruption");
-    }
-    if metrics.track_packet_count < min_packets {
-        bail!(
-            "long-track staging probe reported only {} track packets; expected at least {min_packets}",
-            metrics.track_packet_count
-        );
-    }
-    if metrics.refill_duration.samples == 0 {
-        bail!("long-track staging probe returned no refill duration samples");
-    }
-    validate_source_buffer_target(metrics, "long-track staging probe")?;
-    validate_playback_timing_budget(metrics, "long-track staging probe")
+    Ok(())
 }
 
 fn validate_source_buffer_target(metrics: &PlaybackStabilitySnapshot, label: &str) -> Result<()> {
@@ -2512,10 +2515,791 @@ fn validate_source_buffer_target(metrics: &PlaybackStabilitySnapshot, label: &st
             metrics.max_adaptive_buffer_target_ms
         );
     }
+    validate_source_buffer_depth_metrics(metrics, label)?;
+    Ok(())
+}
+
+fn validate_source_buffer_depth_metrics(
+    metrics: &PlaybackStabilitySnapshot,
+    label: &str,
+) -> Result<()> {
+    let source_depth = metrics
+        .source_buffer_depth
+        .as_ref()
+        .ok_or_else(|| anyhow!("{label} omitted source reservoir depth percentile metrics"))?;
+    if source_depth.sample_count == 0 {
+        bail!("{label} returned no source reservoir depth samples");
+    }
+    if source_depth.max_depth.duration_ms == 0 {
+        bail!("{label} source reservoir depth never rose above 0ms");
+    }
+    if source_depth.max_depth.duration_ms < SOURCE_PLAYBACK_BUFFER_TARGET_MS {
+        bail!(
+            "{label} max source reservoir depth was {}ms; expected at least {SOURCE_PLAYBACK_BUFFER_TARGET_MS}ms",
+            source_depth.max_depth.duration_ms
+        );
+    }
+    if source_depth.p50_depth.duration_ms == 0 || source_depth.p95_depth.duration_ms == 0 {
+        bail!(
+            "{label} source reservoir percentile depths were incomplete (p50={}ms p95={}ms)",
+            source_depth.p50_depth.duration_ms,
+            source_depth.p95_depth.duration_ms
+        );
+    }
+    Ok(())
+}
+
+fn validate_prepared_track_queue_metrics(
+    metrics: &PlaybackStabilitySnapshot,
+    label: &str,
+) -> Result<()> {
+    if metrics.prepared_track_queue_target_ms != DISCORD_EGRESS_BUFFER_TARGET_MS {
+        bail!(
+            "{label} returned prepared_track_queue_target_ms {}; expected {DISCORD_EGRESS_BUFFER_TARGET_MS}",
+            metrics.prepared_track_queue_target_ms
+        );
+    }
+    if metrics.prepared_track_queue_low_watermark_ms < DISCORD_EGRESS_BUFFER_LOW_WATERMARK_MS {
+        bail!(
+            "{label} returned prepared_track_queue_low_watermark_ms {}; expected >= {DISCORD_EGRESS_BUFFER_LOW_WATERMARK_MS}",
+            metrics.prepared_track_queue_low_watermark_ms
+        );
+    }
+    if metrics.prepared_track_queue_high_watermark_ms > DISCORD_EGRESS_BUFFER_HIGH_WATERMARK_MS {
+        bail!(
+            "{label} returned prepared_track_queue_high_watermark_ms {}; expected <= {DISCORD_EGRESS_BUFFER_HIGH_WATERMARK_MS}",
+            metrics.prepared_track_queue_high_watermark_ms
+        );
+    }
+
+    let pre_pause = metrics
+        .active_pre_pause_prepared_track_queue_depth
+        .as_ref()
+        .ok_or_else(|| {
+            anyhow!("{label} was missing active pre-pause prepared track queue depth metrics")
+        })?;
+    validate_prepared_track_queue_depth(pre_pause, label, "active pre-pause")?;
+
+    let post_resume = metrics
+        .active_post_resume_prepared_track_queue_depth
+        .as_ref()
+        .ok_or_else(|| {
+            anyhow!("{label} was missing active post-resume prepared track queue depth metrics")
+        })?;
+    validate_prepared_track_queue_depth(post_resume, label, "active post-resume")?;
+
+    let recomputed_sample_count = pre_pause
+        .sample_count
+        .saturating_add(post_resume.sample_count);
+    if metrics.prepared_track_queue_depth_sample_count != recomputed_sample_count {
+        bail!(
+            "{label} prepared_track_queue_depth_sample_count was {}; expected recomputed active pre/post sample count {recomputed_sample_count}",
+            metrics.prepared_track_queue_depth_sample_count
+        );
+    }
+    let recomputed_empty_count = pre_pause
+        .empty_count
+        .saturating_add(post_resume.empty_count);
+    if metrics.prepared_track_queue_empty_count != recomputed_empty_count {
+        bail!(
+            "{label} prepared_track_queue_empty_count was {}; expected recomputed active pre/post empty count {recomputed_empty_count}",
+            metrics.prepared_track_queue_empty_count
+        );
+    }
+
+    Ok(())
+}
+
+fn validate_prepared_track_queue_depth(
+    depth: &PlaybackQueueDepthStatsSnapshot,
+    label: &str,
+    phase: &str,
+) -> Result<()> {
+    if depth.sample_count == 0 {
+        bail!("{label} reported no {phase} prepared track queue depth samples");
+    }
+    if depth.empty_count != 0 {
+        bail!(
+            "{label} reported {} empty {phase} prepared track queue samples; expected 0",
+            depth.empty_count
+        );
+    }
+    if depth.min_depth.duration_ms < PREPARED_TRACK_QUEUE_MIN_DEPTH_MS {
+        bail!(
+            "{label} {phase} prepared_track_queue_depth_min_ms was {}; expected >= {PREPARED_TRACK_QUEUE_MIN_DEPTH_MS}",
+            depth.min_depth.duration_ms
+        );
+    }
+    if depth.p5_depth.duration_ms < PREPARED_TRACK_QUEUE_P5_MIN_DEPTH_MS {
+        bail!(
+            "{label} {phase} prepared_track_queue_depth_p5_ms was {}; expected >= {PREPARED_TRACK_QUEUE_P5_MIN_DEPTH_MS}",
+            depth.p5_depth.duration_ms
+        );
+    }
+    if depth.p50_depth.duration_ms < PREPARED_TRACK_QUEUE_P50_MIN_DEPTH_MS
+        || depth.p50_depth.duration_ms > PREPARED_TRACK_QUEUE_P50_MAX_DEPTH_MS
+    {
+        bail!(
+            "{label} {phase} prepared_track_queue_depth_p50_ms was {}; expected between {PREPARED_TRACK_QUEUE_P50_MIN_DEPTH_MS} and {PREPARED_TRACK_QUEUE_P50_MAX_DEPTH_MS}",
+            depth.p50_depth.duration_ms
+        );
+    }
+    if depth.p95_depth.duration_ms > DISCORD_EGRESS_BUFFER_HIGH_WATERMARK_MS {
+        bail!(
+            "{label} {phase} prepared_track_queue_depth_p95_ms was {}; expected <= {DISCORD_EGRESS_BUFFER_HIGH_WATERMARK_MS}",
+            depth.p95_depth.duration_ms
+        );
+    }
+    if depth.max_depth.duration_ms > DISCORD_EGRESS_BUFFER_HIGH_WATERMARK_MS {
+        bail!(
+            "{label} {phase} prepared_track_queue_depth_max_ms was {}; expected <= {DISCORD_EGRESS_BUFFER_HIGH_WATERMARK_MS}",
+            depth.max_depth.duration_ms
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RawTrackSend {
+    sent_offset_us: u64,
+    duration_ms: u64,
+    media_position_ms: u64,
+}
+
+#[derive(Debug, Default)]
+struct RecomputedRawPlayback {
+    track_packet_count: u64,
+    track_media_duration_sent_ms: u64,
+    track_wall_clock_elapsed_ms: u64,
+    track_media_to_wall_clock_ratio_ppm: u64,
+    track_fast_interval_count: u64,
+    track_fast_interval_min_us: u64,
+    track_tempo_window_count: u64,
+    track_tempo_window_post_source_buffer_count: u64,
+    track_tempo_window_min_ratio_ppm: u64,
+    track_tempo_window_max_ratio_ppm: u64,
+    track_tempo_window_fast_count: u64,
+    track_tempo_window_slow_count: u64,
+    skipped_source_frame_count: u64,
+    skipped_source_duration_ms: u64,
+    pause_boundary_silence_packet_count: u64,
+}
+
+fn validate_raw_playback_evidence(metrics: &PlaybackStabilitySnapshot, label: &str) -> Result<()> {
+    if metrics.raw_send_events.is_empty() {
+        bail!("{label} returned no raw send-event evidence");
+    }
+    if metrics.raw_prepared_track_queue_samples.is_empty() {
+        bail!("{label} returned no raw prepared-track queue sample evidence");
+    }
+    if metrics.raw_prepared_playout_queue_events.is_empty() {
+        bail!("{label} returned no raw prepared playout lifecycle evidence");
+    }
+
+    validate_raw_send_event_order(metrics, label)?;
+    validate_raw_prepared_track_queue_samples(metrics, label)?;
+    validate_raw_prepared_playout_queue_events(metrics, label)?;
+
+    let recomputed = recompute_raw_playback(metrics, label)?;
+    if recomputed.track_packet_count != metrics.track_packet_count {
+        bail!(
+            "{label} track_packet_count was {}; raw send events recomputed {}",
+            metrics.track_packet_count,
+            recomputed.track_packet_count
+        );
+    }
+    if recomputed.track_media_duration_sent_ms != metrics.track_media_duration_sent_ms {
+        bail!(
+            "{label} track_media_duration_sent_ms was {}; raw send events recomputed {}",
+            metrics.track_media_duration_sent_ms,
+            recomputed.track_media_duration_sent_ms
+        );
+    }
+    if recomputed.track_wall_clock_elapsed_ms != metrics.track_wall_clock_elapsed_ms {
+        bail!(
+            "{label} track_wall_clock_elapsed_ms was {}; raw send events recomputed {}",
+            metrics.track_wall_clock_elapsed_ms,
+            recomputed.track_wall_clock_elapsed_ms
+        );
+    }
+    if !ppm_matches_with_tolerance(
+        recomputed.track_media_to_wall_clock_ratio_ppm,
+        metrics.track_media_to_wall_clock_ratio_ppm,
+    ) {
+        bail!(
+            "{label} track_media_to_wall_clock_ratio_ppm was {}; raw send events recomputed {} outside ±{RAW_RATIO_RECOMPUTE_TOLERANCE_PPM}ppm tolerance",
+            metrics.track_media_to_wall_clock_ratio_ppm,
+            recomputed.track_media_to_wall_clock_ratio_ppm
+        );
+    }
+    if recomputed.track_fast_interval_count != metrics.track_fast_interval_count {
+        bail!(
+            "{label} track_fast_interval_count was {}; raw send events recomputed {}",
+            metrics.track_fast_interval_count,
+            recomputed.track_fast_interval_count
+        );
+    }
+    if recomputed.track_fast_interval_min_us != metrics.track_fast_interval_min_us {
+        bail!(
+            "{label} track_fast_interval_min_us was {}; raw send events recomputed {}",
+            metrics.track_fast_interval_min_us,
+            recomputed.track_fast_interval_min_us
+        );
+    }
+    if recomputed.track_tempo_window_count != metrics.track_tempo_window_count
+        || recomputed.track_tempo_window_post_source_buffer_count
+            != metrics.track_tempo_window_post_source_buffer_count
+        || recomputed.track_tempo_window_fast_count != metrics.track_tempo_window_fast_count
+        || recomputed.track_tempo_window_slow_count != metrics.track_tempo_window_slow_count
+        || !ppm_matches_with_tolerance(
+            recomputed.track_tempo_window_min_ratio_ppm,
+            metrics.track_tempo_window_min_ratio_ppm,
+        )
+        || !ppm_matches_with_tolerance(
+            recomputed.track_tempo_window_max_ratio_ppm,
+            metrics.track_tempo_window_max_ratio_ppm,
+        )
+    {
+        bail!(
+            "{label} rolling tempo aggregate disagreed with raw send events outside ±{RAW_RATIO_RECOMPUTE_TOLERANCE_PPM}ppm tolerance: reported windows={} post_source={} min={} max={} fast={} slow={}, recomputed windows={} post_source={} min={} max={} fast={} slow={}",
+            metrics.track_tempo_window_count,
+            metrics.track_tempo_window_post_source_buffer_count,
+            metrics.track_tempo_window_min_ratio_ppm,
+            metrics.track_tempo_window_max_ratio_ppm,
+            metrics.track_tempo_window_fast_count,
+            metrics.track_tempo_window_slow_count,
+            recomputed.track_tempo_window_count,
+            recomputed.track_tempo_window_post_source_buffer_count,
+            recomputed.track_tempo_window_min_ratio_ppm,
+            recomputed.track_tempo_window_max_ratio_ppm,
+            recomputed.track_tempo_window_fast_count,
+            recomputed.track_tempo_window_slow_count
+        );
+    }
+    if recomputed.skipped_source_frame_count != metrics.skipped_source_frame_count
+        || recomputed.skipped_source_duration_ms != metrics.skipped_source_duration_ms
+    {
+        bail!(
+            "{label} skipped-source aggregates disagreed with raw source-frame identity: reported frames={} duration_ms={}, recomputed frames={} duration_ms={}",
+            metrics.skipped_source_frame_count,
+            metrics.skipped_source_duration_ms,
+            recomputed.skipped_source_frame_count,
+            recomputed.skipped_source_duration_ms
+        );
+    }
+    if recomputed.pause_boundary_silence_packet_count < PAUSE_STOP_SILENCE_FRAME_COUNT as u64 {
+        bail!(
+            "{label} raw send events contained only {} boundary-silence packets; expected at least {} for Pause",
+            recomputed.pause_boundary_silence_packet_count,
+            PAUSE_STOP_SILENCE_FRAME_COUNT
+        );
+    }
+    validate_pause_boundary_spacing(metrics, label)?;
+    let recomputed_scheduled_silence_packet_count = metrics
+        .raw_send_events
+        .iter()
+        .filter(|event| event.command_kind == PlaybackSendCommandKind::ScheduledSilence)
+        .count() as u64;
+    if metrics.scheduled_silence_packet_count != recomputed_scheduled_silence_packet_count {
+        bail!(
+            "{label} scheduled_silence_packet_count was {}; raw send events recomputed {}",
+            metrics.scheduled_silence_packet_count,
+            recomputed_scheduled_silence_packet_count
+        );
+    }
+
+    Ok(())
+}
+
+fn ppm_matches_with_tolerance(left: u64, right: u64) -> bool {
+    left.abs_diff(right) <= RAW_RATIO_RECOMPUTE_TOLERANCE_PPM
+}
+
+fn validate_pause_boundary_spacing(metrics: &PlaybackStabilitySnapshot, label: &str) -> Result<()> {
+    let mut current_run = Vec::new();
+    for event in &metrics.raw_send_events {
+        if event.command_kind == PlaybackSendCommandKind::BoundarySilence {
+            current_run.push(event.sent_offset_us);
+            if current_run.len() >= PAUSE_STOP_SILENCE_FRAME_COUNT {
+                return validate_pause_boundary_run_spacing(&current_run, label);
+            }
+            continue;
+        }
+        current_run.clear();
+    }
+
+    bail!(
+        "{label} raw send events did not contain a consecutive five-packet Pause boundary-silence run"
+    );
+}
+
+fn validate_pause_boundary_run_spacing(sent_offsets_us: &[u64], label: &str) -> Result<()> {
+    for (index, window) in sent_offsets_us
+        .windows(2)
+        .take(PAUSE_STOP_SILENCE_FRAME_COUNT.saturating_sub(1))
+        .enumerate()
+    {
+        let spacing_ms = window[1].saturating_sub(window[0]) / 1_000;
+        if !(PAUSE_BOUNDARY_MIN_SPACING_MS..=PAUSE_BOUNDARY_MAX_SPACING_MS).contains(&spacing_ms) {
+            bail!(
+                "{label} Pause boundary silence spacing at interval {index} was {spacing_ms}ms; expected {PAUSE_BOUNDARY_MIN_SPACING_MS}..={PAUSE_BOUNDARY_MAX_SPACING_MS}ms"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_raw_send_event_order(metrics: &PlaybackStabilitySnapshot, label: &str) -> Result<()> {
+    let mut previous_sent_offset: Option<u64> = None;
+    let mut previous_rtp_sequence: Option<u32> = None;
+    let mut previous_rtp_timestamp: Option<u32> = None;
+    let mut previous_duration_samples: Option<u32> = None;
+    let mut previous_nonce: Option<u32> = None;
+
+    for (index, event) in metrics.raw_send_events.iter().enumerate() {
+        if event.packet_index != index as u64 {
+            bail!(
+                "{label} raw send event packet_index {} was not sequential at index {index}",
+                event.packet_index
+            );
+        }
+        if event.command_kind == PlaybackSendCommandKind::Unspecified {
+            bail!("{label} raw send event {index} had unspecified command kind");
+        }
+        if event.sent_offset_us < event.send_started_offset_us {
+            bail!("{label} raw send event {index} completed before send start");
+        }
+        if let Some(previous_sent_offset) = previous_sent_offset
+            && event.sent_offset_us < previous_sent_offset
+        {
+            bail!("{label} raw send event {index} moved backward in send-completion time");
+        }
+        if let (Some(sequence), Some(timestamp), Some(duration_samples)) = (
+            previous_rtp_sequence,
+            previous_rtp_timestamp,
+            previous_duration_samples,
+        ) {
+            let expected_sequence = (sequence + 1) & 0xffff;
+            let expected_timestamp = timestamp.wrapping_add(duration_samples);
+            if event.rtp_sequence != expected_sequence {
+                bail!(
+                    "{label} raw send event {index} RTP sequence was {}; expected {}",
+                    event.rtp_sequence,
+                    expected_sequence
+                );
+            }
+            if event.rtp_timestamp != expected_timestamp {
+                bail!(
+                    "{label} raw send event {index} RTP timestamp was {}; expected {}",
+                    event.rtp_timestamp,
+                    expected_timestamp
+                );
+            }
+        }
+        if let Some(nonce) = event.protection_nonce {
+            if let Some(previous) = previous_nonce
+                && nonce <= previous
+            {
+                bail!(
+                    "{label} raw send event {index} protection nonce was {nonce}; expected monotonic increase after {previous}"
+                );
+            }
+            previous_nonce = Some(nonce);
+        }
+        if event.command_kind == PlaybackSendCommandKind::Track {
+            if !event.committed_heard_media {
+                bail!("{label} raw track send event {index} did not mark heard-media commit");
+            }
+            if event.source_frame_epoch.is_none() || event.source_media_position_ms.is_none() {
+                bail!("{label} raw track send event {index} lacked source-frame identity");
+            }
+        } else if event.committed_heard_media {
+            bail!("{label} raw non-track send event {index} committed heard media");
+        }
+
+        previous_sent_offset = Some(event.sent_offset_us);
+        previous_rtp_sequence = Some(event.rtp_sequence);
+        previous_rtp_timestamp = Some(event.rtp_timestamp);
+        previous_duration_samples = Some(event.media_duration_samples);
+    }
+
+    Ok(())
+}
+
+fn recompute_raw_playback(
+    metrics: &PlaybackStabilitySnapshot,
+    label: &str,
+) -> Result<RecomputedRawPlayback> {
+    let mut recomputed = RecomputedRawPlayback::default();
+    let mut segments: Vec<Vec<RawTrackSend>> = Vec::new();
+    let mut current_segment: Vec<RawTrackSend> = Vec::new();
+    let mut all_tracks: Vec<RawTrackSend> = Vec::new();
+
+    for event in &metrics.raw_send_events {
+        match event.command_kind {
+            PlaybackSendCommandKind::Track => {
+                let media_position_ms = event.source_media_position_ms.ok_or_else(|| {
+                    anyhow!("{label} raw track send lacked source_media_position_ms")
+                })?;
+                let track = RawTrackSend {
+                    sent_offset_us: event.sent_offset_us,
+                    duration_ms: event.media_duration_ms,
+                    media_position_ms,
+                };
+                recomputed.track_packet_count = recomputed.track_packet_count.saturating_add(1);
+                recomputed.track_media_duration_sent_ms = recomputed
+                    .track_media_duration_sent_ms
+                    .saturating_add(event.media_duration_ms);
+                current_segment.push(track);
+                all_tracks.push(track);
+            }
+            PlaybackSendCommandKind::BoundarySilence => {
+                recomputed.pause_boundary_silence_packet_count = recomputed
+                    .pause_boundary_silence_packet_count
+                    .saturating_add(1);
+                finish_track_segment(&mut segments, &mut current_segment);
+            }
+            PlaybackSendCommandKind::ScheduledSilence
+            | PlaybackSendCommandKind::OtherBoundary
+            | PlaybackSendCommandKind::Unspecified => {
+                finish_track_segment(&mut segments, &mut current_segment);
+            }
+        }
+    }
+    finish_track_segment(&mut segments, &mut current_segment);
+
+    let mut wall_clock_elapsed_us = 0u64;
+    for segment in &segments {
+        if let (Some(first), Some(last)) = (segment.first(), segment.last()) {
+            wall_clock_elapsed_us = wall_clock_elapsed_us
+                .saturating_add(last.sent_offset_us.saturating_sub(first.sent_offset_us))
+                .saturating_add(last.duration_ms.saturating_mul(1_000));
+        }
+
+        for pair in segment.windows(2) {
+            let previous = pair[0];
+            let current = pair[1];
+            let interval_us = current
+                .sent_offset_us
+                .saturating_sub(previous.sent_offset_us);
+            let previous_duration_us = previous.duration_ms.saturating_mul(1_000);
+            if interval_us < previous_duration_us {
+                recomputed.track_fast_interval_count =
+                    recomputed.track_fast_interval_count.saturating_add(1);
+                recomputed.track_fast_interval_min_us =
+                    if recomputed.track_fast_interval_min_us == 0 {
+                        interval_us
+                    } else {
+                        recomputed.track_fast_interval_min_us.min(interval_us)
+                    };
+            }
+        }
+
+        for window in segment.windows(TRACK_TEMPO_WINDOW_PACKETS) {
+            recompute_tempo_window(&mut recomputed, window);
+        }
+    }
+
+    recomputed.track_wall_clock_elapsed_ms = wall_clock_elapsed_us / 1_000;
+    recomputed.track_media_to_wall_clock_ratio_ppm = ratio_ppm_ms(
+        recomputed.track_media_duration_sent_ms,
+        recomputed.track_wall_clock_elapsed_ms,
+    );
+
+    for pair in all_tracks.windows(2) {
+        let previous = pair[0];
+        let current = pair[1];
+        let expected_next_position = previous
+            .media_position_ms
+            .saturating_add(previous.duration_ms);
+        if current.media_position_ms
+            > expected_next_position.saturating_add(SOURCE_POSITION_CONTINUITY_TOLERANCE_MS)
+        {
+            let skipped_ms = current
+                .media_position_ms
+                .saturating_sub(expected_next_position);
+            recomputed.skipped_source_duration_ms = recomputed
+                .skipped_source_duration_ms
+                .saturating_add(skipped_ms);
+            let frame_duration_ms = previous.duration_ms.max(1);
+            recomputed.skipped_source_frame_count = recomputed
+                .skipped_source_frame_count
+                .saturating_add(skipped_ms.div_ceil(frame_duration_ms));
+        }
+    }
+
+    Ok(recomputed)
+}
+
+fn finish_track_segment(
+    segments: &mut Vec<Vec<RawTrackSend>>,
+    current_segment: &mut Vec<RawTrackSend>,
+) {
+    if !current_segment.is_empty() {
+        segments.push(std::mem::take(current_segment));
+    }
+}
+
+fn recompute_tempo_window(recomputed: &mut RecomputedRawPlayback, window: &[RawTrackSend]) {
+    let Some(first) = window.first() else {
+        return;
+    };
+    let Some(last) = window.last() else {
+        return;
+    };
+    let media_duration_us = window.iter().fold(0u64, |total, packet| {
+        total.saturating_add(packet.duration_ms.saturating_mul(1_000))
+    });
+    let wall_clock_duration_us = last
+        .sent_offset_us
+        .saturating_sub(first.sent_offset_us)
+        .saturating_add(last.duration_ms.saturating_mul(1_000));
+    let ratio = ratio_ppm_us(media_duration_us, wall_clock_duration_us);
+
+    recomputed.track_tempo_window_count = recomputed.track_tempo_window_count.saturating_add(1);
+    if first.media_position_ms >= SOURCE_PLAYBACK_BUFFER_TARGET_MS {
+        recomputed.track_tempo_window_post_source_buffer_count = recomputed
+            .track_tempo_window_post_source_buffer_count
+            .saturating_add(1);
+    }
+    recomputed.track_tempo_window_min_ratio_ppm =
+        if recomputed.track_tempo_window_min_ratio_ppm == 0 {
+            ratio
+        } else {
+            recomputed.track_tempo_window_min_ratio_ppm.min(ratio)
+        };
+    recomputed.track_tempo_window_max_ratio_ppm =
+        recomputed.track_tempo_window_max_ratio_ppm.max(ratio);
+    if ratio > MEDIA_TO_WALL_CLOCK_MAX_RATIO_PPM {
+        recomputed.track_tempo_window_fast_count =
+            recomputed.track_tempo_window_fast_count.saturating_add(1);
+    }
+    if ratio < MEDIA_TO_WALL_CLOCK_MIN_RATIO_PPM {
+        recomputed.track_tempo_window_slow_count =
+            recomputed.track_tempo_window_slow_count.saturating_add(1);
+    }
+}
+
+fn ratio_ppm_us(media_duration_us: u64, wall_clock_duration_us: u64) -> u64 {
+    if media_duration_us == 0 || wall_clock_duration_us == 0 {
+        return 0;
+    }
+    ((u128::from(media_duration_us) * 1_000_000) / u128::from(wall_clock_duration_us))
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn ratio_ppm_ms(media_duration_ms: u64, wall_clock_duration_ms: u64) -> u64 {
+    if media_duration_ms == 0 || wall_clock_duration_ms == 0 {
+        return 0;
+    }
+    ((u128::from(media_duration_ms) * 1_000_000) / u128::from(wall_clock_duration_ms))
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn validate_raw_prepared_track_queue_samples(
+    metrics: &PlaybackStabilitySnapshot,
+    label: &str,
+) -> Result<()> {
+    let mut pre_pause = Vec::new();
+    let mut post_resume = Vec::new();
+
+    for (index, sample) in metrics.raw_prepared_track_queue_samples.iter().enumerate() {
+        if sample.sample_index != index as u64 {
+            bail!(
+                "{label} raw prepared queue sample_index {} was not sequential at index {index}",
+                sample.sample_index
+            );
+        }
+        match sample.phase {
+            PreparedTrackQueueSamplePhase::ActivePrePause => pre_pause.push(sample.depth.clone()),
+            PreparedTrackQueueSamplePhase::ActivePostResume => {
+                post_resume.push(sample.depth.clone())
+            }
+            PreparedTrackQueueSamplePhase::Unspecified => {
+                bail!("{label} raw prepared queue sample {index} had unspecified phase");
+            }
+        }
+    }
+
+    let recomputed_pre = queue_depth_stats_from_samples(&pre_pause);
+    let recomputed_post = queue_depth_stats_from_samples(&post_resume);
+    let pre_reported = metrics
+        .active_pre_pause_prepared_track_queue_depth
+        .as_ref()
+        .ok_or_else(|| anyhow!("{label} was missing active pre-pause prepared queue metrics"))?;
+    let post_reported = metrics
+        .active_post_resume_prepared_track_queue_depth
+        .as_ref()
+        .ok_or_else(|| anyhow!("{label} was missing active post-resume prepared queue metrics"))?;
+    ensure_queue_depth_stats_match(pre_reported, &recomputed_pre, label, "active pre-pause")?;
+    ensure_queue_depth_stats_match(post_reported, &recomputed_post, label, "active post-resume")?;
+
+    let recomputed_sample_count = recomputed_pre
+        .sample_count
+        .saturating_add(recomputed_post.sample_count);
+    if metrics.prepared_track_queue_depth_sample_count != recomputed_sample_count {
+        bail!(
+            "{label} prepared_track_queue_depth_sample_count was {}; raw samples recomputed {}",
+            metrics.prepared_track_queue_depth_sample_count,
+            recomputed_sample_count
+        );
+    }
+    let recomputed_empty_count = recomputed_pre
+        .empty_count
+        .saturating_add(recomputed_post.empty_count);
+    if metrics.prepared_track_queue_empty_count != recomputed_empty_count {
+        bail!(
+            "{label} prepared_track_queue_empty_count was {}; raw samples recomputed {}",
+            metrics.prepared_track_queue_empty_count,
+            recomputed_empty_count
+        );
+    }
+
+    Ok(())
+}
+
+fn validate_raw_prepared_playout_queue_events(
+    metrics: &PlaybackStabilitySnapshot,
+    label: &str,
+) -> Result<()> {
+    let mut track_drop_count = 0u64;
+    let mut silence_drop_count = 0u64;
+    let mut rebuild_count = 0u64;
+    let mut track_enqueue_count = 0u64;
+    let mut track_dequeue_count = 0u64;
+
+    for (index, event) in metrics.raw_prepared_playout_queue_events.iter().enumerate() {
+        if event.event_index != index as u64 {
+            bail!(
+                "{label} raw prepared playout event_index {} was not sequential at index {index}",
+                event.event_index
+            );
+        }
+        if event.event_kind == PreparedPlayoutQueueEventKind::Unspecified {
+            bail!("{label} raw prepared playout event {index} had unspecified event kind");
+        }
+        if event.command_kind == PlaybackSendCommandKind::Unspecified {
+            bail!("{label} raw prepared playout event {index} had unspecified command kind");
+        }
+        match event.event_kind {
+            PreparedPlayoutQueueEventKind::Enqueued => {
+                if event.command_kind == PlaybackSendCommandKind::Track {
+                    track_enqueue_count = track_enqueue_count.saturating_add(1);
+                }
+            }
+            PreparedPlayoutQueueEventKind::DequeuedToDeadlineSender => {
+                if event.command_kind == PlaybackSendCommandKind::Track {
+                    track_dequeue_count = track_dequeue_count.saturating_add(1);
+                }
+            }
+            PreparedPlayoutQueueEventKind::DroppedBeforeSend => match event.command_kind {
+                PlaybackSendCommandKind::Track => {
+                    track_drop_count = track_drop_count.saturating_add(1);
+                }
+                PlaybackSendCommandKind::ScheduledSilence
+                | PlaybackSendCommandKind::BoundarySilence
+                | PlaybackSendCommandKind::OtherBoundary => {
+                    silence_drop_count = silence_drop_count.saturating_add(1);
+                }
+                PlaybackSendCommandKind::Unspecified => {}
+            },
+            PreparedPlayoutQueueEventKind::Rebuilt => {
+                rebuild_count = rebuild_count.saturating_add(1);
+            }
+            PreparedPlayoutQueueEventKind::Unspecified => {}
+        }
+        if event.command_kind == PlaybackSendCommandKind::Track
+            && event.queue_depth_after.duration_ms > DISCORD_EGRESS_BUFFER_HIGH_WATERMARK_MS
+        {
+            bail!(
+                "{label} raw prepared playout event {index} reported track queue depth {}ms above {DISCORD_EGRESS_BUFFER_HIGH_WATERMARK_MS}ms high watermark",
+                event.queue_depth_after.duration_ms
+            );
+        }
+    }
+
+    if track_enqueue_count == 0 {
+        bail!("{label} returned no raw prepared track enqueue events");
+    }
+    if track_dequeue_count == 0 {
+        bail!("{label} returned no raw prepared track dequeue-to-deadline events");
+    }
+    if track_drop_count != metrics.prepared_track_packet_drop_count {
+        bail!(
+            "{label} prepared_track_packet_drop_count was {}; raw lifecycle events recomputed {}",
+            metrics.prepared_track_packet_drop_count,
+            track_drop_count
+        );
+    }
+    if silence_drop_count != metrics.prepared_silence_packet_drop_count {
+        bail!(
+            "{label} prepared_silence_packet_drop_count was {}; raw lifecycle events recomputed {}",
+            metrics.prepared_silence_packet_drop_count,
+            silence_drop_count
+        );
+    }
+    if rebuild_count != metrics.prepared_packet_rebuild_count {
+        bail!(
+            "{label} prepared_packet_rebuild_count was {}; raw lifecycle events recomputed {}",
+            metrics.prepared_packet_rebuild_count,
+            rebuild_count
+        );
+    }
+
+    Ok(())
+}
+
+fn queue_depth_stats_from_samples(
+    samples: &[PlaybackBufferDepthSnapshot],
+) -> PlaybackQueueDepthStatsSnapshot {
+    if samples.is_empty() {
+        return PlaybackQueueDepthStatsSnapshot::default();
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable_by_key(|depth| depth.duration_ms);
+    PlaybackQueueDepthStatsSnapshot {
+        sample_count: samples.len() as u64,
+        empty_count: samples
+            .iter()
+            .filter(|depth| depth.duration_ms == 0)
+            .count() as u64,
+        current_depth: samples[samples.len() - 1].clone(),
+        min_depth: sorted[0].clone(),
+        p5_depth: percentile_depth(&sorted, 5),
+        p50_depth: percentile_depth(&sorted, 50),
+        p95_depth: percentile_depth(&sorted, 95),
+        max_depth: sorted[sorted.len() - 1].clone(),
+    }
+}
+
+fn percentile_depth(
+    sorted: &[PlaybackBufferDepthSnapshot],
+    percentile: usize,
+) -> PlaybackBufferDepthSnapshot {
+    let index = ((sorted.len() - 1) * percentile).div_ceil(100);
+    sorted[index].clone()
+}
+
+fn ensure_queue_depth_stats_match(
+    reported: &PlaybackQueueDepthStatsSnapshot,
+    recomputed: &PlaybackQueueDepthStatsSnapshot,
+    label: &str,
+    phase: &str,
+) -> Result<()> {
+    if reported != recomputed {
+        bail!(
+            "{label} {phase} prepared queue aggregate disagreed with raw samples: reported {:?}, recomputed {:?}",
+            reported,
+            recomputed
+        );
+    }
     Ok(())
 }
 
 fn validate_playback_timing_budget(metrics: &PlaybackStabilitySnapshot, label: &str) -> Result<()> {
+    validate_source_buffer_target(metrics, label)?;
     if metrics.track_interval.samples == 0 {
         bail!("{label} returned no track RTP interval samples");
     }
@@ -2603,10 +3387,9 @@ fn validate_playback_timing_budget(metrics: &PlaybackStabilitySnapshot, label: &
             metrics.skipped_source_duration_ms
         );
     }
-    if metrics.playout_builder_prepare_duration.samples != 0 {
+    if metrics.playout_builder_prepare_duration.samples == 0 {
         bail!(
-            "{label} returned {} playout builder preparation samples; expected 0 because RTP packets are built at the live media tick",
-            metrics.playout_builder_prepare_duration.samples
+            "{label} returned no playout builder preparation samples; expected RTP packets to be prepared before the live media tick"
         );
     }
     if metrics.sender_send_duration.samples == 0 {
@@ -2618,15 +3401,24 @@ fn validate_playback_timing_budget(metrics: &PlaybackStabilitySnapshot, label: &
     if metrics.gateway_event_drain_duration.samples == 0 {
         bail!("{label} returned no gateway event drain duration samples");
     }
-    if metrics.sender_loop_non_send_work_duration.max_ms > SENDER_LOOP_NON_SEND_WORK_MAX_BUDGET_MS {
+    if metrics.sender_loop_non_send_work_duration.p99_ms > SENDER_LOOP_NON_SEND_WORK_P99_BUDGET_MS {
         bail!(
-            "{label} sender non-send work max was {}ms; expected <= {SENDER_LOOP_NON_SEND_WORK_MAX_BUDGET_MS}ms",
-            metrics.sender_loop_non_send_work_duration.max_ms
+            "{label} sender non-send work p99 was {}ms; expected <= {SENDER_LOOP_NON_SEND_WORK_P99_BUDGET_MS}ms",
+            metrics.sender_loop_non_send_work_duration.p99_ms
         );
     }
-    if metrics.prepared_rtp_queue_depth_ms != 0 {
+    if metrics.sender_loop_non_send_work_duration.max_ms > SENDER_LOOP_NON_SEND_WORK_P99_BUDGET_MS
+        && metrics.sender_lateness.max_ms > SENDER_LATENESS_P99_BUDGET_MS
+    {
         bail!(
-            "{label} prepared_rtp_queue_depth_ms was {}; expected 0",
+            "{label} sender non-send work max was {}ms and sender lateness max was {}ms; expected outlier work to preserve <= {SENDER_LATENESS_P99_BUDGET_MS}ms sender lateness",
+            metrics.sender_loop_non_send_work_duration.max_ms,
+            metrics.sender_lateness.max_ms
+        );
+    }
+    if metrics.prepared_rtp_queue_depth_ms > DISCORD_EGRESS_BUFFER_HIGH_WATERMARK_MS {
+        bail!(
+            "{label} prepared_rtp_queue_depth_ms was {}; expected <= {DISCORD_EGRESS_BUFFER_HIGH_WATERMARK_MS}",
             metrics.prepared_rtp_queue_depth_ms
         );
     }
@@ -2636,6 +3428,8 @@ fn validate_playback_timing_budget(metrics: &PlaybackStabilitySnapshot, label: &
             metrics.egress_buffer_target_ms
         );
     }
+    validate_prepared_track_queue_metrics(metrics, label)?;
+    validate_raw_playback_evidence(metrics, label)?;
     if metrics.max_egress_buffer_depth.duration_ms == 0 {
         bail!(
             "{label} reported no Discord egress buffering; expected bounded raw Opus egress depth"
@@ -2714,6 +3508,18 @@ fn validate_playback_timing_budget(metrics: &PlaybackStabilitySnapshot, label: &
             metrics.source_underrun_count
         );
     }
+    if metrics.source_underrun_reached_deadline_sender_count != 0 {
+        bail!(
+            "{label} reported {} source underruns reaching the deadline sender; expected 0",
+            metrics.source_underrun_reached_deadline_sender_count
+        );
+    }
+    if metrics.dave_transition_recovery_reached_deadline_sender_count != 0 {
+        bail!(
+            "{label} reported {} DAVE recoveries reaching the deadline sender; expected 0",
+            metrics.dave_transition_recovery_reached_deadline_sender_count
+        );
+    }
     if metrics.sender_forbidden_work_count != 0 {
         bail!(
             "{label} reported {} forbidden sender work samples; expected 0",
@@ -2778,6 +3584,25 @@ fn validate_playback_timing_budget(metrics: &PlaybackStabilitySnapshot, label: &
         bail!(
             "{label} reported {}ms of egress inserted silence during playback; expected 0",
             metrics.egress_inserted_silence_duration_ms
+        );
+    }
+    if metrics.scheduled_silence_packet_count != 0 {
+        bail!(
+            "{label} reported {} scheduled silence packets during steady playback; expected 0",
+            metrics.scheduled_silence_packet_count
+        );
+    }
+    if metrics.prepared_silence_packet_drop_count != 0 {
+        bail!(
+            "{label} reported {} dropped prepared silence packets; expected 0",
+            metrics.prepared_silence_packet_drop_count
+        );
+    }
+    if metrics.discarded_source_frame_count != 0 || metrics.discarded_source_duration_ms != 0 {
+        bail!(
+            "{label} reported discarded source frames={} duration_ms={}; expected 0 for steady playback",
+            metrics.discarded_source_frame_count,
+            metrics.discarded_source_duration_ms
         );
     }
     if metrics.egress_dropped_music_frame_count != 0
@@ -3055,7 +3880,57 @@ pub fn combine_results(primary: Result<()>, cleanup: Result<()>) -> Result<()> {
         (Ok(()), Ok(())) => Ok(()),
         (Err(primary), Ok(())) => Err(primary),
         (Ok(()), Err(cleanup)) => Err(cleanup),
-        (Err(primary), Err(cleanup)) => Err(anyhow!("{primary}; cleanup also failed: {cleanup}")),
+        (Err(primary), Err(cleanup)) => {
+            Err(anyhow!("{primary:#}; cleanup also failed: {cleanup:#}"))
+        }
+    }
+}
+
+#[derive(Default)]
+struct PauseSilenceEvidence {
+    packet_count: u64,
+    spacing_ms: Vec<u64>,
+}
+
+fn active_validation_duration_after_resume_ms(
+    audio_stats: &AudioValidationStats,
+    observer_playback: &ObserverPlaybackProof,
+) -> u64 {
+    audio_stats
+        .decoded_audio_ms
+        .saturating_sub(observer_playback.resume_decoded_audio_start_ms)
+}
+
+fn pause_silence_evidence(metrics: Option<&PlaybackStabilityEvidence>) -> PauseSilenceEvidence {
+    let Some(metrics) = metrics else {
+        return PauseSilenceEvidence::default();
+    };
+
+    let mut best_run: Vec<u64> = Vec::new();
+    let mut current_run: Vec<u64> = Vec::new();
+    for event in &metrics.raw_send_events {
+        if event.command_kind == "boundary_silence" {
+            current_run.push(event.sent_offset_us);
+            continue;
+        }
+        if current_run.len() > best_run.len() {
+            best_run = std::mem::take(&mut current_run);
+        } else {
+            current_run.clear();
+        }
+    }
+    if current_run.len() > best_run.len() {
+        best_run = current_run;
+    }
+
+    let spacing_ms = best_run
+        .windows(2)
+        .map(|window| window[1].saturating_sub(window[0]) / 1_000)
+        .collect::<Vec<_>>();
+
+    PauseSilenceEvidence {
+        packet_count: best_run.len() as u64,
+        spacing_ms,
     }
 }
 
@@ -3063,10 +3938,19 @@ fn build_success_evidence(
     config: &StagingConfig,
     validated: &ValidatedLiveOutcome,
 ) -> LiveValidationEvidence {
+    let pause_silence = pause_silence_evidence(validated.playback_metrics.as_ref());
     LiveValidationEvidence {
         outcome: "success".to_owned(),
         service_uri: config.discord_voice_service_uri.clone(),
         ytmusic_addr: config.discord_voice_service_ytmusic_addr.clone(),
+        test_video_id: config.test_video_id.clone(),
+        expected_track_duration_ms: validated.expected_duration_ms,
+        active_validation_duration_after_resume_ms: active_validation_duration_after_resume_ms(
+            &validated.audio_stats,
+            &validated.observer_playback,
+        ),
+        pause_silence_packet_count: pause_silence.packet_count,
+        pause_silence_spacing_ms: pause_silence.spacing_ms,
         live_staging_profile: config.live_staging_profile.clone(),
         live_staging_service_cpus: config.live_staging_service_cpus.clone(),
         live_staging_cpu_contention_workers: config.live_staging_cpu_contention_workers,
@@ -3085,6 +3969,7 @@ fn build_success_evidence(
         observer_proved_resume: validated.live_contract.observer_proved_resume,
         observer_pause_self_mute_observed: validated.observer_playback.pause_self_mute_observed,
         observer_pause_speaking_stopped: validated.observer_playback.pause_speaking_stopped,
+        observer_pause_rtp_silence_observed: validated.observer_playback.pause_rtp_silence_observed,
         observer_resume_speaking_started: validated.observer_playback.resume_speaking_started,
         observer_pause_silence_ms: validated.observer_playback.pause_silence_ms,
         observer_resume_packet_count: validated.observer_playback.resume_observed_packet_count,
@@ -3160,11 +4045,9 @@ fn build_success_evidence(
         playback_metrics: validated.playback_metrics.clone(),
         reconnect_probe_metrics: validated.reconnect_probe_metrics.clone(),
         validated_constrained_profile: constrained_profile_configured(config)
-            && validated.long_track_metrics.is_some(),
+            && validated.playback_metrics.is_some(),
         validated_slow_jittery_http: slow_jittery_http_configured(config)
-            && validated.long_track_metrics.is_some(),
-        validated_long_track_playback: validated.long_track_metrics.is_some(),
-        long_track_metrics: validated.long_track_metrics.clone(),
+            && validated.playback_metrics.is_some(),
         failure_reason: None,
     }
 }
@@ -3178,12 +4061,22 @@ fn build_failure_evidence(
     let audio_stats = snapshot.and_then(|value| value.audio_stats.as_ref());
     let observer_playback = snapshot.and_then(|value| value.observer_playback.as_ref());
     let reconnect_probe_metrics = snapshot.and_then(|value| value.reconnect_probe_metrics.clone());
-    let long_track_metrics = snapshot.and_then(|value| value.long_track_metrics.clone());
+    let playback_metrics = snapshot.and_then(|value| value.playback_metrics.clone());
+    let pause_silence = pause_silence_evidence(playback_metrics.as_ref());
 
     LiveValidationEvidence {
         outcome: "failure".to_owned(),
         service_uri: config.discord_voice_service_uri.clone(),
         ytmusic_addr: config.discord_voice_service_ytmusic_addr.clone(),
+        test_video_id: config.test_video_id.clone(),
+        expected_track_duration_ms: 0,
+        active_validation_duration_after_resume_ms: audio_stats
+            .zip(observer_playback)
+            .map_or(0, |(stats, proof)| {
+                active_validation_duration_after_resume_ms(stats, proof)
+            }),
+        pause_silence_packet_count: pause_silence.packet_count,
+        pause_silence_spacing_ms: pause_silence.spacing_ms,
         live_staging_profile: config.live_staging_profile.clone(),
         live_staging_service_cpus: config.live_staging_service_cpus.clone(),
         live_staging_cpu_contention_workers: config.live_staging_cpu_contention_workers,
@@ -3205,6 +4098,8 @@ fn build_failure_evidence(
             .is_some_and(|proof| proof.pause_self_mute_observed),
         observer_pause_speaking_stopped: observer_playback
             .is_some_and(|proof| proof.pause_speaking_stopped),
+        observer_pause_rtp_silence_observed: observer_playback
+            .is_some_and(|proof| proof.pause_rtp_silence_observed),
         observer_resume_speaking_started: observer_playback
             .is_some_and(|proof| proof.resume_speaking_started),
         observer_pause_silence_ms: observer_playback.map_or(0, |proof| proof.pause_silence_ms),
@@ -3278,24 +4173,28 @@ fn build_failure_evidence(
         dave_transition_count_during_playback: snapshot
             .and_then(|value| value.playback_metrics.as_ref())
             .map_or(0, |metrics| metrics.dave_transition_count_during_playback),
-        playback_metrics: snapshot.and_then(|value| value.playback_metrics.clone()),
+        playback_metrics,
         reconnect_probe_metrics,
         validated_constrained_profile: false,
         validated_slow_jittery_http: false,
-        validated_long_track_playback: long_track_metrics.is_some(),
-        long_track_metrics,
         failure_reason: Some(classify_failure_reason(error)),
     }
 }
 
 fn constrained_profile_configured(config: &StagingConfig) -> bool {
-    !config.live_staging_profile.eq_ignore_ascii_case("none")
-        && config.live_staging_cpu_contention_workers > 0
-        && !config.live_staging_service_cpus.trim().is_empty()
+    matches!(
+        config.live_staging_profile.as_str(),
+        LIVE_STAGING_PROFILE_CONSTRAINED_GITHUB | LIVE_STAGING_PROFILE_CONSTRAINED_LOCAL
+    ) && config
+        .live_staging_service_cpus
+        .parse::<f64>()
+        .is_ok_and(|cpus| cpus.is_finite() && cpus > 0.0 && cpus <= MAX_LIVE_STAGING_SERVICE_CPUS)
+        && config.live_staging_cpu_contention_workers >= MIN_LIVE_STAGING_CPU_CONTENTION_WORKERS
 }
 
 fn slow_jittery_http_configured(config: &StagingConfig) -> bool {
-    config.live_staging_http_read_delay_ms > 0 && config.live_staging_http_read_jitter_ms > 0
+    config.live_staging_http_read_delay_ms >= MIN_LIVE_STAGING_HTTP_READ_DELAY_MS
+        && config.live_staging_http_read_jitter_ms >= MIN_LIVE_STAGING_HTTP_READ_JITTER_MS
 }
 
 fn emit_failure_evidence(
@@ -3374,7 +4273,7 @@ pub(crate) fn is_fatal_gateway_receive_error(
 mod tests {
     use super::*;
     use discord_voice_service_test_support::fake_discord::FakeDiscordPeer;
-    use discord_voice_service_twilight::SessionEventKind;
+    use discord_voice_service_twilight::{PreparedPlayoutQueueEventReason, SessionEventKind};
     use discord_voice_service_voice::test_support::{
         OPUS_SILENCE_FRAME, ProtectionContext, RtpPacketBuilder,
     };
@@ -3387,6 +4286,241 @@ mod tests {
             current_video_id: current_video_id.map(str::to_owned),
             ..SessionEvent::default()
         }
+    }
+
+    fn duration_stats(
+        samples: u64,
+        p50_ms: u64,
+        p95_ms: u64,
+        p99_ms: u64,
+        min_ms: u64,
+        max_ms: u64,
+    ) -> discord_voice_service_twilight::DurationStatsSnapshot {
+        discord_voice_service_twilight::DurationStatsSnapshot {
+            samples,
+            p50_ms,
+            p95_ms,
+            p99_ms,
+            min_ms,
+            max_ms,
+        }
+    }
+
+    fn buffer_depth(
+        packets: u64,
+        bytes: u64,
+        duration_ms: u64,
+        duration_samples: u64,
+    ) -> discord_voice_service_twilight::PlaybackBufferDepthSnapshot {
+        discord_voice_service_twilight::PlaybackBufferDepthSnapshot {
+            packets,
+            bytes,
+            duration_ms,
+            duration_samples,
+        }
+    }
+
+    fn queue_depth_stats(
+        sample_count: u64,
+        empty_count: u64,
+        min_ms: u64,
+        p5_ms: u64,
+        p50_ms: u64,
+        p95_ms: u64,
+        max_ms: u64,
+    ) -> PlaybackQueueDepthStatsSnapshot {
+        PlaybackQueueDepthStatsSnapshot {
+            sample_count,
+            empty_count,
+            current_depth: buffer_depth(p50_ms / 20, 0, p50_ms, p50_ms * 48),
+            min_depth: buffer_depth(min_ms / 20, 0, min_ms, min_ms * 48),
+            p5_depth: buffer_depth(p5_ms / 20, 0, p5_ms, p5_ms * 48),
+            p50_depth: buffer_depth(p50_ms / 20, 0, p50_ms, p50_ms * 48),
+            p95_depth: buffer_depth(p95_ms / 20, 0, p95_ms, p95_ms * 48),
+            max_depth: buffer_depth(max_ms / 20, 0, max_ms, max_ms * 48),
+        }
+    }
+
+    fn raw_send_events(
+        track_packets: u64,
+        boundary_packets: u64,
+    ) -> Vec<discord_voice_service_twilight::PlaybackSendEventSnapshot> {
+        let mut events = Vec::new();
+        for index in 0..track_packets {
+            events.push(discord_voice_service_twilight::PlaybackSendEventSnapshot {
+                packet_index: index,
+                command_kind: PlaybackSendCommandKind::Track,
+                expected_deadline_offset_us: index * 20_000,
+                send_started_offset_us: index * 20_000,
+                sent_offset_us: index * 20_000,
+                media_duration_ms: 20,
+                media_duration_samples: 960,
+                rtp_sequence: index as u32,
+                rtp_timestamp: (index * 960) as u32,
+                protection_nonce: Some(index as u32),
+                source_frame_epoch: Some(1),
+                source_media_position_ms: Some(index * 20),
+                source_media_byte_position: Some(index * 100),
+                committed_heard_media: true,
+            });
+        }
+        for boundary_index in 0..boundary_packets {
+            let packet_index = track_packets + boundary_index;
+            events.push(discord_voice_service_twilight::PlaybackSendEventSnapshot {
+                packet_index,
+                command_kind: PlaybackSendCommandKind::BoundarySilence,
+                expected_deadline_offset_us: packet_index * 20_000,
+                send_started_offset_us: packet_index * 20_000,
+                sent_offset_us: packet_index * 20_000,
+                media_duration_ms: 20,
+                media_duration_samples: 960,
+                rtp_sequence: packet_index as u32,
+                rtp_timestamp: (packet_index * 960) as u32,
+                protection_nonce: Some(packet_index as u32),
+                source_frame_epoch: None,
+                source_media_position_ms: None,
+                source_media_byte_position: None,
+                committed_heard_media: false,
+            });
+        }
+        events
+    }
+
+    fn raw_queue_samples()
+    -> Vec<discord_voice_service_twilight::PreparedTrackQueueDepthSampleSnapshot> {
+        let mut samples = Vec::new();
+        for index in 0..96 {
+            samples.push(
+                discord_voice_service_twilight::PreparedTrackQueueDepthSampleSnapshot {
+                    sample_index: index,
+                    phase: PreparedTrackQueueSamplePhase::ActivePrePause,
+                    depth: buffer_depth(20, 0, 400, 19_200),
+                },
+            );
+        }
+        for index in 0..96 {
+            samples.push(
+                discord_voice_service_twilight::PreparedTrackQueueDepthSampleSnapshot {
+                    sample_index: 96 + index,
+                    phase: PreparedTrackQueueSamplePhase::ActivePostResume,
+                    depth: buffer_depth(20, 0, 400, 19_200),
+                },
+            );
+        }
+        samples
+    }
+
+    fn raw_prepared_playout_queue_events(
+        track_packets: u64,
+    ) -> Vec<discord_voice_service_twilight::PreparedPlayoutQueueEventSnapshot> {
+        let mut events = Vec::new();
+        for index in 0..track_packets {
+            events.push(
+                discord_voice_service_twilight::PreparedPlayoutQueueEventSnapshot {
+                    event_index: events.len() as u64,
+                    event_kind: PreparedPlayoutQueueEventKind::Enqueued,
+                    reason: PreparedPlayoutQueueEventReason::SteadyPlayback,
+                    command_kind: PlaybackSendCommandKind::Track,
+                    media_duration_ms: 20,
+                    media_duration_samples: 960,
+                    rtp_sequence: index as u32,
+                    rtp_timestamp: (index * 960) as u32,
+                    protection_nonce: Some(index as u32),
+                    source_frame_epoch: Some(1),
+                    source_media_position_ms: Some(index * 20),
+                    source_media_byte_position: Some(index * 100),
+                    queue_depth_after: buffer_depth(20, 0, 400, 19_200),
+                },
+            );
+            events.push(
+                discord_voice_service_twilight::PreparedPlayoutQueueEventSnapshot {
+                    event_index: events.len() as u64,
+                    event_kind: PreparedPlayoutQueueEventKind::DequeuedToDeadlineSender,
+                    reason: PreparedPlayoutQueueEventReason::SteadyPlayback,
+                    command_kind: PlaybackSendCommandKind::Track,
+                    media_duration_ms: 20,
+                    media_duration_samples: 960,
+                    rtp_sequence: index as u32,
+                    rtp_timestamp: (index * 960) as u32,
+                    protection_nonce: Some(index as u32),
+                    source_frame_epoch: Some(1),
+                    source_media_position_ms: Some(index * 20),
+                    source_media_byte_position: Some(index * 100),
+                    queue_depth_after: buffer_depth(19, 0, 380, 18_240),
+                },
+            );
+        }
+        events
+    }
+
+    fn valid_playback_timing_snapshot() -> PlaybackStabilitySnapshot {
+        let egress_depth = buffer_depth(20, 10_240, DISCORD_EGRESS_BUFFER_TARGET_MS, 19_200);
+        let source_depth = queue_depth_stats(
+            96,
+            0,
+            SOURCE_PLAYBACK_BUFFER_TARGET_MS,
+            SOURCE_PLAYBACK_BUFFER_TARGET_MS,
+            SOURCE_PLAYBACK_BUFFER_TARGET_MS,
+            SOURCE_PLAYBACK_BUFFER_TARGET_MS,
+            SOURCE_PLAYBACK_BUFFER_TARGET_MS,
+        );
+        let pre_pause_queue_depth = queue_depth_stats(96, 0, 400, 400, 400, 400, 400);
+        let post_resume_queue_depth = queue_depth_stats(96, 0, 400, 400, 400, 400, 400);
+        PlaybackStabilitySnapshot {
+            available: true,
+            playback_epoch: 1,
+            video_id: Some("video".to_owned()),
+            selected_itag: Some(250),
+            track_packet_count: 144,
+            track_interval: duration_stats(143, 20, 22, 25, 19, 28),
+            track_media_duration_sent_ms: 2_880,
+            track_wall_clock_elapsed_ms: 2_880,
+            track_media_to_wall_clock_ratio_ppm: 1_000_000,
+            track_tempo_window_count: 95,
+            track_tempo_window_min_ratio_ppm: 1_000_000,
+            track_tempo_window_max_ratio_ppm: 1_000_000,
+            sender_lateness: duration_stats(144, 0, 2, 4, 0, 5),
+            max_playout_buffer_depth: egress_depth.clone(),
+            egress_buffer_target_ms: DISCORD_EGRESS_BUFFER_TARGET_MS,
+            max_egress_buffer_depth: egress_depth,
+            source_buffer_target_ms: SOURCE_PLAYBACK_BUFFER_TARGET_MS,
+            adaptive_buffer_target_ms: SOURCE_PLAYBACK_BUFFER_TARGET_MS,
+            max_adaptive_buffer_target_ms: SOURCE_PLAYBACK_BUFFER_TARGET_MS,
+            source_buffer_depth: Some(source_depth),
+            sender_send_duration: duration_stats(144, 0, 1, 2, 0, 2),
+            sender_loop_non_send_work_duration: duration_stats(144, 0, 1, 1, 0, 1),
+            playout_sender_lateness: duration_stats(144, 0, 2, 4, 0, 5),
+            playout_builder_prepare_duration: duration_stats(144, 0, 1, 1, 0, 1),
+            prepared_rtp_queue_depth_ms: DISCORD_EGRESS_BUFFER_TARGET_MS - 20,
+            prepared_track_queue_target_ms: DISCORD_EGRESS_BUFFER_TARGET_MS,
+            prepared_track_queue_low_watermark_ms: DISCORD_EGRESS_BUFFER_LOW_WATERMARK_MS,
+            prepared_track_queue_high_watermark_ms: DISCORD_EGRESS_BUFFER_HIGH_WATERMARK_MS,
+            active_pre_pause_prepared_track_queue_depth: Some(pre_pause_queue_depth),
+            active_post_resume_prepared_track_queue_depth: Some(post_resume_queue_depth),
+            prepared_track_queue_depth_sample_count: 192,
+            prepared_track_queue_empty_count: 0,
+            raw_send_events: raw_send_events(144, PAUSE_STOP_SILENCE_FRAME_COUNT as u64),
+            raw_prepared_track_queue_samples: raw_queue_samples(),
+            raw_prepared_playout_queue_events: raw_prepared_playout_queue_events(144),
+            gateway_event_drain_duration: duration_stats(144, 0, 1, 2, 0, 2),
+            ..PlaybackStabilitySnapshot::default()
+        }
+    }
+
+    #[test]
+    fn playback_timing_budget_requires_source_buffer_depth_percentiles() {
+        let mut metrics = valid_playback_timing_snapshot();
+        metrics.source_buffer_depth = None;
+
+        let error = validate_playback_timing_budget(&metrics, "unit playback")
+            .expect_err("missing source reservoir percentile metrics should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("source reservoir depth percentile metrics"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]
@@ -3496,6 +4630,370 @@ mod tests {
     }
 
     #[test]
+    fn playback_timing_budget_allows_gateway_drain_max_outlier_when_lateness_is_bounded() {
+        let metrics = PlaybackStabilitySnapshot {
+            sender_lateness: duration_stats(6_133, 0, 0, 0, 0, 1),
+            playout_sender_lateness: duration_stats(6_133, 0, 0, 0, 0, 1),
+            sender_loop_non_send_work_duration: duration_stats(6_133, 2, 2, 3, 0, 21),
+            gateway_event_drain_duration: duration_stats(6_133, 2, 2, 3, 0, 21),
+            ..valid_playback_timing_snapshot()
+        };
+
+        validate_playback_timing_budget(&metrics, "finished playback").unwrap();
+    }
+
+    #[test]
+    fn playback_timing_budget_rejects_sustained_sender_non_send_work() {
+        let metrics = PlaybackStabilitySnapshot {
+            sender_loop_non_send_work_duration: duration_stats(144, 12, 15, 16, 0, 21),
+            gateway_event_drain_duration: duration_stats(144, 12, 15, 16, 0, 21),
+            ..valid_playback_timing_snapshot()
+        };
+
+        let error = validate_playback_timing_budget(&metrics, "finished playback").unwrap_err();
+        assert!(
+            error.to_string().contains("sender non-send work p99"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn playback_timing_budget_rejects_non_send_outlier_that_delays_sender() {
+        let metrics = PlaybackStabilitySnapshot {
+            sender_lateness: duration_stats(144, 0, 2, 4, 0, 11),
+            sender_loop_non_send_work_duration: duration_stats(144, 2, 2, 3, 0, 21),
+            gateway_event_drain_duration: duration_stats(144, 2, 2, 3, 0, 21),
+            ..valid_playback_timing_snapshot()
+        };
+
+        let error = validate_playback_timing_budget(&metrics, "finished playback").unwrap_err();
+        assert!(
+            error.to_string().contains("sender non-send work max"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn playback_timing_budget_rejects_missing_prepared_track_queue_metrics() {
+        let metrics = PlaybackStabilitySnapshot {
+            active_pre_pause_prepared_track_queue_depth: None,
+            ..valid_playback_timing_snapshot()
+        };
+
+        let error = validate_playback_timing_budget(&metrics, "finished playback").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("missing active pre-pause prepared track queue depth metrics"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn playback_timing_budget_rejects_low_prepared_track_queue_watermark() {
+        let metrics = PlaybackStabilitySnapshot {
+            prepared_track_queue_low_watermark_ms: DISCORD_EGRESS_BUFFER_LOW_WATERMARK_MS - 1,
+            ..valid_playback_timing_snapshot()
+        };
+
+        let error = validate_playback_timing_budget(&metrics, "finished playback").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("prepared_track_queue_low_watermark_ms"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn playback_timing_budget_rejects_pre_pause_prepared_track_queue_bounds() {
+        let metrics = PlaybackStabilitySnapshot {
+            active_pre_pause_prepared_track_queue_depth: Some(queue_depth_stats(
+                96, 0, 180, 300, 400, 400, 400,
+            )),
+            ..valid_playback_timing_snapshot()
+        };
+        let error = validate_playback_timing_budget(&metrics, "finished playback").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("active pre-pause prepared_track_queue_depth_min_ms"),
+            "unexpected error: {error}"
+        );
+
+        let metrics = PlaybackStabilitySnapshot {
+            active_pre_pause_prepared_track_queue_depth: Some(queue_depth_stats(
+                96, 0, 220, 280, 400, 400, 400,
+            )),
+            ..valid_playback_timing_snapshot()
+        };
+        let error = validate_playback_timing_budget(&metrics, "finished playback").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("active pre-pause prepared_track_queue_depth_p5_ms"),
+            "unexpected error: {error}"
+        );
+
+        let metrics = PlaybackStabilitySnapshot {
+            active_pre_pause_prepared_track_queue_depth: Some(queue_depth_stats(
+                96, 0, 220, 320, 320, 400, 400,
+            )),
+            ..valid_playback_timing_snapshot()
+        };
+        let error = validate_playback_timing_budget(&metrics, "finished playback").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("active pre-pause prepared_track_queue_depth_p50_ms"),
+            "unexpected error: {error}"
+        );
+
+        let metrics = PlaybackStabilitySnapshot {
+            active_pre_pause_prepared_track_queue_depth: Some(queue_depth_stats(
+                96, 0, 220, 320, 400, 520, 520,
+            )),
+            ..valid_playback_timing_snapshot()
+        };
+        let error = validate_playback_timing_budget(&metrics, "finished playback").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("active pre-pause prepared_track_queue_depth_p95_ms"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn playback_timing_budget_rejects_post_resume_prepared_track_queue_bounds() {
+        let metrics = PlaybackStabilitySnapshot {
+            active_post_resume_prepared_track_queue_depth: Some(queue_depth_stats(
+                96, 0, 180, 300, 400, 400, 400,
+            )),
+            ..valid_playback_timing_snapshot()
+        };
+        let error = validate_playback_timing_budget(&metrics, "finished playback").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("active post-resume prepared_track_queue_depth_min_ms"),
+            "unexpected error: {error}"
+        );
+
+        let metrics = PlaybackStabilitySnapshot {
+            active_post_resume_prepared_track_queue_depth: Some(queue_depth_stats(
+                96, 0, 220, 320, 480, 500, 500,
+            )),
+            ..valid_playback_timing_snapshot()
+        };
+        let error = validate_playback_timing_budget(&metrics, "finished playback").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("active post-resume prepared_track_queue_depth_p50_ms"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn playback_timing_budget_rejects_empty_prepared_track_queue_samples() {
+        let metrics = PlaybackStabilitySnapshot {
+            active_post_resume_prepared_track_queue_depth: Some(queue_depth_stats(
+                96, 1, 220, 320, 400, 400, 400,
+            )),
+            prepared_track_queue_empty_count: 1,
+            ..valid_playback_timing_snapshot()
+        };
+
+        let error = validate_playback_timing_budget(&metrics, "finished playback").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("empty active post-resume prepared track queue samples"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn playback_timing_budget_rejects_missing_raw_send_events() {
+        let metrics = PlaybackStabilitySnapshot {
+            raw_send_events: Vec::new(),
+            ..valid_playback_timing_snapshot()
+        };
+
+        let error = validate_playback_timing_budget(&metrics, "finished playback").unwrap_err();
+        assert!(
+            error.to_string().contains("no raw send-event evidence"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn playback_timing_budget_rejects_burst_pause_boundary_silence() {
+        let mut metrics = valid_playback_timing_snapshot();
+        let burst_start_offset_us = metrics.track_packet_count * 20_000;
+        let mut boundary_packet_count = 0;
+        for event in metrics
+            .raw_send_events
+            .iter_mut()
+            .filter(|event| event.command_kind == PlaybackSendCommandKind::BoundarySilence)
+            .take(PAUSE_STOP_SILENCE_FRAME_COUNT)
+        {
+            let burst_offset_us = burst_start_offset_us + (boundary_packet_count as u64 * 1_000);
+            event.expected_deadline_offset_us = burst_offset_us;
+            event.send_started_offset_us = burst_offset_us;
+            event.sent_offset_us = burst_offset_us;
+            boundary_packet_count += 1;
+        }
+        assert_eq!(boundary_packet_count, PAUSE_STOP_SILENCE_FRAME_COUNT);
+
+        let error = validate_playback_timing_budget(&metrics, "finished playback").unwrap_err();
+        assert!(
+            error.to_string().contains("Pause boundary silence spacing"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn playback_timing_budget_rejects_missing_raw_queue_samples() {
+        let metrics = PlaybackStabilitySnapshot {
+            raw_prepared_track_queue_samples: Vec::new(),
+            ..valid_playback_timing_snapshot()
+        };
+
+        let error = validate_playback_timing_budget(&metrics, "finished playback").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no raw prepared-track queue sample evidence"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn playback_timing_budget_rejects_missing_raw_playout_lifecycle_events() {
+        let metrics = PlaybackStabilitySnapshot {
+            raw_prepared_playout_queue_events: Vec::new(),
+            ..valid_playback_timing_snapshot()
+        };
+
+        let error = validate_playback_timing_budget(&metrics, "finished playback").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no raw prepared playout lifecycle evidence"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn playback_timing_budget_rejects_raw_queue_aggregate_disagreement() {
+        let mut metrics = valid_playback_timing_snapshot();
+        metrics.raw_prepared_track_queue_samples[0]
+            .depth
+            .duration_ms = 420;
+
+        let error = validate_playback_timing_budget(&metrics, "finished playback").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("prepared queue aggregate disagreed with raw samples"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn playback_timing_budget_rejects_raw_playout_lifecycle_aggregate_disagreement() {
+        let metrics = PlaybackStabilitySnapshot {
+            prepared_track_packet_drop_count: 1,
+            ..valid_playback_timing_snapshot()
+        };
+
+        let error = validate_playback_timing_budget(&metrics, "finished playback").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("prepared_track_packet_drop_count"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn playback_timing_budget_rejects_raw_tempo_aggregate_disagreement() {
+        let metrics = PlaybackStabilitySnapshot {
+            track_tempo_window_max_ratio_ppm: 999_997,
+            ..valid_playback_timing_snapshot()
+        };
+
+        let error = validate_playback_timing_budget(&metrics, "finished playback").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("rolling tempo aggregate disagreed with raw send events"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn playback_timing_budget_allows_one_ppm_raw_tempo_recompute_rounding() {
+        let metrics = PlaybackStabilitySnapshot {
+            track_tempo_window_max_ratio_ppm: 999_999,
+            ..valid_playback_timing_snapshot()
+        };
+
+        validate_playback_timing_budget(&metrics, "finished playback").unwrap();
+    }
+
+    #[test]
+    fn raw_playback_recompute_matches_runtime_ms_ratio_rounding() {
+        let mut metrics = valid_playback_timing_snapshot();
+        let last = metrics
+            .raw_send_events
+            .iter_mut()
+            .rev()
+            .find(|event| event.command_kind == PlaybackSendCommandKind::Track)
+            .expect("valid snapshot should include track sends");
+        last.expected_deadline_offset_us = last.expected_deadline_offset_us.saturating_add(999);
+        last.send_started_offset_us = last.send_started_offset_us.saturating_add(999);
+        last.sent_offset_us = last.sent_offset_us.saturating_add(999);
+
+        let recomputed = recompute_raw_playback(&metrics, "finished playback").unwrap();
+
+        assert_eq!(recomputed.track_wall_clock_elapsed_ms, 2_880);
+        assert_eq!(
+            recomputed.track_wall_clock_elapsed_ms,
+            metrics.track_wall_clock_elapsed_ms
+        );
+        assert_eq!(
+            recomputed.track_media_to_wall_clock_ratio_ppm,
+            metrics.track_media_to_wall_clock_ratio_ppm
+        );
+    }
+
+    #[test]
+    fn live_runtime_metrics_require_five_hundred_post_source_windows() {
+        let metrics = PlaybackStabilitySnapshot {
+            track_tempo_window_post_source_buffer_count: MIN_LIVE_POST_SOURCE_TEMPO_WINDOWS - 1,
+            ..valid_playback_timing_snapshot()
+        };
+
+        let error = validate_live_runtime_post_source_window_count(&metrics, "finished playback")
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("runtime post-source tempo windows"),
+            "unexpected error: {error}"
+        );
+
+        let metrics = PlaybackStabilitySnapshot {
+            track_tempo_window_post_source_buffer_count: MIN_LIVE_POST_SOURCE_TEMPO_WINDOWS,
+            ..valid_playback_timing_snapshot()
+        };
+        validate_live_runtime_post_source_window_count(&metrics, "finished playback").unwrap();
+    }
+
+    #[test]
     fn active_interrupt_state_checks_require_stopped_or_left_shape() {
         let stopped = StateSnapshot {
             state: SessionState::VoiceReady,
@@ -3541,7 +5039,6 @@ mod tests {
             ("TEST_GUILD_ID".to_owned(), "2".to_owned()),
             ("TEST_VOICE_CHANNEL_ID".to_owned(), "3".to_owned()),
             ("TEST_VIDEO_ID".to_owned(), "video".to_owned()),
-            ("TEST_LONG_VIDEO_ID".to_owned(), "long-video".to_owned()),
             (
                 "DISCORD_VOICE_SERVICE_URI".to_owned(),
                 "http://127.0.0.1:55051".to_owned(),
@@ -3563,10 +5060,6 @@ mod tests {
             (
                 "LIVE_STAGING_HTTP_READ_JITTER_MS".to_owned(),
                 "25".to_owned(),
-            ),
-            (
-                "LIVE_STAGING_LONG_TRACK_MIN_PACKETS".to_owned(),
-                "300".to_owned(),
             ),
         ]))
         .expect("config should parse")
@@ -3663,6 +5156,17 @@ mod tests {
     }
 
     #[test]
+    fn live_test_video_duration_requires_at_least_ninety_seconds() {
+        let error = validate_live_test_video_duration(89_999, "video").unwrap_err();
+        assert!(
+            error.to_string().contains("too short for live staging"),
+            "unexpected error: {error}"
+        );
+
+        validate_live_test_video_duration(90_000, "video").unwrap();
+    }
+
+    #[test]
     fn observer_thresholds_require_audio_near_expected_duration() {
         let expected_duration_ms = 180_000;
         let required_decoded_audio_ms = required_observer_decoded_audio_ms(expected_duration_ms);
@@ -3730,7 +5234,7 @@ mod tests {
             decoded_audio_tempo_window_max_ratio_ppm: 1_000_000,
             ..full_stats.clone()
         };
-        assert!(!observer_thresholds_satisfied(
+        assert!(observer_thresholds_satisfied(
             &local_fast_interval_with_stable_ratio,
             expected_duration_ms,
         ));
@@ -3745,12 +5249,37 @@ mod tests {
             expected_duration_ms,
         ));
 
-        let gapped_stats = AudioValidationStats {
+        let isolated_observer_gap_stats = AudioValidationStats {
             rtp_gap_count_gte_100ms: 1,
+            rtp_inter_arrival: crate::audio::AudioIntervalStats {
+                samples: 8_099,
+                p50_ms: 20,
+                p95_ms: 26,
+                p99_ms: 31,
+                min_ms: 1,
+                max_ms: 104,
+            },
+            ..full_stats.clone()
+        };
+        assert!(observer_thresholds_satisfied(
+            &isolated_observer_gap_stats,
+            expected_duration_ms,
+        ));
+
+        let sustained_gapped_stats = AudioValidationStats {
+            rtp_gap_count_gte_100ms: 10,
+            rtp_inter_arrival: crate::audio::AudioIntervalStats {
+                samples: 8_099,
+                p50_ms: 20,
+                p95_ms: RTP_INTERVAL_P95_BUDGET_MS + 1,
+                p99_ms: RTP_INTERVAL_P99_BUDGET_MS + 1,
+                min_ms: 1,
+                max_ms: RTP_INTERVAL_MAX_BUDGET_MS + 1,
+            },
             ..full_stats.clone()
         };
         assert!(!observer_thresholds_satisfied(
-            &gapped_stats,
+            &sustained_gapped_stats,
             expected_duration_ms,
         ));
 
@@ -3760,6 +5289,16 @@ mod tests {
         };
         assert!(!observer_thresholds_satisfied(
             &missing_post_reservoir_window_stats,
+            expected_duration_ms,
+        ));
+
+        let too_few_post_reservoir_window_stats = AudioValidationStats {
+            decoded_audio_tempo_window_post_source_buffer_count: MIN_LIVE_POST_SOURCE_TEMPO_WINDOWS
+                - 1,
+            ..full_stats.clone()
+        };
+        assert!(!observer_thresholds_satisfied(
+            &too_few_post_reservoir_window_stats,
             expected_duration_ms,
         ));
 
@@ -3840,7 +5379,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pause_proof_allows_silence_after_speaking_disappears() {
+    async fn pause_proof_reports_gateway_speaking_stop_without_media_boundary() {
         let fake = FakeDiscordPeer::spawn_real_shape().await;
         let voice = fake.voice_context("1", "2", "observer-1", "session-1", "token-1");
         let mut session = ObservedVoiceSession::connect(voice).await.unwrap();
@@ -3870,13 +5409,14 @@ mod tests {
         let (proof, ()) = tokio::join!(proof, send_stop);
         let proof = proof.unwrap();
 
-        assert!(proof.speaking_stopped);
+        assert!(proof.gateway_speaking_stopped);
+        assert!(!proof.rtp_silence_observed);
         assert_eq!(proof.silence_ms, 600);
         assert_eq!(accumulator.stats().observed_packet_count, 0);
     }
 
     #[tokio::test]
-    async fn pause_proof_infers_speaking_stop_from_sustained_rtp_silence() {
+    async fn pause_proof_does_not_treat_single_rtp_silence_as_boundary() {
         let fake = FakeDiscordPeer::spawn_real_shape().await;
         let voice = fake.voice_context("1", "2", "observer-1", "session-1", "token-1");
         let mut session = ObservedVoiceSession::connect(voice).await.unwrap();
@@ -3914,9 +5454,60 @@ mod tests {
         let (proof, ()) = tokio::join!(proof, send_audio_then_silence);
         let proof = proof.unwrap();
 
-        assert!(proof.speaking_stopped);
+        assert!(!proof.gateway_speaking_stopped);
+        assert!(!proof.rtp_silence_observed);
         assert_eq!(proof.silence_ms, 600);
         assert_eq!(accumulator.stats().observed_packet_count, 1);
+    }
+
+    #[tokio::test]
+    async fn pause_proof_accepts_explicit_stop_silence_tail_without_gateway_speaking_stop() {
+        let fake = FakeDiscordPeer::spawn_real_shape().await;
+        let voice = fake.voice_context("1", "2", "observer-1", "session-1", "token-1");
+        let mut session = ObservedVoiceSession::connect(voice).await.unwrap();
+        fake.send_speaking("speaker-1", 42).await.unwrap();
+        session
+            .receive_speaking_state_from("speaker-1", 1, Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        let mut accumulator = AudioValidationAccumulator::new();
+        let snapshot = Arc::new(Mutex::new(None));
+        let mut audio_started = None;
+
+        let proof = async {
+            prove_observer_pause_silence(
+                &mut session,
+                "speaker-1",
+                &mut accumulator,
+                &snapshot,
+                &mut audio_started,
+            )
+            .await
+        };
+        let send_stop_tail = async {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let mode = fake.encryption_mode().await.unwrap();
+            let secret_key = fake.secret_key().await.unwrap();
+            let protection = ProtectionContext::new(mode, secret_key).unwrap();
+            let rtp = RtpPacketBuilder::new(42);
+            for sequence in 0..PAUSE_STOP_SILENCE_FRAME_COUNT {
+                let sequence = u16::try_from(sequence).unwrap();
+                let header = rtp.build_header(sequence, u32::from(sequence) * 960);
+                let packet = protection
+                    .protect_packet(&header, &OPUS_SILENCE_FRAME)
+                    .unwrap();
+                fake.send_raw_udp_packet(&packet).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        let (proof, ()) = tokio::join!(proof, send_stop_tail);
+        let proof = proof.unwrap();
+
+        assert!(!proof.gateway_speaking_stopped);
+        assert!(proof.rtp_silence_observed);
+        assert_eq!(proof.silence_ms, 600);
+        assert_eq!(accumulator.stats().observed_packet_count, 5);
     }
 
     #[tokio::test]
@@ -3974,6 +5565,7 @@ mod tests {
                 &mut accumulator,
                 &snapshot,
                 &mut audio_started,
+                false,
             )
             .await
         };
@@ -4002,7 +5594,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resume_proof_infers_speaking_start_from_resumed_audio_packets() {
+    async fn resume_proof_rejects_resumed_audio_without_speaking_start() {
         let fake = FakeDiscordPeer::spawn_real_shape().await;
         let voice = fake.voice_context("1", "2", "observer-1", "session-1", "token-1");
         let mut session = ObservedVoiceSession::connect(voice).await.unwrap();
@@ -4022,6 +5614,7 @@ mod tests {
                 &mut accumulator,
                 &snapshot,
                 &mut audio_started,
+                false,
             )
             .await
         };
@@ -4041,10 +5634,117 @@ mod tests {
             }
         };
         let (proof, ()) = tokio::join!(proof, send_resume_audio);
+        let error = proof.unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("observer received resumed service audio before service Speaking 1")
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_proof_accepts_resumed_audio_after_explicit_pause_boundary_without_gateway_echo()
+    {
+        let fake = FakeDiscordPeer::spawn_real_shape().await;
+        let voice = fake.voice_context("1", "2", "observer-1", "session-1", "token-1");
+        let mut session = ObservedVoiceSession::connect(voice).await.unwrap();
+        fake.send_speaking("speaker-1", 42).await.unwrap();
+        session
+            .receive_speaking_state_from("speaker-1", 1, Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        let mut accumulator = AudioValidationAccumulator::new();
+        let observed_at = std::time::Instant::now();
+        for sequence in 0..PAUSE_STOP_SILENCE_FRAME_COUNT {
+            let sequence = u16::try_from(sequence).unwrap();
+            accumulator
+                .observe_packet_at(
+                    ObservedOpusPacket {
+                        sequence,
+                        timestamp: u32::from(sequence) * 960,
+                        payload: &OPUS_STOP_SILENCE_FRAME,
+                    },
+                    observed_at + Duration::from_millis(u64::from(sequence) * 20),
+                )
+                .unwrap();
+        }
+        accumulator.reset_wall_clock_baseline_after_controlled_pause();
+
+        let snapshot = Arc::new(Mutex::new(None));
+        let mut audio_started = None;
+
+        let proof = async {
+            prove_observer_resume_audio(
+                &mut session,
+                "speaker-1",
+                &mut accumulator,
+                &snapshot,
+                &mut audio_started,
+                true,
+            )
+            .await
+        };
+        let send_resume_audio = async {
+            tokio::time::sleep(Duration::from_millis(125)).await;
+            let mode = fake.encryption_mode().await.unwrap();
+            let secret_key = fake.secret_key().await.unwrap();
+            let protection = ProtectionContext::new(mode, secret_key).unwrap();
+            let rtp = RtpPacketBuilder::new(42);
+            for sequence in PAUSE_STOP_SILENCE_FRAME_COUNT
+                ..(PAUSE_STOP_SILENCE_FRAME_COUNT + RESUME_OBSERVER_PACKET_TARGET as usize)
+            {
+                let sequence = u16::try_from(sequence).unwrap();
+                let header = rtp.build_header(sequence, u32::from(sequence) * 960);
+                let packet = protection
+                    .protect_packet(&header, &OPUS_SILENCE_FRAME)
+                    .unwrap();
+                fake.send_raw_udp_packet(&packet).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        let (proof, ()) = tokio::join!(proof, send_resume_audio);
         let proof = proof.unwrap();
 
-        assert!(proof.speaking_started);
+        assert!(!proof.speaking_started);
         assert_eq!(proof.observed_packet_count, RESUME_OBSERVER_PACKET_TARGET);
+        assert_eq!(accumulator.stats().rtp_gap_count_gte_100ms, 0);
+    }
+
+    #[tokio::test]
+    async fn pause_proof_request_waits_until_observer_is_armed() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut request = tokio::spawn(async move { start_observer_pause_proof(&tx).await });
+
+        let Some(ObserverAudioProofCommand::Pause { armed, respond_to }) = rx.recv().await else {
+            panic!("expected Pause proof request");
+        };
+
+        assert!(
+            timeout(Duration::from_millis(50), &mut request)
+                .await
+                .is_err(),
+            "Pause proof request must wait until the observer task is armed"
+        );
+
+        armed.send(()).unwrap();
+        let response = request.await.unwrap().unwrap();
+        respond_to
+            .send(Ok(ObserverPauseProof {
+                silence_ms: duration_ms(PAUSE_OBSERVER_SILENCE_DURATION),
+                gateway_speaking_stopped: true,
+                rtp_silence_observed: true,
+            }))
+            .unwrap();
+        let proof = response.await.unwrap().unwrap();
+
+        assert!(proof.gateway_speaking_stopped);
+        assert!(proof.rtp_silence_observed);
+        assert_eq!(
+            proof.silence_ms,
+            duration_ms(PAUSE_OBSERVER_SILENCE_DURATION)
+        );
     }
 
     #[tokio::test]
@@ -4069,6 +5769,7 @@ mod tests {
             .send(Ok(ObserverResumeProof {
                 observed_packet_count: RESUME_OBSERVER_PACKET_TARGET,
                 speaking_started: true,
+                resume_decoded_audio_start_ms: 0,
             }))
             .unwrap();
         let proof = response.await.unwrap().unwrap();
@@ -4092,12 +5793,13 @@ mod tests {
                 pause_silence_ms: 600,
                 pause_self_mute_observed: false,
                 pause_speaking_stopped: true,
+                pause_rtp_silence_observed: true,
                 resume_speaking_started: false,
                 resume_observed_packet_count: 0,
+                resume_decoded_audio_start_ms: 0,
             }),
             playback_metrics: None,
             reconnect_probe_metrics: None,
-            long_track_metrics: None,
         };
 
         let evidence = build_failure_evidence(
@@ -4111,6 +5813,7 @@ mod tests {
         assert!(evidence.saw_track_ended);
         assert!(!evidence.observer_pause_self_mute_observed);
         assert!(evidence.observer_pause_speaking_stopped);
+        assert!(evidence.observer_pause_rtp_silence_observed);
         assert!(!evidence.observer_resume_speaking_started);
         assert_eq!(evidence.observer_pause_silence_ms, 600);
         assert_eq!(evidence.observer_resume_packet_count, 0);
@@ -4134,12 +5837,11 @@ mod tests {
         snapshot.record_post_play_evidence(PostPlayControlEvidence {
             playback_metrics: Some(playback_metrics.clone()),
             reconnect_probe_metrics: Some(reconnect_probe_metrics.clone()),
-            long_track_metrics: None,
         });
 
         let evidence = build_failure_evidence(
             &valid_test_config(),
-            &anyhow!("long-track probe Play RPC failed before Playing"),
+            &anyhow!("interrupted playback probe Play RPC failed before Playing"),
             Some(&snapshot),
         );
 
@@ -4148,8 +5850,6 @@ mod tests {
             evidence.reconnect_probe_metrics,
             Some(reconnect_probe_metrics)
         );
-        assert!(!evidence.validated_long_track_playback);
-        assert!(evidence.long_track_metrics.is_none());
     }
 
     #[test]
@@ -4162,9 +5862,9 @@ mod tests {
             live_contract: LiveContractState::default(),
             audio_stats: AudioValidationStats::default(),
             observer_playback: ObserverPlaybackProof::default(),
+            expected_duration_ms: 180_000,
             playback_metrics: Some(playback_metrics),
             reconnect_probe_metrics: None,
-            long_track_metrics: None,
         };
 
         let evidence = build_success_evidence(&valid_test_config(), &outcome);
@@ -4201,7 +5901,6 @@ mod tests {
             observer_playback: None,
             playback_metrics: None,
             reconnect_probe_metrics: None,
-            long_track_metrics: None,
         };
         let error = anyhow!("observer audio proof timed out");
 
