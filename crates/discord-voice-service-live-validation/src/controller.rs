@@ -62,6 +62,8 @@ const PREPARED_TRACK_QUEUE_P5_MIN_DEPTH_MS: u64 = 300;
 const PREPARED_TRACK_QUEUE_P50_MIN_DEPTH_MS: u64 = 340;
 const PREPARED_TRACK_QUEUE_P50_MAX_DEPTH_MS: u64 = 460;
 const TRACK_TEMPO_WINDOW_PACKETS: usize = 50;
+const NATURAL_OPUS_FRAME_DURATION_MS: u64 = 20;
+const NATURAL_OPUS_FRAME_DURATION_SAMPLES: u32 = 960;
 const MIN_LIVE_POST_SOURCE_TEMPO_WINDOWS: u64 = 500;
 const SOURCE_POSITION_CONTINUITY_TOLERANCE_MS: u64 = 1;
 const RAW_RATIO_RECOMPUTE_TOLERANCE_PPM: u64 = 1;
@@ -78,11 +80,13 @@ const MIN_DECODED_AUDIO_MS: u64 = 6_000;
 const MIN_NON_SILENT_AUDIO_MS: u64 = 1_000;
 const OBSERVER_AUDIO_DURATION_TOLERANCE_MS: u64 = 2_000;
 const OBSERVER_AUDIO_DURATION_MIN_RATIO_PERCENT: u64 = 90;
+const OBSERVER_TRACK_ENDED_DRAIN_GRACE: Duration = Duration::from_millis(750);
 const OBSERVER_AUDIO_STARTED_TIMEOUT: Duration = Duration::from_secs(30);
 const PAUSE_OBSERVER_SILENCE_DURATION: Duration = Duration::from_millis(600);
 const PAUSE_AFTER_PLAYBACK_START: Duration = Duration::from_secs(10);
 const PAUSE_HOLD_DURATION: Duration = Duration::from_secs(3);
 const PAUSE_STOP_SILENCE_FRAME_COUNT: usize = 5;
+const PAUSE_PROOF_ARM_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const PAUSE_BOUNDARY_MIN_SPACING_MS: u64 = 15;
 const PAUSE_BOUNDARY_MAX_SPACING_MS: u64 = 45;
 const OPUS_STOP_SILENCE_FRAME: [u8; 3] = [0xF8, 0xFF, 0xFE];
@@ -203,12 +207,18 @@ struct ObserverResumeProof {
     resume_decoded_audio_start_ms: u64,
 }
 
+struct PendingObserverPauseProof {
+    begin: Option<oneshot::Sender<()>>,
+    response: oneshot::Receiver<Result<ObserverPauseProof>>,
+}
+
 enum ObserverAudioProofCommand {
     SpeakingStarted {
         respond_to: oneshot::Sender<Result<()>>,
     },
     Pause {
         armed: oneshot::Sender<()>,
+        begin: oneshot::Receiver<()>,
         respond_to: oneshot::Sender<Result<ObserverPauseProof>>,
     },
     Resume {
@@ -1013,8 +1023,15 @@ async fn observe_audio_until_track_ended(
             track_ended_result = &mut track_ended => {
                 track_ended_result
                     .context("service play-completion contract ended before TrackEnded notification")?;
-                let stats = accumulator.into_stats()
-                    .context("observer audio proof completed without validated packets")?;
+                let stats = drain_observer_audio_after_track_ended(
+                    observer_session,
+                    expected_user_id,
+                    &mut accumulator,
+                    &snapshot,
+                    &mut audio_started,
+                )
+                .await
+                .context("observer audio drain after TrackEnded failed")?;
                 *snapshot.lock().unwrap() = Some(stats.clone());
                 if observer_thresholds_satisfied(&stats, expected_duration_ms) {
                     return Ok(stats);
@@ -1035,8 +1052,30 @@ async fn observe_audio_until_track_ended(
                         }
                         let _ = respond_to.send(result);
                     }
-                    Some(ObserverAudioProofCommand::Pause { armed, respond_to }) => {
+                    Some(ObserverAudioProofCommand::Pause {
+                        armed,
+                        begin,
+                        respond_to,
+                    }) => {
                         let _ = armed.send(());
+                        match wait_for_observer_pause_proof_begin(
+                            observer_session,
+                            expected_user_id,
+                            &mut accumulator,
+                            &snapshot,
+                            &mut audio_started,
+                            begin,
+                        )
+                        .await
+                        {
+                            Ok(_) => {}
+                            Err(error) => {
+                                explicit_pause_boundary_observed = false;
+                                let _ = respond_to.send(Err(error));
+                                continue;
+                            }
+                        }
+                        accumulator.start_controlled_pause();
                         let result = prove_observer_pause_silence(
                             observer_session,
                             expected_user_id,
@@ -1046,16 +1085,13 @@ async fn observe_audio_until_track_ended(
                         )
                         .await;
                         match &result {
-                            Ok(proof) if proof.rtp_silence_observed => {
+                            Ok(proof) => {
                                 info!(
                                     silence_ms = proof.silence_ms,
                                     "observer proved Pause by observing service stop boundary and no service audio",
                                 );
-                                explicit_pause_boundary_observed = true;
+                                explicit_pause_boundary_observed = proof.rtp_silence_observed;
                                 accumulator.reset_wall_clock_baseline_after_controlled_pause();
-                            }
-                            Ok(_) => {
-                                explicit_pause_boundary_observed = false;
                             }
                             Err(_) => {
                                 explicit_pause_boundary_observed = false;
@@ -1126,6 +1162,104 @@ async fn observe_audio_until_track_ended(
                     &mut audio_started,
                 )?;
                 last_stats = Some(stats);
+            }
+        }
+    }
+}
+
+async fn drain_observer_audio_after_track_ended(
+    observer_session: &mut ObservedVoiceSession,
+    expected_user_id: &str,
+    accumulator: &mut AudioValidationAccumulator,
+    snapshot: &Arc<Mutex<Option<AudioValidationStats>>>,
+    audio_started: &mut Option<oneshot::Sender<()>>,
+) -> Result<AudioValidationStats> {
+    accumulator.start_natural_end_drain();
+    let deadline = Instant::now() + OBSERVER_TRACK_ENDED_DRAIN_GRACE;
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return observer_accumulator_stats(accumulator);
+        };
+
+        match observer_session
+            .receive_audio_frame_from(expected_user_id, remaining)
+            .await
+        {
+            Ok(frame) => {
+                record_observer_audio_frame(frame, accumulator, snapshot, audio_started)?;
+            }
+            Err(error) if is_voice_receive_timeout(&error) => {
+                return observer_accumulator_stats(accumulator);
+            }
+            Err(error) => return Err(error).context("observer drain receive failed"),
+        }
+    }
+}
+
+fn observer_accumulator_stats(
+    accumulator: &AudioValidationAccumulator,
+) -> Result<AudioValidationStats> {
+    let stats = accumulator.stats();
+    if stats.observed_packet_count == 0 {
+        bail!("observer audio proof completed without validated packets");
+    }
+    Ok(stats)
+}
+
+async fn wait_for_observer_pause_proof_begin(
+    observer_session: &mut ObservedVoiceSession,
+    expected_user_id: &str,
+    accumulator: &mut AudioValidationAccumulator,
+    snapshot: &Arc<Mutex<Option<AudioValidationStats>>>,
+    audio_started: &mut Option<oneshot::Sender<()>>,
+    mut begin: oneshot::Receiver<()>,
+) -> Result<Option<AudioValidationStats>> {
+    let mut last_stats = None;
+
+    loop {
+        match begin.try_recv() {
+            Ok(()) => return Ok(last_stats),
+            Err(oneshot::error::TryRecvError::Empty) => {}
+            Err(oneshot::error::TryRecvError::Closed) => {
+                bail!("observer Pause proof begin signal was dropped before Pause started");
+            }
+        }
+
+        match observer_session
+            .receive_activity_from(expected_user_id, PAUSE_PROOF_ARM_POLL_INTERVAL)
+            .await
+        {
+            Ok(ObservedVoiceActivity::Audio(frame)) => {
+                last_stats = Some(record_observer_audio_frame(
+                    frame,
+                    accumulator,
+                    snapshot,
+                    audio_started,
+                )?);
+            }
+            Ok(ObservedVoiceActivity::RtpPacket(packet)) => {
+                info!(
+                    sequence = packet.sequence,
+                    ssrc = packet.ssrc,
+                    "observer saw pre-Pause RTP packet while Pause proof was armed",
+                );
+            }
+            Ok(ObservedVoiceActivity::Speaking(state)) => {
+                info!(
+                    user_id = %state.user_id,
+                    ssrc = state.ssrc,
+                    speaking = state.speaking,
+                    "observer saw pre-Pause speaking state while Pause proof was armed",
+                );
+            }
+            Ok(ObservedVoiceActivity::Disconnect(user_id)) => {
+                bail!(
+                    "observer saw service voice client disconnect while Pause proof was armed before Pause started (user_id={user_id})"
+                );
+            }
+            Err(error) if is_voice_receive_timeout(&error) => {}
+            Err(error) => {
+                return Err(error).context("observer pause proof failed while armed before Pause");
             }
         }
     }
@@ -1496,15 +1630,41 @@ fn observer_thresholds_satisfied(stats: &AudioValidationStats, expected_duration
         && stats.decoded_audio_to_wall_clock_ratio_ppm <= MEDIA_TO_WALL_CLOCK_MAX_RATIO_PPM
         && stats.non_silent_audio_ms >= MIN_NON_SILENT_AUDIO_MS
         && stats.rtp_inter_arrival.samples > 0
+        && unclassified_observer_anomaly_count(
+            stats,
+            "rtp_gap_gte_100ms",
+            stats.rtp_gap_count_gte_100ms,
+        ) == 0
+        && unclassified_observer_anomaly_count(
+            stats,
+            "rtp_fast_interval",
+            stats.rtp_fast_interval_count,
+        ) == 0
         && stats.decoded_audio_tempo_window_count > 0
         && stats.decoded_audio_tempo_window_fast_count == 0
         && stats.decoded_audio_tempo_window_slow_count == 0
+        && stats.decoded_audio_short_tempo_window_count > 0
+        && stats.decoded_audio_short_tempo_window_fast_count == 0
+        && stats.decoded_audio_short_tempo_window_slow_count == 0
         && (!observer_post_source_buffer_window_required(expected_duration_ms)
             || stats.decoded_audio_tempo_window_post_source_buffer_count
                 >= MIN_LIVE_POST_SOURCE_TEMPO_WINDOWS)
         && stats.rtp_inter_arrival.p95_ms <= RTP_INTERVAL_P95_BUDGET_MS
         && stats.rtp_inter_arrival.p99_ms <= RTP_INTERVAL_P99_BUDGET_MS
         && stats.rtp_inter_arrival.max_ms < RTP_INTERVAL_MAX_BUDGET_MS
+}
+
+fn unclassified_observer_anomaly_count(
+    stats: &AudioValidationStats,
+    kind: &str,
+    total_count: u64,
+) -> u64 {
+    let controlled_count = stats
+        .observer_anomalies
+        .iter()
+        .filter(|anomaly| anomaly.kind == kind && anomaly.classification == "controlled_pause")
+        .count() as u64;
+    total_count.saturating_sub(controlled_count)
 }
 
 fn observer_post_source_buffer_window_required(expected_duration_ms: u64) -> bool {
@@ -1516,8 +1676,9 @@ fn required_observer_decoded_audio_ms(expected_duration_ms: u64) -> u64 {
         expected_duration_ms.saturating_mul(OBSERVER_AUDIO_DURATION_MIN_RATIO_PERCENT) / 100;
     let tolerance_floor = expected_duration_ms.saturating_sub(OBSERVER_AUDIO_DURATION_TOLERANCE_MS);
     ratio_floor
-        .min(tolerance_floor)
+        .max(tolerance_floor)
         .max(MIN_DECODED_AUDIO_MS.min(expected_duration_ms))
+        .min(expected_duration_ms)
 }
 
 fn observer_threshold_error(
@@ -1527,7 +1688,7 @@ fn observer_threshold_error(
     let required_decoded_audio_ms = required_observer_decoded_audio_ms(expected_duration_ms);
     match stats {
         Some(stats) => anyhow!(
-            "observer audio proof finished before thresholds (observed_packet_count={} decoded_audio_ms={} required_decoded_audio_ms={} expected_duration_ms={} observer_wall_clock_elapsed_ms={} decoded_audio_to_wall_clock_ratio_ppm={} min_ratio_ppm={} max_ratio_ppm={} non_silent_audio_ms={} required_non_silent_audio_ms={} rtp_gap_count_gte_100ms={} rtp_fast_interval_count={} rtp_fast_interval_min_ms={} rtp_fast_interval_min_us={} decoded_audio_tempo_window_count={} decoded_audio_tempo_window_post_source_buffer_count={} decoded_audio_tempo_window_min_ratio_ppm={} decoded_audio_tempo_window_max_ratio_ppm={} decoded_audio_tempo_window_fast_count={} decoded_audio_tempo_window_fastest_ratio_ppm={} decoded_audio_tempo_window_slow_count={} decoded_audio_tempo_window_slowest_ratio_ppm={} rtp_p95_ms={} rtp_p99_ms={} rtp_max_ms={})",
+            "observer audio proof finished before thresholds (observed_packet_count={} decoded_audio_ms={} required_decoded_audio_ms={} expected_duration_ms={} observer_wall_clock_elapsed_ms={} decoded_audio_to_wall_clock_ratio_ppm={} min_ratio_ppm={} max_ratio_ppm={} non_silent_audio_ms={} required_non_silent_audio_ms={} rtp_gap_count_gte_100ms={} unclassified_rtp_gap_count_gte_100ms={} rtp_fast_interval_count={} unclassified_rtp_fast_interval_count={} rtp_fast_interval_min_ms={} rtp_fast_interval_min_us={} observer_anomalies={:?} decoded_audio_tempo_window_count={} decoded_audio_tempo_window_post_source_buffer_count={} decoded_audio_tempo_window_min_ratio_ppm={} decoded_audio_tempo_window_max_ratio_ppm={} decoded_audio_tempo_window_fast_count={} decoded_audio_tempo_window_fastest_ratio_ppm={} decoded_audio_tempo_window_slow_count={} decoded_audio_tempo_window_slowest_ratio_ppm={} decoded_audio_short_tempo_window_count={} decoded_audio_short_tempo_window_fast_count={} decoded_audio_short_tempo_window_slow_count={} decoded_audio_short_tempo_window_fastest={:?} decoded_audio_short_tempo_window_slowest={:?} rtp_p95_ms={} rtp_p99_ms={} rtp_max_ms={})",
             stats.observed_packet_count,
             stats.decoded_audio_ms,
             required_decoded_audio_ms,
@@ -1539,9 +1700,20 @@ fn observer_threshold_error(
             stats.non_silent_audio_ms,
             MIN_NON_SILENT_AUDIO_MS,
             stats.rtp_gap_count_gte_100ms,
+            unclassified_observer_anomaly_count(
+                stats,
+                "rtp_gap_gte_100ms",
+                stats.rtp_gap_count_gte_100ms,
+            ),
             stats.rtp_fast_interval_count,
+            unclassified_observer_anomaly_count(
+                stats,
+                "rtp_fast_interval",
+                stats.rtp_fast_interval_count,
+            ),
             stats.rtp_fast_interval_min_ms,
             stats.rtp_fast_interval_min_us,
+            stats.observer_anomalies,
             stats.decoded_audio_tempo_window_count,
             stats.decoded_audio_tempo_window_post_source_buffer_count,
             stats.decoded_audio_tempo_window_min_ratio_ppm,
@@ -1550,6 +1722,11 @@ fn observer_threshold_error(
             stats.decoded_audio_tempo_window_fastest_ratio_ppm,
             stats.decoded_audio_tempo_window_slow_count,
             stats.decoded_audio_tempo_window_slowest_ratio_ppm,
+            stats.decoded_audio_short_tempo_window_count,
+            stats.decoded_audio_short_tempo_window_fast_count,
+            stats.decoded_audio_short_tempo_window_slow_count,
+            stats.decoded_audio_short_tempo_window_fastest,
+            stats.decoded_audio_short_tempo_window_slowest,
             stats.rtp_inter_arrival.p95_ms,
             stats.rtp_inter_arrival.p99_ms,
             stats.rtp_inter_arrival.max_ms,
@@ -1636,8 +1813,9 @@ async fn wait_for_play_completed_contract_with_controls(
             state.mark_invalid_resume_ignored();
             update_live_contract_snapshot(&snapshot, &state);
 
-            let pause_proof = start_observer_pause_proof(&observer_proof_tx).await?;
+            let mut pause_proof = start_observer_pause_proof(&observer_proof_tx).await?;
             let pause_started_at = Instant::now();
+            begin_observer_pause_proof(&mut pause_proof)?;
             controls
                 .pause()
                 .await
@@ -1727,11 +1905,16 @@ async fn request_observer_speaking_started_proof(
 
 async fn start_observer_pause_proof(
     observer_proof_tx: &mpsc::Sender<ObserverAudioProofCommand>,
-) -> Result<oneshot::Receiver<Result<ObserverPauseProof>>> {
+) -> Result<PendingObserverPauseProof> {
     let (armed, armed_rx) = oneshot::channel();
+    let (begin, begin_rx) = oneshot::channel();
     let (respond_to, response) = oneshot::channel();
     observer_proof_tx
-        .send(ObserverAudioProofCommand::Pause { armed, respond_to })
+        .send(ObserverAudioProofCommand::Pause {
+            armed,
+            begin: begin_rx,
+            respond_to,
+        })
         .await
         .context("request observer Pause proof")?;
     timeout(Duration::from_secs(5), armed_rx)
@@ -1739,15 +1922,32 @@ async fn start_observer_pause_proof(
         .context("timed out arming observer Pause proof")?
         .context("observer Pause proof task ended before arming")?;
 
-    Ok(response)
+    Ok(PendingObserverPauseProof {
+        begin: Some(begin),
+        response,
+    })
+}
+
+fn begin_observer_pause_proof(proof: &mut PendingObserverPauseProof) -> Result<()> {
+    let begin = proof
+        .begin
+        .take()
+        .context("observer Pause proof was already begun")?;
+    begin
+        .send(())
+        .map_err(|_| anyhow!("observer audio task ended before Pause proof began"))
 }
 
 async fn await_observer_pause_proof(
-    response: oneshot::Receiver<Result<ObserverPauseProof>>,
+    proof: PendingObserverPauseProof,
 ) -> Result<ObserverPauseProof> {
+    if proof.begin.is_some() {
+        bail!("observer Pause proof was awaited before Pause began");
+    }
+
     timeout(
         OBSERVER_SPEAKING_STATE_TIMEOUT + PAUSE_OBSERVER_SILENCE_DURATION + Duration::from_secs(5),
-        response,
+        proof.response,
     )
     .await
     .context("timed out waiting for observer Pause proof")?
@@ -2913,6 +3113,15 @@ fn validate_raw_send_event_order(metrics: &PlaybackStabilitySnapshot, label: &st
             if event.source_frame_epoch.is_none() || event.source_media_position_ms.is_none() {
                 bail!("{label} raw track send event {index} lacked source-frame identity");
             }
+            if event.media_duration_ms != NATURAL_OPUS_FRAME_DURATION_MS
+                || event.media_duration_samples != NATURAL_OPUS_FRAME_DURATION_SAMPLES
+            {
+                bail!(
+                    "{label} raw track send event {index} had media duration {}ms/{} samples; expected natural Opus frame duration {NATURAL_OPUS_FRAME_DURATION_MS}ms/{NATURAL_OPUS_FRAME_DURATION_SAMPLES} samples",
+                    event.media_duration_ms,
+                    event.media_duration_samples,
+                );
+            }
         } else if event.committed_heard_media {
             bail!("{label} raw non-track send event {index} committed heard media");
         }
@@ -3318,6 +3527,72 @@ fn validate_playback_timing_budget(metrics: &PlaybackStabilitySnapshot, label: &
     if metrics.track_media_to_wall_clock_ratio_ppm == 0 {
         bail!("{label} returned zero track media-to-wall-clock ratio");
     }
+    if metrics.expected_track_frame_count == 0 {
+        bail!("{label} returned zero expected sender frame count");
+    }
+    if metrics.sent_track_frame_count != metrics.track_packet_count {
+        bail!(
+            "{label} sent_track_frame_count was {}; expected track_packet_count {}",
+            metrics.sent_track_frame_count,
+            metrics.track_packet_count
+        );
+    }
+    let expected_silence_frame_count = metrics
+        .continuity_silence_packet_count
+        .max(metrics.scheduled_silence_packet_count);
+    if metrics.silence_frame_count != expected_silence_frame_count {
+        bail!(
+            "{label} silence_frame_count was {}; expected max(continuity_silence_packet_count={}, scheduled_silence_packet_count={}) = {expected_silence_frame_count}",
+            metrics.silence_frame_count,
+            metrics.continuity_silence_packet_count,
+            metrics.scheduled_silence_packet_count
+        );
+    }
+    let expected_deficit = metrics
+        .expected_track_frame_count
+        .saturating_sub(metrics.sent_track_frame_count + metrics.silence_frame_count);
+    if metrics.frame_deficit_count != expected_deficit {
+        bail!(
+            "{label} frame_deficit_count was {}; expected recomputed deficit {expected_deficit} from expected_frames={} sent_track_frames={} silence_frames={}",
+            metrics.frame_deficit_count,
+            metrics.expected_track_frame_count,
+            metrics.sent_track_frame_count,
+            metrics.silence_frame_count
+        );
+    }
+    if metrics.frame_deficit_count != 0 {
+        bail!(
+            "{label} reported {} sender frame deficits (expected_frames={} sent_track_frames={} silence_frames={} dropped_frames={} late_frames={}); expected 0",
+            metrics.frame_deficit_count,
+            metrics.expected_track_frame_count,
+            metrics.sent_track_frame_count,
+            metrics.silence_frame_count,
+            metrics.dropped_frame_count,
+            metrics.late_frame_count
+        );
+    }
+    let expected_dropped_frame_count = metrics
+        .prepared_track_packet_drop_count
+        .saturating_add(metrics.prepared_silence_packet_drop_count)
+        .saturating_add(metrics.egress_dropped_music_frame_count);
+    if metrics.dropped_frame_count != expected_dropped_frame_count {
+        bail!(
+            "{label} dropped_frame_count was {}; expected recomputed dropped frames {expected_dropped_frame_count}",
+            metrics.dropped_frame_count
+        );
+    }
+    if metrics.dropped_frame_count != 0 {
+        bail!(
+            "{label} reported {} dropped sender frames; expected 0",
+            metrics.dropped_frame_count
+        );
+    }
+    if metrics.late_frame_count != 0 {
+        bail!(
+            "{label} reported {} late sender frames; expected 0",
+            metrics.late_frame_count
+        );
+    }
     if metrics.track_media_to_wall_clock_ratio_ppm < MEDIA_TO_WALL_CLOCK_MIN_RATIO_PPM {
         bail!(
             "{label} track media-to-wall-clock ratio was {}ppm; expected >= {MEDIA_TO_WALL_CLOCK_MIN_RATIO_PPM}ppm",
@@ -3385,6 +3660,12 @@ fn validate_playback_timing_budget(metrics: &PlaybackStabilitySnapshot, label: &
         bail!(
             "{label} reported {}ms skipped source duration; expected 0 for steady playback",
             metrics.skipped_source_duration_ms
+        );
+    }
+    if metrics.tempo_rebase_count != 0 {
+        bail!(
+            "{label} reported {} track tempo rebases; expected 0",
+            metrics.tempo_rebase_count
         );
     }
     if metrics.playout_builder_prepare_duration.samples == 0 {
@@ -3506,6 +3787,12 @@ fn validate_playback_timing_budget(metrics: &PlaybackStabilitySnapshot, label: &
         bail!(
             "{label} reported {} source underruns; expected 0",
             metrics.source_underrun_count
+        );
+    }
+    if metrics.source_underrun_reached_builder_count != 0 {
+        bail!(
+            "{label} reported {} source underruns reaching the playout builder; expected 0",
+            metrics.source_underrun_reached_builder_count
         );
     }
     if metrics.source_underrun_reached_deadline_sender_count != 0 {
@@ -3642,6 +3929,7 @@ fn validate_reconnect_probe_metrics(
     if metrics.sender_lateness.samples == 0 {
         bail!("Reconnect rollover probe metrics returned no sender lateness samples");
     }
+    validate_playback_timing_budget(metrics, "Reconnect rollover probe playback")?;
 
     Ok(())
 }
@@ -4002,6 +4290,8 @@ fn build_success_evidence(
         observer_rtp_fast_interval_count: validated.audio_stats.rtp_fast_interval_count,
         observer_rtp_fast_interval_min_ms: validated.audio_stats.rtp_fast_interval_min_ms,
         observer_rtp_fast_interval_min_us: validated.audio_stats.rtp_fast_interval_min_us,
+        observer_anomaly_count: validated.audio_stats.observer_anomalies.len() as u64,
+        observer_anomalies: validated.audio_stats.observer_anomalies.clone(),
         observer_decoded_audio_tempo_window_count: validated
             .audio_stats
             .decoded_audio_tempo_window_count,
@@ -4038,6 +4328,23 @@ fn build_success_evidence(
         observer_decoded_audio_tempo_window_slowest_wall_clock_us: validated
             .audio_stats
             .decoded_audio_tempo_window_slowest_wall_clock_us,
+        observer_decoded_audio_short_tempo_window_count: validated
+            .audio_stats
+            .decoded_audio_short_tempo_window_count,
+        observer_decoded_audio_short_tempo_window_fast_count: validated
+            .audio_stats
+            .decoded_audio_short_tempo_window_fast_count,
+        observer_decoded_audio_short_tempo_window_slow_count: validated
+            .audio_stats
+            .decoded_audio_short_tempo_window_slow_count,
+        observer_decoded_audio_short_tempo_window_fastest: validated
+            .audio_stats
+            .decoded_audio_short_tempo_window_fastest
+            .clone(),
+        observer_decoded_audio_short_tempo_window_slowest: validated
+            .audio_stats
+            .decoded_audio_short_tempo_window_slowest
+            .clone(),
         dave_transition_count_during_playback: validated
             .playback_metrics
             .as_ref()
@@ -4140,6 +4447,10 @@ fn build_failure_evidence(
             .map_or(0, |stats| stats.rtp_fast_interval_min_ms),
         observer_rtp_fast_interval_min_us: audio_stats
             .map_or(0, |stats| stats.rtp_fast_interval_min_us),
+        observer_anomaly_count: audio_stats
+            .map_or(0, |stats| stats.observer_anomalies.len() as u64),
+        observer_anomalies: audio_stats
+            .map_or_else(Vec::new, |stats| stats.observer_anomalies.clone()),
         observer_decoded_audio_tempo_window_count: audio_stats
             .map_or(0, |stats| stats.decoded_audio_tempo_window_count),
         observer_decoded_audio_tempo_window_post_source_buffer_count: audio_stats
@@ -4170,6 +4481,16 @@ fn build_failure_evidence(
         observer_decoded_audio_tempo_window_slowest_wall_clock_us: audio_stats.map_or(0, |stats| {
             stats.decoded_audio_tempo_window_slowest_wall_clock_us
         }),
+        observer_decoded_audio_short_tempo_window_count: audio_stats
+            .map_or(0, |stats| stats.decoded_audio_short_tempo_window_count),
+        observer_decoded_audio_short_tempo_window_fast_count: audio_stats
+            .map_or(0, |stats| stats.decoded_audio_short_tempo_window_fast_count),
+        observer_decoded_audio_short_tempo_window_slow_count: audio_stats
+            .map_or(0, |stats| stats.decoded_audio_short_tempo_window_slow_count),
+        observer_decoded_audio_short_tempo_window_fastest: audio_stats
+            .and_then(|stats| stats.decoded_audio_short_tempo_window_fastest.clone()),
+        observer_decoded_audio_short_tempo_window_slowest: audio_stats
+            .and_then(|stats| stats.decoded_audio_short_tempo_window_slowest.clone()),
         dave_transition_count_during_playback: snapshot
             .and_then(|value| value.playback_metrics.as_ref())
             .map_or(0, |metrics| metrics.dave_transition_count_during_playback),
@@ -4476,6 +4797,12 @@ mod tests {
             track_media_duration_sent_ms: 2_880,
             track_wall_clock_elapsed_ms: 2_880,
             track_media_to_wall_clock_ratio_ppm: 1_000_000,
+            expected_track_frame_count: 144,
+            sent_track_frame_count: 144,
+            silence_frame_count: 0,
+            frame_deficit_count: 0,
+            dropped_frame_count: 0,
+            late_frame_count: 0,
             track_tempo_window_count: 95,
             track_tempo_window_min_ratio_ppm: 1_000_000,
             track_tempo_window_max_ratio_ppm: 1_000_000,
@@ -4505,6 +4832,22 @@ mod tests {
             gateway_event_drain_duration: duration_stats(144, 0, 1, 2, 0, 2),
             ..PlaybackStabilitySnapshot::default()
         }
+    }
+
+    fn assert_playback_timing_budget_rejects(
+        mutate: impl FnOnce(&mut PlaybackStabilitySnapshot),
+        expected_message: &str,
+    ) {
+        let mut metrics = valid_playback_timing_snapshot();
+        mutate(&mut metrics);
+
+        let error = validate_playback_timing_budget(&metrics, "finished playback")
+            .expect_err("playback timing budget should reject the mutated metrics");
+
+        assert!(
+            error.to_string().contains(expected_message),
+            "expected error to contain `{expected_message}`, got: {error}"
+        );
     }
 
     #[test]
@@ -4606,15 +4949,8 @@ mod tests {
     #[test]
     fn reconnect_probe_metrics_require_reconnect_counter() {
         let metrics = PlaybackStabilitySnapshot {
-            available: true,
-            video_id: Some("video".to_owned()),
-            track_packet_count: 1,
-            sender_lateness: discord_voice_service_twilight::DurationStatsSnapshot {
-                samples: 1,
-                ..Default::default()
-            },
             reconnect_interruptions: 1,
-            ..Default::default()
+            ..valid_playback_timing_snapshot()
         };
         validate_reconnect_probe_metrics(&metrics, "video").unwrap();
 
@@ -4625,6 +4961,22 @@ mod tests {
         let error = validate_reconnect_probe_metrics(&without_reconnect, "video").unwrap_err();
         assert!(
             error.to_string().contains("reconnect interruption"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn reconnect_probe_metrics_apply_strict_playback_budget() {
+        let metrics = PlaybackStabilitySnapshot {
+            reconnect_interruptions: 1,
+            expected_track_frame_count: 145,
+            frame_deficit_count: 1,
+            ..valid_playback_timing_snapshot()
+        };
+
+        let error = validate_reconnect_probe_metrics(&metrics, "video").unwrap_err();
+        assert!(
+            error.to_string().contains("sender frame deficits"),
             "unexpected error: {error}"
         );
     }
@@ -4911,9 +5263,7 @@ mod tests {
 
         let error = validate_playback_timing_budget(&metrics, "finished playback").unwrap_err();
         assert!(
-            error
-                .to_string()
-                .contains("prepared_track_packet_drop_count"),
+            error.to_string().contains("dropped_frame_count"),
             "unexpected error: {error}"
         );
     }
@@ -4930,6 +5280,181 @@ mod tests {
             error
                 .to_string()
                 .contains("rolling tempo aggregate disagreed with raw send events"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn playback_timing_budget_rejects_tempo_rebase_count() {
+        let metrics = PlaybackStabilitySnapshot {
+            tempo_rebase_count: 1,
+            ..valid_playback_timing_snapshot()
+        };
+
+        let error = validate_playback_timing_budget(&metrics, "finished playback").unwrap_err();
+        assert!(
+            error.to_string().contains("track tempo rebases"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn playback_timing_budget_rejects_named_sender_anomaly_counters() {
+        assert_playback_timing_budget_rejects(
+            |metrics| metrics.track_fast_interval_count = 1,
+            "shortened local track intervals",
+        );
+        assert_playback_timing_budget_rejects(
+            |metrics| {
+                metrics.track_tempo_window_fast_count = 1;
+                metrics.track_tempo_window_max_ratio_ppm = MEDIA_TO_WALL_CLOCK_MAX_RATIO_PPM + 1;
+            },
+            "faster-than-real-time rolling tempo windows",
+        );
+        assert_playback_timing_budget_rejects(
+            |metrics| {
+                metrics.track_tempo_window_slow_count = 1;
+                metrics.track_tempo_window_min_ratio_ppm = MEDIA_TO_WALL_CLOCK_MIN_RATIO_PPM - 1;
+            },
+            "slower-than-real-time rolling tempo windows",
+        );
+        assert_playback_timing_budget_rejects(
+            |metrics| metrics.scheduler_late_reset_count = 1,
+            "scheduler-late media clock resets",
+        );
+        assert_playback_timing_budget_rejects(
+            |metrics| metrics.source_underrun_count = 1,
+            "source underruns",
+        );
+        assert_playback_timing_budget_rejects(
+            |metrics| metrics.source_underrun_reached_builder_count = 1,
+            "source underruns reaching the playout builder",
+        );
+        assert_playback_timing_budget_rejects(
+            |metrics| metrics.source_underrun_reached_deadline_sender_count = 1,
+            "source underruns reaching the deadline sender",
+        );
+        assert_playback_timing_budget_rejects(|metrics| metrics.rebuffer_count = 1, "rebuffers");
+        assert_playback_timing_budget_rejects(
+            |metrics| metrics.continuity_silence_packet_count = 1,
+            "silence_frame_count was 0; expected max",
+        );
+        assert_playback_timing_budget_rejects(
+            |metrics| {
+                metrics.inserted_silence_duration_ms = 20;
+                metrics.egress_inserted_silence_duration_ms = 20;
+            },
+            "inserted silence during playback",
+        );
+        assert_playback_timing_budget_rejects(
+            |metrics| {
+                metrics.scheduled_silence_packet_count = 1;
+                metrics.silence_frame_count = 1;
+                let last = metrics
+                    .raw_send_events
+                    .last()
+                    .expect("valid snapshot should include raw send events")
+                    .clone();
+                metrics.raw_send_events.push(
+                    discord_voice_service_twilight::PlaybackSendEventSnapshot {
+                        packet_index: last.packet_index + 1,
+                        command_kind: PlaybackSendCommandKind::ScheduledSilence,
+                        expected_deadline_offset_us: last.expected_deadline_offset_us + 20_000,
+                        send_started_offset_us: last.send_started_offset_us + 20_000,
+                        sent_offset_us: last.sent_offset_us + 20_000,
+                        media_duration_ms: NATURAL_OPUS_FRAME_DURATION_MS,
+                        media_duration_samples: NATURAL_OPUS_FRAME_DURATION_SAMPLES,
+                        rtp_sequence: (last.rtp_sequence + 1) & 0xffff,
+                        rtp_timestamp: last.rtp_timestamp.wrapping_add(last.media_duration_samples),
+                        protection_nonce: last.protection_nonce.map(|nonce| nonce + 1),
+                        source_frame_epoch: None,
+                        source_media_position_ms: None,
+                        source_media_byte_position: None,
+                        committed_heard_media: false,
+                    },
+                );
+            },
+            "scheduled silence packets during steady playback",
+        );
+        assert_playback_timing_budget_rejects(
+            |metrics| metrics.late_frame_count = 1,
+            "late sender frames",
+        );
+    }
+
+    #[test]
+    fn playback_timing_budget_rejects_sender_frame_deficits_and_drops() {
+        assert_playback_timing_budget_rejects(
+            |metrics| {
+                metrics.expected_track_frame_count = metrics.expected_track_frame_count + 1;
+                metrics.frame_deficit_count = 1;
+            },
+            "sender frame deficits",
+        );
+        assert_playback_timing_budget_rejects(
+            |metrics| {
+                metrics.prepared_track_packet_drop_count = 1;
+                metrics.dropped_frame_count = 1;
+            },
+            "dropped sender frames",
+        );
+        assert_playback_timing_budget_rejects(
+            |metrics| {
+                metrics.egress_dropped_music_frame_count = 1;
+                metrics.egress_dropped_music_duration_ms = 20;
+                metrics.dropped_frame_count = 1;
+            },
+            "dropped sender frames",
+        );
+        assert_playback_timing_budget_rejects(
+            |metrics| {
+                metrics.discarded_source_frame_count = 1;
+                metrics.discarded_source_duration_ms = 20;
+            },
+            "discarded source frames",
+        );
+    }
+
+    #[test]
+    fn playback_timing_budget_rejects_skipped_source_frames_and_speed_like_durations() {
+        assert_playback_timing_budget_rejects(
+            |metrics| {
+                metrics.raw_send_events[42].source_media_position_ms = metrics.raw_send_events[42]
+                    .source_media_position_ms
+                    .map(|position| {
+                        position
+                            + NATURAL_OPUS_FRAME_DURATION_MS
+                            + SOURCE_POSITION_CONTINUITY_TOLERANCE_MS
+                            + 1
+                    });
+                metrics.skipped_source_frame_count = 1;
+                metrics.skipped_source_duration_ms =
+                    NATURAL_OPUS_FRAME_DURATION_MS + SOURCE_POSITION_CONTINUITY_TOLERANCE_MS + 1;
+            },
+            "skipped source frames",
+        );
+        assert_playback_timing_budget_rejects(
+            |metrics| {
+                let event = &mut metrics.raw_send_events[10];
+                event.media_duration_ms = 10;
+                event.media_duration_samples = 480;
+            },
+            "expected natural Opus frame duration",
+        );
+    }
+
+    #[test]
+    fn playback_timing_budget_rejects_source_underrun_reset_count() {
+        let metrics = PlaybackStabilitySnapshot {
+            source_underrun_reset_count: 1,
+            ..valid_playback_timing_snapshot()
+        };
+
+        let error = validate_playback_timing_budget(&metrics, "finished playback").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("source-underrun media clock resets"),
             "unexpected error: {error}"
         );
     }
@@ -5170,7 +5695,7 @@ mod tests {
     fn observer_thresholds_require_audio_near_expected_duration() {
         let expected_duration_ms = 180_000;
         let required_decoded_audio_ms = required_observer_decoded_audio_ms(expected_duration_ms);
-        assert_eq!(required_decoded_audio_ms, 162_000);
+        assert_eq!(required_decoded_audio_ms, 178_000);
 
         let short_stats = AudioValidationStats {
             observed_packet_count: 700,
@@ -5195,6 +5720,9 @@ mod tests {
             decoded_audio_tempo_window_max_ratio_ppm: 1_000_000,
             decoded_audio_tempo_window_fast_count: 0,
             decoded_audio_tempo_window_slow_count: 0,
+            decoded_audio_short_tempo_window_count: 16_100,
+            decoded_audio_short_tempo_window_fast_count: 0,
+            decoded_audio_short_tempo_window_slow_count: 0,
             rtp_inter_arrival: crate::audio::AudioIntervalStats {
                 samples: 8_099,
                 p50_ms: 20,
@@ -5234,7 +5762,7 @@ mod tests {
             decoded_audio_tempo_window_max_ratio_ppm: 1_000_000,
             ..full_stats.clone()
         };
-        assert!(observer_thresholds_satisfied(
+        assert!(!observer_thresholds_satisfied(
             &local_fast_interval_with_stable_ratio,
             expected_duration_ms,
         ));
@@ -5261,8 +5789,35 @@ mod tests {
             },
             ..full_stats.clone()
         };
-        assert!(observer_thresholds_satisfied(
+        assert!(!observer_thresholds_satisfied(
             &isolated_observer_gap_stats,
+            expected_duration_ms,
+        ));
+
+        let controlled_pause_gap_stats = AudioValidationStats {
+            rtp_gap_count_gte_100ms: 1,
+            observer_anomalies: vec![crate::audio::AudioObserverAnomaly {
+                kind: "rtp_gap_gte_100ms".to_owned(),
+                classification: "controlled_pause".to_owned(),
+                sequence: Some(10),
+                previous_sequence: Some(9),
+                interval_ms: 3_000,
+                interval_us: 3_000_000,
+                expected_duration_ms: 20,
+                expected_duration_us: 20_000,
+            }],
+            rtp_inter_arrival: crate::audio::AudioIntervalStats {
+                samples: 8_099,
+                p50_ms: 20,
+                p95_ms: 26,
+                p99_ms: 31,
+                min_ms: 1,
+                max_ms: 104,
+            },
+            ..full_stats.clone()
+        };
+        assert!(observer_thresholds_satisfied(
+            &controlled_pause_gap_stats,
             expected_duration_ms,
         ));
 
@@ -5717,7 +6272,12 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
         let mut request = tokio::spawn(async move { start_observer_pause_proof(&tx).await });
 
-        let Some(ObserverAudioProofCommand::Pause { armed, respond_to }) = rx.recv().await else {
+        let Some(ObserverAudioProofCommand::Pause {
+            armed,
+            mut begin,
+            respond_to,
+        }) = rx.recv().await
+        else {
             panic!("expected Pause proof request");
         };
 
@@ -5729,7 +6289,15 @@ mod tests {
         );
 
         armed.send(()).unwrap();
-        let response = request.await.unwrap().unwrap();
+        let mut proof = request.await.unwrap().unwrap();
+        assert!(
+            timeout(Duration::from_millis(50), &mut begin)
+                .await
+                .is_err(),
+            "Pause proof request must not begin when it is only armed"
+        );
+        begin_observer_pause_proof(&mut proof).unwrap();
+        begin.await.unwrap();
         respond_to
             .send(Ok(ObserverPauseProof {
                 silence_ms: duration_ms(PAUSE_OBSERVER_SILENCE_DURATION),
@@ -5737,13 +6305,130 @@ mod tests {
                 rtp_silence_observed: true,
             }))
             .unwrap();
-        let proof = response.await.unwrap().unwrap();
+        let proof = await_observer_pause_proof(proof).await.unwrap();
 
         assert!(proof.gateway_speaking_stopped);
         assert!(proof.rtp_silence_observed);
         assert_eq!(
             proof.silence_ms,
             duration_ms(PAUSE_OBSERVER_SILENCE_DURATION)
+        );
+    }
+
+    #[tokio::test]
+    async fn pause_proof_arm_window_records_pre_pause_audio_before_begin() {
+        let fake = FakeDiscordPeer::spawn_real_shape().await;
+        let voice = fake.voice_context("1", "2", "observer-1", "session-1", "token-1");
+        let mut session = ObservedVoiceSession::connect(voice).await.unwrap();
+        fake.send_speaking("speaker-1", 42).await.unwrap();
+        session
+            .receive_speaking_state_from("speaker-1", 1, Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        let mut accumulator = AudioValidationAccumulator::new();
+        let snapshot = Arc::new(Mutex::new(None));
+        let mut audio_started = None;
+        let (begin, begin_rx) = oneshot::channel();
+
+        let proof_begin = async {
+            wait_for_observer_pause_proof_begin(
+                &mut session,
+                "speaker-1",
+                &mut accumulator,
+                &snapshot,
+                &mut audio_started,
+                begin_rx,
+            )
+            .await
+        };
+        let send_pre_pause_audio = async {
+            let mode = fake.encryption_mode().await.unwrap();
+            let secret_key = fake.secret_key().await.unwrap();
+            let protection = ProtectionContext::new(mode, secret_key).unwrap();
+            let rtp = RtpPacketBuilder::new(42);
+            for sequence in 0..2u16 {
+                let header = rtp.build_header(sequence, u32::from(sequence) * 960);
+                let packet = protection
+                    .protect_packet(&header, &OPUS_SILENCE_FRAME)
+                    .unwrap();
+                fake.send_raw_udp_packet(&packet).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(120)).await;
+            }
+            begin.send(()).unwrap();
+        };
+        let (arm_result, ()) = tokio::join!(proof_begin, send_pre_pause_audio);
+        let stats = arm_result.unwrap().unwrap();
+
+        assert_eq!(stats.rtp_gap_count_gte_100ms, 1);
+        assert_eq!(stats.observer_anomalies.len(), 1);
+        assert_eq!(stats.observer_anomalies[0].kind, "rtp_gap_gte_100ms");
+        assert_eq!(
+            stats.observer_anomalies[0].classification,
+            "pre_pause_steady_playback"
+        );
+    }
+
+    #[tokio::test]
+    async fn observer_fake_discord_records_stall_then_catch_up_as_pre_pause_anomalies() {
+        let fake = FakeDiscordPeer::spawn_real_shape().await;
+        let voice = fake.voice_context("1", "2", "observer-1", "session-1", "token-1");
+        let mut session = ObservedVoiceSession::connect(voice).await.unwrap();
+        fake.send_speaking("speaker-1", 42).await.unwrap();
+        session
+            .receive_speaking_state_from("speaker-1", 1, Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        let mut accumulator = AudioValidationAccumulator::new();
+        let snapshot = Arc::new(Mutex::new(None));
+        let mut audio_started = None;
+
+        let receive_observer_audio = async {
+            for _ in 0..3 {
+                let frame = session
+                    .receive_audio_frame_from("speaker-1", Duration::from_secs(2))
+                    .await
+                    .unwrap();
+                record_observer_audio_frame(frame, &mut accumulator, &snapshot, &mut audio_started)
+                    .unwrap();
+            }
+            accumulator.stats()
+        };
+        let send_stall_then_catch_up = async {
+            let mode = fake.encryption_mode().await.unwrap();
+            let secret_key = fake.secret_key().await.unwrap();
+            let protection = ProtectionContext::new(mode, secret_key).unwrap();
+            let rtp = RtpPacketBuilder::new(42);
+            for sequence in 0..3u16 {
+                if sequence == 1 {
+                    tokio::time::sleep(Duration::from_millis(120)).await;
+                }
+                let header = rtp.build_header(sequence, u32::from(sequence) * 960);
+                let packet = protection
+                    .protect_packet(&header, &OPUS_SILENCE_FRAME)
+                    .unwrap();
+                fake.send_raw_udp_packet(&packet).await.unwrap();
+            }
+        };
+
+        let (stats, ()) = tokio::join!(receive_observer_audio, send_stall_then_catch_up);
+
+        assert_eq!(stats.rtp_gap_count_gte_100ms, 1);
+        assert_eq!(stats.rtp_fast_interval_count, 1);
+        assert!(stats.rtp_fast_interval_min_us < 20_000);
+        let anomaly_kinds = stats
+            .observer_anomalies
+            .iter()
+            .map(|anomaly| anomaly.kind.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(anomaly_kinds, ["rtp_gap_gte_100ms", "rtp_fast_interval"]);
+        assert!(
+            stats
+                .observer_anomalies
+                .iter()
+                .all(|anomaly| anomaly.classification == "pre_pause_steady_playback"),
+            "fake Discord stall/catch-up anomalies should remain steady-playback evidence: {stats:?}"
         );
     }
 

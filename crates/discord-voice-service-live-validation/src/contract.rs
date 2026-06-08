@@ -17,7 +17,7 @@ use discord_voice_service_twilight::{
     SessionEventKind,
 };
 
-use crate::audio::AudioIntervalStats;
+use crate::audio::{AudioIntervalStats, AudioObserverAnomaly, AudioTempoWindowEvidence};
 
 #[derive(Debug, Clone, Default)]
 pub struct LiveContractState {
@@ -98,6 +98,8 @@ pub struct LiveValidationEvidence {
     pub observer_rtp_fast_interval_count: u64,
     pub observer_rtp_fast_interval_min_ms: u64,
     pub observer_rtp_fast_interval_min_us: u64,
+    pub observer_anomaly_count: u64,
+    pub observer_anomalies: Vec<AudioObserverAnomaly>,
     pub observer_decoded_audio_tempo_window_count: u64,
     pub observer_decoded_audio_tempo_window_post_source_buffer_count: u64,
     pub observer_decoded_audio_tempo_window_min_ratio_ppm: u64,
@@ -110,6 +112,11 @@ pub struct LiveValidationEvidence {
     pub observer_decoded_audio_tempo_window_slowest_ratio_ppm: u64,
     pub observer_decoded_audio_tempo_window_slowest_media_ms: u64,
     pub observer_decoded_audio_tempo_window_slowest_wall_clock_us: u64,
+    pub observer_decoded_audio_short_tempo_window_count: u64,
+    pub observer_decoded_audio_short_tempo_window_fast_count: u64,
+    pub observer_decoded_audio_short_tempo_window_slow_count: u64,
+    pub observer_decoded_audio_short_tempo_window_fastest: Option<AudioTempoWindowEvidence>,
+    pub observer_decoded_audio_short_tempo_window_slowest: Option<AudioTempoWindowEvidence>,
     pub dave_transition_count_during_playback: u64,
     pub playback_metrics: Option<PlaybackStabilityEvidence>,
     pub reconnect_probe_metrics: Option<PlaybackStabilityEvidence>,
@@ -220,6 +227,12 @@ pub struct PlaybackStabilityEvidence {
     pub skipped_source_frame_count: u64,
     pub skipped_source_duration_ms: u64,
     pub tempo_rebase_count: u64,
+    pub expected_track_frame_count: u64,
+    pub sent_track_frame_count: u64,
+    pub silence_frame_count: u64,
+    pub frame_deficit_count: u64,
+    pub dropped_frame_count: u64,
+    pub late_frame_count: u64,
     pub all_packet_interval: PlaybackDurationStatsEvidence,
     pub sender_lateness: PlaybackDurationStatsEvidence,
     pub max_consecutive_late_packets: u64,
@@ -467,6 +480,12 @@ impl From<&TwilightPlaybackStabilitySnapshot> for PlaybackStabilityEvidence {
             skipped_source_frame_count: value.skipped_source_frame_count,
             skipped_source_duration_ms: value.skipped_source_duration_ms,
             tempo_rebase_count: value.tempo_rebase_count,
+            expected_track_frame_count: value.expected_track_frame_count,
+            sent_track_frame_count: value.sent_track_frame_count,
+            silence_frame_count: value.silence_frame_count,
+            frame_deficit_count: value.frame_deficit_count,
+            dropped_frame_count: value.dropped_frame_count,
+            late_frame_count: value.late_frame_count,
             all_packet_interval: (&value.all_packet_interval).into(),
             sender_lateness: (&value.sender_lateness).into(),
             max_consecutive_late_packets: value.max_consecutive_late_packets,

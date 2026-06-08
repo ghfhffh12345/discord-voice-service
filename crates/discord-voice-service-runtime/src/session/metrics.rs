@@ -8,6 +8,7 @@ use tokio::time::Instant;
 
 const FIRST_INTERVAL_SAMPLE_LIMIT: usize = 10;
 const LATE_PACKET_THRESHOLD: Duration = Duration::from_millis(5);
+const OPUS_FRAME_DURATION_MS: u64 = 20;
 const TRACK_TEMPO_WINDOW_PACKETS: usize = 50;
 const TRACK_POST_SOURCE_BUFFER_MEDIA_MS: u64 = 5_000;
 const MIN_MEDIA_TO_WALL_CLOCK_RATIO_PPM: u64 = 980_000;
@@ -233,6 +234,12 @@ pub struct PlaybackStabilitySnapshot {
     pub skipped_source_frame_count: u64,
     pub skipped_source_duration_ms: u64,
     pub tempo_rebase_count: u64,
+    pub expected_track_frame_count: u64,
+    pub sent_track_frame_count: u64,
+    pub silence_frame_count: u64,
+    pub frame_deficit_count: u64,
+    pub dropped_frame_count: u64,
+    pub late_frame_count: u64,
     pub all_packet_interval: DurationStatsSnapshot,
     pub sender_lateness: DurationStatsSnapshot,
     pub max_consecutive_late_packets: usize,
@@ -342,6 +349,7 @@ pub struct PlaybackStabilitySnapshot {
 pub(crate) enum MediaClockResetReason {
     PauseResume,
     SchedulerLate,
+    SourceUnderrun,
     DaveTransitionRecovery,
 }
 
@@ -486,6 +494,8 @@ pub(crate) struct PlaybackStabilityCollector {
     playout_buffer_low_watermark_count: u64,
     buffer_underrun_count: u64,
     playout_underrun_count: u64,
+    egress_dropped_music_frame_count: u64,
+    egress_dropped_music_duration_ms: u64,
     source_underrun_count: u64,
     rebuffer_count: u64,
     pause_resume_first_intervals_ms: Vec<u64>,
@@ -501,6 +511,7 @@ pub(crate) struct PlaybackStabilityCollector {
     url_reresolve_count: u64,
     max_consecutive_late_packets: usize,
     current_consecutive_late_packets: usize,
+    late_frame_count: u64,
     playout_sender_lateness: Vec<Duration>,
     max_consecutive_playout_late_packets: usize,
     current_consecutive_playout_late_packets: usize,
@@ -629,6 +640,8 @@ impl PlaybackStabilityCollector {
             playout_buffer_low_watermark_count: 0,
             buffer_underrun_count: 0,
             playout_underrun_count: 0,
+            egress_dropped_music_frame_count: 0,
+            egress_dropped_music_duration_ms: 0,
             source_underrun_count: 0,
             rebuffer_count: 0,
             pause_resume_first_intervals_ms: Vec::new(),
@@ -644,6 +657,7 @@ impl PlaybackStabilityCollector {
             url_reresolve_count: 0,
             max_consecutive_late_packets: 0,
             current_consecutive_late_packets: 0,
+            late_frame_count: 0,
             playout_sender_lateness: Vec::new(),
             max_consecutive_playout_late_packets: 0,
             current_consecutive_playout_late_packets: 0,
@@ -914,12 +928,34 @@ impl PlaybackStabilityCollector {
 
     pub(crate) fn record_source_underrun(&mut self, depth: OpusBufferDepth) {
         self.source_underrun_count = self.source_underrun_count.saturating_add(1);
+        self.post_stall_intervals_remaining = FIRST_INTERVAL_SAMPLE_LIMIT;
+        self.post_stall_first_intervals_ms.clear();
         self.record_source_buffer_depth(depth, u64::MAX);
+    }
+
+    pub(crate) fn record_rebuffer(&mut self, depth: OpusBufferDepth, low_watermark_ms: u64) {
+        self.rebuffer_count = self.rebuffer_count.saturating_add(1);
+        self.post_rebuffer_intervals_remaining = FIRST_INTERVAL_SAMPLE_LIMIT;
+        self.post_rebuffer_first_intervals_ms.clear();
+        self.record_source_buffer_depth(depth, low_watermark_ms);
     }
 
     pub(crate) fn record_playout_underrun(&mut self, depth: OpusBufferDepth) {
         self.playout_underrun_count = self.playout_underrun_count.saturating_add(1);
         self.record_playout_buffer_depth(depth, u64::MAX);
+    }
+
+    pub(crate) fn record_egress_dropped_music_frames(
+        &mut self,
+        frame_count: u64,
+        duration_ms: u64,
+    ) {
+        self.egress_dropped_music_frame_count = self
+            .egress_dropped_music_frame_count
+            .saturating_add(frame_count);
+        self.egress_dropped_music_duration_ms = self
+            .egress_dropped_music_duration_ms
+            .saturating_add(duration_ms);
     }
 
     pub(crate) fn record_speaking_prepare_duration(&mut self, duration: Duration) {
@@ -968,6 +1004,13 @@ impl PlaybackStabilityCollector {
                 self.scheduler_late_reset_count = self.scheduler_late_reset_count.saturating_add(1);
                 self.controlled_media_interruption_count =
                     self.controlled_media_interruption_count.saturating_add(1);
+            }
+            MediaClockResetReason::SourceUnderrun => {
+                self.source_underrun_reset_count =
+                    self.source_underrun_reset_count.saturating_add(1);
+                self.controlled_media_interruption_count =
+                    self.controlled_media_interruption_count.saturating_add(1);
+                self.reset_active_track_tempo_window();
             }
             MediaClockResetReason::DaveTransitionRecovery => {
                 self.dave_transition_recovery_reset_count =
@@ -1024,6 +1067,7 @@ impl PlaybackStabilityCollector {
         self.sender_lateness.push(lateness);
         self.playout_sender_lateness.push(lateness);
         if lateness > LATE_PACKET_THRESHOLD {
+            self.late_frame_count = self.late_frame_count.saturating_add(1);
             self.current_consecutive_late_packets =
                 self.current_consecutive_late_packets.saturating_add(1);
             self.max_consecutive_late_packets = self
@@ -1184,6 +1228,18 @@ impl PlaybackStabilityCollector {
         ended: bool,
     ) -> PlaybackStabilitySnapshot {
         let track_wall_clock_elapsed_ms = self.track_wall_clock_elapsed_ms();
+        let expected_track_frame_count =
+            expected_frame_count_for_wall_clock(track_wall_clock_elapsed_ms);
+        let sent_track_frame_count = self.track_packet_count as u64;
+        let silence_frame_count = u64::try_from(self.continuity_silence_packet_count)
+            .unwrap_or(u64::MAX)
+            .max(self.scheduled_silence_packet_count);
+        let dropped_frame_count = self
+            .prepared_track_packet_drop_count
+            .saturating_add(self.prepared_silence_packet_drop_count)
+            .saturating_add(self.egress_dropped_music_frame_count);
+        let frame_deficit_count =
+            expected_track_frame_count.saturating_sub(sent_track_frame_count + silence_frame_count);
         let track_media_to_wall_clock_ratio_ppm = media_to_wall_clock_ratio_ppm(
             self.track_media_duration_sent_ms,
             track_wall_clock_elapsed_ms,
@@ -1233,6 +1289,12 @@ impl PlaybackStabilityCollector {
             skipped_source_frame_count: self.skipped_source_frame_count,
             skipped_source_duration_ms: self.skipped_source_duration_ms,
             tempo_rebase_count: self.tempo_rebase_count,
+            expected_track_frame_count,
+            sent_track_frame_count,
+            silence_frame_count,
+            frame_deficit_count,
+            dropped_frame_count,
+            late_frame_count: self.late_frame_count,
             all_packet_interval: DurationStatsSnapshot::from_samples(&self.all_packet_intervals),
             sender_lateness: DurationStatsSnapshot::from_samples(&self.sender_lateness),
             max_consecutive_late_packets: self.max_consecutive_late_packets,
@@ -1304,8 +1366,8 @@ impl PlaybackStabilityCollector {
             playout_underrun_count: self.playout_underrun_count,
             egress_underrun_count: self.playout_underrun_count,
             egress_inserted_silence_duration_ms: self.inserted_silence_duration_ms,
-            egress_dropped_music_frame_count: 0,
-            egress_dropped_music_duration_ms: 0,
+            egress_dropped_music_frame_count: self.egress_dropped_music_frame_count,
+            egress_dropped_music_duration_ms: self.egress_dropped_music_duration_ms,
             source_underrun_count: self.source_underrun_count,
             rebuffer_count: self.rebuffer_count,
             refill_duration: DurationStatsSnapshot::from_samples(&self.refill_durations),
@@ -1440,6 +1502,13 @@ fn duration_micros(duration: Duration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
+fn expected_frame_count_for_wall_clock(wall_clock_elapsed_ms: u64) -> u64 {
+    if wall_clock_elapsed_ms == 0 {
+        return 0;
+    }
+    wall_clock_elapsed_ms.div_ceil(OPUS_FRAME_DURATION_MS)
+}
+
 fn media_to_wall_clock_ratio_ppm(media_duration_ms: u64, wall_clock_elapsed_ms: u64) -> u64 {
     if media_duration_ms == 0 || wall_clock_elapsed_ms == 0 {
         return 0;
@@ -1517,6 +1586,9 @@ mod tests {
             snapshot_for_offsets(&offsets_for_window_wall_clock(Duration::from_millis(900)));
 
         assert_eq!(snapshot.track_tempo_window_count, 1);
+        assert_eq!(snapshot.expected_track_frame_count, 45);
+        assert_eq!(snapshot.sent_track_frame_count, 50);
+        assert_eq!(snapshot.frame_deficit_count, 0);
         assert_eq!(snapshot.track_tempo_window_fast_count, 1);
         assert_eq!(snapshot.track_tempo_window_slow_count, 0);
         assert!(snapshot.track_tempo_window_fastest_ratio_ppm > MAX_MEDIA_TO_WALL_CLOCK_RATIO_PPM);
@@ -1530,6 +1602,9 @@ mod tests {
             snapshot_for_offsets(&offsets_for_window_wall_clock(Duration::from_millis(1_100)));
 
         assert_eq!(snapshot.track_tempo_window_count, 1);
+        assert_eq!(snapshot.expected_track_frame_count, 55);
+        assert_eq!(snapshot.sent_track_frame_count, 50);
+        assert_eq!(snapshot.frame_deficit_count, 5);
         assert_eq!(snapshot.track_tempo_window_fast_count, 0);
         assert_eq!(snapshot.track_tempo_window_slow_count, 1);
         assert!(snapshot.track_tempo_window_slowest_ratio_ppm < MIN_MEDIA_TO_WALL_CLOCK_RATIO_PPM);
@@ -1563,6 +1638,83 @@ mod tests {
         assert_eq!(snapshot.track_tempo_window_slow_count, 0);
         assert_eq!(snapshot.track_tempo_window_min_ratio_ppm, 1_000_000);
         assert_eq!(snapshot.track_tempo_window_max_ratio_ppm, 1_000_000);
+        assert_eq!(snapshot.expected_track_frame_count, 50);
+        assert_eq!(snapshot.sent_track_frame_count, 50);
+        assert_eq!(snapshot.frame_deficit_count, 0);
+    }
+
+    #[test]
+    fn frame_accounting_counts_silence_drops_and_late_frames() {
+        let mut collector = collector();
+        let start = Instant::now();
+        let mut sent_at = start;
+
+        for index in 0..10 {
+            if index > 0 {
+                sent_at += Duration::from_millis(20);
+            }
+            let expected_deadline = if index == 5 {
+                sent_at - Duration::from_millis(6)
+            } else {
+                sent_at
+            };
+            collector.record_track_packet(expected_deadline, sent_at, sent_at, 20, false);
+        }
+
+        sent_at += Duration::from_millis(20);
+        collector.record_send_event(PlaybackSendEventRecord {
+            packet_index: 10,
+            command_kind: PlaybackSendCommandKind::ScheduledSilence,
+            expected_deadline: sent_at,
+            send_started_at: sent_at,
+            sent_at,
+            media_duration_ms: 20,
+            media_duration_samples: 960,
+            rtp_sequence: 10,
+            rtp_timestamp: 9_600,
+            protection_nonce: Some(10),
+            source_frame_epoch: None,
+            source_media_position_ms: None,
+            source_media_byte_position: None,
+            committed_heard_media: false,
+        });
+        collector.record_continuity_silence_packet(sent_at, 20);
+        collector.prepared_track_packet_drop_count = 1;
+        collector.record_egress_dropped_music_frames(2, 40);
+
+        let snapshot = collector.snapshot(0, 0, 0, false);
+        assert_eq!(snapshot.expected_track_frame_count, 10);
+        assert_eq!(snapshot.sent_track_frame_count, 10);
+        assert_eq!(snapshot.silence_frame_count, 1);
+        assert_eq!(snapshot.frame_deficit_count, 0);
+        assert_eq!(snapshot.dropped_frame_count, 3);
+        assert_eq!(snapshot.egress_dropped_music_frame_count, 2);
+        assert_eq!(snapshot.egress_dropped_music_duration_ms, 40);
+        assert_eq!(snapshot.late_frame_count, 1);
+    }
+
+    #[test]
+    fn source_underrun_rebuffer_and_reset_metrics_are_published() {
+        let mut collector = collector();
+        let empty_depth = OpusBufferDepth::default();
+        let resumed_depth = OpusBufferDepth {
+            packets: 5,
+            bytes: 2_560,
+            duration_ms: 100,
+            duration_samples: 4_800,
+        };
+
+        collector.record_source_underrun(empty_depth);
+        collector.record_media_clock_reset(MediaClockResetReason::SourceUnderrun);
+        collector.record_rebuffer(resumed_depth, 300);
+
+        let snapshot = collector.snapshot(0, 0, 0, false);
+        assert_eq!(snapshot.source_underrun_count, 1);
+        assert_eq!(snapshot.source_underrun_reset_count, 1);
+        assert_eq!(snapshot.rebuffer_count, 1);
+        assert_eq!(snapshot.current_source_buffer_depth.duration_ms, 100);
+        assert_eq!(snapshot.source_buffer_low_watermark_count, 1);
+        assert_eq!(snapshot.controlled_media_interruption_count, 1);
     }
 
     #[test]

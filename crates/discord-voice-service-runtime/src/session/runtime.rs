@@ -587,6 +587,10 @@ enum PlaybackPipelineMetric {
         duration_ms: u64,
         remaining_depth: OpusBufferDepth,
     },
+    EgressDroppedMusicFrames {
+        frame_count: u64,
+        duration_ms: u64,
+    },
     SenderSourceUnderrun {
         depth: OpusBufferDepth,
     },
@@ -1541,9 +1545,15 @@ impl VoiceSessionRuntime {
                                 state.position_ms = position_ms;
                             }
                         }
+                        PlaybackPipelineMetric::EgressDroppedMusicFrames {
+                            frame_count,
+                            duration_ms,
+                        } => {
+                            metrics.record_egress_dropped_music_frames(frame_count, duration_ms);
+                        }
                         PlaybackPipelineMetric::SenderResumedAfterSourceUnderrun { depth } => {
                             latest_source_depth = depth;
-                            metrics.record_source_buffer_depth(
+                            metrics.record_rebuffer(
                                 depth,
                                 PLAYBACK_SOURCE_BUFFER_LOW_WATERMARK_MS,
                             );
@@ -2710,7 +2720,6 @@ impl LiveMediaDriver {
         pending_deadline_commands: &mut VecDeque<PendingDeadlineCommand>,
         reason: PreparedPlayoutQueueEventReason,
     ) -> Result<(), RuntimeError> {
-        self.session.prepare_speaking_before_media().await?;
         let packet = self
             .session
             .prepare_current_slot_audio_packet(Bytes::from_static(&SILENCE_FRAME), 960)?;
@@ -2789,6 +2798,12 @@ impl LiveMediaDriver {
             })
             .count();
 
+        if pending_recovery_silence < DAVE_RECOVERY_DEADLINE_AHEAD_PACKETS
+            && deadline_sender.available_command_capacity() > 0
+        {
+            self.session.prepare_speaking_before_media().await?;
+        }
+
         while pending_recovery_silence < DAVE_RECOVERY_DEADLINE_AHEAD_PACKETS
             && deadline_sender.available_command_capacity() > 0
         {
@@ -2814,6 +2829,12 @@ impl LiveMediaDriver {
                 pending.kind == PreparedPacketKind::ScheduledSilence && pending.frame.is_none()
             })
             .count();
+
+        if pending_source_silence < SOURCE_UNDERRUN_DEADLINE_AHEAD_PACKETS
+            && deadline_sender.available_command_capacity() > 0
+        {
+            self.session.prepare_speaking_before_media().await?;
+        }
 
         while pending_source_silence < SOURCE_UNDERRUN_DEADLINE_AHEAD_PACKETS
             && deadline_sender.available_command_capacity() > 0
@@ -2954,6 +2975,14 @@ impl LiveMediaDriver {
             }
             if source_ended && current_source_depth(&self.source_buffer).await?.packets > 0 {
                 source_ended = false;
+            }
+
+            if dave_recovery_active {
+                self.fill_dave_recovery_silence_deadline_queue(
+                    &mut deadline_sender,
+                    &mut pending_deadline_commands,
+                )
+                .await?;
             }
 
             let expected_deadline = if dave_recovery_active {
@@ -3122,6 +3151,16 @@ impl LiveMediaDriver {
                             .try_send(PlaybackPipelineMetric::SenderSourceUnderrun {
                                 depth: latest_source_depth,
                             });
+                    let _ =
+                        self.metrics_tx
+                            .try_send(PlaybackPipelineMetric::SenderMediaClockReset {
+                                reason: MediaClockResetReason::SourceUnderrun,
+                            });
+                    let _ =
+                        self.metrics_tx
+                            .try_send(PlaybackPipelineMetric::ExplicitMediaBoundary {
+                                reason: PreparedPlayoutQueueEventReason::SourceUnderrun,
+                            });
                     let _ = self
                         .metrics_tx
                         .try_send(PlaybackPipelineMetric::SourceUnderrunReachedBuilder);
@@ -3240,6 +3279,13 @@ impl LiveMediaDriver {
                 frame,
             };
             let rebuild_reason = self.take_rebuild_credit(&prepared.frame);
+            let yield_after_controlled_rebuild = matches!(
+                rebuild_reason,
+                Some(
+                    PreparedPlayoutQueueEventReason::DaveTransitionRecovery
+                        | PreparedPlayoutQueueEventReason::SourceUnderrun
+                )
+            );
             let event_kind = rebuild_reason
                 .map(|_| PreparedPlayoutQueueEventKind::Rebuilt)
                 .unwrap_or(PreparedPlayoutQueueEventKind::Enqueued);
@@ -3261,6 +3307,9 @@ impl LiveMediaDriver {
                 .try_send(PlaybackPipelineMetric::PlayoutBuilderPrepared {
                     duration: prepare_duration,
                 });
+            if yield_after_controlled_rebuild {
+                tokio::task::yield_now().await;
+            }
             latest_source_depth = self
                 .refill_egress_buffer(
                     source_ended,
@@ -3332,6 +3381,12 @@ impl LiveMediaDriver {
                         },
                     );
                 }
+                let _ =
+                    self.metrics_tx
+                        .try_send(PlaybackPipelineMetric::EgressDroppedMusicFrames {
+                            frame_count: 1,
+                            duration_ms: frame.duration_ms,
+                        });
                 let _ = self
                     .metrics_tx
                     .try_send(PlaybackPipelineMetric::DiscardedSourceFrames {
@@ -3430,6 +3485,12 @@ impl LiveMediaDriver {
                 .metrics_tx
                 .try_send(PlaybackPipelineMetric::DiscardedSourceFrames {
                     reason,
+                    frame_count: discarded_count,
+                    duration_ms: discarded_duration_ms,
+                });
+            let _ = self
+                .metrics_tx
+                .try_send(PlaybackPipelineMetric::EgressDroppedMusicFrames {
                     frame_count: discarded_count,
                     duration_ms: discarded_duration_ms,
                 });
@@ -3540,6 +3601,12 @@ impl LiveMediaDriver {
                                 frame_count: 1,
                                 duration_ms: frame.duration_ms,
                                 remaining_depth,
+                            },
+                        );
+                        let _ = self.metrics_tx.try_send(
+                            PlaybackPipelineMetric::EgressDroppedMusicFrames {
+                                frame_count: 1,
+                                duration_ms: frame.duration_ms,
                             },
                         );
                     }

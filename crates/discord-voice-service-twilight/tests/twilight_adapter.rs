@@ -269,6 +269,12 @@ fn proto_playback_metrics_convert_to_typed_snapshot() {
         skipped_source_frame_count: 0,
         skipped_source_duration_ms: 0,
         tempo_rebase_count: 2,
+        expected_track_frame_count: 63,
+        sent_track_frame_count: 60,
+        silence_frame_count: 2,
+        frame_deficit_count: 1,
+        dropped_frame_count: 2,
+        late_frame_count: 3,
         all_packet_interval: Some(proto::DurationStatsSnapshot {
             samples: 60,
             p50_ms: 20,
@@ -567,6 +573,12 @@ fn proto_playback_metrics_convert_to_typed_snapshot() {
     assert_eq!(snapshot.skipped_source_frame_count, 0);
     assert_eq!(snapshot.skipped_source_duration_ms, 0);
     assert_eq!(snapshot.tempo_rebase_count, 2);
+    assert_eq!(snapshot.expected_track_frame_count, 63);
+    assert_eq!(snapshot.sent_track_frame_count, 60);
+    assert_eq!(snapshot.silence_frame_count, 2);
+    assert_eq!(snapshot.frame_deficit_count, 1);
+    assert_eq!(snapshot.dropped_frame_count, 2);
+    assert_eq!(snapshot.late_frame_count, 3);
     assert_eq!(snapshot.all_packet_interval.samples, 60);
     assert_eq!(snapshot.sender_lateness.p99_ms, 8);
     assert_eq!(snapshot.current_buffer_depth.duration_samples, 7680);

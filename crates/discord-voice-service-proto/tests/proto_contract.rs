@@ -75,6 +75,12 @@ fn generated_control_messages_expose_expected_fields() {
         skipped_source_frame_count: 0,
         skipped_source_duration_ms: 0,
         tempo_rebase_count: 0,
+        expected_track_frame_count: 52,
+        sent_track_frame_count: 50,
+        silence_frame_count: 2,
+        frame_deficit_count: 0,
+        dropped_frame_count: 1,
+        late_frame_count: 3,
         current_buffer_depth: Some(PlaybackBufferDepthSnapshot {
             packets: 10,
             bytes: 4096,
@@ -333,6 +339,12 @@ fn generated_control_messages_expose_expected_fields() {
     assert_eq!(metrics.track_tempo_window_max_ratio_ppm, 1_000_000);
     assert_eq!(metrics.track_tempo_window_fast_count, 0);
     assert_eq!(metrics.track_tempo_window_slow_count, 0);
+    assert_eq!(metrics.expected_track_frame_count, 52);
+    assert_eq!(metrics.sent_track_frame_count, 50);
+    assert_eq!(metrics.silence_frame_count, 2);
+    assert_eq!(metrics.frame_deficit_count, 0);
+    assert_eq!(metrics.dropped_frame_count, 1);
+    assert_eq!(metrics.late_frame_count, 3);
     assert_eq!(
         metrics
             .current_buffer_depth
@@ -452,6 +464,12 @@ fn control_proto_exposes_update_voice_context_and_reason_codes() {
     assert!(proto.contains("PlaybackBufferDepthSnapshot current_source_buffer_depth = 34;"));
     assert!(proto.contains("uint64 source_buffer_target_ms = 37;"));
     assert!(proto.contains("PlaybackQueueDepthStatsSnapshot source_buffer_depth = 132;"));
+    assert!(proto.contains("uint64 expected_track_frame_count = 133;"));
+    assert!(proto.contains("uint64 sent_track_frame_count = 134;"));
+    assert!(proto.contains("uint64 silence_frame_count = 135;"));
+    assert!(proto.contains("uint64 frame_deficit_count = 136;"));
+    assert!(proto.contains("uint64 dropped_frame_count = 137;"));
+    assert!(proto.contains("uint64 late_frame_count = 138;"));
     assert!(proto.contains("uint64 rebuffer_count = 39;"));
     assert!(proto.contains("PlaybackBufferDepthSnapshot current_playout_buffer_depth = 40;"));
     assert!(proto.contains("uint64 playout_underrun_count = 44;"));

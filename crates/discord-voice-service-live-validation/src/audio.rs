@@ -14,6 +14,7 @@ const OBSERVER_GAP_THRESHOLD: Duration = Duration::from_millis(100);
 // wider window than the local sender metrics while still requiring consecutive
 // packets and catching sustained 18ms/22ms tempo drift.
 const OBSERVER_TEMPO_WINDOW_PACKETS: usize = 250;
+const OBSERVER_SHORT_TEMPO_WINDOW_PACKETS: [usize; 2] = [25, 50];
 const OBSERVER_POST_SOURCE_BUFFER_AUDIO_MS: u64 = 5_000;
 const MIN_MEDIA_TO_WALL_CLOCK_RATIO_PPM: u64 = 980_000;
 const MAX_MEDIA_TO_WALL_CLOCK_RATIO_PPM: u64 = 1_020_000;
@@ -41,6 +42,7 @@ pub struct AudioValidationStats {
     pub rtp_fast_interval_count: u64,
     pub rtp_fast_interval_min_ms: u64,
     pub rtp_fast_interval_min_us: u64,
+    pub observer_anomalies: Vec<AudioObserverAnomaly>,
     pub decoded_audio_tempo_window_count: u64,
     pub decoded_audio_tempo_window_post_source_buffer_count: u64,
     pub decoded_audio_tempo_window_min_ratio_ppm: u64,
@@ -53,6 +55,11 @@ pub struct AudioValidationStats {
     pub decoded_audio_tempo_window_slowest_ratio_ppm: u64,
     pub decoded_audio_tempo_window_slowest_media_ms: u64,
     pub decoded_audio_tempo_window_slowest_wall_clock_us: u64,
+    pub decoded_audio_short_tempo_window_count: u64,
+    pub decoded_audio_short_tempo_window_fast_count: u64,
+    pub decoded_audio_short_tempo_window_slow_count: u64,
+    pub decoded_audio_short_tempo_window_fastest: Option<AudioTempoWindowEvidence>,
+    pub decoded_audio_short_tempo_window_slowest: Option<AudioTempoWindowEvidence>,
     pub max_peak_amplitude: f32,
     pub rms_amplitude: f32,
     pub first_sequence: Option<u16>,
@@ -69,6 +76,48 @@ pub struct AudioIntervalStats {
     pub max_ms: u64,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct AudioObserverAnomaly {
+    pub kind: String,
+    pub classification: String,
+    pub sequence: Option<u16>,
+    pub previous_sequence: Option<u16>,
+    pub interval_ms: u64,
+    pub interval_us: u64,
+    pub expected_duration_ms: u64,
+    pub expected_duration_us: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct AudioTempoWindowEvidence {
+    pub classification: String,
+    pub window_packet_count: u64,
+    pub media_ms: u64,
+    pub wall_clock_us: u64,
+    pub ratio_ppm: u64,
+    pub first_sequence: u16,
+    pub last_sequence: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObserverPlaybackSegment {
+    PrePauseSteady,
+    ControlledPause,
+    PostResumeSteady,
+    NaturalEndDrain,
+}
+
+impl ObserverPlaybackSegment {
+    fn label(self) -> &'static str {
+        match self {
+            Self::PrePauseSteady => "pre_pause_steady_playback",
+            Self::ControlledPause => "controlled_pause",
+            Self::PostResumeSteady => "post_resume_steady_playback",
+            Self::NaturalEndDrain => "natural_end_drain",
+        }
+    }
+}
+
 pub struct AudioValidationAccumulator {
     mono_decoder: Option<OpusDecoder>,
     stereo_decoder: Option<OpusDecoder>,
@@ -83,6 +132,7 @@ pub struct AudioValidationAccumulator {
     last_packet_sequence: Option<u16>,
     inter_arrivals: Vec<Duration>,
     observed_packet_timings: Vec<ObservedPacketTiming>,
+    segment: ObserverPlaybackSegment,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -90,6 +140,7 @@ struct ObservedPacketTiming {
     observed_at: Instant,
     duration: Duration,
     decoded_audio_start_ms: u64,
+    sequence: u16,
 }
 
 impl AudioValidationAccumulator {
@@ -108,6 +159,7 @@ impl AudioValidationAccumulator {
             last_packet_sequence: None,
             inter_arrivals: Vec::new(),
             observed_packet_timings: Vec::new(),
+            segment: ObserverPlaybackSegment::PrePauseSteady,
         }
     }
 
@@ -201,7 +253,7 @@ impl AudioValidationAccumulator {
         self.stats.max_peak_amplitude = self.stats.max_peak_amplitude.max(packet_peak);
         self.stats.first_sequence.get_or_insert(packet.sequence);
         self.stats.last_sequence = Some(packet.sequence);
-        self.record_inter_arrival(observed_at, packet_duration);
+        self.record_inter_arrival(observed_at, packet_duration, packet.sequence);
         self.last_packet_duration = Some(packet_duration);
         self.last_packet_duration_samples = Some(declared_duration.samples);
         self.last_packet_timestamp = Some(packet.timestamp);
@@ -210,8 +262,9 @@ impl AudioValidationAccumulator {
             observed_at,
             duration: packet_duration,
             decoded_audio_start_ms,
+            sequence: packet.sequence,
         });
-        self.record_latest_decoded_audio_tempo_window();
+        self.record_latest_decoded_audio_tempo_windows();
 
         self.total_squared_amplitude += packet_square_sum;
         self.total_samples += pcm.len();
@@ -219,11 +272,27 @@ impl AudioValidationAccumulator {
         Ok(self.stats())
     }
 
-    fn record_inter_arrival(&mut self, observed_at: Instant, current_packet_duration: Duration) {
+    fn record_inter_arrival(
+        &mut self,
+        observed_at: Instant,
+        current_packet_duration: Duration,
+        sequence: u16,
+    ) {
+        let previous_sequence = self.last_packet_sequence;
         if let Some(previous) = self.last_observed_at.replace(observed_at) {
             let interval = observed_at.saturating_duration_since(previous);
             if interval >= OBSERVER_GAP_THRESHOLD {
                 self.stats.rtp_gap_count_gte_100ms += 1;
+                self.stats.observer_anomalies.push(AudioObserverAnomaly {
+                    kind: "rtp_gap_gte_100ms".to_owned(),
+                    classification: self.segment.label().to_owned(),
+                    sequence: Some(sequence),
+                    previous_sequence,
+                    interval_ms: duration_ms(interval),
+                    interval_us: duration_us(interval),
+                    expected_duration_ms: self.last_packet_duration.map_or(0, duration_ms),
+                    expected_duration_us: self.last_packet_duration.map_or(0, duration_us),
+                });
             }
             if let Some(previous_duration) = self.last_packet_duration
                 && interval + LOCAL_OBSERVER_JITTER_ALLOWANCE < previous_duration
@@ -242,6 +311,16 @@ impl AudioValidationAccumulator {
                 } else {
                     self.stats.rtp_fast_interval_min_us.min(interval_us)
                 };
+                self.stats.observer_anomalies.push(AudioObserverAnomaly {
+                    kind: "rtp_fast_interval".to_owned(),
+                    classification: self.segment.label().to_owned(),
+                    sequence: Some(sequence),
+                    previous_sequence,
+                    interval_ms,
+                    interval_us,
+                    expected_duration_ms: duration_ms(previous_duration),
+                    expected_duration_us: duration_us(previous_duration),
+                });
             }
             if let Some(previous_duration) = self.last_packet_duration {
                 self.active_wall_clock_elapsed = self
@@ -283,7 +362,14 @@ impl AudioValidationAccumulator {
         Ok(())
     }
 
-    fn record_latest_decoded_audio_tempo_window(&mut self) {
+    fn record_latest_decoded_audio_tempo_windows(&mut self) {
+        for window_packet_count in OBSERVER_SHORT_TEMPO_WINDOW_PACKETS {
+            self.record_latest_short_decoded_audio_tempo_window(window_packet_count);
+        }
+        self.record_latest_long_decoded_audio_tempo_window();
+    }
+
+    fn record_latest_long_decoded_audio_tempo_window(&mut self) {
         if self.observed_packet_timings.len() < OBSERVER_TEMPO_WINDOW_PACKETS {
             return;
         }
@@ -362,6 +448,73 @@ impl AudioValidationAccumulator {
         }
     }
 
+    fn record_latest_short_decoded_audio_tempo_window(&mut self, window_packet_count: usize) {
+        if self.observed_packet_timings.len() < window_packet_count {
+            return;
+        }
+
+        let start = self.observed_packet_timings.len() - window_packet_count;
+        let window = &self.observed_packet_timings[start..];
+        let Some(first) = window.first() else {
+            return;
+        };
+        let Some(last) = window.last() else {
+            return;
+        };
+
+        let media_duration = window
+            .iter()
+            .fold(Duration::ZERO, |total, packet| total + packet.duration);
+        let wall_clock_duration = last
+            .observed_at
+            .saturating_duration_since(first.observed_at)
+            + last.duration;
+        let ratio = media_to_wall_clock_ratio_ppm_duration(media_duration, wall_clock_duration);
+        let evidence = AudioTempoWindowEvidence {
+            classification: self.segment.label().to_owned(),
+            window_packet_count: u64::try_from(window_packet_count).unwrap_or(u64::MAX),
+            media_ms: duration_ms(media_duration),
+            wall_clock_us: duration_us(wall_clock_duration),
+            ratio_ppm: ratio,
+            first_sequence: first.sequence,
+            last_sequence: last.sequence,
+        };
+
+        self.stats.decoded_audio_short_tempo_window_count = self
+            .stats
+            .decoded_audio_short_tempo_window_count
+            .saturating_add(1);
+        if self
+            .stats
+            .decoded_audio_short_tempo_window_fastest
+            .as_ref()
+            .is_none_or(|current| ratio > current.ratio_ppm)
+        {
+            self.stats.decoded_audio_short_tempo_window_fastest = Some(evidence.clone());
+        }
+        if self
+            .stats
+            .decoded_audio_short_tempo_window_slowest
+            .as_ref()
+            .is_none_or(|current| ratio < current.ratio_ppm)
+        {
+            self.stats.decoded_audio_short_tempo_window_slowest = Some(evidence.clone());
+        }
+
+        if ratio > MAX_MEDIA_TO_WALL_CLOCK_RATIO_PPM {
+            self.stats.decoded_audio_short_tempo_window_fast_count = self
+                .stats
+                .decoded_audio_short_tempo_window_fast_count
+                .saturating_add(1);
+        }
+        if ratio < MIN_MEDIA_TO_WALL_CLOCK_RATIO_PPM {
+            self.stats.decoded_audio_short_tempo_window_slow_count = self
+                .stats
+                .decoded_audio_short_tempo_window_slow_count
+                .saturating_add(1);
+        }
+    }
+
     pub fn stats(&self) -> AudioValidationStats {
         let mut stats = self.stats.clone();
         if self.stats.observed_packet_count > 0 {
@@ -385,10 +538,19 @@ impl AudioValidationAccumulator {
         self.observed_packet_timings.clear();
     }
 
+    pub fn start_controlled_pause(&mut self) {
+        self.segment = ObserverPlaybackSegment::ControlledPause;
+    }
+
     pub fn reset_wall_clock_baseline_after_controlled_pause(&mut self) {
         self.last_observed_at = None;
         self.last_packet_duration = None;
         self.observed_packet_timings.clear();
+        self.segment = ObserverPlaybackSegment::PostResumeSteady;
+    }
+
+    pub fn start_natural_end_drain(&mut self) {
+        self.segment = ObserverPlaybackSegment::NaturalEndDrain;
     }
 
     pub fn into_stats(self) -> Result<AudioValidationStats> {
