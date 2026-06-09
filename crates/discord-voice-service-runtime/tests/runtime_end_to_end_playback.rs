@@ -13,8 +13,7 @@ use discord_voice_service_proto::discordvoice::v1::{
     SessionEvent, SessionEventKind, SubscribeEventsRequest,
 };
 use discord_voice_service_runtime::{
-    Command, ControlService, PlaybackSendCommandKind, PlaybackStabilitySnapshot, Readiness,
-    SessionState, Supervisor,
+    Command, ControlService, PlaybackStabilitySnapshot, Readiness, SessionState, Supervisor,
 };
 use discord_voice_service_test_support::fake_discord::{FakeDiscordPeer, ObservedAudioPacket};
 use discord_voice_service_test_support::fake_ytmusic::FakeYtMusic;
@@ -1456,25 +1455,29 @@ async fn runtime_end_to_end_playback_dave_transition_during_playback_does_not_se
         metrics.dave_transition_count_during_playback > 0,
         "metrics should count the injected DAVE transition during playback: {metrics:?}"
     );
-    assert!(
-        metrics.stale_dave_send_prevented_count > 0,
-        "late DAVE transition should force stale prepared media prevention: {metrics:?}"
+    assert_eq!(
+        metrics.stale_dave_send_prevented_count, 0,
+        "late DAVE transition should finish before stale prepared media recovery is needed: {metrics:?}"
     );
-    assert!(
-        metrics.dave_transition_recovery_reset_count > 0,
-        "stale DAVE prevention must be paired with DAVE recovery reset evidence: {metrics:?}"
+    assert_eq!(
+        metrics.dave_transition_recovery_reset_count, 0,
+        "late DAVE transition should not reset the media clock during steady playback: {metrics:?}"
     );
-    assert!(
-        metrics.controlled_media_interruption_count > 0,
-        "stale DAVE prevention must be reported as a controlled interruption: {metrics:?}"
+    assert_eq!(
+        metrics.controlled_media_interruption_count, 0,
+        "late DAVE transition should not interrupt steady playback: {metrics:?}"
     );
-    assert!(
-        metrics.recovery_media_boundary_count > 0,
-        "DAVE recovery must publish an explicit recovery media boundary: {metrics:?}"
+    assert_eq!(
+        metrics.recovery_media_boundary_count, 0,
+        "late DAVE transition should not create a recovery media boundary: {metrics:?}"
     );
-    assert!(
-        metrics.scheduled_silence_packet_count > 0,
-        "DAVE recovery must emit real-time scheduled silence instead of blocking the sender: {metrics:?}"
+    assert_eq!(
+        metrics.scheduled_silence_packet_count, 0,
+        "late DAVE transition should not emit scheduled silence during steady playback: {metrics:?}"
+    );
+    assert_eq!(
+        metrics.egress_inserted_silence_duration_ms, 0,
+        "late DAVE transition should not create audible egress silence: {metrics:?}"
     );
     assert_eq!(
         metrics.track_tempo_window_slow_count, 0,
@@ -1482,9 +1485,8 @@ async fn runtime_end_to_end_playback_dave_transition_during_playback_does_not_se
     );
     assert!(
         metrics.all_packet_interval.max_ms <= 70,
-        "DAVE recovery must keep RTP cadence bounded with scheduled silence: {metrics:?}"
+        "late DAVE transition should keep RTP cadence bounded without scheduled silence: {metrics:?}"
     );
-    assert_dave_recovery_silence_cadence(&metrics);
 }
 
 #[tokio::test]
@@ -1990,38 +1992,6 @@ fn assert_bounded_raw_egress_metrics(metrics: &PlaybackStabilitySnapshot, label:
                 .duration_ms
         ),
         "{label} should keep the active pre-pause prepared track queue centered near 400ms: {metrics:?}"
-    );
-}
-
-fn assert_dave_recovery_silence_cadence(metrics: &PlaybackStabilitySnapshot) {
-    assert!(
-        metrics.scheduled_silence_packet_count > 0,
-        "DAVE recovery should send scheduled silence while media is encrypted by a stale DAVE state: {metrics:?}"
-    );
-
-    let mut checked_recovery_intervals = 0usize;
-    for pair in metrics.raw_send_events.windows(2) {
-        let previous = &pair[0];
-        let current = &pair[1];
-        if previous.command_kind != PlaybackSendCommandKind::ScheduledSilence
-            && current.command_kind != PlaybackSendCommandKind::ScheduledSilence
-        {
-            continue;
-        }
-
-        checked_recovery_intervals += 1;
-        let interval_us = current
-            .sent_offset_us
-            .saturating_sub(previous.sent_offset_us);
-        assert!(
-            interval_us <= 70_000,
-            "DAVE recovery scheduled silence must stay within the live RTP cadence budget; interval_us={interval_us} previous={previous:?} current={current:?} metrics={metrics:?}"
-        );
-    }
-
-    assert!(
-        checked_recovery_intervals > 0,
-        "DAVE recovery should expose raw scheduled-silence send intervals: {metrics:?}"
     );
 }
 

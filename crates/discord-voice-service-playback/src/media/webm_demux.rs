@@ -7,12 +7,15 @@ use webm_iterable::errors::{TagIteratorError, WebmCoercionError};
 use webm_iterable::matroska_spec::{Block, Frame, Master, MatroskaSpec, SimpleBlock};
 
 use crate::error::PlaybackError;
-use crate::media::opus_queue::{OpusPacketDuration, opus_packet_duration};
+use crate::media::opus_queue::{
+    OPUS_SAMPLE_RATE_HZ, OpusPacketDuration, duration_ms_from_samples, opus_packet_duration,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DemuxedPacket {
     pub data: Bytes,
     pub timestamp_ms: u64,
+    pub timestamp_samples: u64,
     pub duration_ms: u64,
     pub duration_samples: u32,
 }
@@ -227,36 +230,45 @@ impl WebmDemuxState {
             "unsupported opus packet duration",
         ))?;
 
-        let mut timestamp_ms = self.block_timestamp_ms(relative_timestamp)?;
+        let mut timestamp_samples = self.block_timestamp_samples(relative_timestamp)?;
         let mut packets = Vec::with_capacity(frames.len());
 
         for (frame, duration) in frames.into_iter().zip(durations) {
             packets.push(DemuxedPacket {
                 data: Bytes::copy_from_slice(frame.data),
-                timestamp_ms,
+                timestamp_ms: duration_ms_from_samples(timestamp_samples),
+                timestamp_samples,
                 duration_ms: duration.ms,
                 duration_samples: duration.samples,
             });
-            timestamp_ms = timestamp_ms.saturating_add(duration.ms);
+            timestamp_samples = timestamp_samples.saturating_add(u64::from(duration.samples));
         }
 
         Ok(packets)
     }
 
-    fn block_timestamp_ms(&self, relative_timestamp: i16) -> Result<u64, PlaybackError> {
+    fn block_timestamp_samples(&self, relative_timestamp: i16) -> Result<u64, PlaybackError> {
         let total_ticks = i128::from(self.cluster_timestamp) + i128::from(relative_timestamp);
         if total_ticks < 0 {
             return Err(PlaybackError::MediaParse("negative block timestamp"));
         }
 
-        self.scale_timestamp_to_ms(total_ticks as u64)
+        self.scale_timestamp_to_samples(total_ticks as u64)
     }
 
-    fn scale_timestamp_to_ms(&self, ticks: u64) -> Result<u64, PlaybackError> {
+    fn scale_timestamp_to_samples(&self, ticks: u64) -> Result<u64, PlaybackError> {
         let scaled = u128::from(ticks)
             .checked_mul(u128::from(self.timestamp_scale_ns))
             .ok_or(PlaybackError::MediaParse("timestamp overflow"))?;
-        Ok((scaled / 1_000_000) as u64)
+        let samples = scaled
+            .checked_mul(u128::from(OPUS_SAMPLE_RATE_HZ))
+            .ok_or(PlaybackError::MediaParse("timestamp overflow"))?
+            .checked_add(500_000_000)
+            .ok_or(PlaybackError::MediaParse("timestamp overflow"))?
+            / 1_000_000_000;
+        samples
+            .try_into()
+            .map_err(|_| PlaybackError::MediaParse("timestamp overflow"))
     }
 
     fn is_target_track(&self, track_number: u64) -> bool {
@@ -282,6 +294,45 @@ mod tests {
     use super::*;
 
     use discord_voice_service_test_support::fixtures::load_fixture_bytes;
+
+    #[test]
+    fn laced_fractional_packets_advance_timestamp_samples_exactly() {
+        let frames = vec![
+            Frame { data: &[0x80] },
+            Frame {
+                data: &[0xF8, 0xFF, 0xFE],
+            },
+            Frame { data: &[0x80] },
+        ];
+        let packets = WebmDemuxState::default()
+            .frames_to_packets(0, frames)
+            .expect("fractional opus frames should demux");
+
+        assert_eq!(packets.len(), 3);
+        assert_eq!(packets[0].timestamp_samples, 0);
+        assert_eq!(packets[0].timestamp_ms, 0);
+        assert_eq!(packets[0].duration_samples, 120);
+        assert_eq!(packets[0].duration_ms, 2);
+        assert_eq!(packets[1].timestamp_samples, 120);
+        assert_eq!(packets[1].timestamp_ms, 2);
+        assert_eq!(packets[1].duration_samples, 960);
+        assert_eq!(packets[1].duration_ms, 20);
+        assert_eq!(packets[2].timestamp_samples, 1_080);
+        assert_eq!(packets[2].timestamp_ms, 22);
+        assert_eq!(packets[2].duration_samples, 120);
+        assert_eq!(packets[2].duration_ms, 2);
+    }
+
+    #[test]
+    fn block_timestamp_scale_rounds_to_nearest_opus_sample() {
+        let state = WebmDemuxState {
+            timestamp_scale_ns: 31_250,
+            cluster_timestamp: 1,
+            opus_track: None,
+        };
+
+        assert_eq!(state.block_timestamp_samples(0).unwrap(), 2);
+    }
 
     #[test]
     fn demux_does_not_retain_completed_audio_prefix() {

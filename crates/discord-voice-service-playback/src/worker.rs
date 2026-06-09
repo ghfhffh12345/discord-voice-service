@@ -1,9 +1,9 @@
 use super::ytmusic_client::YtMusicClient;
 use crate::error::PlaybackError;
-use crate::media::opus_queue::{OpusFrame, OpusFrameQueue};
+use crate::media::opus_queue::{OpusFrame, OpusFrameQueue, samples_from_duration_ms_u64};
 use crate::media::position::{PlaybackPosition, SharedPlaybackPosition, shared_playback_position};
 use crate::media::webm_demux::DemuxedPacket;
-use crate::recovery::{PlaybackRecovery, PlaybackRecoveryMetrics};
+use crate::recovery::{PlaybackRecovery, PlaybackRecoveryMetrics, PlaybackResumePosition};
 use crate::source::PlaybackSource;
 
 const DEFAULT_PREBUFFER_TARGET_MS: u64 = 80;
@@ -34,14 +34,16 @@ impl PlaybackWorker {
             return Err(PlaybackError::BufferFull);
         }
 
-        let resume_position_ms = if self.current_video_id.as_deref() == Some(video_id) {
-            self.position.lock().unwrap().sent_duration_ms()
+        let resume_position = if self.current_video_id.as_deref() == Some(video_id) {
+            PlaybackResumePosition::from_samples(
+                self.position.lock().unwrap().sent_duration_samples(),
+            )
         } else {
             self.position = shared_playback_position(PlaybackPosition::default());
-            0
+            PlaybackResumePosition::default()
         };
 
-        let mut source = self.recovery.recover(video_id, resume_position_ms).await?;
+        let mut source = self.recovery.recover(video_id, resume_position).await?;
         self.position = source.shared_position();
 
         self.fill_queue(&mut source, queue).await?;
@@ -83,8 +85,13 @@ impl PlaybackWorker {
         target_ms: u64,
     ) -> Result<(), PlaybackError> {
         let target_ms = target_ms.max(1);
-        while queue.buffered_duration_ms() < target_ms && !queue.is_full() {
+        let target_samples = samples_from_duration_ms_u64(target_ms);
+        while queue.buffered_samples() < target_samples && !queue.is_full() {
             if let Some(packet) = source.pending_packets_mut().pop_front() {
+                if !packet_fits(queue, &packet) {
+                    source.pending_packets_mut().push_front(packet);
+                    break;
+                }
                 self.buffer_packet(queue, packet)?;
                 continue;
             }
@@ -100,11 +107,19 @@ impl PlaybackWorker {
             };
             tokio::task::yield_now().await;
 
-            for packet in packets {
-                if queue.buffered_duration_ms() < target_ms && !queue.is_full() {
+            let mut packets = packets.into_iter();
+            while let Some(packet) = packets.next() {
+                if queue.buffered_samples() < target_samples && !queue.is_full() {
+                    if !packet_fits(queue, &packet) {
+                        source.pending_packets_mut().push_back(packet);
+                        source.pending_packets_mut().extend(packets);
+                        break;
+                    }
                     self.buffer_packet(queue, packet)?;
                 } else {
                     source.pending_packets_mut().push_back(packet);
+                    source.pending_packets_mut().extend(packets);
+                    break;
                 }
             }
         }
@@ -123,7 +138,11 @@ impl PlaybackWorker {
             packet.duration_ms,
             packet.duration_samples,
         )
-        .with_metadata(packet.timestamp_ms, None, 0);
+        .with_exact_metadata(packet.timestamp_ms, packet.timestamp_samples, None, 0);
         queue.push(frame).map_err(|_| PlaybackError::BufferFull)
     }
+}
+
+fn packet_fits(queue: &OpusFrameQueue, packet: &DemuxedPacket) -> bool {
+    queue.can_fit_resource(packet.data.len(), packet.duration_samples)
 }

@@ -166,6 +166,48 @@ fn audio_validator_reports_non_silence_for_generated_opus_packet() {
 }
 
 #[test]
+fn audio_validator_totals_fractional_packet_duration_from_samples() {
+    let mut encoder =
+        OpusEncoder::new(48_000, 1, Application::RestrictedLowDelay).expect("create opus encoder");
+    let pcm = (0..120)
+        .map(|sample| ((sample as f32) * 0.1).sin() * 0.2)
+        .collect::<Vec<_>>();
+    let mut encoded = vec![0u8; 1500];
+    let encoded_len = encoder
+        .encode(&pcm, 120, &mut encoded)
+        .expect("encode 2.5ms opus packet");
+    encoded.truncate(encoded_len);
+
+    let mut accumulator = AudioValidationAccumulator::new();
+    let start = Instant::now();
+    accumulator
+        .observe_packet_at(
+            ObservedOpusPacket {
+                sequence: 0,
+                timestamp: 0,
+                payload: encoded.as_ref(),
+            },
+            start,
+        )
+        .expect("first 2.5ms packet should decode");
+    let stats = accumulator
+        .observe_packet_at(
+            ObservedOpusPacket {
+                sequence: 1,
+                timestamp: 120,
+                payload: encoded.as_ref(),
+            },
+            start + Duration::from_micros(2_500),
+        )
+        .expect("second 2.5ms packet should decode");
+
+    assert_eq!(stats.observed_packet_count, 2);
+    assert_eq!(stats.decoded_audio_ms, 5);
+    assert_eq!(stats.wall_clock_elapsed_ms, 5);
+    assert_eq!(stats.decoded_audio_to_wall_clock_ratio_ppm, 1_000_000);
+}
+
+#[test]
 fn audio_validator_counts_local_fast_interval_without_whole_window_ratio_gate() {
     let mut demux = WebmOpusDemux::default();
     demux.push_bytes(load_fixture_bytes("audio-itag250.webm"));

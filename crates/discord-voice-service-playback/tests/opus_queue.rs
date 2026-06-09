@@ -1,7 +1,8 @@
 use bytes::Bytes;
 use discord_voice_service_playback::media::opus_queue::{
-    OpusFrame, OpusFrameQueue, opus_packet_duration,
+    OpusFrame, OpusFrameQueue, duration_from_samples, opus_packet_duration,
 };
+use std::time::Duration;
 
 #[test]
 fn opus_packet_duration_reads_samples_from_packet_toc() {
@@ -12,6 +13,19 @@ fn opus_packet_duration_reads_samples_from_packet_toc() {
     assert_eq!(duration.samples, 960);
     assert!(opus_packet_duration(&[]).is_none());
     assert!(opus_packet_duration(&[0x03]).is_none());
+}
+
+#[test]
+fn opus_packet_duration_preserves_fractional_millisecond_samples() {
+    let celt_2_5ms = [0x80];
+    let duration = opus_packet_duration(&celt_2_5ms).expect("2.5ms frame duration");
+
+    assert_eq!(duration.samples, 120);
+    assert_eq!(duration.ms, 2);
+    assert_eq!(
+        duration_from_samples(u64::from(duration.samples)),
+        Duration::from_micros(2_500)
+    );
 }
 
 #[test]
@@ -40,6 +54,31 @@ fn queue_enforces_capacity_and_fifo_order() {
         queue.pop().unwrap(),
         OpusFrame::new(Bytes::from_static(b"b"), 40)
     );
+}
+
+#[test]
+fn queue_depth_uses_samples_instead_of_summing_floored_packet_ms() {
+    let mut queue = OpusFrameQueue::with_resource_limits(4, 16, 5);
+    queue
+        .push(OpusFrame::with_duration_samples(
+            Bytes::from_static(b"a"),
+            2,
+            120,
+        ))
+        .unwrap();
+    queue
+        .push(OpusFrame::with_duration_samples(
+            Bytes::from_static(b"b"),
+            2,
+            120,
+        ))
+        .unwrap();
+
+    let depth = queue.depth();
+    assert_eq!(depth.packets, 2);
+    assert_eq!(depth.duration_samples, 240);
+    assert_eq!(depth.duration_ms, 5);
+    assert!(queue.is_full());
 }
 
 #[test]

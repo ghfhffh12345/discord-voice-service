@@ -7,7 +7,7 @@ use discord_voice_service_test_support::fixtures::{
 use std::time::{Duration, Instant};
 
 use discord_voice_service_playback::YtMusicClient;
-use discord_voice_service_playback::recovery::PlaybackRecovery;
+use discord_voice_service_playback::recovery::{PlaybackRecovery, PlaybackResumePosition};
 
 #[tokio::test]
 async fn recovery_reruns_get_song_and_decipher_when_playable_url_is_stale() {
@@ -20,7 +20,7 @@ async fn recovery_reruns_get_song_and_decipher_when_playable_url_is_stale() {
     let mut recovery =
         PlaybackRecovery::new(YtMusicClient::connect(fake.endpoint()).await.unwrap());
     let start = Instant::now();
-    let result = recovery.recover("video-1", 180).await.unwrap();
+    let result = recovery.recover("video-1", resume_ms(180)).await.unwrap();
 
     assert!(start.elapsed() < Duration::from_secs(2));
     assert!(result.playable_url().starts_with("http://"));
@@ -48,8 +48,8 @@ async fn recovery_reopens_same_video_without_rerunning_resolution() {
 
     let mut recovery =
         PlaybackRecovery::new(YtMusicClient::connect(fake.endpoint()).await.unwrap());
-    recovery.recover("video-1", 0).await.unwrap();
-    recovery.recover("video-1", 180).await.unwrap();
+    recovery.recover("video-1", resume_ms(0)).await.unwrap();
+    recovery.recover("video-1", resume_ms(180)).await.unwrap();
 
     assert_eq!(
         fake.calls()
@@ -75,7 +75,7 @@ async fn recovery_does_not_rerun_resolution_when_open_fails_with_non_stale_http_
 
     let mut recovery =
         PlaybackRecovery::new(YtMusicClient::connect(fake.endpoint()).await.unwrap());
-    let result = recovery.recover("video-1", 180).await;
+    let result = recovery.recover("video-1", resume_ms(180)).await;
 
     assert!(result.is_err());
     assert_eq!(
@@ -102,7 +102,7 @@ async fn recovery_errors_when_requested_position_cannot_be_reached() {
 
     let mut recovery =
         PlaybackRecovery::new(YtMusicClient::connect(fake.endpoint()).await.unwrap());
-    let result = recovery.recover("video-1", 999_999).await;
+    let result = recovery.recover("video-1", resume_ms(999_999)).await;
 
     let err = match result {
         Ok(_) => panic!("recovery should fail when resume point is unreachable"),
@@ -135,7 +135,7 @@ async fn recovery_tolerates_a_slow_but_valid_first_media_chunk() {
 
     let mut recovery =
         PlaybackRecovery::new(YtMusicClient::connect(fake.endpoint()).await.unwrap());
-    let result = recovery.recover("video-1", 0).await.unwrap();
+    let result = recovery.recover("video-1", resume_ms(0)).await.unwrap();
 
     assert!(result.playable_url().starts_with("http://"));
     assert_eq!(
@@ -157,7 +157,7 @@ async fn recovery_tolerates_a_ci_slow_first_media_chunk() {
 
     let mut recovery =
         PlaybackRecovery::new(YtMusicClient::connect(fake.endpoint()).await.unwrap());
-    let result = recovery.recover("video-1", 0).await.unwrap();
+    let result = recovery.recover("video-1", resume_ms(0)).await.unwrap();
 
     assert!(result.playable_url().starts_with("http://"));
     assert_eq!(
@@ -178,7 +178,7 @@ async fn recovery_fails_when_the_first_media_chunk_never_arrives_within_policy()
     let mut recovery =
         PlaybackRecovery::new(YtMusicClient::connect(fake.endpoint()).await.unwrap());
     let err = recovery
-        .recover("video-1", 0)
+        .recover("video-1", resume_ms(0))
         .await
         .map(|_| ())
         .expect_err("open should time out");
@@ -200,4 +200,8 @@ async fn recovery_fails_when_the_first_media_chunk_never_arrives_within_policy()
             .count(),
         2
     );
+}
+
+fn resume_ms(duration_ms: u64) -> PlaybackResumePosition {
+    PlaybackResumePosition::from_millis(duration_ms)
 }

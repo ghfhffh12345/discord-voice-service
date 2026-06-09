@@ -42,7 +42,7 @@ async fn prepare_buffers_real_packets_and_returns_selected_itag() {
     assert!(!queue.is_empty());
 
     let first_packet = queue.pop().expect("queue should contain a packet");
-    source.record_sent_packet(first_packet.duration_ms);
+    source.record_sent_packet_samples(first_packet.duration_samples);
     assert_eq!(
         source.position().sent_duration_ms(),
         first_packet.duration_ms
@@ -62,6 +62,7 @@ async fn fill_queue_to_duration_ms_releases_smaller_producer_batches() {
         .map(|index| DemuxedPacket {
             data: Bytes::from(format!("frame-{index}")),
             timestamp_ms: index * 20,
+            timestamp_samples: index * 960,
             duration_ms: 20,
             duration_samples: 960,
         })
@@ -95,6 +96,123 @@ async fn fill_queue_to_duration_ms_releases_smaller_producer_batches() {
 }
 
 #[tokio::test]
+async fn fill_queue_to_duration_ms_preserves_fractional_source_sample_positions() {
+    let fake_yt = FakeYtMusic::spawn().await;
+    let http = spawn_hanging_server().await;
+    let mut worker = PlaybackWorker::new(
+        YtMusicClient::connect(fake_yt.endpoint())
+            .await
+            .expect("client"),
+    );
+    let pending_packets = VecDeque::from([
+        DemuxedPacket {
+            data: Bytes::from_static(b"frame-a"),
+            timestamp_ms: 0,
+            timestamp_samples: 0,
+            duration_ms: 2,
+            duration_samples: 120,
+        },
+        DemuxedPacket {
+            data: Bytes::from_static(b"frame-b"),
+            timestamp_ms: 2,
+            timestamp_samples: 120,
+            duration_ms: 2,
+            duration_samples: 120,
+        },
+    ]);
+    let mut source = PlaybackSource::new(
+        ResolvedPlaybackSource {
+            selected_itag: 250,
+            playable_url: http.url(),
+            approx_duration_ms: None,
+        },
+        HttpOpusStream::new(http.url()),
+        WebmOpusDemux::default(),
+        pending_packets,
+        shared_playback_position(PlaybackPosition::default()),
+    );
+    let mut queue = OpusFrameQueue::new(10);
+
+    worker
+        .fill_queue_to_duration_ms(&mut source, &mut queue, 5)
+        .await
+        .expect("fractional pending packets should fill without HTTP");
+
+    let depth = queue.depth();
+    assert_eq!(depth.packets, 2);
+    assert_eq!(depth.duration_samples, 240);
+    assert_eq!(depth.duration_ms, 5);
+    assert_eq!(source.pending_packets_mut().len(), 0);
+
+    let first_frame = queue.pop().expect("queue should preserve first frame");
+    let second_frame = queue.pop().expect("queue should preserve second frame");
+    assert_eq!(first_frame.source_position_samples, 0);
+    assert_eq!(second_frame.source_position_samples, 120);
+    assert_eq!(first_frame.duration_samples, 120);
+    assert_eq!(second_frame.duration_samples, 120);
+}
+
+#[tokio::test]
+async fn fill_queue_to_duration_ms_stops_at_fractional_sample_cap_without_buffer_full() {
+    const TARGET_BUFFER_MS: u64 = 5_000;
+    const FRAME_SAMPLES: u32 = 360;
+    const ACCEPTED_FRAMES: usize = 666;
+    const TOTAL_FRAMES: usize = ACCEPTED_FRAMES + 1;
+
+    let fake_yt = FakeYtMusic::spawn().await;
+    let http = spawn_hanging_server().await;
+    let mut worker = PlaybackWorker::new(
+        YtMusicClient::connect(fake_yt.endpoint())
+            .await
+            .expect("client"),
+    );
+    let pending_packets = (0..TOTAL_FRAMES)
+        .map(|index| DemuxedPacket {
+            data: Bytes::from(format!("frame-{index}")),
+            timestamp_ms: (index as u64 * 7_500) / 1_000,
+            timestamp_samples: index as u64 * u64::from(FRAME_SAMPLES),
+            duration_ms: 7,
+            duration_samples: FRAME_SAMPLES,
+        })
+        .collect::<VecDeque<_>>();
+    let mut source = PlaybackSource::new(
+        ResolvedPlaybackSource {
+            selected_itag: 250,
+            playable_url: http.url(),
+            approx_duration_ms: None,
+        },
+        HttpOpusStream::new(http.url()),
+        WebmOpusDemux::default(),
+        pending_packets,
+        shared_playback_position(PlaybackPosition::default()),
+    );
+    let mut queue =
+        OpusFrameQueue::with_resource_limits(TOTAL_FRAMES, 4 * 1024 * 1024, TARGET_BUFFER_MS);
+
+    worker
+        .fill_queue_to_duration_ms(&mut source, &mut queue, TARGET_BUFFER_MS)
+        .await
+        .expect("fractional source fill should stop before overflowing the sample cap");
+
+    let depth = queue.depth();
+    assert_eq!(depth.packets, ACCEPTED_FRAMES);
+    assert_eq!(
+        depth.duration_samples,
+        ACCEPTED_FRAMES as u64 * u64::from(FRAME_SAMPLES)
+    );
+    assert_eq!(depth.duration_ms, 4_995);
+    assert_eq!(source.pending_packets_mut().len(), 1);
+    assert_eq!(
+        source
+            .pending_packets_mut()
+            .front()
+            .unwrap()
+            .timestamp_samples,
+        ACCEPTED_FRAMES as u64 * u64::from(FRAME_SAMPLES)
+    );
+}
+
+#[tokio::test]
 async fn fill_queue_to_duration_ms_can_fill_five_second_source_buffer() {
     const TARGET_BUFFER_MS: u64 = 5_000;
     const FRAME_DURATION_MS: u64 = 20;
@@ -113,6 +231,7 @@ async fn fill_queue_to_duration_ms_can_fill_five_second_source_buffer() {
         .map(|index| DemuxedPacket {
             data: Bytes::from(format!("frame-{index}")),
             timestamp_ms: index as u64 * FRAME_DURATION_MS,
+            timestamp_samples: index as u64 * u64::from(FRAME_SAMPLES),
             duration_ms: FRAME_DURATION_MS,
             duration_samples: FRAME_SAMPLES,
         })
@@ -227,7 +346,7 @@ async fn prepare_preserves_current_track_position_when_recovering_same_video() {
 
     let mut first_source = worker.prepare("video-1", &mut first_queue).await.unwrap();
     let first_packet = first_queue.pop().expect("queue should contain a packet");
-    first_source.record_sent_packet(first_packet.duration_ms);
+    first_source.record_sent_packet_samples(first_packet.duration_samples);
     assert_eq!(
         first_source.position().sent_duration_ms(),
         first_packet.duration_ms
@@ -272,7 +391,7 @@ async fn reset_discards_same_video_resume_state() {
 
     let mut first_source = worker.prepare("video-1", &mut first_queue).await.unwrap();
     let first_packet = first_queue.pop().expect("queue should contain a packet");
-    first_source.record_sent_packet(first_packet.duration_ms);
+    first_source.record_sent_packet_samples(first_packet.duration_samples);
 
     worker.reset();
 

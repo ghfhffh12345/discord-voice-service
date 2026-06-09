@@ -113,6 +113,58 @@ async fn connected_voice_session_accepts_late_local_commit_echo_before_prepare_e
 }
 
 #[tokio::test]
+async fn connected_voice_session_deadline_drain_waits_for_late_dave_execute_within_slot_budget() {
+    let fake = FakeDiscordPeer::spawn_with_established_dave_group().await;
+    let voice = fake.voice_context("1", "2", BOT_USER_ID, "session-1", "token-1");
+    let mut session = ConnectedVoiceSession::connect(voice).await.unwrap();
+    assert!(session.dave_enabled());
+
+    let initial_opus = hex::decode("0dc5aedd5bdc3f20be5697e54dd1f437").unwrap();
+    session
+        .send_audio_frame(Bytes::from(initial_opus.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        fake.decrypt_last_dave_audio_frame_from_creator(BOT_USER_ID)
+            .await
+            .unwrap(),
+        initial_opus
+    );
+
+    fake.inject_late_dave_listener_transition_after_gateway_noise(LATE_LISTENER_USER_ID, 8)
+        .await
+        .unwrap();
+    sleep(Duration::from_millis(25)).await;
+
+    let report = session
+        .prepare_media_state_before_slot(Instant::now() + Duration::from_millis(250))
+        .await
+        .expect("deadline drain should complete a ready late DAVE transition before the slot");
+    assert!(
+        report.dave_transition_count > 0,
+        "deadline drain should report processed DAVE transition events: {report:?}"
+    );
+    assert!(
+        fake.saw_late_dave_transition_ready_within(Duration::from_millis(250))
+            .await,
+        "deadline drain must signal DAVE transition ready"
+    );
+
+    let later_opus = hex::decode("f8b4011b2e11df489afb841af48c").unwrap();
+    let packet = session
+        .prepare_current_slot_audio_packet(Bytes::from(later_opus.clone()), 960)
+        .unwrap();
+    session.send_current_slot_packet(packet).await.unwrap();
+
+    assert_eq!(fake.audio_frame_count_at_least(2).await, 2);
+    let decrypted = fake
+        .decrypt_last_dave_audio_frame_from_late_listener(BOT_USER_ID)
+        .await
+        .unwrap();
+    assert_eq!(decrypted, later_opus);
+}
+
+#[tokio::test]
 async fn connected_voice_session_processes_late_dave_transition_behind_gateway_noise() {
     let fake = FakeDiscordPeer::spawn_with_established_dave_group().await;
     let voice = fake.voice_context("1", "2", BOT_USER_ID, "session-1", "token-1");

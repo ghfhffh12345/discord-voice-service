@@ -334,8 +334,9 @@ async fn prepared_packets_preserve_rtp_duration_timestamps() {
     let mut packets = Vec::new();
     for (payload, duration_ms, duration_samples) in [
         (Bytes::from_static(b"opus-a"), 20, 960),
-        (Bytes::from_static(b"opus-b"), 40, 1_920),
-        (Bytes::from_static(b"opus-c"), 60, 2_880),
+        (Bytes::from_static(b"opus-b"), 2, 120),
+        (Bytes::from_static(b"opus-c"), 7, 360),
+        (Bytes::from_static(b"opus-d"), 5, 240),
     ] {
         let packet = transport
             .prepare_audio_packet_with_duration_samples(
@@ -358,16 +359,16 @@ async fn prepared_packets_preserve_rtp_duration_timestamps() {
             .iter()
             .map(|header| header.sequence)
             .collect::<Vec<_>>(),
-        vec![0, 1, 2]
+        vec![0, 1, 2, 3]
     );
     assert_eq!(
         headers
             .iter()
             .map(|header| header.timestamp)
             .collect::<Vec<_>>(),
-        vec![0, 960, 2_880]
+        vec![0, 960, 1_080, 1_440]
     );
-    assert_eq!(fake.audio_packets(3).await.len(), 3);
+    assert_eq!(fake.audio_packets(4).await.len(), 4);
 }
 
 #[tokio::test]

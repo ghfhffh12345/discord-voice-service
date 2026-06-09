@@ -71,12 +71,12 @@ impl PlaybackSource {
         self.position.clone()
     }
 
-    pub fn record_sent_packet(&mut self, duration_ms: u64) {
+    pub fn record_sent_packet_samples(&mut self, duration_samples: u32) {
         self.sync_position();
         self.position
             .lock()
             .unwrap()
-            .record_sent_packet(duration_ms);
+            .record_sent_packet_samples(duration_samples);
     }
 
     pub fn stream_mut(&mut self) -> &mut HttpOpusStream {

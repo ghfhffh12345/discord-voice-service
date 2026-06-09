@@ -122,6 +122,8 @@ pub struct AudioValidationAccumulator {
     mono_decoder: Option<OpusDecoder>,
     stereo_decoder: Option<OpusDecoder>,
     stats: AudioValidationStats,
+    decoded_audio_duration: Duration,
+    non_silent_audio_duration: Duration,
     total_squared_amplitude: f64,
     total_samples: usize,
     active_wall_clock_elapsed: Duration,
@@ -149,6 +151,8 @@ impl AudioValidationAccumulator {
             mono_decoder: None,
             stereo_decoder: None,
             stats: AudioValidationStats::default(),
+            decoded_audio_duration: Duration::ZERO,
+            non_silent_audio_duration: Duration::ZERO,
             total_squared_amplitude: 0.0,
             total_samples: 0,
             active_wall_clock_elapsed: Duration::ZERO,
@@ -193,7 +197,6 @@ impl AudioValidationAccumulator {
                 packet.sequence
             )
         })?;
-        let duration_ms = declared_duration.ms;
         let packet_duration = Duration::from_nanos(
             u64::from(declared_duration.samples).saturating_mul(1_000_000_000) / 48_000,
         );
@@ -244,11 +247,13 @@ impl AudioValidationAccumulator {
             })
             .sum();
 
-        let decoded_audio_start_ms = self.stats.decoded_audio_ms;
+        let decoded_audio_start_ms = duration_ms(self.decoded_audio_duration);
         self.stats.observed_packet_count += 1;
-        self.stats.decoded_audio_ms += duration_ms;
+        self.decoded_audio_duration = self.decoded_audio_duration.saturating_add(packet_duration);
         if packet_peak > NON_SILENCE_PEAK_THRESHOLD {
-            self.stats.non_silent_audio_ms += duration_ms;
+            self.non_silent_audio_duration = self
+                .non_silent_audio_duration
+                .saturating_add(packet_duration);
         }
         self.stats.max_peak_amplitude = self.stats.max_peak_amplitude.max(packet_peak);
         self.stats.first_sequence.get_or_insert(packet.sequence);
@@ -518,9 +523,13 @@ impl AudioValidationAccumulator {
     pub fn stats(&self) -> AudioValidationStats {
         let mut stats = self.stats.clone();
         if self.stats.observed_packet_count > 0 {
+            stats.decoded_audio_ms = duration_ms(self.decoded_audio_duration);
+            stats.non_silent_audio_ms = duration_ms(self.non_silent_audio_duration);
             stats.wall_clock_elapsed_ms = duration_ms(self.active_wall_clock_elapsed);
-            stats.decoded_audio_to_wall_clock_ratio_ppm =
-                media_to_wall_clock_ratio_ppm(stats.decoded_audio_ms, stats.wall_clock_elapsed_ms);
+            stats.decoded_audio_to_wall_clock_ratio_ppm = media_to_wall_clock_ratio_ppm_duration(
+                self.decoded_audio_duration,
+                self.active_wall_clock_elapsed,
+            );
         }
         stats.rms_amplitude = if self.total_samples == 0 {
             0.0
@@ -605,16 +614,6 @@ fn duration_ms(duration: Duration) -> u64 {
 
 fn duration_us(duration: Duration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
-}
-
-fn media_to_wall_clock_ratio_ppm(media_duration_ms: u64, wall_clock_elapsed_ms: u64) -> u64 {
-    if media_duration_ms == 0 || wall_clock_elapsed_ms == 0 {
-        return 0;
-    }
-
-    ((u128::from(media_duration_ms) * 1_000_000) / u128::from(wall_clock_elapsed_ms))
-        .try_into()
-        .unwrap_or(u64::MAX)
 }
 
 fn media_to_wall_clock_ratio_ppm_duration(

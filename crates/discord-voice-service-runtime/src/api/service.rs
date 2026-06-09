@@ -252,6 +252,7 @@ fn map_playback_stability_snapshot(
         track_tempo_window_slowest_wall_clock_us: snapshot.track_tempo_window_slowest_wall_clock_us,
         skipped_source_frame_count: snapshot.skipped_source_frame_count,
         skipped_source_duration_ms: snapshot.skipped_source_duration_ms,
+        skipped_source_duration_samples: snapshot.skipped_source_duration_samples,
         tempo_rebase_count: snapshot.tempo_rebase_count,
         expected_track_frame_count: snapshot.expected_track_frame_count,
         sent_track_frame_count: snapshot.sent_track_frame_count,
@@ -331,14 +332,19 @@ fn map_playback_stability_snapshot(
             .source_underrun_reached_deadline_sender_count,
         discarded_source_frame_count: snapshot.discarded_source_frame_count,
         discarded_source_duration_ms: snapshot.discarded_source_duration_ms,
+        discarded_source_duration_samples: snapshot.discarded_source_duration_samples,
         stop_discarded_source_frame_count: snapshot.stop_discarded_source_frame_count,
         stop_discarded_source_duration_ms: snapshot.stop_discarded_source_duration_ms,
+        stop_discarded_source_duration_samples: snapshot.stop_discarded_source_duration_samples,
         interruption_discarded_source_frame_count: snapshot
             .interruption_discarded_source_frame_count,
         interruption_discarded_source_duration_ms: snapshot
             .interruption_discarded_source_duration_ms,
+        interruption_discarded_source_duration_samples: snapshot
+            .interruption_discarded_source_duration_samples,
         restored_source_frame_count: snapshot.restored_source_frame_count,
         restored_source_duration_ms: snapshot.restored_source_duration_ms,
+        restored_source_duration_samples: snapshot.restored_source_duration_samples,
         source_buffer_target_ms: snapshot.source_buffer_target_ms,
         adaptive_buffer_target_ms: snapshot.adaptive_buffer_target_ms,
         max_adaptive_buffer_target_ms: snapshot.max_adaptive_buffer_target_ms,
@@ -351,6 +357,7 @@ fn map_playback_stability_snapshot(
         egress_inserted_silence_duration_ms: snapshot.egress_inserted_silence_duration_ms,
         egress_dropped_music_frame_count: snapshot.egress_dropped_music_frame_count,
         egress_dropped_music_duration_ms: snapshot.egress_dropped_music_duration_ms,
+        egress_dropped_music_duration_samples: snapshot.egress_dropped_music_duration_samples,
         rebuffer_count: snapshot.rebuffer_count,
         refill_duration: Some(map_duration_stats(snapshot.refill_duration)),
         producer_stall_duration: Some(map_duration_stats(snapshot.producer_stall_duration)),
@@ -453,6 +460,7 @@ fn map_raw_send_event(event: RuntimePlaybackSendEventSnapshot) -> ProtoPlaybackS
         protection_nonce: event.protection_nonce,
         source_frame_epoch: event.source_frame_epoch,
         source_media_position_ms: event.source_media_position_ms,
+        source_media_position_samples: event.source_media_position_samples,
         source_media_byte_position: event.source_media_byte_position,
         committed_heard_media: event.committed_heard_media,
     }
@@ -498,6 +506,7 @@ fn map_raw_prepared_playout_queue_event(
         protection_nonce: event.protection_nonce,
         source_frame_epoch: event.source_frame_epoch,
         source_media_position_ms: event.source_media_position_ms,
+        source_media_position_samples: event.source_media_position_samples,
         source_media_byte_position: event.source_media_byte_position,
         queue_depth_after: Some(map_buffer_depth(event.queue_depth_after)),
     }

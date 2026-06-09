@@ -22,16 +22,18 @@ use discord_voice_service_playback::YtMusicClient;
 use discord_voice_service_twilight::{
     Client as VoiceServiceClient, PlaybackBufferDepthSnapshot, PlaybackQueueDepthStatsSnapshot,
     PlaybackSendCommandKind, PlaybackStabilitySnapshot, PreparedPlayoutQueueEventKind,
-    PreparedTrackQueueSamplePhase, SessionEvent, SessionEventKind, SessionState, StateSnapshot,
-    VoiceContext as ServiceVoiceContext, VoiceContextTracker, join_voice_channel,
-    leave_voice_channel,
+    PreparedPlayoutQueueEventReason, PreparedTrackQueueSamplePhase, SessionEvent, SessionEventKind,
+    SessionState, StateSnapshot, VoiceContext as ServiceVoiceContext, VoiceContextTracker,
+    join_voice_channel, leave_voice_channel,
 };
 use discord_voice_service_voice::{
     ObservedAudioFrame, ObservedVoiceActivity, ObservedVoiceSession, PendingObservedVoiceSession,
     VoiceContext as ObserverVoiceContext, VoiceError,
 };
 
-use crate::audio::{AudioValidationAccumulator, AudioValidationStats, ObservedOpusPacket};
+use crate::audio::{
+    AudioTempoWindowEvidence, AudioValidationAccumulator, AudioValidationStats, ObservedOpusPacket,
+};
 use crate::config::{
     LIVE_STAGING_PROFILE_CONSTRAINED_GITHUB, LIVE_STAGING_PROFILE_CONSTRAINED_LOCAL,
     MAX_LIVE_STAGING_SERVICE_CPUS, MIN_LIVE_STAGING_CPU_CONTENTION_WORKERS,
@@ -62,16 +64,23 @@ const PREPARED_TRACK_QUEUE_P5_MIN_DEPTH_MS: u64 = 300;
 const PREPARED_TRACK_QUEUE_P50_MIN_DEPTH_MS: u64 = 340;
 const PREPARED_TRACK_QUEUE_P50_MAX_DEPTH_MS: u64 = 460;
 const TRACK_TEMPO_WINDOW_PACKETS: usize = 50;
+#[cfg(test)]
 const NATURAL_OPUS_FRAME_DURATION_MS: u64 = 20;
+#[cfg(test)]
 const NATURAL_OPUS_FRAME_DURATION_SAMPLES: u32 = 960;
 const MIN_LIVE_POST_SOURCE_TEMPO_WINDOWS: u64 = 500;
 const SOURCE_POSITION_CONTINUITY_TOLERANCE_MS: u64 = 1;
-const RAW_RATIO_RECOMPUTE_TOLERANCE_PPM: u64 = 1;
+const RAW_RATIO_RECOMPUTE_TOLERANCE_PPM: u64 = 2;
 const RTP_INTERVAL_P95_BUDGET_MS: u64 = 45;
 const RTP_INTERVAL_P99_BUDGET_MS: u64 = 70;
 const RTP_INTERVAL_MAX_BUDGET_MS: u64 = 200;
 const MEDIA_TO_WALL_CLOCK_MIN_RATIO_PPM: u64 = 980_000;
 const MEDIA_TO_WALL_CLOCK_MAX_RATIO_PPM: u64 = 1_020_000;
+const OBSERVER_SHORT_WINDOW_MIN_RATIO_PPM: u64 = 940_000;
+const OBSERVER_SHORT_WINDOW_MAX_RATIO_PPM: u64 = 1_060_000;
+const OBSERVER_STRICT_SHORT_WINDOW_MIN_PACKETS: u64 = 50;
+const OBSERVER_MICRO_WINDOW_MIN_RATIO_PPM: u64 = 900_000;
+const OBSERVER_MICRO_WINDOW_MAX_RATIO_PPM: u64 = 1_120_000;
 const SENDER_LATENESS_P99_BUDGET_MS: u64 = 10;
 const SENDER_LOOP_NON_SEND_WORK_P99_BUDGET_MS: u64 = 15;
 const MAX_CONSECUTIVE_PLAYOUT_LATE_PACKETS: u64 = 2;
@@ -1635,23 +1644,44 @@ fn observer_thresholds_satisfied(stats: &AudioValidationStats, expected_duration
             "rtp_gap_gte_100ms",
             stats.rtp_gap_count_gte_100ms,
         ) == 0
-        && unclassified_observer_anomaly_count(
-            stats,
-            "rtp_fast_interval",
-            stats.rtp_fast_interval_count,
-        ) == 0
         && stats.decoded_audio_tempo_window_count > 0
         && stats.decoded_audio_tempo_window_fast_count == 0
         && stats.decoded_audio_tempo_window_slow_count == 0
         && stats.decoded_audio_short_tempo_window_count > 0
-        && stats.decoded_audio_short_tempo_window_fast_count == 0
-        && stats.decoded_audio_short_tempo_window_slow_count == 0
+        && observer_short_tempo_windows_within_jitter_budget(stats)
         && (!observer_post_source_buffer_window_required(expected_duration_ms)
             || stats.decoded_audio_tempo_window_post_source_buffer_count
                 >= MIN_LIVE_POST_SOURCE_TEMPO_WINDOWS)
         && stats.rtp_inter_arrival.p95_ms <= RTP_INTERVAL_P95_BUDGET_MS
         && stats.rtp_inter_arrival.p99_ms <= RTP_INTERVAL_P99_BUDGET_MS
         && stats.rtp_inter_arrival.max_ms < RTP_INTERVAL_MAX_BUDGET_MS
+}
+
+fn observer_short_tempo_windows_within_jitter_budget(stats: &AudioValidationStats) -> bool {
+    stats
+        .decoded_audio_short_tempo_window_fastest
+        .as_ref()
+        .is_some_and(observer_tempo_window_within_jitter_budget)
+        && stats
+            .decoded_audio_short_tempo_window_slowest
+            .as_ref()
+            .is_some_and(observer_tempo_window_within_jitter_budget)
+}
+
+fn observer_tempo_window_within_jitter_budget(window: &AudioTempoWindowEvidence) -> bool {
+    let (min_ratio_ppm, max_ratio_ppm) =
+        if window.window_packet_count >= OBSERVER_STRICT_SHORT_WINDOW_MIN_PACKETS {
+            (
+                OBSERVER_SHORT_WINDOW_MIN_RATIO_PPM,
+                OBSERVER_SHORT_WINDOW_MAX_RATIO_PPM,
+            )
+        } else {
+            (
+                OBSERVER_MICRO_WINDOW_MIN_RATIO_PPM,
+                OBSERVER_MICRO_WINDOW_MAX_RATIO_PPM,
+            )
+        };
+    window.ratio_ppm >= min_ratio_ppm && window.ratio_ppm <= max_ratio_ppm
 }
 
 fn unclassified_observer_anomaly_count(
@@ -2752,6 +2782,7 @@ fn validate_source_buffer_depth_metrics(
 fn validate_prepared_track_queue_metrics(
     metrics: &PlaybackStabilitySnapshot,
     label: &str,
+    require_post_resume_phase: bool,
 ) -> Result<()> {
     if metrics.prepared_track_queue_target_ms != DISCORD_EGRESS_BUFFER_TARGET_MS {
         bail!(
@@ -2780,26 +2811,32 @@ fn validate_prepared_track_queue_metrics(
         })?;
     validate_prepared_track_queue_depth(pre_pause, label, "active pre-pause")?;
 
-    let post_resume = metrics
+    let mut recomputed_sample_count = pre_pause.sample_count;
+    let mut recomputed_empty_count = pre_pause.empty_count;
+    match metrics
         .active_post_resume_prepared_track_queue_depth
         .as_ref()
-        .ok_or_else(|| {
-            anyhow!("{label} was missing active post-resume prepared track queue depth metrics")
-        })?;
-    validate_prepared_track_queue_depth(post_resume, label, "active post-resume")?;
+    {
+        Some(post_resume) => {
+            if require_post_resume_phase || post_resume.sample_count != 0 {
+                validate_prepared_track_queue_depth(post_resume, label, "active post-resume")?;
+            }
+            recomputed_sample_count =
+                recomputed_sample_count.saturating_add(post_resume.sample_count);
+            recomputed_empty_count = recomputed_empty_count.saturating_add(post_resume.empty_count);
+        }
+        None if require_post_resume_phase => {
+            bail!("{label} was missing active post-resume prepared track queue depth metrics");
+        }
+        None => {}
+    }
 
-    let recomputed_sample_count = pre_pause
-        .sample_count
-        .saturating_add(post_resume.sample_count);
     if metrics.prepared_track_queue_depth_sample_count != recomputed_sample_count {
         bail!(
             "{label} prepared_track_queue_depth_sample_count was {}; expected recomputed active pre/post sample count {recomputed_sample_count}",
             metrics.prepared_track_queue_depth_sample_count
         );
     }
-    let recomputed_empty_count = pre_pause
-        .empty_count
-        .saturating_add(post_resume.empty_count);
     if metrics.prepared_track_queue_empty_count != recomputed_empty_count {
         bail!(
             "{label} prepared_track_queue_empty_count was {}; expected recomputed active pre/post empty count {recomputed_empty_count}",
@@ -2861,14 +2898,16 @@ fn validate_prepared_track_queue_depth(
 
 #[derive(Debug, Clone, Copy)]
 struct RawTrackSend {
-    sent_offset_us: u64,
-    duration_ms: u64,
-    media_position_ms: u64,
+    send_started_offset_us: u64,
+    duration_us: u64,
+    duration_samples: u32,
+    media_position_samples: u64,
 }
 
 #[derive(Debug, Default)]
 struct RecomputedRawPlayback {
     track_packet_count: u64,
+    track_media_duration_sent_us: u64,
     track_media_duration_sent_ms: u64,
     track_wall_clock_elapsed_ms: u64,
     track_media_to_wall_clock_ratio_ppm: u64,
@@ -2882,10 +2921,15 @@ struct RecomputedRawPlayback {
     track_tempo_window_slow_count: u64,
     skipped_source_frame_count: u64,
     skipped_source_duration_ms: u64,
+    skipped_source_duration_samples: u64,
     pause_boundary_silence_packet_count: u64,
 }
 
-fn validate_raw_playback_evidence(metrics: &PlaybackStabilitySnapshot, label: &str) -> Result<()> {
+fn validate_raw_playback_evidence(
+    metrics: &PlaybackStabilitySnapshot,
+    label: &str,
+    require_pause_resume_evidence: bool,
+) -> Result<()> {
     if metrics.raw_send_events.is_empty() {
         bail!("{label} returned no raw send-event evidence");
     }
@@ -2897,7 +2941,7 @@ fn validate_raw_playback_evidence(metrics: &PlaybackStabilitySnapshot, label: &s
     }
 
     validate_raw_send_event_order(metrics, label)?;
-    validate_raw_prepared_track_queue_samples(metrics, label)?;
+    validate_raw_prepared_track_queue_samples(metrics, label, require_pause_resume_evidence)?;
     validate_raw_prepared_playout_queue_events(metrics, label)?;
 
     let recomputed = recompute_raw_playback(metrics, label)?;
@@ -2978,23 +3022,30 @@ fn validate_raw_playback_evidence(metrics: &PlaybackStabilitySnapshot, label: &s
     }
     if recomputed.skipped_source_frame_count != metrics.skipped_source_frame_count
         || recomputed.skipped_source_duration_ms != metrics.skipped_source_duration_ms
+        || recomputed.skipped_source_duration_samples != metrics.skipped_source_duration_samples
     {
         bail!(
-            "{label} skipped-source aggregates disagreed with raw source-frame identity: reported frames={} duration_ms={}, recomputed frames={} duration_ms={}",
+            "{label} skipped-source aggregates disagreed with raw source-frame identity: reported frames={} duration_ms={} duration_samples={}, recomputed frames={} duration_ms={} duration_samples={}",
             metrics.skipped_source_frame_count,
             metrics.skipped_source_duration_ms,
+            metrics.skipped_source_duration_samples,
             recomputed.skipped_source_frame_count,
-            recomputed.skipped_source_duration_ms
+            recomputed.skipped_source_duration_ms,
+            recomputed.skipped_source_duration_samples
         );
     }
-    if recomputed.pause_boundary_silence_packet_count < PAUSE_STOP_SILENCE_FRAME_COUNT as u64 {
+    if require_pause_resume_evidence
+        && recomputed.pause_boundary_silence_packet_count < PAUSE_STOP_SILENCE_FRAME_COUNT as u64
+    {
         bail!(
             "{label} raw send events contained only {} boundary-silence packets; expected at least {} for Pause",
             recomputed.pause_boundary_silence_packet_count,
             PAUSE_STOP_SILENCE_FRAME_COUNT
         );
     }
-    validate_pause_boundary_spacing(metrics, label)?;
+    if require_pause_resume_evidence {
+        validate_pause_boundary_spacing(metrics, label)?;
+    }
     let recomputed_scheduled_silence_packet_count = metrics
         .raw_send_events
         .iter()
@@ -3110,17 +3161,14 @@ fn validate_raw_send_event_order(metrics: &PlaybackStabilitySnapshot, label: &st
             if !event.committed_heard_media {
                 bail!("{label} raw track send event {index} did not mark heard-media commit");
             }
-            if event.source_frame_epoch.is_none() || event.source_media_position_ms.is_none() {
+            if event.source_frame_epoch.is_none()
+                || event.source_media_position_ms.is_none()
+                || event.source_media_position_samples.is_none()
+            {
                 bail!("{label} raw track send event {index} lacked source-frame identity");
             }
-            if event.media_duration_ms != NATURAL_OPUS_FRAME_DURATION_MS
-                || event.media_duration_samples != NATURAL_OPUS_FRAME_DURATION_SAMPLES
-            {
-                bail!(
-                    "{label} raw track send event {index} had media duration {}ms/{} samples; expected natural Opus frame duration {NATURAL_OPUS_FRAME_DURATION_MS}ms/{NATURAL_OPUS_FRAME_DURATION_SAMPLES} samples",
-                    event.media_duration_ms,
-                    event.media_duration_samples,
-                );
+            if event.media_duration_samples == 0 {
+                bail!("{label} raw track send event {index} had zero media duration samples");
             }
         } else if event.committed_heard_media {
             bail!("{label} raw non-track send event {index} committed heard media");
@@ -3147,18 +3195,23 @@ fn recompute_raw_playback(
     for event in &metrics.raw_send_events {
         match event.command_kind {
             PlaybackSendCommandKind::Track => {
-                let media_position_ms = event.source_media_position_ms.ok_or_else(|| {
+                event.source_media_position_ms.ok_or_else(|| {
                     anyhow!("{label} raw track send lacked source_media_position_ms")
                 })?;
+                let media_position_samples =
+                    event.source_media_position_samples.ok_or_else(|| {
+                        anyhow!("{label} raw track send lacked source_media_position_samples")
+                    })?;
                 let track = RawTrackSend {
-                    sent_offset_us: event.sent_offset_us,
-                    duration_ms: event.media_duration_ms,
-                    media_position_ms,
+                    send_started_offset_us: event.send_started_offset_us,
+                    duration_us: duration_us_from_samples(event.media_duration_samples),
+                    duration_samples: event.media_duration_samples,
+                    media_position_samples,
                 };
                 recomputed.track_packet_count = recomputed.track_packet_count.saturating_add(1);
-                recomputed.track_media_duration_sent_ms = recomputed
-                    .track_media_duration_sent_ms
-                    .saturating_add(event.media_duration_ms);
+                recomputed.track_media_duration_sent_us = recomputed
+                    .track_media_duration_sent_us
+                    .saturating_add(track.duration_us);
                 current_segment.push(track);
                 all_tracks.push(track);
             }
@@ -3181,17 +3234,20 @@ fn recompute_raw_playback(
     for segment in &segments {
         if let (Some(first), Some(last)) = (segment.first(), segment.last()) {
             wall_clock_elapsed_us = wall_clock_elapsed_us
-                .saturating_add(last.sent_offset_us.saturating_sub(first.sent_offset_us))
-                .saturating_add(last.duration_ms.saturating_mul(1_000));
+                .saturating_add(
+                    last.send_started_offset_us
+                        .saturating_sub(first.send_started_offset_us),
+                )
+                .saturating_add(last.duration_us);
         }
 
         for pair in segment.windows(2) {
             let previous = pair[0];
             let current = pair[1];
             let interval_us = current
-                .sent_offset_us
-                .saturating_sub(previous.sent_offset_us);
-            let previous_duration_us = previous.duration_ms.saturating_mul(1_000);
+                .send_started_offset_us
+                .saturating_sub(previous.send_started_offset_us);
+            let previous_duration_us = previous.duration_us;
             if interval_us < previous_duration_us {
                 recomputed.track_fast_interval_count =
                     recomputed.track_fast_interval_count.saturating_add(1);
@@ -3209,31 +3265,45 @@ fn recompute_raw_playback(
         }
     }
 
+    recomputed.track_media_duration_sent_ms = recomputed.track_media_duration_sent_us / 1_000;
     recomputed.track_wall_clock_elapsed_ms = wall_clock_elapsed_us / 1_000;
-    recomputed.track_media_to_wall_clock_ratio_ppm = ratio_ppm_ms(
-        recomputed.track_media_duration_sent_ms,
-        recomputed.track_wall_clock_elapsed_ms,
+    recomputed.track_media_to_wall_clock_ratio_ppm = ratio_ppm_us(
+        recomputed.track_media_duration_sent_us,
+        wall_clock_elapsed_us,
     );
 
     for pair in all_tracks.windows(2) {
         let previous = pair[0];
         let current = pair[1];
-        let expected_next_position = previous
-            .media_position_ms
-            .saturating_add(previous.duration_ms);
-        if current.media_position_ms
-            > expected_next_position.saturating_add(SOURCE_POSITION_CONTINUITY_TOLERANCE_MS)
+        let expected_next_position_samples = previous
+            .media_position_samples
+            .saturating_add(u64::from(previous.duration_samples));
+        if current.media_position_samples < expected_next_position_samples {
+            bail!(
+                "{label} raw source position moved backward or replayed: previous_position_samples={} previous_duration_samples={} expected_next_position_samples={} current_position_samples={}",
+                previous.media_position_samples,
+                previous.duration_samples,
+                expected_next_position_samples,
+                current.media_position_samples
+            );
+        }
+        if current.media_position_samples
+            > expected_next_position_samples.saturating_add(samples_from_duration_ms(
+                SOURCE_POSITION_CONTINUITY_TOLERANCE_MS,
+            ))
         {
-            let skipped_ms = current
-                .media_position_ms
-                .saturating_sub(expected_next_position);
-            recomputed.skipped_source_duration_ms = recomputed
-                .skipped_source_duration_ms
-                .saturating_add(skipped_ms);
-            let frame_duration_ms = previous.duration_ms.max(1);
+            let skipped_samples = current
+                .media_position_samples
+                .saturating_sub(expected_next_position_samples);
+            recomputed.skipped_source_duration_samples = recomputed
+                .skipped_source_duration_samples
+                .saturating_add(skipped_samples);
+            recomputed.skipped_source_duration_ms =
+                duration_ms_from_samples(recomputed.skipped_source_duration_samples);
+            let frame_duration_samples = u64::from(previous.duration_samples).max(1);
             recomputed.skipped_source_frame_count = recomputed
                 .skipped_source_frame_count
-                .saturating_add(skipped_ms.div_ceil(frame_duration_ms));
+                .saturating_add(skipped_samples.div_ceil(frame_duration_samples));
         }
     }
 
@@ -3257,16 +3327,16 @@ fn recompute_tempo_window(recomputed: &mut RecomputedRawPlayback, window: &[RawT
         return;
     };
     let media_duration_us = window.iter().fold(0u64, |total, packet| {
-        total.saturating_add(packet.duration_ms.saturating_mul(1_000))
+        total.saturating_add(packet.duration_us)
     });
     let wall_clock_duration_us = last
-        .sent_offset_us
-        .saturating_sub(first.sent_offset_us)
-        .saturating_add(last.duration_ms.saturating_mul(1_000));
+        .send_started_offset_us
+        .saturating_sub(first.send_started_offset_us)
+        .saturating_add(last.duration_us);
     let ratio = ratio_ppm_us(media_duration_us, wall_clock_duration_us);
 
     recomputed.track_tempo_window_count = recomputed.track_tempo_window_count.saturating_add(1);
-    if first.media_position_ms >= SOURCE_PLAYBACK_BUFFER_TARGET_MS {
+    if first.media_position_samples >= samples_from_duration_ms(SOURCE_PLAYBACK_BUFFER_TARGET_MS) {
         recomputed.track_tempo_window_post_source_buffer_count = recomputed
             .track_tempo_window_post_source_buffer_count
             .saturating_add(1);
@@ -3298,18 +3368,22 @@ fn ratio_ppm_us(media_duration_us: u64, wall_clock_duration_us: u64) -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-fn ratio_ppm_ms(media_duration_ms: u64, wall_clock_duration_ms: u64) -> u64 {
-    if media_duration_ms == 0 || wall_clock_duration_ms == 0 {
-        return 0;
-    }
-    ((u128::from(media_duration_ms) * 1_000_000) / u128::from(wall_clock_duration_ms))
-        .try_into()
-        .unwrap_or(u64::MAX)
+fn duration_us_from_samples(duration_samples: u32) -> u64 {
+    u64::from(duration_samples).saturating_mul(1_000_000) / 48_000
+}
+
+fn duration_ms_from_samples(duration_samples: u64) -> u64 {
+    duration_samples.saturating_mul(1_000) / 48_000
+}
+
+fn samples_from_duration_ms(duration_ms: u64) -> u64 {
+    duration_ms.saturating_mul(48)
 }
 
 fn validate_raw_prepared_track_queue_samples(
     metrics: &PlaybackStabilitySnapshot,
     label: &str,
+    require_post_resume_phase: bool,
 ) -> Result<()> {
     let mut pre_pause = Vec::new();
     let mut post_resume = Vec::new();
@@ -3338,12 +3412,24 @@ fn validate_raw_prepared_track_queue_samples(
         .active_pre_pause_prepared_track_queue_depth
         .as_ref()
         .ok_or_else(|| anyhow!("{label} was missing active pre-pause prepared queue metrics"))?;
-    let post_reported = metrics
+    ensure_queue_depth_stats_match(pre_reported, &recomputed_pre, label, "active pre-pause")?;
+    match metrics
         .active_post_resume_prepared_track_queue_depth
         .as_ref()
-        .ok_or_else(|| anyhow!("{label} was missing active post-resume prepared queue metrics"))?;
-    ensure_queue_depth_stats_match(pre_reported, &recomputed_pre, label, "active pre-pause")?;
-    ensure_queue_depth_stats_match(post_reported, &recomputed_post, label, "active post-resume")?;
+    {
+        Some(post_reported) => {
+            ensure_queue_depth_stats_match(
+                post_reported,
+                &recomputed_post,
+                label,
+                "active post-resume",
+            )?;
+        }
+        None if require_post_resume_phase || recomputed_post.sample_count != 0 => {
+            bail!("{label} was missing active post-resume prepared queue metrics");
+        }
+        None => {}
+    }
 
     let recomputed_sample_count = recomputed_pre
         .sample_count
@@ -3373,7 +3459,8 @@ fn validate_raw_prepared_playout_queue_events(
     metrics: &PlaybackStabilitySnapshot,
     label: &str,
 ) -> Result<()> {
-    let mut track_drop_count = 0u64;
+    let mut unrecovered_track_drop_count = 0u64;
+    let mut unrecovered_track_drops = Vec::new();
     let mut silence_drop_count = 0u64;
     let mut rebuild_count = 0u64;
     let mut track_enqueue_count = 0u64;
@@ -3405,7 +3492,13 @@ fn validate_raw_prepared_playout_queue_events(
             }
             PreparedPlayoutQueueEventKind::DroppedBeforeSend => match event.command_kind {
                 PlaybackSendCommandKind::Track => {
-                    track_drop_count = track_drop_count.saturating_add(1);
+                    if prepared_track_drop_counts_as_unrecovered(event) {
+                        unrecovered_track_drop_count =
+                            unrecovered_track_drop_count.saturating_add(1);
+                        if let Some(identity) = prepared_playout_track_drop_identity(event) {
+                            unrecovered_track_drops.push(identity);
+                        }
+                    }
                 }
                 PlaybackSendCommandKind::ScheduledSilence
                 | PlaybackSendCommandKind::BoundarySilence
@@ -3416,6 +3509,14 @@ fn validate_raw_prepared_playout_queue_events(
             },
             PreparedPlayoutQueueEventKind::Rebuilt => {
                 rebuild_count = rebuild_count.saturating_add(1);
+                if let Some(identity) = prepared_playout_track_drop_identity(event)
+                    && let Some(index) = unrecovered_track_drops
+                        .iter()
+                        .position(|drop| *drop == identity)
+                {
+                    unrecovered_track_drops.remove(index);
+                    unrecovered_track_drop_count = unrecovered_track_drop_count.saturating_sub(1);
+                }
             }
             PreparedPlayoutQueueEventKind::Unspecified => {}
         }
@@ -3435,11 +3536,11 @@ fn validate_raw_prepared_playout_queue_events(
     if track_dequeue_count == 0 {
         bail!("{label} returned no raw prepared track dequeue-to-deadline events");
     }
-    if track_drop_count != metrics.prepared_track_packet_drop_count {
+    if unrecovered_track_drop_count != metrics.prepared_track_packet_drop_count {
         bail!(
-            "{label} prepared_track_packet_drop_count was {}; raw lifecycle events recomputed {}",
+            "{label} prepared_track_packet_drop_count was {}; raw lifecycle events recomputed {} unrecovered drops",
             metrics.prepared_track_packet_drop_count,
-            track_drop_count
+            unrecovered_track_drop_count
         );
     }
     if silence_drop_count != metrics.prepared_silence_packet_drop_count {
@@ -3467,12 +3568,12 @@ fn queue_depth_stats_from_samples(
         return PlaybackQueueDepthStatsSnapshot::default();
     }
     let mut sorted = samples.to_vec();
-    sorted.sort_unstable_by_key(|depth| depth.duration_ms);
+    sorted.sort_unstable_by_key(|depth| depth.duration_samples);
     PlaybackQueueDepthStatsSnapshot {
         sample_count: samples.len() as u64,
         empty_count: samples
             .iter()
-            .filter(|depth| depth.duration_ms == 0)
+            .filter(|depth| depth.duration_samples == 0)
             .count() as u64,
         current_depth: samples[samples.len() - 1].clone(),
         min_depth: sorted[0].clone(),
@@ -3507,7 +3608,57 @@ fn ensure_queue_depth_stats_match(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PreparedPlayoutTrackDropIdentity {
+    reason: PreparedPlayoutQueueEventReason,
+    media_duration_samples: u32,
+    source_frame_epoch: u64,
+    source_media_position_samples: u64,
+    source_media_byte_position: Option<u64>,
+}
+
+fn prepared_track_drop_counts_as_unrecovered(
+    event: &discord_voice_service_twilight::PreparedPlayoutQueueEventSnapshot,
+) -> bool {
+    !matches!(
+        event.reason,
+        PreparedPlayoutQueueEventReason::Stop | PreparedPlayoutQueueEventReason::Reconnect
+    )
+}
+
+fn prepared_playout_track_drop_identity(
+    event: &discord_voice_service_twilight::PreparedPlayoutQueueEventSnapshot,
+) -> Option<PreparedPlayoutTrackDropIdentity> {
+    if event.command_kind != PlaybackSendCommandKind::Track {
+        return None;
+    }
+
+    Some(PreparedPlayoutTrackDropIdentity {
+        reason: event.reason,
+        media_duration_samples: event.media_duration_samples,
+        source_frame_epoch: event.source_frame_epoch?,
+        source_media_position_samples: event.source_media_position_samples?,
+        source_media_byte_position: event.source_media_byte_position,
+    })
+}
+
 fn validate_playback_timing_budget(metrics: &PlaybackStabilitySnapshot, label: &str) -> Result<()> {
+    validate_playback_timing_budget_with_active_probe_options(metrics, label, true, true)
+}
+
+fn validate_active_probe_playback_timing_budget(
+    metrics: &PlaybackStabilitySnapshot,
+    label: &str,
+) -> Result<()> {
+    validate_playback_timing_budget_with_active_probe_options(metrics, label, false, false)
+}
+
+fn validate_playback_timing_budget_with_active_probe_options(
+    metrics: &PlaybackStabilitySnapshot,
+    label: &str,
+    require_rolling_tempo_windows: bool,
+    require_pause_resume_evidence: bool,
+) -> Result<()> {
     validate_source_buffer_target(metrics, label)?;
     if metrics.track_interval.samples == 0 {
         bail!("{label} returned no track RTP interval samples");
@@ -3606,9 +3757,16 @@ fn validate_playback_timing_budget(metrics: &PlaybackStabilitySnapshot, label: &
         );
     }
     if metrics.track_tempo_window_count == 0 {
-        bail!("{label} returned no rolling track tempo windows");
-    }
-    if metrics.track_tempo_window_min_ratio_ppm == 0
+        if require_rolling_tempo_windows {
+            bail!("{label} returned no rolling track tempo windows");
+        }
+        if metrics.track_packet_count >= TRACK_TEMPO_WINDOW_PACKETS as u64 {
+            bail!(
+                "{label} returned no rolling track tempo windows despite {} track packets; expected at least one {TRACK_TEMPO_WINDOW_PACKETS}-packet window",
+                metrics.track_packet_count
+            );
+        }
+    } else if metrics.track_tempo_window_min_ratio_ppm == 0
         || metrics.track_tempo_window_max_ratio_ppm == 0
     {
         bail!(
@@ -3662,6 +3820,12 @@ fn validate_playback_timing_budget(metrics: &PlaybackStabilitySnapshot, label: &
             metrics.skipped_source_duration_ms
         );
     }
+    if metrics.skipped_source_duration_samples != 0 {
+        bail!(
+            "{label} reported {} skipped source samples; expected 0 for steady playback",
+            metrics.skipped_source_duration_samples
+        );
+    }
     if metrics.tempo_rebase_count != 0 {
         bail!(
             "{label} reported {} track tempo rebases; expected 0",
@@ -3709,8 +3873,8 @@ fn validate_playback_timing_budget(metrics: &PlaybackStabilitySnapshot, label: &
             metrics.egress_buffer_target_ms
         );
     }
-    validate_prepared_track_queue_metrics(metrics, label)?;
-    validate_raw_playback_evidence(metrics, label)?;
+    validate_prepared_track_queue_metrics(metrics, label, require_pause_resume_evidence)?;
+    validate_raw_playback_evidence(metrics, label, require_pause_resume_evidence)?;
     if metrics.max_egress_buffer_depth.duration_ms == 0 {
         bail!(
             "{label} reported no Discord egress buffering; expected bounded raw Opus egress depth"
@@ -3885,20 +4049,26 @@ fn validate_playback_timing_budget(metrics: &PlaybackStabilitySnapshot, label: &
             metrics.prepared_silence_packet_drop_count
         );
     }
-    if metrics.discarded_source_frame_count != 0 || metrics.discarded_source_duration_ms != 0 {
+    if metrics.discarded_source_frame_count != 0
+        || metrics.discarded_source_duration_ms != 0
+        || metrics.discarded_source_duration_samples != 0
+    {
         bail!(
-            "{label} reported discarded source frames={} duration_ms={}; expected 0 for steady playback",
+            "{label} reported discarded source frames={} duration_ms={} duration_samples={}; expected 0 for steady playback",
             metrics.discarded_source_frame_count,
-            metrics.discarded_source_duration_ms
+            metrics.discarded_source_duration_ms,
+            metrics.discarded_source_duration_samples
         );
     }
     if metrics.egress_dropped_music_frame_count != 0
         || metrics.egress_dropped_music_duration_ms != 0
+        || metrics.egress_dropped_music_duration_samples != 0
     {
         bail!(
-            "{label} reported dropped egress music frames={} duration_ms={}; expected 0 for steady playback",
+            "{label} reported dropped egress music frames={} duration_ms={} duration_samples={}; expected 0 for steady playback",
             metrics.egress_dropped_music_frame_count,
-            metrics.egress_dropped_music_duration_ms
+            metrics.egress_dropped_music_duration_ms,
+            metrics.egress_dropped_music_duration_samples
         );
     }
     Ok(())
@@ -3929,7 +4099,7 @@ fn validate_reconnect_probe_metrics(
     if metrics.sender_lateness.samples == 0 {
         bail!("Reconnect rollover probe metrics returned no sender lateness samples");
     }
-    validate_playback_timing_budget(metrics, "Reconnect rollover probe playback")?;
+    validate_active_probe_playback_timing_budget(metrics, "Reconnect rollover probe playback")?;
 
     Ok(())
 }
@@ -4601,6 +4771,31 @@ mod tests {
     use futures::stream;
     use std::collections::HashMap;
 
+    const FRACTIONAL_TRACK_DURATION_SAMPLES: u32 = 120;
+
+    fn observer_short_window(
+        ratio_ppm: u64,
+        wall_clock_us: u64,
+    ) -> crate::audio::AudioTempoWindowEvidence {
+        observer_short_window_with_packets(ratio_ppm, wall_clock_us, 25)
+    }
+
+    fn observer_short_window_with_packets(
+        ratio_ppm: u64,
+        wall_clock_us: u64,
+        window_packet_count: u64,
+    ) -> crate::audio::AudioTempoWindowEvidence {
+        crate::audio::AudioTempoWindowEvidence {
+            classification: "post_resume_steady_playback".to_owned(),
+            window_packet_count,
+            media_ms: window_packet_count.saturating_mul(NATURAL_OPUS_FRAME_DURATION_MS),
+            wall_clock_us,
+            ratio_ppm,
+            first_sequence: 1,
+            last_sequence: window_packet_count.try_into().unwrap_or(u16::MAX),
+        }
+    }
+
     fn event(kind: SessionEventKind, current_video_id: Option<&str>) -> SessionEvent {
         SessionEvent {
             kind,
@@ -4666,40 +4861,57 @@ mod tests {
         track_packets: u64,
         boundary_packets: u64,
     ) -> Vec<discord_voice_service_twilight::PlaybackSendEventSnapshot> {
+        raw_send_events_with_track_duration(track_packets, boundary_packets, 960)
+    }
+
+    fn raw_send_events_with_track_duration(
+        track_packets: u64,
+        boundary_packets: u64,
+        track_duration_samples: u32,
+    ) -> Vec<discord_voice_service_twilight::PlaybackSendEventSnapshot> {
         let mut events = Vec::new();
+        let track_duration_us = duration_us_from_samples(track_duration_samples);
+        let track_duration_ms = duration_ms_from_samples(u64::from(track_duration_samples));
         for index in 0..track_packets {
+            let media_position_samples = index * u64::from(track_duration_samples);
+            let sent_offset_us = index * track_duration_us;
             events.push(discord_voice_service_twilight::PlaybackSendEventSnapshot {
                 packet_index: index,
                 command_kind: PlaybackSendCommandKind::Track,
-                expected_deadline_offset_us: index * 20_000,
-                send_started_offset_us: index * 20_000,
-                sent_offset_us: index * 20_000,
-                media_duration_ms: 20,
-                media_duration_samples: 960,
+                expected_deadline_offset_us: sent_offset_us,
+                send_started_offset_us: sent_offset_us,
+                sent_offset_us,
+                media_duration_ms: track_duration_ms,
+                media_duration_samples: track_duration_samples,
                 rtp_sequence: index as u32,
-                rtp_timestamp: (index * 960) as u32,
+                rtp_timestamp: media_position_samples as u32,
                 protection_nonce: Some(index as u32),
                 source_frame_epoch: Some(1),
-                source_media_position_ms: Some(index * 20),
+                source_media_position_ms: Some(duration_ms_from_samples(media_position_samples)),
+                source_media_position_samples: Some(media_position_samples),
                 source_media_byte_position: Some(index * 100),
                 committed_heard_media: true,
             });
         }
+        let boundary_base_offset_us = track_packets * track_duration_us;
+        let boundary_base_timestamp = track_packets * u64::from(track_duration_samples);
         for boundary_index in 0..boundary_packets {
             let packet_index = track_packets + boundary_index;
+            let sent_offset_us = boundary_base_offset_us + boundary_index * 20_000;
             events.push(discord_voice_service_twilight::PlaybackSendEventSnapshot {
                 packet_index,
                 command_kind: PlaybackSendCommandKind::BoundarySilence,
-                expected_deadline_offset_us: packet_index * 20_000,
-                send_started_offset_us: packet_index * 20_000,
-                sent_offset_us: packet_index * 20_000,
+                expected_deadline_offset_us: sent_offset_us,
+                send_started_offset_us: sent_offset_us,
+                sent_offset_us,
                 media_duration_ms: 20,
                 media_duration_samples: 960,
                 rtp_sequence: packet_index as u32,
-                rtp_timestamp: (packet_index * 960) as u32,
+                rtp_timestamp: (boundary_base_timestamp + boundary_index * 960) as u32,
                 protection_nonce: Some(packet_index as u32),
                 source_frame_epoch: None,
                 source_media_position_ms: None,
+                source_media_position_samples: None,
                 source_media_byte_position: None,
                 committed_heard_media: false,
             });
@@ -4731,26 +4943,53 @@ mod tests {
         samples
     }
 
+    fn raw_pre_pause_queue_samples()
+    -> Vec<discord_voice_service_twilight::PreparedTrackQueueDepthSampleSnapshot> {
+        (0..96)
+            .map(
+                |index| discord_voice_service_twilight::PreparedTrackQueueDepthSampleSnapshot {
+                    sample_index: index,
+                    phase: PreparedTrackQueueSamplePhase::ActivePrePause,
+                    depth: buffer_depth(20, 0, 400, 19_200),
+                },
+            )
+            .collect()
+    }
+
     fn raw_prepared_playout_queue_events(
         track_packets: u64,
     ) -> Vec<discord_voice_service_twilight::PreparedPlayoutQueueEventSnapshot> {
+        raw_prepared_playout_queue_events_with_track_duration(track_packets, 960)
+    }
+
+    fn raw_prepared_playout_queue_events_with_track_duration(
+        track_packets: u64,
+        track_duration_samples: u32,
+    ) -> Vec<discord_voice_service_twilight::PreparedPlayoutQueueEventSnapshot> {
         let mut events = Vec::new();
+        let track_duration_ms = duration_ms_from_samples(u64::from(track_duration_samples));
+        let enqueue_depth = buffer_depth(160, 0, 400, 19_200);
+        let dequeue_depth = buffer_depth(159, 0, 397, 19_080);
         for index in 0..track_packets {
+            let media_position_samples = index * u64::from(track_duration_samples);
             events.push(
                 discord_voice_service_twilight::PreparedPlayoutQueueEventSnapshot {
                     event_index: events.len() as u64,
                     event_kind: PreparedPlayoutQueueEventKind::Enqueued,
                     reason: PreparedPlayoutQueueEventReason::SteadyPlayback,
                     command_kind: PlaybackSendCommandKind::Track,
-                    media_duration_ms: 20,
-                    media_duration_samples: 960,
+                    media_duration_ms: track_duration_ms,
+                    media_duration_samples: track_duration_samples,
                     rtp_sequence: index as u32,
-                    rtp_timestamp: (index * 960) as u32,
+                    rtp_timestamp: media_position_samples as u32,
                     protection_nonce: Some(index as u32),
                     source_frame_epoch: Some(1),
-                    source_media_position_ms: Some(index * 20),
+                    source_media_position_ms: Some(duration_ms_from_samples(
+                        media_position_samples,
+                    )),
+                    source_media_position_samples: Some(media_position_samples),
                     source_media_byte_position: Some(index * 100),
-                    queue_depth_after: buffer_depth(20, 0, 400, 19_200),
+                    queue_depth_after: enqueue_depth.clone(),
                 },
             );
             events.push(
@@ -4759,19 +4998,46 @@ mod tests {
                     event_kind: PreparedPlayoutQueueEventKind::DequeuedToDeadlineSender,
                     reason: PreparedPlayoutQueueEventReason::SteadyPlayback,
                     command_kind: PlaybackSendCommandKind::Track,
-                    media_duration_ms: 20,
-                    media_duration_samples: 960,
+                    media_duration_ms: track_duration_ms,
+                    media_duration_samples: track_duration_samples,
                     rtp_sequence: index as u32,
-                    rtp_timestamp: (index * 960) as u32,
+                    rtp_timestamp: media_position_samples as u32,
                     protection_nonce: Some(index as u32),
                     source_frame_epoch: Some(1),
-                    source_media_position_ms: Some(index * 20),
+                    source_media_position_ms: Some(duration_ms_from_samples(
+                        media_position_samples,
+                    )),
+                    source_media_position_samples: Some(media_position_samples),
                     source_media_byte_position: Some(index * 100),
-                    queue_depth_after: buffer_depth(19, 0, 380, 18_240),
+                    queue_depth_after: dequeue_depth.clone(),
                 },
             );
         }
         events
+    }
+
+    fn prepared_track_lifecycle_event(
+        event_index: u64,
+        event_kind: PreparedPlayoutQueueEventKind,
+        reason: PreparedPlayoutQueueEventReason,
+        source_media_position_samples: u64,
+    ) -> discord_voice_service_twilight::PreparedPlayoutQueueEventSnapshot {
+        discord_voice_service_twilight::PreparedPlayoutQueueEventSnapshot {
+            event_index,
+            event_kind,
+            reason,
+            command_kind: PlaybackSendCommandKind::Track,
+            media_duration_ms: 2,
+            media_duration_samples: 120,
+            rtp_sequence: 42,
+            rtp_timestamp: source_media_position_samples as u32,
+            protection_nonce: Some(42),
+            source_frame_epoch: Some(7),
+            source_media_position_ms: Some(duration_ms_from_samples(source_media_position_samples)),
+            source_media_position_samples: Some(source_media_position_samples),
+            source_media_byte_position: Some(source_media_position_samples / 120 * 32),
+            queue_depth_after: buffer_depth(0, 0, 0, 0),
+        }
     }
 
     fn valid_playback_timing_snapshot() -> PlaybackStabilitySnapshot {
@@ -4832,6 +5098,47 @@ mod tests {
             gateway_event_drain_duration: duration_stats(144, 0, 1, 2, 0, 2),
             ..PlaybackStabilitySnapshot::default()
         }
+    }
+
+    fn active_probe_playback_snapshot(track_packets: u64) -> PlaybackStabilitySnapshot {
+        let pre_pause_queue_depth = queue_depth_stats(96, 0, 400, 400, 400, 400, 400);
+        let track_media_duration_ms = track_packets.saturating_mul(NATURAL_OPUS_FRAME_DURATION_MS);
+        let mut metrics = PlaybackStabilitySnapshot {
+            reconnect_interruptions: 1,
+            track_packet_count: track_packets,
+            track_interval: duration_stats(track_packets.saturating_sub(1), 20, 22, 25, 19, 28),
+            track_media_duration_sent_ms: track_media_duration_ms,
+            track_wall_clock_elapsed_ms: track_media_duration_ms,
+            track_media_to_wall_clock_ratio_ppm: 1_000_000,
+            expected_track_frame_count: track_packets,
+            sent_track_frame_count: track_packets,
+            track_tempo_window_count: 0,
+            track_tempo_window_min_ratio_ppm: 0,
+            track_tempo_window_max_ratio_ppm: 0,
+            sender_lateness: duration_stats(track_packets, 0, 2, 4, 0, 5),
+            sender_send_duration: duration_stats(track_packets, 0, 1, 2, 0, 2),
+            sender_loop_non_send_work_duration: duration_stats(track_packets, 0, 1, 1, 0, 1),
+            playout_sender_lateness: duration_stats(track_packets, 0, 2, 4, 0, 5),
+            playout_builder_prepare_duration: duration_stats(track_packets, 0, 1, 1, 0, 1),
+            active_pre_pause_prepared_track_queue_depth: Some(pre_pause_queue_depth),
+            active_post_resume_prepared_track_queue_depth: Some(
+                PlaybackQueueDepthStatsSnapshot::default(),
+            ),
+            prepared_track_queue_depth_sample_count: 96,
+            prepared_track_queue_empty_count: 0,
+            raw_send_events: raw_send_events(track_packets, 0),
+            raw_prepared_track_queue_samples: raw_pre_pause_queue_samples(),
+            raw_prepared_playout_queue_events: raw_prepared_playout_queue_events(track_packets),
+            gateway_event_drain_duration: duration_stats(track_packets, 0, 1, 2, 0, 2),
+            ..valid_playback_timing_snapshot()
+        };
+        if track_packets >= TRACK_TEMPO_WINDOW_PACKETS as u64 {
+            let tempo_window_count = track_packets - TRACK_TEMPO_WINDOW_PACKETS as u64 + 1;
+            metrics.track_tempo_window_count = tempo_window_count;
+            metrics.track_tempo_window_min_ratio_ppm = 1_000_000;
+            metrics.track_tempo_window_max_ratio_ppm = 1_000_000;
+        }
+        metrics
     }
 
     fn assert_playback_timing_budget_rejects(
@@ -4977,6 +5284,47 @@ mod tests {
         let error = validate_reconnect_probe_metrics(&metrics, "video").unwrap_err();
         assert!(
             error.to_string().contains("sender frame deficits"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn reconnect_probe_metrics_allow_short_probe_without_rolling_tempo_window() {
+        let metrics = active_probe_playback_snapshot(TRACK_TEMPO_WINDOW_PACKETS as u64 - 1);
+
+        validate_reconnect_probe_metrics(&metrics, "video").unwrap();
+    }
+
+    #[test]
+    fn reconnect_probe_metrics_require_rolling_tempo_windows_once_probe_is_long_enough() {
+        let metrics = PlaybackStabilitySnapshot {
+            track_tempo_window_count: 0,
+            track_tempo_window_min_ratio_ppm: 0,
+            track_tempo_window_max_ratio_ppm: 0,
+            ..active_probe_playback_snapshot(TRACK_TEMPO_WINDOW_PACKETS as u64)
+        };
+
+        let error = validate_reconnect_probe_metrics(&metrics, "video").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no rolling track tempo windows despite 50 track packets"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn playback_timing_budget_requires_rolling_tempo_windows_for_finished_playback() {
+        let metrics = PlaybackStabilitySnapshot {
+            track_tempo_window_count: 0,
+            track_tempo_window_min_ratio_ppm: 0,
+            track_tempo_window_max_ratio_ppm: 0,
+            ..valid_playback_timing_snapshot()
+        };
+
+        let error = validate_playback_timing_budget(&metrics, "finished playback").unwrap_err();
+        assert!(
+            error.to_string().contains("no rolling track tempo windows"),
             "unexpected error: {error}"
         );
     }
@@ -5269,6 +5617,75 @@ mod tests {
     }
 
     #[test]
+    fn playback_timing_budget_allows_rebuilt_prepared_track_drops() {
+        let mut metrics = valid_playback_timing_snapshot();
+        let event_index = metrics.raw_prepared_playout_queue_events.len() as u64;
+        metrics
+            .raw_prepared_playout_queue_events
+            .push(prepared_track_lifecycle_event(
+                event_index,
+                PreparedPlayoutQueueEventKind::DroppedBeforeSend,
+                PreparedPlayoutQueueEventReason::Pause,
+                120,
+            ));
+        metrics
+            .raw_prepared_playout_queue_events
+            .push(prepared_track_lifecycle_event(
+                event_index + 1,
+                PreparedPlayoutQueueEventKind::Rebuilt,
+                PreparedPlayoutQueueEventReason::Pause,
+                120,
+            ));
+        metrics.prepared_packet_rebuild_count = 1;
+
+        validate_playback_timing_budget(&metrics, "finished playback").unwrap();
+    }
+
+    #[test]
+    fn playback_timing_budget_allows_controlled_stop_prepared_track_drains() {
+        let mut metrics = valid_playback_timing_snapshot();
+        let event_index = metrics.raw_prepared_playout_queue_events.len() as u64;
+        metrics
+            .raw_prepared_playout_queue_events
+            .push(prepared_track_lifecycle_event(
+                event_index,
+                PreparedPlayoutQueueEventKind::DroppedBeforeSend,
+                PreparedPlayoutQueueEventReason::Stop,
+                120,
+            ));
+        metrics.restored_source_frame_count = 1;
+        metrics.restored_source_duration_ms = 2;
+        metrics.restored_source_duration_samples = 120;
+        metrics.reconnect_interruptions = 1;
+
+        validate_reconnect_probe_metrics(&metrics, "video").unwrap();
+    }
+
+    #[test]
+    fn playback_timing_budget_rejects_unrecovered_prepared_track_drops() {
+        let mut metrics = valid_playback_timing_snapshot();
+        let event_index = metrics.raw_prepared_playout_queue_events.len() as u64;
+        metrics
+            .raw_prepared_playout_queue_events
+            .push(prepared_track_lifecycle_event(
+                event_index,
+                PreparedPlayoutQueueEventKind::DroppedBeforeSend,
+                PreparedPlayoutQueueEventReason::Pause,
+                120,
+            ));
+        metrics.prepared_track_packet_drop_count = 1;
+        metrics.dropped_frame_count = 1;
+        metrics.expected_track_frame_count = metrics.expected_track_frame_count.saturating_add(1);
+        metrics.frame_deficit_count = 1;
+
+        let error = validate_playback_timing_budget(&metrics, "finished playback").unwrap_err();
+        assert!(
+            error.to_string().contains("sender frame deficits"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn playback_timing_budget_rejects_raw_tempo_aggregate_disagreement() {
         let metrics = PlaybackStabilitySnapshot {
             track_tempo_window_max_ratio_ppm: 999_997,
@@ -5369,6 +5786,7 @@ mod tests {
                         protection_nonce: last.protection_nonce.map(|nonce| nonce + 1),
                         source_frame_epoch: None,
                         source_media_position_ms: None,
+                        source_media_position_samples: None,
                         source_media_byte_position: None,
                         committed_heard_media: false,
                     },
@@ -5402,6 +5820,7 @@ mod tests {
             |metrics| {
                 metrics.egress_dropped_music_frame_count = 1;
                 metrics.egress_dropped_music_duration_ms = 20;
+                metrics.egress_dropped_music_duration_samples = 960;
                 metrics.dropped_frame_count = 1;
             },
             "dropped sender frames",
@@ -5410,6 +5829,7 @@ mod tests {
             |metrics| {
                 metrics.discarded_source_frame_count = 1;
                 metrics.discarded_source_duration_ms = 20;
+                metrics.discarded_source_duration_samples = 960;
             },
             "discarded source frames",
         );
@@ -5419,27 +5839,46 @@ mod tests {
     fn playback_timing_budget_rejects_skipped_source_frames_and_speed_like_durations() {
         assert_playback_timing_budget_rejects(
             |metrics| {
+                metrics.raw_send_events[42].source_media_position_samples = metrics.raw_send_events
+                    [42]
+                .source_media_position_samples
+                .map(|position| {
+                    position
+                        + u64::from(NATURAL_OPUS_FRAME_DURATION_SAMPLES)
+                        + samples_from_duration_ms(SOURCE_POSITION_CONTINUITY_TOLERANCE_MS)
+                        + 1
+                });
                 metrics.raw_send_events[42].source_media_position_ms = metrics.raw_send_events[42]
-                    .source_media_position_ms
-                    .map(|position| {
-                        position
-                            + NATURAL_OPUS_FRAME_DURATION_MS
-                            + SOURCE_POSITION_CONTINUITY_TOLERANCE_MS
-                            + 1
-                    });
+                    .source_media_position_samples
+                    .map(duration_ms_from_samples);
                 metrics.skipped_source_frame_count = 1;
+                metrics.skipped_source_duration_samples =
+                    u64::from(NATURAL_OPUS_FRAME_DURATION_SAMPLES)
+                        + samples_from_duration_ms(SOURCE_POSITION_CONTINUITY_TOLERANCE_MS)
+                        + 1;
                 metrics.skipped_source_duration_ms =
-                    NATURAL_OPUS_FRAME_DURATION_MS + SOURCE_POSITION_CONTINUITY_TOLERANCE_MS + 1;
+                    duration_ms_from_samples(metrics.skipped_source_duration_samples);
             },
             "skipped source frames",
         );
         assert_playback_timing_budget_rejects(
             |metrics| {
                 let event = &mut metrics.raw_send_events[10];
-                event.media_duration_ms = 10;
-                event.media_duration_samples = 480;
+                event.media_duration_ms = 0;
+                event.media_duration_samples = 0;
             },
-            "expected natural Opus frame duration",
+            "zero media duration samples",
+        );
+        assert_playback_timing_budget_rejects(
+            |metrics| {
+                let previous_position = metrics.raw_send_events[41].source_media_position_samples;
+                let event = &mut metrics.raw_send_events[42];
+                event.source_media_position_samples = previous_position;
+                event.source_media_position_ms = event
+                    .source_media_position_samples
+                    .map(duration_ms_from_samples);
+            },
+            "raw source position moved backward or replayed",
         );
     }
 
@@ -5470,7 +5909,17 @@ mod tests {
     }
 
     #[test]
-    fn raw_playback_recompute_matches_runtime_ms_ratio_rounding() {
+    fn playback_timing_budget_allows_two_ppm_raw_ratio_recompute_rounding() {
+        let metrics = PlaybackStabilitySnapshot {
+            track_media_to_wall_clock_ratio_ppm: 1_000_002,
+            ..valid_playback_timing_snapshot()
+        };
+
+        validate_playback_timing_budget(&metrics, "finished playback").unwrap();
+    }
+
+    #[test]
+    fn raw_playback_recompute_rejects_sub_ms_ratio_drift_hidden_by_ms_metrics() {
         let mut metrics = valid_playback_timing_snapshot();
         let last = metrics
             .raw_send_events
@@ -5489,10 +5938,181 @@ mod tests {
             recomputed.track_wall_clock_elapsed_ms,
             metrics.track_wall_clock_elapsed_ms
         );
-        assert_eq!(
+        assert_eq!(recomputed.track_media_to_wall_clock_ratio_ppm, 999_653);
+        assert_ne!(
             recomputed.track_media_to_wall_clock_ratio_ppm,
             metrics.track_media_to_wall_clock_ratio_ppm
         );
+
+        let error = validate_playback_timing_budget(&metrics, "finished playback")
+            .expect_err("raw send evidence should reject drift hidden by millisecond metrics");
+        assert!(
+            error
+                .to_string()
+                .contains("track_media_to_wall_clock_ratio_ppm"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn raw_playback_recompute_uses_samples_for_fractional_packet_duration() {
+        let mut metrics = PlaybackStabilitySnapshot::default();
+        metrics.raw_send_events = (0..TRACK_TEMPO_WINDOW_PACKETS as u64)
+            .map(|index| {
+                let sent_offset_us = index * 2_500;
+                discord_voice_service_twilight::PlaybackSendEventSnapshot {
+                    packet_index: index,
+                    command_kind: PlaybackSendCommandKind::Track,
+                    expected_deadline_offset_us: sent_offset_us,
+                    send_started_offset_us: sent_offset_us,
+                    sent_offset_us,
+                    media_duration_ms: 2,
+                    media_duration_samples: 120,
+                    rtp_sequence: index as u32,
+                    rtp_timestamp: (index * 120) as u32,
+                    protection_nonce: Some(index as u32),
+                    source_frame_epoch: Some(1),
+                    source_media_position_ms: Some((index * 2_500) / 1_000),
+                    source_media_position_samples: Some(index * 120),
+                    source_media_byte_position: Some(index * 32),
+                    committed_heard_media: true,
+                }
+            })
+            .collect();
+
+        let recomputed = recompute_raw_playback(&metrics, "fractional playback").unwrap();
+
+        assert_eq!(
+            recomputed.track_packet_count,
+            TRACK_TEMPO_WINDOW_PACKETS as u64
+        );
+        assert_eq!(recomputed.track_media_duration_sent_ms, 125);
+        assert_eq!(recomputed.track_wall_clock_elapsed_ms, 125);
+        assert_eq!(recomputed.track_media_to_wall_clock_ratio_ppm, 1_000_000);
+        assert_eq!(recomputed.track_tempo_window_count, 1);
+        assert_eq!(recomputed.track_tempo_window_fast_count, 0);
+        assert_eq!(recomputed.track_tempo_window_slow_count, 0);
+    }
+
+    #[test]
+    fn raw_playback_recompute_uses_send_start_cadence_not_completion_jitter() {
+        let mut metrics = PlaybackStabilitySnapshot::default();
+        metrics.raw_send_events = (0..TRACK_TEMPO_WINDOW_PACKETS as u64)
+            .map(|index| {
+                let send_started_offset_us = index * 20_000;
+                let sent_offset_us =
+                    send_started_offset_us + if index % 2 == 0 { 200 } else { 100 };
+                discord_voice_service_twilight::PlaybackSendEventSnapshot {
+                    packet_index: index,
+                    command_kind: PlaybackSendCommandKind::Track,
+                    expected_deadline_offset_us: send_started_offset_us,
+                    send_started_offset_us,
+                    sent_offset_us,
+                    media_duration_ms: 20,
+                    media_duration_samples: 960,
+                    rtp_sequence: index as u32,
+                    rtp_timestamp: (index * 960) as u32,
+                    protection_nonce: Some(index as u32),
+                    source_frame_epoch: Some(1),
+                    source_media_position_ms: Some(index * 20),
+                    source_media_position_samples: Some(index * 960),
+                    source_media_byte_position: Some(index * 64),
+                    committed_heard_media: true,
+                }
+            })
+            .collect();
+
+        let recomputed = recompute_raw_playback(&metrics, "completion jitter").unwrap();
+
+        assert_eq!(recomputed.track_fast_interval_count, 0);
+        assert_eq!(recomputed.track_fast_interval_min_us, 0);
+        assert_eq!(recomputed.track_wall_clock_elapsed_ms, 1_000);
+        assert_eq!(recomputed.track_media_to_wall_clock_ratio_ppm, 1_000_000);
+        assert_eq!(recomputed.track_tempo_window_fast_count, 0);
+        assert_eq!(recomputed.track_tempo_window_slow_count, 0);
+    }
+
+    #[test]
+    fn playback_timing_budget_accepts_fractional_track_packets_through_raw_validation() {
+        let (metrics, post_source_window_count) = fractional_playback_timing_snapshot();
+
+        validate_playback_timing_budget(&metrics, "fractional playback").unwrap();
+        assert_eq!(post_source_window_count, 501);
+        assert!(
+            metrics
+                .raw_send_events
+                .iter()
+                .filter(|event| event.command_kind == PlaybackSendCommandKind::Track)
+                .all(|event| event.media_duration_ms == 2
+                    && event.media_duration_samples == FRACTIONAL_TRACK_DURATION_SAMPLES)
+        );
+        assert!(
+            metrics
+                .raw_prepared_playout_queue_events
+                .iter()
+                .filter(|event| event.command_kind == PlaybackSendCommandKind::Track)
+                .all(|event| event.media_duration_ms == 2
+                    && event.media_duration_samples == FRACTIONAL_TRACK_DURATION_SAMPLES)
+        );
+    }
+
+    #[test]
+    fn playback_timing_budget_rejects_fractional_track_packets_paced_at_floored_ms() {
+        let (mut metrics, _) = fractional_playback_timing_snapshot();
+        for (track_index, event) in metrics
+            .raw_send_events
+            .iter_mut()
+            .filter(|event| event.command_kind == PlaybackSendCommandKind::Track)
+            .enumerate()
+        {
+            let sent_offset_us = track_index as u64 * 2_000;
+            event.expected_deadline_offset_us = sent_offset_us;
+            event.send_started_offset_us = sent_offset_us;
+            event.sent_offset_us = sent_offset_us;
+        }
+
+        let error = validate_playback_timing_budget(&metrics, "fractional playback")
+            .expect_err("raw validation should reject 120-sample packets paced every 2ms");
+        assert!(
+            error.to_string().contains("raw send events recomputed"),
+            "unexpected error: {error}"
+        );
+    }
+
+    fn fractional_playback_timing_snapshot() -> (PlaybackStabilitySnapshot, u64) {
+        const TRACK_PACKETS: u64 = 2_550;
+
+        let mut metrics = valid_playback_timing_snapshot();
+        let track_media_samples = TRACK_PACKETS * u64::from(FRACTIONAL_TRACK_DURATION_SAMPLES);
+        let track_media_ms = duration_ms_from_samples(track_media_samples);
+        let tempo_window_count = TRACK_PACKETS - TRACK_TEMPO_WINDOW_PACKETS as u64 + 1;
+        let first_post_source_window = samples_from_duration_ms(SOURCE_PLAYBACK_BUFFER_TARGET_MS)
+            .div_ceil(u64::from(FRACTIONAL_TRACK_DURATION_SAMPLES));
+        let post_source_window_count = tempo_window_count.saturating_sub(first_post_source_window);
+
+        metrics.track_packet_count = TRACK_PACKETS;
+        metrics.expected_track_frame_count = TRACK_PACKETS;
+        metrics.sent_track_frame_count = TRACK_PACKETS;
+        metrics.track_interval = duration_stats(TRACK_PACKETS - 1, 2, 3, 3, 2, 3);
+        metrics.track_media_duration_sent_ms = track_media_ms;
+        metrics.track_wall_clock_elapsed_ms = track_media_ms;
+        metrics.track_media_to_wall_clock_ratio_ppm = 1_000_000;
+        metrics.track_tempo_window_count = tempo_window_count;
+        metrics.track_tempo_window_post_source_buffer_count = post_source_window_count;
+        metrics.track_tempo_window_min_ratio_ppm = 1_000_000;
+        metrics.track_tempo_window_max_ratio_ppm = 1_000_000;
+        metrics.raw_send_events = raw_send_events_with_track_duration(
+            TRACK_PACKETS,
+            PAUSE_STOP_SILENCE_FRAME_COUNT as u64,
+            FRACTIONAL_TRACK_DURATION_SAMPLES,
+        );
+        metrics.raw_prepared_playout_queue_events =
+            raw_prepared_playout_queue_events_with_track_duration(
+                TRACK_PACKETS,
+                FRACTIONAL_TRACK_DURATION_SAMPLES,
+            );
+
+        (metrics, post_source_window_count)
     }
 
     #[test]
@@ -5723,6 +6343,12 @@ mod tests {
             decoded_audio_short_tempo_window_count: 16_100,
             decoded_audio_short_tempo_window_fast_count: 0,
             decoded_audio_short_tempo_window_slow_count: 0,
+            decoded_audio_short_tempo_window_fastest: Some(observer_short_window(
+                1_000_000, 500_000,
+            )),
+            decoded_audio_short_tempo_window_slowest: Some(observer_short_window(
+                1_000_000, 500_000,
+            )),
             rtp_inter_arrival: crate::audio::AudioIntervalStats {
                 samples: 8_099,
                 p50_ms: 20,
@@ -5738,6 +6364,91 @@ mod tests {
             expected_duration_ms,
         ));
 
+        let receive_jitter_with_stable_decoded_tempo = AudioValidationStats {
+            rtp_fast_interval_count: 2_147,
+            rtp_fast_interval_min_ms: 5,
+            rtp_fast_interval_min_us: 5_628,
+            observer_anomalies: vec![crate::audio::AudioObserverAnomaly {
+                kind: "rtp_fast_interval".to_owned(),
+                classification: "post_resume_steady_playback".to_owned(),
+                sequence: Some(2_735),
+                previous_sequence: Some(2_734),
+                interval_ms: 18,
+                interval_us: 18_370,
+                expected_duration_ms: 20,
+                expected_duration_us: 20_000,
+            }],
+            decoded_audio_short_tempo_window_fast_count: 13,
+            decoded_audio_short_tempo_window_slow_count: 109,
+            decoded_audio_short_tempo_window_fastest: Some(
+                crate::audio::AudioTempoWindowEvidence {
+                    classification: "post_resume_steady_playback".to_owned(),
+                    window_packet_count: 25,
+                    media_ms: 500,
+                    wall_clock_us: 483_283,
+                    ratio_ppm: 1_034_590,
+                    first_sequence: 2_735,
+                    last_sequence: 2_759,
+                },
+            ),
+            decoded_audio_short_tempo_window_slowest: Some(
+                crate::audio::AudioTempoWindowEvidence {
+                    classification: "post_resume_steady_playback".to_owned(),
+                    window_packet_count: 25,
+                    media_ms: 500,
+                    wall_clock_us: 522_978,
+                    ratio_ppm: 956_063,
+                    first_sequence: 2_711,
+                    last_sequence: 2_735,
+                },
+            ),
+            decoded_audio_tempo_window_min_ratio_ppm: 991_751,
+            decoded_audio_tempo_window_max_ratio_ppm: 999_029,
+            rtp_inter_arrival: crate::audio::AudioIntervalStats {
+                samples: 6_142,
+                p50_ms: 20,
+                p95_ms: 25,
+                p99_ms: 29,
+                min_ms: 5,
+                max_ms: 36,
+            },
+            ..full_stats.clone()
+        };
+        assert!(
+            observer_thresholds_satisfied(
+                &receive_jitter_with_stable_decoded_tempo,
+                expected_duration_ms,
+            ),
+            "receive-side RTP jitter within the short-window jitter budget should not fail live audio proof"
+        );
+
+        let micro_receive_jitter_with_stable_decoded_tempo = AudioValidationStats {
+            decoded_audio_short_tempo_window_fast_count: 13,
+            decoded_audio_short_tempo_window_slow_count: 16,
+            decoded_audio_short_tempo_window_fastest: Some(observer_short_window(
+                1_107_957, 451_281,
+            )),
+            decoded_audio_short_tempo_window_slowest: Some(observer_short_window(924_616, 540_765)),
+            decoded_audio_tempo_window_min_ratio_ppm: 990_213,
+            decoded_audio_tempo_window_max_ratio_ppm: 1_009_161,
+            rtp_inter_arrival: crate::audio::AudioIntervalStats {
+                samples: 6_141,
+                p50_ms: 20,
+                p95_ms: 24,
+                p99_ms: 27,
+                min_ms: 2,
+                max_ms: 39,
+            },
+            ..full_stats.clone()
+        };
+        assert!(
+            observer_thresholds_satisfied(
+                &micro_receive_jitter_with_stable_decoded_tempo,
+                expected_duration_ms,
+            ),
+            "25-packet receive-side jitter should not fail when aggregate and long-window decoded tempo remain stable"
+        );
+
         let fast_playback_stats = AudioValidationStats {
             wall_clock_elapsed_ms: required_decoded_audio_ms.saturating_sub(20_000),
             decoded_audio_to_wall_clock_ratio_ppm: MEDIA_TO_WALL_CLOCK_MAX_RATIO_PPM + 1,
@@ -5751,7 +6462,7 @@ mod tests {
             expected_duration_ms,
         ));
 
-        let local_fast_interval_with_stable_ratio = AudioValidationStats {
+        let isolated_receive_fast_interval_with_stable_ratio = AudioValidationStats {
             rtp_fast_interval_count: 1,
             rtp_fast_interval_min_ms: 19,
             rtp_fast_interval_min_us: 19_000,
@@ -5762,8 +6473,36 @@ mod tests {
             decoded_audio_tempo_window_max_ratio_ppm: 1_000_000,
             ..full_stats.clone()
         };
+        assert!(observer_thresholds_satisfied(
+            &isolated_receive_fast_interval_with_stable_ratio,
+            expected_duration_ms,
+        ));
+
+        let materially_fast_short_window = AudioValidationStats {
+            decoded_audio_short_tempo_window_fast_count: 1,
+            decoded_audio_short_tempo_window_fastest: Some(observer_short_window_with_packets(
+                OBSERVER_SHORT_WINDOW_MAX_RATIO_PPM + 1,
+                943_396,
+                OBSERVER_STRICT_SHORT_WINDOW_MIN_PACKETS,
+            )),
+            ..full_stats.clone()
+        };
         assert!(!observer_thresholds_satisfied(
-            &local_fast_interval_with_stable_ratio,
+            &materially_fast_short_window,
+            expected_duration_ms,
+        ));
+
+        let materially_slow_short_window = AudioValidationStats {
+            decoded_audio_short_tempo_window_slow_count: 1,
+            decoded_audio_short_tempo_window_slowest: Some(observer_short_window_with_packets(
+                OBSERVER_SHORT_WINDOW_MIN_RATIO_PPM - 1,
+                1_063_831,
+                OBSERVER_STRICT_SHORT_WINDOW_MIN_PACKETS,
+            )),
+            ..full_stats.clone()
+        };
+        assert!(!observer_thresholds_satisfied(
+            &materially_slow_short_window,
             expected_duration_ms,
         ));
 

@@ -4,6 +4,7 @@ use std::time::Duration;
 use super::ytmusic_client::YtMusicClient;
 use crate::error::PlaybackError;
 use crate::media::http_stream::HttpOpusStream;
+use crate::media::opus_queue::{duration_ms_from_samples, samples_from_duration_ms_u64};
 use crate::media::position::{PlaybackPosition, shared_playback_position};
 use crate::media::webm_demux::{DemuxedPacket, WebmOpusDemux};
 use crate::source::{PlaybackSource, ResolvedPlaybackSource};
@@ -19,6 +20,35 @@ const OPEN_CHUNK_ATTEMPTS: usize = 2;
 pub struct PlaybackRecoveryMetrics {
     pub http_retry_count: u64,
     pub url_reresolve_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PlaybackResumePosition {
+    samples: u64,
+}
+
+impl PlaybackResumePosition {
+    pub const fn from_samples(samples: u64) -> Self {
+        Self { samples }
+    }
+
+    pub fn from_millis(duration_ms: u64) -> Self {
+        Self {
+            samples: samples_from_duration_ms_u64(duration_ms),
+        }
+    }
+
+    pub const fn samples(self) -> u64 {
+        self.samples
+    }
+
+    pub fn millis(self) -> u64 {
+        duration_ms_from_samples(self.samples)
+    }
+
+    pub const fn is_start(self) -> bool {
+        self.samples == 0
+    }
 }
 
 #[derive(Debug)]
@@ -42,15 +72,15 @@ impl PlaybackRecovery {
     pub async fn recover(
         &mut self,
         video_id: &str,
-        position_ms: u64,
+        position: PlaybackResumePosition,
     ) -> Result<PlaybackSource, PlaybackError> {
         if self.last_video_id.as_deref() == Some(video_id)
-            && let Ok(source) = self.try_reopen_existing(position_ms).await
+            && let Ok(source) = self.try_reopen_existing(position).await
         {
             return Ok(source);
         }
 
-        self.resolve_and_open(video_id, position_ms).await
+        self.resolve_and_open(video_id, position).await
     }
 
     pub fn reset(&mut self) {
@@ -69,7 +99,7 @@ impl PlaybackRecovery {
 
     async fn try_reopen_existing(
         &mut self,
-        position_ms: u64,
+        position: PlaybackResumePosition,
     ) -> Result<PlaybackSource, PlaybackError> {
         let resolved = self
             .last_resolved
@@ -77,16 +107,16 @@ impl PlaybackRecovery {
             .ok_or(PlaybackError::InvalidState(
                 "no playback source available to reopen",
             ))?;
-        self.open_from_position(resolved, position_ms).await
+        self.open_from_position(resolved, position).await
     }
 
     async fn resolve_and_open(
         &mut self,
         video_id: &str,
-        position_ms: u64,
+        position: PlaybackResumePosition,
     ) -> Result<PlaybackSource, PlaybackError> {
         let resolved = self.client.resolve_playback_source(video_id).await?;
-        match self.open_from_position(resolved, position_ms).await {
+        match self.open_from_position(resolved, position).await {
             Ok(source) => {
                 self.remember_source(video_id, &source);
                 Ok(source)
@@ -95,7 +125,7 @@ impl PlaybackRecovery {
                 self.metrics.url_reresolve_count =
                     self.metrics.url_reresolve_count.saturating_add(1);
                 let resolved = self.client.resolve_playback_source(video_id).await?;
-                let source = self.open_from_position(resolved, position_ms).await?;
+                let source = self.open_from_position(resolved, position).await?;
                 self.remember_source(video_id, &source);
                 Ok(source)
             }
@@ -106,12 +136,12 @@ impl PlaybackRecovery {
     async fn open_from_position(
         &mut self,
         resolved: ResolvedPlaybackSource,
-        position_ms: u64,
+        resume_position: PlaybackResumePosition,
     ) -> Result<PlaybackSource, PlaybackError> {
         let mut stream = HttpOpusStream::new(resolved.playable_url.clone());
         let mut demux = WebmOpusDemux::default();
         let mut pending_packets = VecDeque::new();
-        let mut position = PlaybackPosition::default();
+        let mut playback_position = PlaybackPosition::default();
 
         let opening = read_opening_chunk(&mut stream, &resolved.playable_url).await?;
         self.metrics.http_retry_count = self
@@ -123,13 +153,15 @@ impl PlaybackRecovery {
         };
         demux.push_bytes(chunk);
         for packet in demux.drain_packets()? {
-            position.record_buffered(&packet);
-            if packet_end_ms(&packet) > position_ms {
+            playback_position.record_buffered(&packet);
+            if packet_overlaps_resume(&packet, resume_position) {
                 pending_packets.push_back(packet);
             }
         }
 
-        while pending_packets.is_empty() || position.timestamp_ms() < position_ms {
+        while pending_packets.is_empty()
+            || playback_position.timestamp_samples() < resume_position.samples()
+        {
             let Some(chunk) = read_chunk_with_timeout(&mut stream, &resolved.playable_url).await?
             else {
                 break;
@@ -137,22 +169,25 @@ impl PlaybackRecovery {
 
             demux.push_bytes(chunk);
             for packet in demux.drain_packets()? {
-                position.record_buffered(&packet);
-                if packet_end_ms(&packet) > position_ms {
+                playback_position.record_buffered(&packet);
+                if packet_overlaps_resume(&packet, resume_position) {
                     pending_packets.push_back(packet);
                 }
             }
         }
 
-        if position.timestamp_ms() < position_ms {
+        if playback_position.timestamp_samples() < resume_position.samples() {
             return Err(PlaybackError::MediaParseDetail(format!(
-                "playback source ended before requested resume position {position_ms}ms; reached {}ms",
-                position.timestamp_ms()
+                "playback source ended before requested resume position {}ms/{} samples; reached {}ms/{} samples",
+                resume_position.millis(),
+                resume_position.samples(),
+                playback_position.timestamp_ms(),
+                playback_position.timestamp_samples()
             )));
         }
 
-        if position_ms > 0 {
-            position.record_sent_packet(position_ms);
+        if !resume_position.is_start() {
+            playback_position.set_sent_duration_samples(resume_position.samples());
         }
 
         Ok(PlaybackSource::new(
@@ -160,13 +195,19 @@ impl PlaybackRecovery {
             stream,
             demux,
             pending_packets,
-            shared_playback_position(position),
+            shared_playback_position(playback_position),
         ))
     }
 }
 
-fn packet_end_ms(packet: &DemuxedPacket) -> u64 {
-    packet.timestamp_ms.saturating_add(packet.duration_ms)
+fn packet_end_samples(packet: &DemuxedPacket) -> u64 {
+    packet
+        .timestamp_samples
+        .saturating_add(u64::from(packet.duration_samples))
+}
+
+fn packet_overlaps_resume(packet: &DemuxedPacket, position: PlaybackResumePosition) -> bool {
+    packet_end_samples(packet) > position.samples()
 }
 
 async fn read_opening_chunk(
@@ -227,4 +268,53 @@ fn is_stale_source_status(status: StatusCode) -> bool {
         status,
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND | StatusCode::GONE
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use bytes::Bytes;
+
+    #[test]
+    fn resume_position_preserves_fractional_samples_while_exposing_floor_ms() {
+        let resume_position = PlaybackResumePosition::from_samples(120);
+        let mut playback_position = PlaybackPosition::default();
+        playback_position.set_sent_duration_samples(resume_position.samples());
+
+        assert_eq!(resume_position.samples(), 120);
+        assert_eq!(resume_position.millis(), 2);
+        assert_eq!(playback_position.sent_duration_samples(), 120);
+        assert_eq!(playback_position.sent_duration_ms(), 2);
+        assert_eq!(
+            samples_from_duration_ms_u64(resume_position.millis()),
+            96,
+            "a millisecond-only resume position would lose the 24 fractional samples"
+        );
+    }
+
+    #[test]
+    fn resume_filter_uses_sample_boundaries_for_fractional_packets() {
+        let first = packet(0, 120);
+        let second = packet(120, 120);
+        let third = packet(240, 120);
+
+        let after_first = PlaybackResumePosition::from_samples(120);
+        assert!(!packet_overlaps_resume(&first, after_first));
+        assert!(packet_overlaps_resume(&second, after_first));
+
+        let after_second = PlaybackResumePosition::from_samples(240);
+        assert!(!packet_overlaps_resume(&second, after_second));
+        assert!(packet_overlaps_resume(&third, after_second));
+    }
+
+    fn packet(timestamp_samples: u64, duration_samples: u32) -> DemuxedPacket {
+        DemuxedPacket {
+            data: Bytes::from_static(b"packet"),
+            timestamp_ms: duration_ms_from_samples(timestamp_samples),
+            timestamp_samples,
+            duration_ms: duration_ms_from_samples(u64::from(duration_samples)),
+            duration_samples,
+        }
+    }
 }

@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use discord_voice_service_playback::media::opus_queue::{
-    OpusBufferDepth, OpusFrame, OpusFrameQueue,
+    OpusBufferDepth, OpusFrame, OpusFrameQueue, duration_ms_from_samples,
+    samples_from_duration_ms_u64,
 };
 use discord_voice_service_playback::media::position::SharedPlaybackPosition;
 use discord_voice_service_playback::pacer::{
@@ -19,7 +20,7 @@ use discord_voice_service_voice::{
     ConnectedVoiceSession, VoiceContext, VoiceGatewayDrainReport, VoicePreparedPacketSender,
 };
 use tokio::sync::{Mutex, Notify, RwLock, broadcast, mpsc, oneshot, watch};
-use tokio::task::JoinHandle;
+use tokio::task::JoinHandle as TokioJoinHandle;
 use tokio::time::Instant;
 
 use super::deadline_sender::{
@@ -57,10 +58,7 @@ const MEDIA_SENDER_DAVE_READY_RETRY: Duration = Duration::from_millis(100);
 const MEDIA_OWNER_RETURN_TIMEOUT: Duration = Duration::from_secs(5);
 const LIVE_DEADLINE_COMMAND_CHANNEL_CAPACITY: usize = 25;
 const LIVE_DEADLINE_RECORD_CHANNEL_CAPACITY: usize = 64;
-const DAVE_RECOVERY_DEADLINE_AHEAD_PACKETS: usize = 3;
 const SOURCE_UNDERRUN_DEADLINE_AHEAD_PACKETS: usize = 3;
-const DAVE_RECOVERY_DEADLINE_START_GUARD: Duration = FRAME_DURATION;
-const DAVE_RECOVERY_GATEWAY_POLL: Duration = Duration::from_millis(1);
 
 type LiveMediaDelayHook = Arc<dyn Fn(u64) -> Option<Duration> + Send + Sync>;
 
@@ -154,8 +152,8 @@ impl DiscordEgressBuffer {
         self.queue.is_full()
     }
 
-    fn buffered_duration_ms(&self) -> u64 {
-        self.queue.buffered_duration_ms()
+    fn buffered_samples(&self) -> u64 {
+        self.queue.buffered_samples()
     }
 }
 
@@ -168,7 +166,6 @@ struct PreparedPlayoutQueue {
     queue: VecDeque<PreparedTrackPlayout>,
     packets: usize,
     bytes: usize,
-    duration_ms: u64,
     duration_samples: u64,
 }
 
@@ -178,15 +175,16 @@ impl PreparedPlayoutQueue {
             queue: VecDeque::with_capacity(DISCORD_EGRESS_BUFFER_HIGH_WATERMARK_MS as usize / 20),
             packets: 0,
             bytes: 0,
-            duration_ms: 0,
             duration_samples: 0,
         }
     }
 
     fn push(&mut self, prepared: PreparedTrackPlayout) -> Result<(), PreparedTrackPlayout> {
         let frame = &prepared.frame;
-        if self.duration_ms.saturating_add(frame.duration_ms)
-            > DISCORD_EGRESS_BUFFER_HIGH_WATERMARK_MS
+        if self
+            .duration_samples
+            .saturating_add(u64::from(frame.duration_samples))
+            > samples_from_duration_ms_u64(DISCORD_EGRESS_BUFFER_HIGH_WATERMARK_MS)
         {
             return Err(prepared);
         }
@@ -199,7 +197,6 @@ impl PreparedPlayoutQueue {
 
         self.packets = self.packets.saturating_add(1);
         self.bytes = self.bytes.saturating_add(frame.byte_len());
-        self.duration_ms = self.duration_ms.saturating_add(frame.duration_ms);
         self.duration_samples = self
             .duration_samples
             .saturating_add(u64::from(frame.duration_samples));
@@ -211,7 +208,6 @@ impl PreparedPlayoutQueue {
         let prepared = self.queue.pop_front()?;
         self.packets = self.packets.saturating_sub(1);
         self.bytes = self.bytes.saturating_sub(prepared.frame.byte_len());
-        self.duration_ms = self.duration_ms.saturating_sub(prepared.frame.duration_ms);
         self.duration_samples = self
             .duration_samples
             .saturating_sub(u64::from(prepared.frame.duration_samples));
@@ -222,17 +218,14 @@ impl PreparedPlayoutQueue {
         OpusBufferDepth {
             packets: self.packets,
             bytes: self.bytes,
-            duration_ms: self.duration_ms,
+            duration_ms: duration_ms_from_samples(self.duration_samples),
             duration_samples: self.duration_samples,
         }
     }
 
-    fn buffered_duration_ms(&self) -> u64 {
-        self.duration_ms
-    }
-
     fn is_full(&self) -> bool {
-        self.duration_ms >= DISCORD_EGRESS_BUFFER_HIGH_WATERMARK_MS
+        self.duration_samples
+            >= samples_from_duration_ms_u64(DISCORD_EGRESS_BUFFER_HIGH_WATERMARK_MS)
             || self.packets >= PLAYBACK_QUEUE_CAPACITY
             || self.bytes >= PLAYBACK_BUFFER_MEMORY_CAP_BYTES
     }
@@ -303,6 +296,7 @@ struct LiveMediaDriver {
 struct PreparedFrameIdentity {
     epoch: u64,
     source_position_ms: u64,
+    source_position_samples: u64,
     source_byte_position: Option<u64>,
 }
 
@@ -319,15 +313,15 @@ fn restore_interrupted_frames_to_egress_buffer(
     frames: Vec<OpusFrame>,
 ) -> (u64, u64, Vec<OpusFrame>) {
     let mut restored_count = 0u64;
-    let mut restored_duration_ms = 0u64;
+    let mut restored_duration_samples = 0u64;
     let mut source_restore_frames = Vec::new();
     for frame in frames {
         let restored_frame = frame.clone();
         match egress_buffer.push(frame) {
             Ok(()) => {
                 restored_count = restored_count.saturating_add(1);
-                restored_duration_ms =
-                    restored_duration_ms.saturating_add(restored_frame.duration_ms);
+                restored_duration_samples = restored_duration_samples
+                    .saturating_add(u64::from(restored_frame.duration_samples));
                 prepared_rebuild_credits.push_back(PreparedFrameRebuildCredit {
                     identity: prepared_frame_identity(&restored_frame),
                     reason,
@@ -337,7 +331,11 @@ fn restore_interrupted_frames_to_egress_buffer(
         }
     }
 
-    (restored_count, restored_duration_ms, source_restore_frames)
+    (
+        restored_count,
+        restored_duration_samples,
+        source_restore_frames,
+    )
 }
 
 enum LiveDeadlineOutcome {
@@ -412,7 +410,7 @@ struct LiveDeadlineSender {
     send_record_rx: mpsc::Receiver<DeadlineSendRecord>,
     drop_record_rx: mpsc::Receiver<DeadlineDropRecord>,
     shutdown: Arc<AtomicBool>,
-    task: Option<JoinHandle<Result<DeadlineSenderMetrics, RuntimeError>>>,
+    task: Option<thread::JoinHandle<Result<DeadlineSenderMetrics, RuntimeError>>>,
 }
 
 impl LiveDeadlineSender {
@@ -420,7 +418,7 @@ impl LiveDeadlineSender {
         sink: VoicePreparedPacketSender,
         active_generation: Arc<AtomicU64>,
         next_deadline: Instant,
-    ) -> Self {
+    ) -> Result<Self, RuntimeError> {
         let (command_tx, command_rx) = mpsc::channel(LIVE_DEADLINE_COMMAND_CHANNEL_CAPACITY);
         let (send_record_tx, send_record_rx) = mpsc::channel(LIVE_DEADLINE_RECORD_CHANNEL_CAPACITY);
         let (drop_record_tx, drop_record_rx) = mpsc::channel(LIVE_DEADLINE_RECORD_CHANNEL_CAPACITY);
@@ -434,15 +432,24 @@ impl LiveDeadlineSender {
             Arc::clone(&shutdown),
             next_deadline,
         );
-        let task = tokio::spawn(async move { sender.run().await });
+        let task = thread::Builder::new()
+            .name("discord-live-deadline-sender".to_owned())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|_| RuntimeError::InvalidState("deadline sender runtime failed"))?;
+                runtime.block_on(sender.run())
+            })
+            .map_err(|_| RuntimeError::InvalidState("deadline sender thread failed to start"))?;
 
-        Self {
+        Ok(Self {
             command_tx,
             send_record_rx,
             drop_record_rx,
             shutdown,
             task: Some(task),
-        }
+        })
     }
 
     async fn send_command(&self, command: PreparedPlayoutCommand) -> Result<(), RuntimeError> {
@@ -506,10 +513,10 @@ impl LiveDeadlineSender {
         let Some(task) = self.task.take() else {
             return Ok(());
         };
-        match task.await {
-            Ok(Ok(_metrics)) => Ok(()),
-            Ok(Err(err)) => Err(err),
-            Err(_join_error) => Err(RuntimeError::InvalidState("deadline sender task failed")),
+        match tokio::task::spawn_blocking(move || task.join()).await {
+            Ok(Ok(Ok(_metrics))) => Ok(()),
+            Ok(Ok(Err(err))) => Err(err),
+            Ok(Err(_)) | Err(_) => Err(RuntimeError::InvalidState("deadline sender task failed")),
         }
     }
 }
@@ -517,9 +524,6 @@ impl LiveDeadlineSender {
 impl Drop for LiveDeadlineSender {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
-        if let Some(task) = self.task.take() {
-            task.abort();
-        }
     }
 }
 
@@ -563,33 +567,33 @@ enum PlaybackPipelineMetric {
     ExplicitMediaBoundary {
         reason: PreparedPlayoutQueueEventReason,
     },
-    DaveTransitionReachedBuilder,
     SourceUnderrunReachedBuilder,
     SourceUnderrunReachedDeadlineSender,
     RestoredSourceFrames {
         frame_count: u64,
-        duration_ms: u64,
+        duration_samples: u64,
     },
     DiscardedSourceFrames {
         reason: PreparedPlayoutQueueEventReason,
         frame_count: u64,
-        duration_ms: u64,
+        duration_samples: u64,
     },
     PlayoutBuilderPrepared {
         duration: Duration,
     },
+    GatewayDrain(VoiceGatewayDrainReport),
     SenderSent(SenderSentMetric),
     SenderEgressUnderrun {
         depth: OpusBufferDepth,
     },
     SenderSkippedSourceFrames {
         frame_count: u64,
-        duration_ms: u64,
+        duration_samples: u64,
         remaining_depth: OpusBufferDepth,
     },
     EgressDroppedMusicFrames {
         frame_count: u64,
-        duration_ms: u64,
+        duration_samples: u64,
     },
     SenderSourceUnderrun {
         depth: OpusBufferDepth,
@@ -601,7 +605,6 @@ enum PlaybackPipelineMetric {
     SenderMediaClockReset {
         reason: MediaClockResetReason,
     },
-    SenderStaleDaveSendPrevented,
 }
 
 pub struct VoiceSessionRuntime {
@@ -878,8 +881,9 @@ impl VoiceSessionRuntime {
                     PLAYBACK_SOURCE_BUFFER_TARGET_MS,
                 )
                 .await?;
-            let source_ended_before_playing =
-                source_queue.buffered_duration_ms() < PLAYBACK_SOURCE_BUFFER_TARGET_MS;
+            let source_ended_before_playing = source_queue.buffered_samples()
+                < samples_from_duration_ms_u64(PLAYBACK_SOURCE_BUFFER_TARGET_MS)
+                && source.pending_packets_mut().is_empty();
             (worker.recovery_metrics(), source_ended_before_playing)
         };
         let initial_producer_sample = ProducerMetricsSample {
@@ -1417,9 +1421,6 @@ impl VoiceSessionRuntime {
                         PlaybackPipelineMetric::ExplicitMediaBoundary { reason } => {
                             metrics.record_explicit_media_boundary(reason);
                         }
-                        PlaybackPipelineMetric::DaveTransitionReachedBuilder => {
-                            metrics.record_dave_transition_reached_builder();
-                        }
                         PlaybackPipelineMetric::SourceUnderrunReachedBuilder => {
                             metrics.record_source_underrun_reached_builder();
                         }
@@ -1428,23 +1429,26 @@ impl VoiceSessionRuntime {
                         }
                         PlaybackPipelineMetric::RestoredSourceFrames {
                             frame_count,
-                            duration_ms,
+                            duration_samples,
                         } => {
-                            metrics.record_restored_source_frames(frame_count, duration_ms);
+                            metrics.record_restored_source_frames(frame_count, duration_samples);
                         }
                         PlaybackPipelineMetric::DiscardedSourceFrames {
                             reason,
                             frame_count,
-                            duration_ms,
+                            duration_samples,
                         } => {
                             metrics.record_discarded_source_frames(
                                 reason,
                                 frame_count,
-                                duration_ms,
+                                duration_samples,
                             );
                         }
                         PlaybackPipelineMetric::PlayoutBuilderPrepared { duration } => {
                             metrics.record_playout_builder_prepare_duration(duration);
+                        }
+                        PlaybackPipelineMetric::GatewayDrain(report) => {
+                            metrics.record_gateway_drain(report);
                         }
                         PlaybackPipelineMetric::SenderEgressUnderrun { depth } => {
                             metrics.record_playout_underrun(depth);
@@ -1476,6 +1480,9 @@ impl VoiceSessionRuntime {
                                 source_media_position_ms: sent
                                     .media_frame
                                     .map(|frame| frame.media_position_ms),
+                                source_media_position_samples: sent
+                                    .media_frame
+                                    .map(|frame| frame.media_position_samples),
                                 source_media_byte_position: sent
                                     .media_frame
                                     .and_then(|frame| frame.media_byte_position),
@@ -1500,6 +1507,7 @@ impl VoiceSessionRuntime {
                                     sent.send_started_at,
                                     sent.sent_at,
                                     sent.duration_ms,
+                                    sent.duration_samples,
                                     sent.tempo_rebased,
                                 );
                                 update_adaptive_buffer_target_from_lateness(
@@ -1510,11 +1518,13 @@ impl VoiceSessionRuntime {
                                         .checked_duration_since(sent.expected_deadline)
                                         .unwrap_or(Duration::ZERO),
                                 );
-                                shared_position
-                                    .lock()
-                                    .unwrap()
-                                    .record_sent_packet(sent.duration_ms);
-                                position_ms = position_ms.saturating_add(sent.duration_ms);
+                                {
+                                    let mut shared_position =
+                                        shared_position.lock().unwrap();
+                                    shared_position
+                                        .record_sent_packet_samples(sent.duration_samples);
+                                    position_ms = shared_position.sent_duration_ms();
+                                }
                             } else if matches!(sent.kind, PreparedPacketKind::ScheduledSilence) {
                                 metrics.record_continuity_silence_packet(
                                     sent.sent_at,
@@ -1530,11 +1540,11 @@ impl VoiceSessionRuntime {
                         }
                         PlaybackPipelineMetric::SenderSkippedSourceFrames {
                             frame_count,
-                            duration_ms,
+                            duration_samples,
                             remaining_depth,
                         } => {
                             latest_source_depth = remaining_depth;
-                            metrics.record_skipped_source_frames(frame_count, duration_ms);
+                            metrics.record_skipped_source_frames(frame_count, duration_samples);
                             metrics.record_source_buffer_depth(
                                 remaining_depth,
                                 PLAYBACK_SOURCE_BUFFER_LOW_WATERMARK_MS,
@@ -1547,9 +1557,12 @@ impl VoiceSessionRuntime {
                         }
                         PlaybackPipelineMetric::EgressDroppedMusicFrames {
                             frame_count,
-                            duration_ms,
+                            duration_samples,
                         } => {
-                            metrics.record_egress_dropped_music_frames(frame_count, duration_ms);
+                            metrics.record_egress_dropped_music_frames(
+                                frame_count,
+                                duration_samples,
+                            );
                         }
                         PlaybackPipelineMetric::SenderResumedAfterSourceUnderrun { depth } => {
                             latest_source_depth = depth;
@@ -1575,9 +1588,6 @@ impl VoiceSessionRuntime {
                         }
                         PlaybackPipelineMetric::SenderMediaClockReset { reason } => {
                             metrics.record_media_clock_reset(reason);
-                        }
-                        PlaybackPipelineMetric::SenderStaleDaveSendPrevented => {
-                            metrics.record_stale_dave_send_prevented();
                         }
                     }
                 }
@@ -2302,7 +2312,7 @@ fn spawn_playback_producer(
     source_buffer: Arc<SharedSourceBuffer>,
     metrics_tx: mpsc::Sender<PlaybackPipelineMetric>,
     buffer_target_rx: watch::Receiver<u64>,
-) -> JoinHandle<()> {
+) -> TokioJoinHandle<()> {
     tokio::spawn(async move {
         let buffer_target_rx = buffer_target_rx;
         loop {
@@ -2353,8 +2363,13 @@ fn spawn_playback_producer(
 
             let fill_duration = fill_started.elapsed();
             let produced_frames = refill_queue.len();
-            let produced_duration_ms = refill_queue.buffered_duration_ms();
-            let source_ended = produced_frames == 0 || produced_duration_ms < refill_target_ms;
+            let pending_packets_empty = source.pending_packets_mut().is_empty();
+            let source_ended = producer_refill_reached_end_of_stream(
+                produced_frames,
+                refill_queue.buffered_samples(),
+                refill_target_ms,
+                pending_packets_empty,
+            );
             let source_buffer_depth = {
                 let mut source_state = source_buffer.state.lock().await;
                 while let Some(frame) = refill_queue.pop() {
@@ -2501,10 +2516,10 @@ impl LiveMediaDriver {
                 let pending_depth = pending.track_depth();
                 depth.packets = depth.packets.saturating_add(pending_depth.packets);
                 depth.bytes = depth.bytes.saturating_add(pending_depth.bytes);
-                depth.duration_ms = depth.duration_ms.saturating_add(pending_depth.duration_ms);
                 depth.duration_samples = depth
                     .duration_samples
                     .saturating_add(pending_depth.duration_samples);
+                depth.duration_ms = duration_ms_from_samples(depth.duration_samples);
                 depth
             })
     }
@@ -2517,10 +2532,10 @@ impl LiveMediaDriver {
         let pending_depth = Self::pending_deadline_track_depth(pending_deadline_commands);
         depth.packets = depth.packets.saturating_add(pending_depth.packets);
         depth.bytes = depth.bytes.saturating_add(pending_depth.bytes);
-        depth.duration_ms = depth.duration_ms.saturating_add(pending_depth.duration_ms);
         depth.duration_samples = depth
             .duration_samples
             .saturating_add(pending_depth.duration_samples);
+        depth.duration_ms = duration_ms_from_samples(depth.duration_samples);
         depth
     }
 
@@ -2573,7 +2588,7 @@ impl LiveMediaDriver {
             self.session.cloned_prepared_packet_sender()?,
             Arc::clone(&self.playout_generation),
             next_deadline,
-        );
+        )?;
         let mut pending_frames = Vec::new();
         while let Some(mut pending) = pending_deadline_commands.pop_front() {
             let event = pending_prepared_playout_queue_event(
@@ -2590,6 +2605,30 @@ impl LiveMediaDriver {
             }
         }
         Ok(pending_frames)
+    }
+
+    async fn rebuild_prepared_playout_for_dave_transition(
+        &mut self,
+        deadline_sender: &mut LiveDeadlineSender,
+        pending_deadline_commands: &mut VecDeque<PendingDeadlineCommand>,
+        next_deadline: Instant,
+    ) -> Result<(), RuntimeError> {
+        self.invalidate_prepared_playout_generation();
+        self.session.discard_unsent_prepared_packets();
+        let pending_frames = self
+            .replace_deadline_sender_after_invalidation_at(
+                deadline_sender,
+                pending_deadline_commands,
+                PreparedPlayoutQueueEventReason::DaveTransitionRecovery,
+                next_deadline,
+            )
+            .await?;
+        self.flush_egress_buffer_for_interruption(
+            PreparedPlayoutQueueEventReason::DaveTransitionRecovery,
+            pending_frames,
+        )
+        .await;
+        Ok(())
     }
 
     async fn account_deadline_outcome(
@@ -2760,19 +2799,6 @@ impl LiveMediaDriver {
         Ok(())
     }
 
-    async fn enqueue_dave_recovery_scheduled_silence(
-        &mut self,
-        deadline_sender: &mut LiveDeadlineSender,
-        pending_deadline_commands: &mut VecDeque<PendingDeadlineCommand>,
-    ) -> Result<(), RuntimeError> {
-        self.enqueue_scheduled_silence(
-            deadline_sender,
-            pending_deadline_commands,
-            PreparedPlayoutQueueEventReason::DaveTransitionRecovery,
-        )
-        .await
-    }
-
     async fn enqueue_source_underrun_scheduled_silence(
         &mut self,
         deadline_sender: &mut LiveDeadlineSender,
@@ -2784,38 +2810,6 @@ impl LiveMediaDriver {
             PreparedPlayoutQueueEventReason::SourceUnderrun,
         )
         .await
-    }
-
-    async fn fill_dave_recovery_silence_deadline_queue(
-        &mut self,
-        deadline_sender: &mut LiveDeadlineSender,
-        pending_deadline_commands: &mut VecDeque<PendingDeadlineCommand>,
-    ) -> Result<(), RuntimeError> {
-        let mut pending_recovery_silence = pending_deadline_commands
-            .iter()
-            .filter(|pending| {
-                pending.kind == PreparedPacketKind::ScheduledSilence && pending.frame.is_none()
-            })
-            .count();
-
-        if pending_recovery_silence < DAVE_RECOVERY_DEADLINE_AHEAD_PACKETS
-            && deadline_sender.available_command_capacity() > 0
-        {
-            self.session.prepare_speaking_before_media().await?;
-        }
-
-        while pending_recovery_silence < DAVE_RECOVERY_DEADLINE_AHEAD_PACKETS
-            && deadline_sender.available_command_capacity() > 0
-        {
-            self.enqueue_dave_recovery_scheduled_silence(
-                deadline_sender,
-                pending_deadline_commands,
-            )
-            .await?;
-            pending_recovery_silence += 1;
-        }
-
-        Ok(())
     }
 
     async fn fill_source_underrun_silence_deadline_queue(
@@ -2850,52 +2844,18 @@ impl LiveMediaDriver {
         Ok(())
     }
 
-    async fn send_dave_recovery_scheduled_silence(
-        &mut self,
-        deadline_sender: &mut LiveDeadlineSender,
-        pending_deadline_commands: &mut VecDeque<PendingDeadlineCommand>,
-        pacer: &mut AudioPacer,
-        packet_index: &mut u64,
-        gateway_drain: VoiceGatewayDrainReport,
-        remaining_source_depth: OpusBufferDepth,
-    ) -> Result<(), RuntimeError> {
-        self.fill_dave_recovery_silence_deadline_queue(deadline_sender, pending_deadline_commands)
-            .await?;
-
-        let outcome = deadline_sender.next_outcome().await?;
-        let Some(sent_record) = self
-            .account_deadline_outcome(pending_deadline_commands, outcome, remaining_source_depth)
-            .await?
-        else {
-            return Err(RuntimeError::InvalidState(
-                "deadline sender dropped DAVE recovery silence",
-            ));
-        };
-        self.record_deadline_send_metric(
-            pacer,
-            packet_index,
-            sent_record,
-            Duration::ZERO,
-            gateway_drain,
-            remaining_source_depth,
-            self.prepared_playout_depth_with_pending(pending_deadline_commands),
-        );
-        Ok(())
-    }
-
     async fn run_loop(&mut self) -> Result<bool, RuntimeError> {
         let mut pacer = AudioPacer::starting_after(FRAME_DURATION);
         let mut deadline_sender = LiveDeadlineSender::spawn(
             self.session.cloned_prepared_packet_sender()?,
             Arc::clone(&self.playout_generation),
             pacer.next_deadline(),
-        );
+        )?;
         let mut pending_deadline_commands = VecDeque::new();
         let mut packet_index = 0u64;
         let mut paused = false;
         let mut source_ended = false;
         let mut source_underrun_active = false;
-        let mut dave_recovery_active = false;
         let source_depth = current_source_depth(&self.source_buffer).await?;
         let _ = self
             .metrics_tx
@@ -2909,6 +2869,7 @@ impl LiveMediaDriver {
         'egress: loop {
             if !self.playback_is_current() {
                 self.invalidate_prepared_playout_generation();
+                self.session.discard_unsent_prepared_packets();
                 self.account_popped_frame_as_skipped_on_stop = true;
                 let pending_frames = self
                     .replace_deadline_sender_after_invalidation(
@@ -2977,85 +2938,96 @@ impl LiveMediaDriver {
                 source_ended = false;
             }
 
-            if dave_recovery_active {
-                self.fill_dave_recovery_silence_deadline_queue(
-                    &mut deadline_sender,
-                    &mut pending_deadline_commands,
-                )
-                .await?;
-            }
-
-            let expected_deadline = if dave_recovery_active {
-                Instant::now() + DAVE_RECOVERY_GATEWAY_POLL
-            } else {
-                pacer.next_deadline()
-            };
+            let expected_deadline = pacer.next_deadline();
             let gateway_drain = match self
                 .session
                 .prepare_media_state_before_slot(expected_deadline)
                 .await
             {
-                Ok(report) => {
-                    dave_recovery_active = false;
-                    report
-                }
+                Ok(report) => report,
                 Err(err) if err.to_string().contains("dave") => {
-                    if !dave_recovery_active {
-                        dave_recovery_active = true;
-                        let _ = self
-                            .metrics_tx
-                            .try_send(PlaybackPipelineMetric::DaveTransitionReachedBuilder);
-                        let _ = self.metrics_tx.try_send(
-                            PlaybackPipelineMetric::SenderMediaClockReset {
-                                reason: MediaClockResetReason::DaveTransitionRecovery,
-                            },
-                        );
-                        let _ = self.metrics_tx.try_send(
-                            PlaybackPipelineMetric::ExplicitMediaBoundary {
-                                reason: PreparedPlayoutQueueEventReason::DaveTransitionRecovery,
-                            },
-                        );
-                        let _ = self
-                            .metrics_tx
-                            .try_send(PlaybackPipelineMetric::SenderStaleDaveSendPrevented);
-                        self.invalidate_prepared_playout_generation();
-                        self.session.discard_unsent_prepared_packets();
-                        let recovery_deadline = expected_deadline
-                            .max(Instant::now() + DAVE_RECOVERY_DEADLINE_START_GUARD);
-                        let pending_frames = self
-                            .replace_deadline_sender_after_invalidation_at(
-                                &mut deadline_sender,
-                                &mut pending_deadline_commands,
-                                PreparedPlayoutQueueEventReason::DaveTransitionRecovery,
-                                recovery_deadline,
-                            )
-                            .await?;
-                        self.flush_egress_buffer_for_interruption(
-                            PreparedPlayoutQueueEventReason::DaveTransitionRecovery,
-                            pending_frames,
+                    let gateway_drain = self
+                        .session
+                        .settle_pending_dave_transition_for_playback()
+                        .await?;
+
+                    let ready_source_depth = current_source_depth(&self.source_buffer).await?;
+                    let ready_sent_records = self
+                        .drain_ready_deadline_outcomes(
+                            &mut deadline_sender,
+                            &mut pending_deadline_commands,
+                            ready_source_depth,
                         )
-                        .await;
+                        .await?;
+                    for sent_record in ready_sent_records {
+                        self.record_deadline_send_metric(
+                            &mut pacer,
+                            &mut packet_index,
+                            sent_record,
+                            Duration::ZERO,
+                            VoiceGatewayDrainReport::default(),
+                            ready_source_depth,
+                            self.prepared_playout_depth_with_pending(&pending_deadline_commands),
+                        );
                     }
-                    let recovery_source_depth = current_source_depth(&self.source_buffer).await?;
-                    self.send_dave_recovery_scheduled_silence(
+                    let _ = self
+                        .metrics_tx
+                        .try_send(PlaybackPipelineMetric::GatewayDrain(gateway_drain));
+                    self.rebuild_prepared_playout_for_dave_transition(
                         &mut deadline_sender,
                         &mut pending_deadline_commands,
-                        &mut pacer,
-                        &mut packet_index,
-                        VoiceGatewayDrainReport::default(),
-                        recovery_source_depth,
+                        pacer.next_deadline().max(Instant::now()),
                     )
                     .await?;
+                    let latest_source_depth = self
+                        .fill_prepared_playout_queue(
+                            &mut source_ended,
+                            &mut source_underrun_active,
+                            Self::pending_deadline_track_depth(&pending_deadline_commands)
+                                .duration_samples,
+                        )
+                        .await?;
+                    self.pump_prepared_playout_to_deadline_sender(
+                        &mut deadline_sender,
+                        &mut pending_deadline_commands,
+                    )
+                    .await?;
+                    if source_underrun_active && !source_ended {
+                        self.fill_source_underrun_silence_deadline_queue(
+                            &mut deadline_sender,
+                            &mut pending_deadline_commands,
+                        )
+                        .await?;
+                    }
+                    let _ =
+                        self.metrics_tx
+                            .try_send(PlaybackPipelineMetric::PreparedTrackQueueDepth(
+                                self.prepared_playout_depth_with_pending(
+                                    &pending_deadline_commands,
+                                ),
+                            ));
+                    let _ = self
+                        .metrics_tx
+                        .try_send(PlaybackPipelineMetric::SourceDepth(latest_source_depth));
                     continue;
                 }
                 Err(err) => return Err(RuntimeError::from(err)),
             };
 
+            if gateway_drain.dave_transition_count > 0 {
+                self.rebuild_prepared_playout_for_dave_transition(
+                    &mut deadline_sender,
+                    &mut pending_deadline_commands,
+                    pacer.next_deadline().max(Instant::now()),
+                )
+                .await?;
+            }
+
             let latest_source_depth = self
                 .fill_prepared_playout_queue(
                     &mut source_ended,
                     &mut source_underrun_active,
-                    Self::pending_deadline_track_depth(&pending_deadline_commands).duration_ms,
+                    Self::pending_deadline_track_depth(&pending_deadline_commands).duration_samples,
                 )
                 .await?;
             self.pump_prepared_playout_to_deadline_sender(
@@ -3233,20 +3205,20 @@ impl LiveMediaDriver {
         &mut self,
         source_ended: &mut bool,
         source_underrun_active: &mut bool,
-        pending_playout_duration_ms: u64,
+        pending_playout_duration_samples: u64,
     ) -> Result<OpusBufferDepth, RuntimeError> {
         let mut latest_source_depth = self
             .refill_egress_buffer(
                 source_ended,
                 source_underrun_active,
-                pending_playout_duration_ms,
+                pending_playout_duration_samples,
             )
             .await?;
 
         while (!*source_ended || self.egress_buffer.depth().packets > 0)
-            && pending_playout_duration_ms
-                .saturating_add(self.prepared_playout_queue.buffered_duration_ms())
-                < DISCORD_EGRESS_BUFFER_TARGET_MS
+            && pending_playout_duration_samples
+                .saturating_add(self.prepared_playout_queue.duration_samples)
+                < samples_from_duration_ms_u64(DISCORD_EGRESS_BUFFER_TARGET_MS)
             && !self.prepared_playout_queue.is_full()
         {
             if self.egress_buffer.depth().packets == 0 {
@@ -3254,7 +3226,7 @@ impl LiveMediaDriver {
                     .refill_egress_buffer(
                         source_ended,
                         source_underrun_active,
-                        pending_playout_duration_ms,
+                        pending_playout_duration_samples,
                     )
                     .await?;
             }
@@ -3314,7 +3286,7 @@ impl LiveMediaDriver {
                 .refill_egress_buffer(
                     source_ended,
                     source_underrun_active,
-                    pending_playout_duration_ms,
+                    pending_playout_duration_samples,
                 )
                 .await?;
         }
@@ -3363,7 +3335,7 @@ impl LiveMediaDriver {
         remaining_source_depth: OpusBufferDepth,
         reason: PreparedPlayoutQueueEventReason,
     ) {
-        let duration_ms = frame.duration_ms;
+        let duration_samples = u64::from(frame.duration_samples);
         let mut restored = true;
         let mut frame_for_credit = Some(frame.clone());
         if let Err(frame) = self.egress_buffer.push_front(frame) {
@@ -3376,7 +3348,7 @@ impl LiveMediaDriver {
                     let _ = self.metrics_tx.try_send(
                         PlaybackPipelineMetric::SenderSkippedSourceFrames {
                             frame_count: 1,
-                            duration_ms: frame.duration_ms,
+                            duration_samples: u64::from(frame.duration_samples),
                             remaining_depth: remaining_source_depth,
                         },
                     );
@@ -3385,14 +3357,14 @@ impl LiveMediaDriver {
                     self.metrics_tx
                         .try_send(PlaybackPipelineMetric::EgressDroppedMusicFrames {
                             frame_count: 1,
-                            duration_ms: frame.duration_ms,
+                            duration_samples: u64::from(frame.duration_samples),
                         });
                 let _ = self
                     .metrics_tx
                     .try_send(PlaybackPipelineMetric::DiscardedSourceFrames {
                         reason,
                         frame_count: 1,
-                        duration_ms: frame.duration_ms,
+                        duration_samples: u64::from(frame.duration_samples),
                     });
             }
         }
@@ -3404,7 +3376,7 @@ impl LiveMediaDriver {
                 .metrics_tx
                 .try_send(PlaybackPipelineMetric::RestoredSourceFrames {
                     frame_count: 1,
-                    duration_ms,
+                    duration_samples,
                 });
         }
         let _ = self
@@ -3430,8 +3402,8 @@ impl LiveMediaDriver {
         }
 
         let mut skipped_count = 0u64;
-        let mut skipped_duration_ms = 0u64;
-        let (mut restored_count, mut restored_duration_ms, source_restore_frames) =
+        let mut skipped_duration_samples = 0u64;
+        let (mut restored_count, mut restored_duration_samples, source_restore_frames) =
             restore_interrupted_frames_to_egress_buffer(
                 &mut self.egress_buffer,
                 &mut self.prepared_rebuild_credits,
@@ -3439,7 +3411,7 @@ impl LiveMediaDriver {
                 frames,
             );
         let mut discarded_count = 0u64;
-        let mut discarded_duration_ms = 0u64;
+        let mut discarded_duration_samples = 0u64;
         let mut remaining_depth = current_source_depth(&self.source_buffer)
             .await
             .unwrap_or_default();
@@ -3449,16 +3421,18 @@ impl LiveMediaDriver {
                 Ok(depth) => {
                     remaining_depth = depth;
                     restored_count = restored_count.saturating_add(1);
-                    restored_duration_ms =
-                        restored_duration_ms.saturating_add(restored_frame.duration_ms);
+                    restored_duration_samples = restored_duration_samples
+                        .saturating_add(u64::from(restored_frame.duration_samples));
                     self.remember_rebuild_credit(&restored_frame, reason);
                 }
                 Err(frame) => {
                     discarded_count = discarded_count.saturating_add(1);
-                    discarded_duration_ms = discarded_duration_ms.saturating_add(frame.duration_ms);
+                    discarded_duration_samples = discarded_duration_samples
+                        .saturating_add(u64::from(frame.duration_samples));
                     if !self.account_popped_frame_as_skipped_on_stop {
                         skipped_count = skipped_count.saturating_add(1);
-                        skipped_duration_ms = skipped_duration_ms.saturating_add(frame.duration_ms);
+                        skipped_duration_samples = skipped_duration_samples
+                            .saturating_add(u64::from(frame.duration_samples));
                     }
                 }
             }
@@ -3468,7 +3442,7 @@ impl LiveMediaDriver {
                 .metrics_tx
                 .try_send(PlaybackPipelineMetric::SenderSkippedSourceFrames {
                     frame_count: skipped_count,
-                    duration_ms: skipped_duration_ms,
+                    duration_samples: skipped_duration_samples,
                     remaining_depth,
                 });
         }
@@ -3477,7 +3451,7 @@ impl LiveMediaDriver {
                 .metrics_tx
                 .try_send(PlaybackPipelineMetric::RestoredSourceFrames {
                     frame_count: restored_count,
-                    duration_ms: restored_duration_ms,
+                    duration_samples: restored_duration_samples,
                 });
         }
         if discarded_count > 0 {
@@ -3486,13 +3460,13 @@ impl LiveMediaDriver {
                 .try_send(PlaybackPipelineMetric::DiscardedSourceFrames {
                     reason,
                     frame_count: discarded_count,
-                    duration_ms: discarded_duration_ms,
+                    duration_samples: discarded_duration_samples,
                 });
             let _ = self
                 .metrics_tx
                 .try_send(PlaybackPipelineMetric::EgressDroppedMusicFrames {
                     frame_count: discarded_count,
-                    duration_ms: discarded_duration_ms,
+                    duration_samples: discarded_duration_samples,
                 });
         }
         let _ = self
@@ -3560,15 +3534,16 @@ impl LiveMediaDriver {
         &mut self,
         source_ended: &mut bool,
         source_underrun_active: &mut bool,
-        pending_playout_duration_ms: u64,
+        pending_playout_duration_samples: u64,
     ) -> Result<OpusBufferDepth, RuntimeError> {
         let mut latest_source_depth = current_source_depth(&self.source_buffer).await?;
-        let raw_refill_target_ms = DISCORD_EGRESS_BUFFER_TARGET_MS
-            .saturating_sub(pending_playout_duration_ms)
-            .saturating_sub(self.prepared_playout_queue.buffered_duration_ms());
+        let raw_refill_target_samples =
+            samples_from_duration_ms_u64(DISCORD_EGRESS_BUFFER_TARGET_MS)
+                .saturating_sub(pending_playout_duration_samples)
+                .saturating_sub(self.prepared_playout_queue.duration_samples);
 
         while !*source_ended
-            && self.egress_buffer.buffered_duration_ms() < raw_refill_target_ms
+            && self.egress_buffer.buffered_samples() < raw_refill_target_samples
             && !self.egress_buffer.is_full()
         {
             let source_poll =
@@ -3599,14 +3574,14 @@ impl LiveMediaDriver {
                         let _ = self.metrics_tx.try_send(
                             PlaybackPipelineMetric::SenderSkippedSourceFrames {
                                 frame_count: 1,
-                                duration_ms: frame.duration_ms,
+                                duration_samples: u64::from(frame.duration_samples),
                                 remaining_depth,
                             },
                         );
                         let _ = self.metrics_tx.try_send(
                             PlaybackPipelineMetric::EgressDroppedMusicFrames {
                                 frame_count: 1,
-                                duration_ms: frame.duration_ms,
+                                duration_samples: u64::from(frame.duration_samples),
                             },
                         );
                     }
@@ -3821,6 +3796,7 @@ fn prepared_media_frame(frame: &OpusFrame) -> PreparedMediaFrame {
         duration_ms: frame.duration_ms,
         duration_samples: frame.duration_samples,
         media_position_ms: frame.source_position_ms,
+        media_position_samples: frame.source_position_samples,
         media_byte_position: frame.source_byte_position,
         epoch: frame.epoch,
     }
@@ -3830,6 +3806,7 @@ fn prepared_frame_identity(frame: &OpusFrame) -> PreparedFrameIdentity {
     PreparedFrameIdentity {
         epoch: frame.epoch,
         source_position_ms: frame.source_position_ms,
+        source_position_samples: frame.source_position_samples,
         source_byte_position: frame.source_byte_position,
     }
 }
@@ -3852,6 +3829,9 @@ fn prepared_playout_queue_event(
         protection_nonce: command.packet.protection_nonce,
         source_frame_epoch: command.media_frame.map(|frame| frame.epoch),
         source_media_position_ms: command.media_frame.map(|frame| frame.media_position_ms),
+        source_media_position_samples: command
+            .media_frame
+            .map(|frame| frame.media_position_samples),
         source_media_byte_position: command
             .media_frame
             .and_then(|frame| frame.media_byte_position),
@@ -3876,6 +3856,7 @@ fn dropped_prepared_playout_queue_event(
         protection_nonce: drop.protection_nonce,
         source_frame_epoch: drop.media_frame.map(|frame| frame.epoch),
         source_media_position_ms: drop.media_frame.map(|frame| frame.media_position_ms),
+        source_media_position_samples: drop.media_frame.map(|frame| frame.media_position_samples),
         source_media_byte_position: drop.media_frame.and_then(|frame| frame.media_byte_position),
         queue_depth_after: queue_depth_after.into(),
     }
@@ -3899,6 +3880,9 @@ fn pending_prepared_playout_queue_event(
         protection_nonce: pending.protection_nonce,
         source_frame_epoch: pending.media_frame.map(|frame| frame.epoch),
         source_media_position_ms: pending.media_frame.map(|frame| frame.media_position_ms),
+        source_media_position_samples: pending
+            .media_frame
+            .map(|frame| frame.media_position_samples),
         source_media_byte_position: pending
             .media_frame
             .and_then(|frame| frame.media_byte_position),
@@ -3914,7 +3898,7 @@ async fn send_stop_audio_boundary_with_owned_deadline_sender(
         session.cloned_prepared_packet_sender()?,
         Arc::new(AtomicU64::new(0)),
         next_deadline,
-    );
+    )?;
     let _records =
         send_stop_audio_boundary_through_deadline_sender(session, &mut deadline_sender, 0).await?;
     deadline_sender.shutdown().await
@@ -3988,6 +3972,17 @@ fn update_adaptive_buffer_target_from_lateness(
     metrics.record_adaptive_buffer_target(buffer_policy.target_ms(), buffer_policy.max_target_ms());
 }
 
+fn producer_refill_reached_end_of_stream(
+    produced_frames: usize,
+    produced_samples: u64,
+    refill_target_ms: u64,
+    pending_packets_empty: bool,
+) -> bool {
+    pending_packets_empty
+        && (produced_frames == 0
+            || produced_samples < samples_from_duration_ms_u64(refill_target_ms))
+}
+
 fn apply_voice_context(snapshot: &mut Snapshot, voice: &VoiceContext) {
     snapshot.guild_id = Some(voice.guild_id.clone());
     snapshot.channel_id = Some(voice.channel_id.clone());
@@ -4002,6 +3997,8 @@ fn apply_rollover_state(snapshot: &mut Snapshot, session: &ConnectedVoiceSession
 mod tests {
     use super::*;
 
+    use discord_voice_service_voice::PreparedVoicePacket;
+
     #[test]
     fn playback_buffer_policy_reports_five_second_source_target() {
         let mut policy = PlaybackBufferPolicy::new();
@@ -4014,6 +4011,41 @@ mod tests {
         assert_eq!(policy.target_ms(), PLAYBACK_SOURCE_BUFFER_TARGET_MS);
 
         assert_eq!(policy.max_target_ms(), PLAYBACK_SOURCE_BUFFER_TARGET_MS);
+    }
+
+    #[test]
+    fn producer_refill_does_not_mark_end_when_pending_packet_did_not_fit_batch() {
+        assert!(
+            !producer_refill_reached_end_of_stream(
+                0,
+                0,
+                PLAYBACK_SOURCE_BUFFER_REFILL_BATCH_MS,
+                false,
+            ),
+            "pending packets left behind by a sample cap are still playable media"
+        );
+    }
+
+    #[test]
+    fn producer_refill_marks_end_only_when_short_refill_has_no_pending_packets() {
+        assert!(producer_refill_reached_end_of_stream(
+            0,
+            0,
+            PLAYBACK_SOURCE_BUFFER_REFILL_BATCH_MS,
+            true,
+        ));
+        assert!(producer_refill_reached_end_of_stream(
+            1,
+            samples_from_duration_ms_u64(PLAYBACK_SOURCE_BUFFER_REFILL_BATCH_MS - 20),
+            PLAYBACK_SOURCE_BUFFER_REFILL_BATCH_MS,
+            true,
+        ));
+        assert!(!producer_refill_reached_end_of_stream(
+            1,
+            samples_from_duration_ms_u64(PLAYBACK_SOURCE_BUFFER_REFILL_BATCH_MS),
+            PLAYBACK_SOURCE_BUFFER_REFILL_BATCH_MS,
+            true,
+        ));
     }
 
     #[test]
@@ -4087,7 +4119,7 @@ mod tests {
     fn skipped_source_metrics_do_not_advance_heard_position() {
         let source = include_str!("runtime.rs");
         let skipped_arm = source
-            .split("metrics.record_skipped_source_frames(frame_count, duration_ms);")
+            .split("metrics.record_skipped_source_frames(frame_count, duration_samples);")
             .nth(1)
             .and_then(|tail| {
                 tail.split("PlaybackPipelineMetric::SenderResumedAfterSourceUnderrun")
@@ -4166,13 +4198,18 @@ mod tests {
             "send_record_rx: mpsc::Receiver<DeadlineSendRecord>",
             "drop_record_rx: mpsc::Receiver<DeadlineDropRecord>",
             "shutdown: Arc<AtomicBool>",
-            "task: Option<JoinHandle<Result<DeadlineSenderMetrics, RuntimeError>>>",
         ] {
             assert!(
                 state.contains(required_field),
                 "live deadline sender handle should own field: {required_field}"
             );
         }
+        assert!(
+            state.contains(
+                "task: Option<thread::JoinHandle<Result<DeadlineSenderMetrics, RuntimeError>>>"
+            ),
+            "live deadline sender should own a dedicated thread handle"
+        );
 
         let spawn = source
             .split("fn spawn(")
@@ -4181,11 +4218,12 @@ mod tests {
             .expect("runtime should spawn the live deadline sender");
         assert!(
             spawn.contains("sink: VoicePreparedPacketSender"),
-            "live deadline sender task should be constructed from a narrow send-only sink"
+            "live deadline sender should be constructed from a narrow send-only sink"
         );
         assert!(
-            spawn.contains("tokio::spawn(async move { sender.run().await })"),
-            "deadline sender should run as a long-lived task"
+            spawn.contains("thread::Builder::new()")
+                && spawn.contains("runtime.block_on(sender.run())"),
+            "deadline sender should run on a dedicated runtime thread"
         );
     }
 
@@ -4269,7 +4307,7 @@ mod tests {
             .find("async fn fill_source_underrun_silence_deadline_queue")
             .expect("live driver should top up source-underrun scheduled silence");
         let fill_body = source[fill..]
-            .split("async fn send_dave_recovery_scheduled_silence")
+            .split("async fn run_loop")
             .next()
             .expect("source underrun silence fill body should be bounded");
         for required in [
@@ -4349,49 +4387,149 @@ mod tests {
     }
 
     #[test]
-    fn interruption_restore_keeps_unsent_frames_in_source_order() {
+    fn prepared_playout_and_pending_depths_derive_ms_from_total_samples() {
+        let mut queue = PreparedPlayoutQueue::new();
+        let mut pending_commands = VecDeque::new();
+
+        for index in 0..2u16 {
+            let (command, frame) = fractional_prepared_track(index);
+            pending_commands.push_back(PendingDeadlineCommand::new(&command, Some(frame.clone())));
+            assert!(
+                queue.push(PreparedTrackPlayout { command, frame }).is_ok(),
+                "fractional prepared packet should fit"
+            );
+        }
+
+        let prepared_depth = queue.depth();
+        assert_eq!(prepared_depth.packets, 2);
+        assert_eq!(prepared_depth.duration_samples, 240);
+        assert_eq!(prepared_depth.duration_ms, 5);
+
+        let pending_depth = LiveMediaDriver::pending_deadline_track_depth(&pending_commands);
+        assert_eq!(pending_depth.packets, 2);
+        assert_eq!(pending_depth.duration_samples, 240);
+        assert_eq!(pending_depth.duration_ms, 5);
+    }
+
+    fn assert_fractional_interruption_restore_keeps_source_order(
+        reason: PreparedPlayoutQueueEventReason,
+    ) {
         let mut buffer = DiscordEgressBuffer::new();
         let mut rebuild_credits = VecDeque::new();
-        let interrupted_frames = (0..20u64)
-            .map(|index| {
-                OpusFrame::with_duration_samples(Bytes::from(vec![index as u8]), 20, 960)
-                    .with_metadata(index * 20, Some(index), 12)
-            })
-            .collect::<Vec<_>>();
+        let durations = [120u32, 240, 360, 960];
+        let mut interrupted_frames = Vec::new();
+        let mut expected_positions = Vec::new();
+        let mut position_samples = 0u64;
+        for index in 0..20u64 {
+            let duration_samples = durations[index as usize % durations.len()];
+            let position_ms = duration_ms_from_samples(position_samples);
+            interrupted_frames.push(
+                OpusFrame::with_duration_samples(
+                    Bytes::from(vec![index as u8]),
+                    duration_ms_from_samples(u64::from(duration_samples)),
+                    duration_samples,
+                )
+                .with_exact_metadata(
+                    position_ms,
+                    position_samples,
+                    Some(index),
+                    12,
+                ),
+            );
+            expected_positions.push((position_ms, position_samples));
+            position_samples = position_samples.saturating_add(u64::from(duration_samples));
+        }
+        let expected_duration_samples = position_samples;
 
-        let (restored_count, restored_duration_ms, source_restore_frames) =
+        let (restored_count, restored_duration_samples, source_restore_frames) =
             restore_interrupted_frames_to_egress_buffer(
                 &mut buffer,
                 &mut rebuild_credits,
-                PreparedPlayoutQueueEventReason::Pause,
+                reason,
                 interrupted_frames,
             );
 
         assert_eq!(restored_count, 20);
-        assert_eq!(restored_duration_ms, 400);
+        assert_eq!(restored_duration_samples, expected_duration_samples);
+        assert_eq!(duration_ms_from_samples(restored_duration_samples), 175);
         assert!(
             source_restore_frames.is_empty(),
-            "a normal 400ms prepared reservoir should restore without overflowing egress"
+            "a fractional prepared reservoir should restore without overflowing egress"
         );
 
         let restored_positions = std::iter::from_fn(|| buffer.pop())
-            .map(|frame| frame.source_position_ms)
+            .map(|frame| (frame.source_position_ms, frame.source_position_samples))
             .collect::<Vec<_>>();
         assert_eq!(
-            restored_positions,
-            (0..20u64).map(|index| index * 20).collect::<Vec<_>>(),
+            restored_positions, expected_positions,
             "pause must not resume unsent prepared frames in reverse order"
         );
         let credited_positions = rebuild_credits
             .iter()
-            .map(|credit| credit.identity.source_position_ms)
+            .map(|credit| {
+                (
+                    credit.identity.source_position_ms,
+                    credit.identity.source_position_samples,
+                )
+            })
             .collect::<Vec<_>>();
         assert_eq!(credited_positions, restored_positions);
-        assert!(
-            rebuild_credits
-                .iter()
-                .all(|credit| credit.reason == PreparedPlayoutQueueEventReason::Pause)
+        assert!(rebuild_credits.iter().all(|credit| credit.reason == reason));
+    }
+
+    #[test]
+    fn pause_restore_keeps_fractional_unsent_frames_in_source_order() {
+        assert_fractional_interruption_restore_keeps_source_order(
+            PreparedPlayoutQueueEventReason::Pause,
         );
+    }
+
+    #[test]
+    fn reconnect_restore_keeps_fractional_unsent_frames_in_source_order() {
+        assert_fractional_interruption_restore_keeps_source_order(
+            PreparedPlayoutQueueEventReason::Reconnect,
+        );
+    }
+
+    #[test]
+    fn dave_transition_restore_keeps_fractional_unsent_frames_in_source_order() {
+        assert_fractional_interruption_restore_keeps_source_order(
+            PreparedPlayoutQueueEventReason::DaveTransitionRecovery,
+        );
+    }
+
+    #[test]
+    fn source_underrun_restore_keeps_fractional_unsent_frames_in_source_order() {
+        assert_fractional_interruption_restore_keeps_source_order(
+            PreparedPlayoutQueueEventReason::SourceUnderrun,
+        );
+    }
+
+    fn fractional_prepared_track(sequence: u16) -> (PreparedPlayoutCommand, OpusFrame) {
+        let duration_samples = 120;
+        let source_position_samples = u64::from(sequence) * u64::from(duration_samples);
+        let frame = OpusFrame::with_duration_samples(Bytes::from(vec![sequence as u8]), 2, 120)
+            .with_exact_metadata(
+                duration_ms_from_samples(source_position_samples),
+                source_position_samples,
+                Some(u64::from(sequence)),
+                7,
+            );
+        let command = PreparedPlayoutCommand {
+            packet: PreparedVoicePacket {
+                bytes: frame.data.clone(),
+                duration_ms: frame.duration_ms,
+                duration_samples: frame.duration_samples,
+                is_track: true,
+                rtp_sequence: sequence,
+                rtp_timestamp: u32::from(sequence) * duration_samples,
+                protection_nonce: Some(u32::from(sequence)),
+            },
+            kind: PreparedPacketKind::Track,
+            media_frame: Some(prepared_media_frame(&frame)),
+            generation: 7,
+        };
+        (command, frame)
     }
 
     #[tokio::test]

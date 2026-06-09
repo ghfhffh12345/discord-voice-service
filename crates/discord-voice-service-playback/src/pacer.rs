@@ -164,3 +164,48 @@ async fn sleep_until_precise(deadline: Instant) {
         tokio::task::yield_now().await;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn pacer_schedules_from_actual_send_start_through_small_lateness() {
+        let mut pacer = AudioPacer::starting_after(FRAME_DURATION);
+        let scheduled_deadline = pacer.next_deadline();
+        let send_started_at = scheduled_deadline + Duration::from_millis(5);
+
+        let mark = pacer.mark_sent(
+            PacedPacketKind::Track,
+            scheduled_deadline,
+            FRAME_DURATION,
+            send_started_at,
+        );
+
+        assert!(!mark.media_clock_reset);
+        assert!(!mark.tempo_rebased);
+        assert_eq!(pacer.next_deadline(), send_started_at + FRAME_DURATION);
+        assert_eq!(pacer.clock_reset_count(), 0);
+        assert_eq!(pacer.tempo_rebase_count(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pacer_rebases_after_missed_media_slot() {
+        let mut pacer = AudioPacer::starting_after(FRAME_DURATION);
+        let scheduled_deadline = pacer.next_deadline();
+        let send_started_at = scheduled_deadline + FRAME_DURATION + Duration::from_millis(5);
+
+        let mark = pacer.mark_sent(
+            PacedPacketKind::Track,
+            scheduled_deadline,
+            FRAME_DURATION,
+            send_started_at,
+        );
+
+        assert!(mark.media_clock_reset);
+        assert!(mark.tempo_rebased);
+        assert_eq!(pacer.next_deadline(), send_started_at + FRAME_DURATION);
+        assert_eq!(pacer.clock_reset_count(), 1);
+        assert_eq!(pacer.tempo_rebase_count(), 1);
+    }
+}

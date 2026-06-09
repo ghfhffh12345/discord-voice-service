@@ -452,6 +452,7 @@ fn proto_playback_metrics_convert_to_typed_snapshot() {
             protection_nonce: Some(42),
             source_frame_epoch: Some(1),
             source_media_position_ms: Some(5_000),
+            source_media_position_samples: Some(240_000),
             source_media_byte_position: Some(123_456),
             committed_heard_media: true,
         }],
@@ -477,6 +478,7 @@ fn proto_playback_metrics_convert_to_typed_snapshot() {
             protection_nonce: Some(43),
             source_frame_epoch: Some(1),
             source_media_position_ms: Some(5_020),
+            source_media_position_samples: Some(240_960),
             source_media_byte_position: Some(124_000),
             queue_depth_after: Some(proto::PlaybackBufferDepthSnapshot {
                 packets: 20,
@@ -508,12 +510,16 @@ fn proto_playback_metrics_convert_to_typed_snapshot() {
         source_underrun_reached_deadline_sender_count: 0,
         discarded_source_frame_count: 0,
         discarded_source_duration_ms: 0,
+        discarded_source_duration_samples: 0,
         stop_discarded_source_frame_count: 0,
         stop_discarded_source_duration_ms: 0,
+        stop_discarded_source_duration_samples: 0,
         interruption_discarded_source_frame_count: 0,
         interruption_discarded_source_duration_ms: 0,
+        interruption_discarded_source_duration_samples: 0,
         restored_source_frame_count: 2,
         restored_source_duration_ms: 40,
+        restored_source_duration_samples: 1_920,
         gateway_event_drain_duration: Some(proto::DurationStatsSnapshot {
             samples: 60,
             p50_ms: 0,
@@ -634,6 +640,7 @@ fn proto_playback_metrics_convert_to_typed_snapshot() {
     assert_eq!(raw_send.command_kind, PlaybackSendCommandKind::Track);
     assert_eq!(raw_send.protection_nonce, Some(42));
     assert_eq!(raw_send.source_media_position_ms, Some(5_000));
+    assert_eq!(raw_send.source_media_position_samples, Some(240_000));
     assert!(raw_send.committed_heard_media);
     assert_eq!(snapshot.raw_prepared_track_queue_samples.len(), 1);
     let raw_queue_sample = &snapshot.raw_prepared_track_queue_samples[0];
@@ -657,12 +664,17 @@ fn proto_playback_metrics_convert_to_typed_snapshot() {
         PlaybackSendCommandKind::Track
     );
     assert_eq!(raw_playout_event.protection_nonce, Some(43));
+    assert_eq!(
+        raw_playout_event.source_media_position_samples,
+        Some(240_960)
+    );
     assert_eq!(raw_playout_event.queue_depth_after.duration_ms, 400);
     assert_eq!(snapshot.prepared_track_packet_drop_count, 2);
     assert_eq!(snapshot.prepared_packet_rebuild_count, 1);
     assert_eq!(snapshot.pause_media_boundary_count, 1);
     assert_eq!(snapshot.restored_source_frame_count, 2);
     assert_eq!(snapshot.restored_source_duration_ms, 40);
+    assert_eq!(snapshot.restored_source_duration_samples, 1_920);
     assert_eq!(snapshot.gateway_event_drain_duration.max_ms, 2);
     assert_eq!(snapshot.gateway_event_drain_count, 4);
     assert_eq!(snapshot.dave_transition_count, 3);

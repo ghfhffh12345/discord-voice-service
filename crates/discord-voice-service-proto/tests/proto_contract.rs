@@ -74,6 +74,7 @@ fn generated_control_messages_expose_expected_fields() {
         track_tempo_window_slowest_wall_clock_us: 0,
         skipped_source_frame_count: 0,
         skipped_source_duration_ms: 0,
+        skipped_source_duration_samples: 0,
         tempo_rebase_count: 0,
         expected_track_frame_count: 52,
         sent_track_frame_count: 50,
@@ -241,6 +242,7 @@ fn generated_control_messages_expose_expected_fields() {
             protection_nonce: Some(42),
             source_frame_epoch: Some(1),
             source_media_position_ms: Some(5_000),
+            source_media_position_samples: Some(240_000),
             source_media_byte_position: Some(123_456),
             committed_heard_media: true,
         }],
@@ -266,6 +268,7 @@ fn generated_control_messages_expose_expected_fields() {
             protection_nonce: Some(42),
             source_frame_epoch: Some(1),
             source_media_position_ms: Some(5_000),
+            source_media_position_samples: Some(240_000),
             source_media_byte_position: Some(123_456),
             queue_depth_after: Some(PlaybackBufferDepthSnapshot {
                 packets: 20,
@@ -297,12 +300,16 @@ fn generated_control_messages_expose_expected_fields() {
         source_underrun_reached_deadline_sender_count: 0,
         discarded_source_frame_count: 0,
         discarded_source_duration_ms: 0,
+        discarded_source_duration_samples: 0,
         stop_discarded_source_frame_count: 0,
         stop_discarded_source_duration_ms: 0,
+        stop_discarded_source_duration_samples: 0,
         interruption_discarded_source_frame_count: 0,
         interruption_discarded_source_duration_ms: 0,
+        interruption_discarded_source_duration_samples: 0,
         restored_source_frame_count: 1,
         restored_source_duration_ms: 20,
+        restored_source_duration_samples: 960,
         gateway_event_drain_duration: Some(DurationStatsSnapshot {
             samples: 50,
             p50_ms: 0,
@@ -531,6 +538,7 @@ fn control_proto_exposes_update_voice_context_and_reason_codes() {
     assert!(proto.contains("uint64 prepared_track_queue_depth_sample_count = 103;"));
     assert!(proto.contains("uint64 prepared_track_queue_empty_count = 104;"));
     assert!(proto.contains("message PlaybackSendEventSnapshot"));
+    assert!(proto.contains("optional uint64 source_media_position_samples = 15;"));
     assert!(proto.contains("enum PlaybackSendCommandKind"));
     assert!(proto.contains("enum PreparedTrackQueueSamplePhase"));
     assert!(proto.contains("repeated PlaybackSendEventSnapshot raw_send_events = 105;"));
@@ -538,6 +546,7 @@ fn control_proto_exposes_update_voice_context_and_reason_codes() {
         "repeated PreparedTrackQueueDepthSampleSnapshot raw_prepared_track_queue_samples = 106;"
     ));
     assert!(proto.contains("message PreparedPlayoutQueueEventSnapshot"));
+    assert!(proto.contains("optional uint64 source_media_position_samples = 14;"));
     assert!(proto.contains("enum PreparedPlayoutQueueEventKind"));
     assert!(proto.contains("enum PreparedPlayoutQueueEventReason"));
     assert!(proto.contains(
@@ -551,6 +560,8 @@ fn control_proto_exposes_update_voice_context_and_reason_codes() {
     assert!(proto.contains("uint64 pause_media_boundary_count = 116;"));
     assert!(proto.contains("uint64 dave_transition_recovery_reached_deadline_sender_count = 121;"));
     assert!(proto.contains("uint64 restored_source_frame_count = 130;"));
+    assert!(proto.contains("uint64 skipped_source_duration_samples = 139;"));
+    assert!(proto.contains("uint64 restored_source_duration_samples = 144;"));
     assert!(proto.contains("VOICE_RECONNECTING"));
     for reason in [
         "SESSION_EVENT_REASON_UNSPECIFIED",

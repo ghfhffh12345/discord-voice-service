@@ -1,14 +1,15 @@
 use std::time::Duration;
 
 use discord_voice_service_playback::media::http_stream::HttpOpusStreamMetrics;
-use discord_voice_service_playback::media::opus_queue::OpusBufferDepth;
+use discord_voice_service_playback::media::opus_queue::{
+    OpusBufferDepth, duration_from_samples, duration_ms_from_samples, samples_from_duration_ms_u64,
+};
 use discord_voice_service_playback::recovery::PlaybackRecoveryMetrics;
 use discord_voice_service_voice::VoiceGatewayDrainReport;
 use tokio::time::Instant;
 
 const FIRST_INTERVAL_SAMPLE_LIMIT: usize = 10;
 const LATE_PACKET_THRESHOLD: Duration = Duration::from_millis(5);
-const OPUS_FRAME_DURATION_MS: u64 = 20;
 const TRACK_TEMPO_WINDOW_PACKETS: usize = 50;
 const TRACK_POST_SOURCE_BUFFER_MEDIA_MS: u64 = 5_000;
 const MIN_MEDIA_TO_WALL_CLOCK_RATIO_PPM: u64 = 980_000;
@@ -98,7 +99,7 @@ impl PlaybackQueueDepthStatsSnapshot {
         }
 
         let mut sorted = samples.to_vec();
-        sorted.sort_unstable_by_key(|depth| depth.duration_ms);
+        sorted.sort_unstable_by_key(|depth| depth.duration_samples);
         Self {
             sample_count: samples.len(),
             empty_count,
@@ -140,6 +141,7 @@ pub struct PlaybackSendEventSnapshot {
     pub protection_nonce: Option<u32>,
     pub source_frame_epoch: Option<u64>,
     pub source_media_position_ms: Option<u64>,
+    pub source_media_position_samples: Option<u64>,
     pub source_media_byte_position: Option<u64>,
     pub committed_heard_media: bool,
 }
@@ -194,8 +196,41 @@ pub struct PreparedPlayoutQueueEventSnapshot {
     pub protection_nonce: Option<u32>,
     pub source_frame_epoch: Option<u64>,
     pub source_media_position_ms: Option<u64>,
+    pub source_media_position_samples: Option<u64>,
     pub source_media_byte_position: Option<u64>,
     pub queue_depth_after: PlaybackBufferDepthSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PreparedPlayoutTrackDropIdentity {
+    reason: PreparedPlayoutQueueEventReason,
+    media_duration_samples: u32,
+    source_frame_epoch: u64,
+    source_media_position_samples: u64,
+    source_media_byte_position: Option<u64>,
+}
+
+fn prepared_track_drop_counts_as_unrecovered(event: &PreparedPlayoutQueueEventSnapshot) -> bool {
+    !matches!(
+        event.reason,
+        PreparedPlayoutQueueEventReason::Stop | PreparedPlayoutQueueEventReason::Reconnect
+    )
+}
+
+fn prepared_playout_track_drop_identity(
+    event: &PreparedPlayoutQueueEventSnapshot,
+) -> Option<PreparedPlayoutTrackDropIdentity> {
+    if event.command_kind != PlaybackSendCommandKind::Track {
+        return None;
+    }
+
+    Some(PreparedPlayoutTrackDropIdentity {
+        reason: event.reason,
+        media_duration_samples: event.media_duration_samples,
+        source_frame_epoch: event.source_frame_epoch?,
+        source_media_position_samples: event.source_media_position_samples?,
+        source_media_byte_position: event.source_media_byte_position,
+    })
 }
 
 impl Default for PreparedTrackQueueSamplePhase {
@@ -233,6 +268,7 @@ pub struct PlaybackStabilitySnapshot {
     pub track_tempo_window_slowest_wall_clock_us: u64,
     pub skipped_source_frame_count: u64,
     pub skipped_source_duration_ms: u64,
+    pub skipped_source_duration_samples: u64,
     pub tempo_rebase_count: u64,
     pub expected_track_frame_count: u64,
     pub sent_track_frame_count: u64,
@@ -287,12 +323,16 @@ pub struct PlaybackStabilitySnapshot {
     pub source_underrun_reached_deadline_sender_count: u64,
     pub discarded_source_frame_count: u64,
     pub discarded_source_duration_ms: u64,
+    pub discarded_source_duration_samples: u64,
     pub stop_discarded_source_frame_count: u64,
     pub stop_discarded_source_duration_ms: u64,
+    pub stop_discarded_source_duration_samples: u64,
     pub interruption_discarded_source_frame_count: u64,
     pub interruption_discarded_source_duration_ms: u64,
+    pub interruption_discarded_source_duration_samples: u64,
     pub restored_source_frame_count: u64,
     pub restored_source_duration_ms: u64,
+    pub restored_source_duration_samples: u64,
     pub source_buffer_target_ms: u64,
     pub adaptive_buffer_target_ms: u64,
     pub max_adaptive_buffer_target_ms: u64,
@@ -305,6 +345,7 @@ pub struct PlaybackStabilitySnapshot {
     pub egress_inserted_silence_duration_ms: u64,
     pub egress_dropped_music_frame_count: u64,
     pub egress_dropped_music_duration_ms: u64,
+    pub egress_dropped_music_duration_samples: u64,
     pub source_underrun_count: u64,
     pub rebuffer_count: u64,
     pub refill_duration: DurationStatsSnapshot,
@@ -350,7 +391,6 @@ pub(crate) enum MediaClockResetReason {
     PauseResume,
     SchedulerLate,
     SourceUnderrun,
-    DaveTransitionRecovery,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -364,9 +404,9 @@ pub(crate) struct ProducerMetricsSample {
 
 #[derive(Debug, Clone, Copy)]
 struct TrackPacketTiming {
-    sent_at: Instant,
+    send_started_at: Instant,
     duration: Duration,
-    media_start_ms: u64,
+    media_start: Duration,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -383,6 +423,7 @@ pub(crate) struct PlaybackSendEventRecord {
     pub(crate) protection_nonce: Option<u32>,
     pub(crate) source_frame_epoch: Option<u64>,
     pub(crate) source_media_position_ms: Option<u64>,
+    pub(crate) source_media_position_samples: Option<u64>,
     pub(crate) source_media_byte_position: Option<u64>,
     pub(crate) committed_heard_media: bool,
 }
@@ -403,13 +444,13 @@ struct PreparedTrackQueueDepthCollector {
 impl PreparedTrackQueueDepthCollector {
     fn record(&mut self, depth: PlaybackBufferDepthSnapshot, target_ms: u64) -> bool {
         if !self.warmed {
-            if depth.duration_ms < target_ms {
+            if depth.duration_samples < samples_from_duration_ms_u64(target_ms) {
                 return false;
             }
             self.warmed = true;
         }
 
-        if depth.duration_ms == 0 {
+        if depth.duration_samples == 0 {
             self.empty_count = self.empty_count.saturating_add(1);
         }
         self.samples.push(depth);
@@ -435,7 +476,7 @@ pub(crate) struct PlaybackStabilityCollector {
     sender_lateness: Vec<Duration>,
     refill_durations: Vec<Duration>,
     producer_stall_durations: Vec<Duration>,
-    last_track_send_at: Option<Instant>,
+    last_track_send_started_at: Option<Instant>,
     last_track_duration: Option<Duration>,
     active_track_wall_clock_elapsed: Duration,
     track_packet_timings: Vec<TrackPacketTiming>,
@@ -462,6 +503,7 @@ pub(crate) struct PlaybackStabilityCollector {
     raw_send_events: Vec<PlaybackSendEventRecord>,
     raw_prepared_track_queue_samples: Vec<PreparedTrackQueueDepthSampleSnapshot>,
     raw_prepared_playout_queue_events: Vec<PreparedPlayoutQueueEventSnapshot>,
+    unmatched_prepared_track_drops: Vec<PreparedPlayoutTrackDropIdentity>,
     current_scheduled_silence_queue_depth: PlaybackBufferDepthSnapshot,
     max_scheduled_silence_queue_depth: PlaybackBufferDepthSnapshot,
     current_boundary_queue_depth: PlaybackBufferDepthSnapshot,
@@ -479,13 +521,13 @@ pub(crate) struct PlaybackStabilityCollector {
     source_underrun_reached_builder_count: u64,
     source_underrun_reached_deadline_sender_count: u64,
     discarded_source_frame_count: u64,
-    discarded_source_duration_ms: u64,
+    discarded_source_duration_samples: u64,
     stop_discarded_source_frame_count: u64,
-    stop_discarded_source_duration_ms: u64,
+    stop_discarded_source_duration_samples: u64,
     interruption_discarded_source_frame_count: u64,
-    interruption_discarded_source_duration_ms: u64,
+    interruption_discarded_source_duration_samples: u64,
     restored_source_frame_count: u64,
-    restored_source_duration_ms: u64,
+    restored_source_duration_samples: u64,
     source_buffer_target_ms: u64,
     adaptive_buffer_target_ms: u64,
     max_adaptive_buffer_target_ms: u64,
@@ -495,7 +537,7 @@ pub(crate) struct PlaybackStabilityCollector {
     buffer_underrun_count: u64,
     playout_underrun_count: u64,
     egress_dropped_music_frame_count: u64,
-    egress_dropped_music_duration_ms: u64,
+    egress_dropped_music_duration_samples: u64,
     source_underrun_count: u64,
     rebuffer_count: u64,
     pause_resume_first_intervals_ms: Vec<u64>,
@@ -526,7 +568,7 @@ pub(crate) struct PlaybackStabilityCollector {
     dave_transition_count_during_playback: u64,
     stale_dave_send_prevented_count: u64,
     controlled_media_interruption_count: u64,
-    track_media_duration_sent_ms: u64,
+    track_media_duration_sent: Duration,
     track_fast_interval_count: u64,
     track_fast_interval_min: Option<Duration>,
     track_tempo_window_count: u64,
@@ -542,7 +584,7 @@ pub(crate) struct PlaybackStabilityCollector {
     track_tempo_window_slowest_media_ms: u64,
     track_tempo_window_slowest_wall_clock: Option<Duration>,
     skipped_source_frame_count: u64,
-    skipped_source_duration_ms: u64,
+    skipped_source_duration_samples: u64,
     tempo_rebase_count: u64,
     media_clock_reset_count: u64,
     scheduler_late_reset_count: u64,
@@ -579,7 +621,7 @@ impl PlaybackStabilityCollector {
             sender_lateness: Vec::new(),
             refill_durations: Vec::new(),
             producer_stall_durations: Vec::new(),
-            last_track_send_at: None,
+            last_track_send_started_at: None,
             last_track_duration: None,
             active_track_wall_clock_elapsed: Duration::ZERO,
             track_packet_timings: Vec::new(),
@@ -593,7 +635,7 @@ impl PlaybackStabilityCollector {
             min_source_buffer_depth: initial_source_depth,
             max_source_buffer_depth: initial_source_depth,
             source_buffer_depth_samples: vec![initial_source_depth],
-            source_buffer_empty_count: u64::from(initial_source_depth.duration_ms == 0),
+            source_buffer_empty_count: u64::from(initial_source_depth.duration_samples == 0),
             current_playout_buffer_depth: PlaybackBufferDepthSnapshot::default(),
             min_playout_buffer_depth: PlaybackBufferDepthSnapshot::default(),
             max_playout_buffer_depth: PlaybackBufferDepthSnapshot::default(),
@@ -608,6 +650,7 @@ impl PlaybackStabilityCollector {
             raw_send_events: Vec::new(),
             raw_prepared_track_queue_samples: Vec::new(),
             raw_prepared_playout_queue_events: Vec::new(),
+            unmatched_prepared_track_drops: Vec::new(),
             current_scheduled_silence_queue_depth: PlaybackBufferDepthSnapshot::default(),
             max_scheduled_silence_queue_depth: PlaybackBufferDepthSnapshot::default(),
             current_boundary_queue_depth: PlaybackBufferDepthSnapshot::default(),
@@ -625,13 +668,13 @@ impl PlaybackStabilityCollector {
             source_underrun_reached_builder_count: 0,
             source_underrun_reached_deadline_sender_count: 0,
             discarded_source_frame_count: 0,
-            discarded_source_duration_ms: 0,
+            discarded_source_duration_samples: 0,
             stop_discarded_source_frame_count: 0,
-            stop_discarded_source_duration_ms: 0,
+            stop_discarded_source_duration_samples: 0,
             interruption_discarded_source_frame_count: 0,
-            interruption_discarded_source_duration_ms: 0,
+            interruption_discarded_source_duration_samples: 0,
             restored_source_frame_count: 0,
-            restored_source_duration_ms: 0,
+            restored_source_duration_samples: 0,
             source_buffer_target_ms,
             adaptive_buffer_target_ms: 0,
             max_adaptive_buffer_target_ms: 0,
@@ -641,7 +684,7 @@ impl PlaybackStabilityCollector {
             buffer_underrun_count: 0,
             playout_underrun_count: 0,
             egress_dropped_music_frame_count: 0,
-            egress_dropped_music_duration_ms: 0,
+            egress_dropped_music_duration_samples: 0,
             source_underrun_count: 0,
             rebuffer_count: 0,
             pause_resume_first_intervals_ms: Vec::new(),
@@ -672,7 +715,7 @@ impl PlaybackStabilityCollector {
             dave_transition_count_during_playback: 0,
             stale_dave_send_prevented_count: 0,
             controlled_media_interruption_count: 0,
-            track_media_duration_sent_ms: 0,
+            track_media_duration_sent: Duration::ZERO,
             track_fast_interval_count: 0,
             track_fast_interval_min: None,
             track_tempo_window_count: 0,
@@ -688,7 +731,7 @@ impl PlaybackStabilityCollector {
             track_tempo_window_slowest_media_ms: 0,
             track_tempo_window_slowest_wall_clock: None,
             skipped_source_frame_count: 0,
-            skipped_source_duration_ms: 0,
+            skipped_source_duration_samples: 0,
             tempo_rebase_count: 0,
             media_clock_reset_count: 0,
             scheduler_late_reset_count: 0,
@@ -735,10 +778,12 @@ impl PlaybackStabilityCollector {
         self.min_source_buffer_depth = min_depth(self.min_source_buffer_depth, depth);
         self.max_source_buffer_depth = max_depth(self.max_source_buffer_depth, depth);
         self.source_buffer_depth_samples.push(depth);
-        if depth.duration_ms == 0 {
+        if depth.duration_samples == 0 {
             self.source_buffer_empty_count = self.source_buffer_empty_count.saturating_add(1);
         }
-        if low_watermark_ms != u64::MAX && depth.duration_ms <= low_watermark_ms {
+        if low_watermark_ms != u64::MAX
+            && depth.duration_samples <= samples_from_duration_ms_u64(low_watermark_ms)
+        {
             self.source_buffer_low_watermark_count =
                 self.source_buffer_low_watermark_count.saturating_add(1);
         }
@@ -753,7 +798,9 @@ impl PlaybackStabilityCollector {
         self.current_playout_buffer_depth = depth;
         self.min_playout_buffer_depth = min_depth(self.min_playout_buffer_depth, depth);
         self.max_playout_buffer_depth = max_depth(self.max_playout_buffer_depth, depth);
-        if low_watermark_ms != u64::MAX && depth.duration_ms <= low_watermark_ms {
+        if low_watermark_ms != u64::MAX
+            && depth.duration_samples <= samples_from_duration_ms_u64(low_watermark_ms)
+        {
             self.playout_buffer_low_watermark_count =
                 self.playout_buffer_low_watermark_count.saturating_add(1);
         }
@@ -791,8 +838,13 @@ impl PlaybackStabilityCollector {
         if event.event_kind == PreparedPlayoutQueueEventKind::DroppedBeforeSend {
             match event.command_kind {
                 PlaybackSendCommandKind::Track => {
-                    self.prepared_track_packet_drop_count =
-                        self.prepared_track_packet_drop_count.saturating_add(1);
+                    if prepared_track_drop_counts_as_unrecovered(&event) {
+                        self.prepared_track_packet_drop_count =
+                            self.prepared_track_packet_drop_count.saturating_add(1);
+                        if let Some(identity) = prepared_playout_track_drop_identity(&event) {
+                            self.unmatched_prepared_track_drops.push(identity);
+                        }
+                    }
                 }
                 PlaybackSendCommandKind::ScheduledSilence
                 | PlaybackSendCommandKind::BoundarySilence
@@ -805,6 +857,16 @@ impl PlaybackStabilityCollector {
         if event.event_kind == PreparedPlayoutQueueEventKind::Rebuilt {
             self.prepared_packet_rebuild_count =
                 self.prepared_packet_rebuild_count.saturating_add(1);
+            if let Some(identity) = prepared_playout_track_drop_identity(&event)
+                && let Some(index) = self
+                    .unmatched_prepared_track_drops
+                    .iter()
+                    .position(|drop| *drop == identity)
+            {
+                self.unmatched_prepared_track_drops.remove(index);
+                self.prepared_track_packet_drop_count =
+                    self.prepared_track_packet_drop_count.saturating_sub(1);
+            }
         }
         self.raw_prepared_playout_queue_events.push(event);
     }
@@ -856,15 +918,6 @@ impl PlaybackStabilityCollector {
         }
     }
 
-    pub(crate) fn record_dave_transition_reached_builder(&mut self) {
-        self.dave_transition_recovery_reached_builder_count = self
-            .dave_transition_recovery_reached_builder_count
-            .saturating_add(1);
-        self.dave_transition_count = self.dave_transition_count.saturating_add(1);
-        self.dave_transition_count_during_playback =
-            self.dave_transition_count_during_playback.saturating_add(1);
-    }
-
     pub(crate) fn record_source_underrun_reached_builder(&mut self) {
         self.source_underrun_reached_builder_count =
             self.source_underrun_reached_builder_count.saturating_add(1);
@@ -876,33 +929,38 @@ impl PlaybackStabilityCollector {
             .saturating_add(1);
     }
 
-    pub(crate) fn record_restored_source_frames(&mut self, frame_count: u64, duration_ms: u64) {
+    pub(crate) fn record_restored_source_frames(
+        &mut self,
+        frame_count: u64,
+        duration_samples: u64,
+    ) {
         self.restored_source_frame_count =
             self.restored_source_frame_count.saturating_add(frame_count);
-        self.restored_source_duration_ms =
-            self.restored_source_duration_ms.saturating_add(duration_ms);
+        self.restored_source_duration_samples = self
+            .restored_source_duration_samples
+            .saturating_add(duration_samples);
     }
 
     pub(crate) fn record_discarded_source_frames(
         &mut self,
         reason: PreparedPlayoutQueueEventReason,
         frame_count: u64,
-        duration_ms: u64,
+        duration_samples: u64,
     ) {
         self.discarded_source_frame_count = self
             .discarded_source_frame_count
             .saturating_add(frame_count);
-        self.discarded_source_duration_ms = self
-            .discarded_source_duration_ms
-            .saturating_add(duration_ms);
+        self.discarded_source_duration_samples = self
+            .discarded_source_duration_samples
+            .saturating_add(duration_samples);
         match reason {
             PreparedPlayoutQueueEventReason::Stop | PreparedPlayoutQueueEventReason::NaturalEnd => {
                 self.stop_discarded_source_frame_count = self
                     .stop_discarded_source_frame_count
                     .saturating_add(frame_count);
-                self.stop_discarded_source_duration_ms = self
-                    .stop_discarded_source_duration_ms
-                    .saturating_add(duration_ms);
+                self.stop_discarded_source_duration_samples = self
+                    .stop_discarded_source_duration_samples
+                    .saturating_add(duration_samples);
             }
             PreparedPlayoutQueueEventReason::Interruption
             | PreparedPlayoutQueueEventReason::Reconnect
@@ -911,9 +969,9 @@ impl PlaybackStabilityCollector {
                 self.interruption_discarded_source_frame_count = self
                     .interruption_discarded_source_frame_count
                     .saturating_add(frame_count);
-                self.interruption_discarded_source_duration_ms = self
-                    .interruption_discarded_source_duration_ms
-                    .saturating_add(duration_ms);
+                self.interruption_discarded_source_duration_samples = self
+                    .interruption_discarded_source_duration_samples
+                    .saturating_add(duration_samples);
             }
             PreparedPlayoutQueueEventReason::Unspecified
             | PreparedPlayoutQueueEventReason::SteadyPlayback
@@ -948,14 +1006,14 @@ impl PlaybackStabilityCollector {
     pub(crate) fn record_egress_dropped_music_frames(
         &mut self,
         frame_count: u64,
-        duration_ms: u64,
+        duration_samples: u64,
     ) {
         self.egress_dropped_music_frame_count = self
             .egress_dropped_music_frame_count
             .saturating_add(frame_count);
-        self.egress_dropped_music_duration_ms = self
-            .egress_dropped_music_duration_ms
-            .saturating_add(duration_ms);
+        self.egress_dropped_music_duration_samples = self
+            .egress_dropped_music_duration_samples
+            .saturating_add(duration_samples);
     }
 
     pub(crate) fn record_speaking_prepare_duration(&mut self, duration: Duration) {
@@ -987,13 +1045,6 @@ impl PlaybackStabilityCollector {
             .saturating_add(report.dave_transition_count);
     }
 
-    pub(crate) fn record_stale_dave_send_prevented(&mut self) {
-        self.stale_dave_send_prevented_count =
-            self.stale_dave_send_prevented_count.saturating_add(1);
-        self.controlled_media_interruption_count =
-            self.controlled_media_interruption_count.saturating_add(1);
-    }
-
     pub(crate) fn record_media_clock_reset(&mut self, reason: MediaClockResetReason) {
         self.media_clock_reset_count = self.media_clock_reset_count.saturating_add(1);
         match reason {
@@ -1012,18 +1063,11 @@ impl PlaybackStabilityCollector {
                     self.controlled_media_interruption_count.saturating_add(1);
                 self.reset_active_track_tempo_window();
             }
-            MediaClockResetReason::DaveTransitionRecovery => {
-                self.dave_transition_recovery_reset_count =
-                    self.dave_transition_recovery_reset_count.saturating_add(1);
-                self.controlled_media_interruption_count =
-                    self.controlled_media_interruption_count.saturating_add(1);
-                self.reset_active_track_tempo_window();
-            }
         }
     }
 
     fn reset_active_track_tempo_window(&mut self) {
-        self.last_track_send_at = None;
+        self.last_track_send_started_at = None;
         self.last_track_duration = None;
         self.track_packet_timings.clear();
         self.last_any_send_at = None;
@@ -1048,15 +1092,16 @@ impl PlaybackStabilityCollector {
         &mut self,
         expected_deadline: Instant,
         send_started_at: Instant,
-        sent_at: Instant,
-        duration_ms: u64,
+        _sent_at: Instant,
+        _duration_ms: u64,
+        duration_samples: u32,
         tempo_rebased: bool,
     ) {
-        let frame_duration = Duration::from_millis(duration_ms);
-        let media_start_ms = self.track_media_duration_sent_ms;
-        self.track_media_duration_sent_ms = self
-            .track_media_duration_sent_ms
-            .saturating_add(duration_ms);
+        let frame_duration = duration_from_samples(u64::from(duration_samples));
+        let media_start = self.track_media_duration_sent;
+        self.track_media_duration_sent = self
+            .track_media_duration_sent
+            .saturating_add(frame_duration);
         if tempo_rebased {
             self.tempo_rebase_count = self.tempo_rebase_count.saturating_add(1);
         }
@@ -1084,8 +1129,8 @@ impl PlaybackStabilityCollector {
             self.current_consecutive_playout_late_packets = 0;
         }
 
-        if let Some(previous) = self.last_track_send_at.replace(sent_at) {
-            let interval = sent_at.saturating_duration_since(previous);
+        if let Some(previous) = self.last_track_send_started_at.replace(send_started_at) {
+            let interval = send_started_at.saturating_duration_since(previous);
             self.track_intervals.push(interval);
             if let Some(previous_duration) = self.last_track_duration
                 && interval < previous_duration
@@ -1124,13 +1169,13 @@ impl PlaybackStabilityCollector {
         }
         self.last_track_duration = Some(frame_duration);
         self.track_packet_timings.push(TrackPacketTiming {
-            sent_at,
+            send_started_at,
             duration: frame_duration,
-            media_start_ms,
+            media_start,
         });
         self.record_latest_track_tempo_window();
 
-        self.record_any_packet(sent_at);
+        self.record_any_packet(send_started_at);
         self.track_packet_count = self.track_packet_count.saturating_add(1);
     }
 
@@ -1151,11 +1196,13 @@ impl PlaybackStabilityCollector {
         let media_duration = window
             .iter()
             .fold(Duration::ZERO, |total, packet| total + packet.duration);
-        let wall_clock_duration =
-            last.sent_at.saturating_duration_since(first.sent_at) + last.duration;
+        let wall_clock_duration = last
+            .send_started_at
+            .saturating_duration_since(first.send_started_at)
+            + last.duration;
 
         self.track_tempo_window_count = self.track_tempo_window_count.saturating_add(1);
-        if first.media_start_ms >= TRACK_POST_SOURCE_BUFFER_MEDIA_MS {
+        if first.media_start >= Duration::from_millis(TRACK_POST_SOURCE_BUFFER_MEDIA_MS) {
             self.track_tempo_window_post_source_buffer_count = self
                 .track_tempo_window_post_source_buffer_count
                 .saturating_add(1);
@@ -1202,11 +1249,12 @@ impl PlaybackStabilityCollector {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn record_skipped_source_frames(&mut self, frame_count: u64, duration_ms: u64) {
+    pub(crate) fn record_skipped_source_frames(&mut self, frame_count: u64, duration_samples: u64) {
         self.skipped_source_frame_count =
             self.skipped_source_frame_count.saturating_add(frame_count);
-        self.skipped_source_duration_ms =
-            self.skipped_source_duration_ms.saturating_add(duration_ms);
+        self.skipped_source_duration_samples = self
+            .skipped_source_duration_samples
+            .saturating_add(duration_samples);
     }
 
     fn record_any_packet(&mut self, sent_at: Instant) {
@@ -1228,8 +1276,6 @@ impl PlaybackStabilityCollector {
         ended: bool,
     ) -> PlaybackStabilitySnapshot {
         let track_wall_clock_elapsed_ms = self.track_wall_clock_elapsed_ms();
-        let expected_track_frame_count =
-            expected_frame_count_for_wall_clock(track_wall_clock_elapsed_ms);
         let sent_track_frame_count = self.track_packet_count as u64;
         let silence_frame_count = u64::try_from(self.continuity_silence_packet_count)
             .unwrap_or(u64::MAX)
@@ -1238,11 +1284,30 @@ impl PlaybackStabilityCollector {
             .prepared_track_packet_drop_count
             .saturating_add(self.prepared_silence_packet_drop_count)
             .saturating_add(self.egress_dropped_music_frame_count);
+        let dropped_track_frame_count = self
+            .prepared_track_packet_drop_count
+            .saturating_add(self.egress_dropped_music_frame_count);
+        let expected_track_frame_count = sent_track_frame_count
+            .saturating_add(silence_frame_count)
+            .saturating_add(dropped_track_frame_count);
         let frame_deficit_count =
             expected_track_frame_count.saturating_sub(sent_track_frame_count + silence_frame_count);
-        let track_media_to_wall_clock_ratio_ppm = media_to_wall_clock_ratio_ppm(
-            self.track_media_duration_sent_ms,
-            track_wall_clock_elapsed_ms,
+        let track_media_duration_sent_ms = duration_millis(self.track_media_duration_sent);
+        let skipped_source_duration_ms =
+            duration_ms_from_samples(self.skipped_source_duration_samples);
+        let discarded_source_duration_ms =
+            duration_ms_from_samples(self.discarded_source_duration_samples);
+        let stop_discarded_source_duration_ms =
+            duration_ms_from_samples(self.stop_discarded_source_duration_samples);
+        let interruption_discarded_source_duration_ms =
+            duration_ms_from_samples(self.interruption_discarded_source_duration_samples);
+        let restored_source_duration_ms =
+            duration_ms_from_samples(self.restored_source_duration_samples);
+        let egress_dropped_music_duration_ms =
+            duration_ms_from_samples(self.egress_dropped_music_duration_samples);
+        let track_media_to_wall_clock_ratio_ppm = media_to_wall_clock_ratio_ppm_duration(
+            self.track_media_duration_sent,
+            self.active_track_wall_clock_elapsed,
         );
         let active_pre_pause_prepared_track_queue_depth =
             self.active_pre_pause_prepared_track_queue_depth.snapshot();
@@ -1263,7 +1328,7 @@ impl PlaybackStabilityCollector {
             continuity_silence_packet_count: self.continuity_silence_packet_count,
             inserted_silence_duration_ms: self.inserted_silence_duration_ms,
             track_interval: DurationStatsSnapshot::from_samples(&self.track_intervals),
-            track_media_duration_sent_ms: self.track_media_duration_sent_ms,
+            track_media_duration_sent_ms,
             track_wall_clock_elapsed_ms,
             track_media_to_wall_clock_ratio_ppm,
             track_fast_interval_count: self.track_fast_interval_count,
@@ -1287,7 +1352,8 @@ impl PlaybackStabilityCollector {
                 .track_tempo_window_slowest_wall_clock
                 .map_or(0, duration_micros),
             skipped_source_frame_count: self.skipped_source_frame_count,
-            skipped_source_duration_ms: self.skipped_source_duration_ms,
+            skipped_source_duration_ms,
+            skipped_source_duration_samples: self.skipped_source_duration_samples,
             tempo_rebase_count: self.tempo_rebase_count,
             expected_track_frame_count,
             sent_track_frame_count,
@@ -1347,15 +1413,19 @@ impl PlaybackStabilityCollector {
             source_underrun_reached_deadline_sender_count: self
                 .source_underrun_reached_deadline_sender_count,
             discarded_source_frame_count: self.discarded_source_frame_count,
-            discarded_source_duration_ms: self.discarded_source_duration_ms,
+            discarded_source_duration_ms,
+            discarded_source_duration_samples: self.discarded_source_duration_samples,
             stop_discarded_source_frame_count: self.stop_discarded_source_frame_count,
-            stop_discarded_source_duration_ms: self.stop_discarded_source_duration_ms,
+            stop_discarded_source_duration_ms,
+            stop_discarded_source_duration_samples: self.stop_discarded_source_duration_samples,
             interruption_discarded_source_frame_count: self
                 .interruption_discarded_source_frame_count,
-            interruption_discarded_source_duration_ms: self
-                .interruption_discarded_source_duration_ms,
+            interruption_discarded_source_duration_ms,
+            interruption_discarded_source_duration_samples: self
+                .interruption_discarded_source_duration_samples,
             restored_source_frame_count: self.restored_source_frame_count,
-            restored_source_duration_ms: self.restored_source_duration_ms,
+            restored_source_duration_ms,
+            restored_source_duration_samples: self.restored_source_duration_samples,
             source_buffer_target_ms: self.source_buffer_target_ms,
             adaptive_buffer_target_ms: self.adaptive_buffer_target_ms,
             max_adaptive_buffer_target_ms: self.max_adaptive_buffer_target_ms,
@@ -1367,7 +1437,8 @@ impl PlaybackStabilityCollector {
             egress_underrun_count: self.playout_underrun_count,
             egress_inserted_silence_duration_ms: self.inserted_silence_duration_ms,
             egress_dropped_music_frame_count: self.egress_dropped_music_frame_count,
-            egress_dropped_music_duration_ms: self.egress_dropped_music_duration_ms,
+            egress_dropped_music_duration_ms,
+            egress_dropped_music_duration_samples: self.egress_dropped_music_duration_samples,
             source_underrun_count: self.source_underrun_count,
             rebuffer_count: self.rebuffer_count,
             refill_duration: DurationStatsSnapshot::from_samples(&self.refill_durations),
@@ -1449,6 +1520,7 @@ fn playback_send_event_snapshots(
             protection_nonce: event.protection_nonce,
             source_frame_epoch: event.source_frame_epoch,
             source_media_position_ms: event.source_media_position_ms,
+            source_media_position_samples: event.source_media_position_samples,
             source_media_byte_position: event.source_media_byte_position,
             committed_heard_media: event.committed_heard_media,
         })
@@ -1463,7 +1535,7 @@ fn min_depth(
     current: PlaybackBufferDepthSnapshot,
     observed: PlaybackBufferDepthSnapshot,
 ) -> PlaybackBufferDepthSnapshot {
-    if observed.duration_ms < current.duration_ms {
+    if observed.duration_samples < current.duration_samples {
         observed
     } else {
         current
@@ -1474,7 +1546,7 @@ fn max_depth(
     current: PlaybackBufferDepthSnapshot,
     observed: PlaybackBufferDepthSnapshot,
 ) -> PlaybackBufferDepthSnapshot {
-    if observed.duration_ms > current.duration_ms {
+    if observed.duration_samples > current.duration_samples {
         observed
     } else {
         current
@@ -1500,23 +1572,6 @@ fn duration_millis(duration: Duration) -> u64 {
 
 fn duration_micros(duration: Duration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
-}
-
-fn expected_frame_count_for_wall_clock(wall_clock_elapsed_ms: u64) -> u64 {
-    if wall_clock_elapsed_ms == 0 {
-        return 0;
-    }
-    wall_clock_elapsed_ms.div_ceil(OPUS_FRAME_DURATION_MS)
-}
-
-fn media_to_wall_clock_ratio_ppm(media_duration_ms: u64, wall_clock_elapsed_ms: u64) -> u64 {
-    if media_duration_ms == 0 || wall_clock_elapsed_ms == 0 {
-        return 0;
-    }
-
-    ((u128::from(media_duration_ms) * 1_000_000) / u128::from(wall_clock_elapsed_ms))
-        .try_into()
-        .unwrap_or(u64::MAX)
 }
 
 fn media_to_wall_clock_ratio_ppm_duration(
@@ -1558,7 +1613,7 @@ mod tests {
         let start = Instant::now();
         for offset in offsets {
             let sent_at = start + *offset;
-            collector.record_track_packet(sent_at, sent_at, sent_at, 20, false);
+            collector.record_track_packet(sent_at, sent_at, sent_at, 20, 960, false);
         }
         collector.snapshot(0, 0, 0, false)
     }
@@ -1580,13 +1635,36 @@ mod tests {
             .collect()
     }
 
+    fn prepared_track_event(
+        event_kind: PreparedPlayoutQueueEventKind,
+        reason: PreparedPlayoutQueueEventReason,
+        source_media_position_samples: u64,
+    ) -> PreparedPlayoutQueueEventSnapshot {
+        PreparedPlayoutQueueEventSnapshot {
+            event_index: 0,
+            event_kind,
+            reason,
+            command_kind: PlaybackSendCommandKind::Track,
+            media_duration_ms: 2,
+            media_duration_samples: 120,
+            rtp_sequence: 42,
+            rtp_timestamp: source_media_position_samples as u32,
+            protection_nonce: Some(42),
+            source_frame_epoch: Some(7),
+            source_media_position_ms: Some(duration_ms_from_samples(source_media_position_samples)),
+            source_media_position_samples: Some(source_media_position_samples),
+            source_media_byte_position: Some(source_media_position_samples / 120 * 32),
+            queue_depth_after: PlaybackBufferDepthSnapshot::default(),
+        }
+    }
+
     #[test]
     fn track_tempo_window_counts_fifty_packets_over_900ms_as_fast() {
         let snapshot =
             snapshot_for_offsets(&offsets_for_window_wall_clock(Duration::from_millis(900)));
 
         assert_eq!(snapshot.track_tempo_window_count, 1);
-        assert_eq!(snapshot.expected_track_frame_count, 45);
+        assert_eq!(snapshot.expected_track_frame_count, 50);
         assert_eq!(snapshot.sent_track_frame_count, 50);
         assert_eq!(snapshot.frame_deficit_count, 0);
         assert_eq!(snapshot.track_tempo_window_fast_count, 1);
@@ -1602,9 +1680,9 @@ mod tests {
             snapshot_for_offsets(&offsets_for_window_wall_clock(Duration::from_millis(1_100)));
 
         assert_eq!(snapshot.track_tempo_window_count, 1);
-        assert_eq!(snapshot.expected_track_frame_count, 55);
+        assert_eq!(snapshot.expected_track_frame_count, 50);
         assert_eq!(snapshot.sent_track_frame_count, 50);
-        assert_eq!(snapshot.frame_deficit_count, 5);
+        assert_eq!(snapshot.frame_deficit_count, 0);
         assert_eq!(snapshot.track_tempo_window_fast_count, 0);
         assert_eq!(snapshot.track_tempo_window_slow_count, 1);
         assert!(snapshot.track_tempo_window_slowest_ratio_ppm < MIN_MEDIA_TO_WALL_CLOCK_RATIO_PPM);
@@ -1644,6 +1722,128 @@ mod tests {
     }
 
     #[test]
+    fn track_intervals_use_send_start_cadence_not_completion_jitter() {
+        let mut collector = collector();
+        let start = Instant::now();
+
+        for index in 0..TRACK_TEMPO_WINDOW_PACKETS {
+            let send_started_at = start + Duration::from_millis(index as u64 * 20);
+            let sent_at = send_started_at
+                + if index % 2 == 0 {
+                    Duration::from_micros(200)
+                } else {
+                    Duration::from_micros(100)
+                };
+            collector.record_track_packet(
+                send_started_at,
+                send_started_at,
+                sent_at,
+                20,
+                960,
+                false,
+            );
+        }
+
+        let snapshot = collector.snapshot(0, 0, 0, false);
+        assert_eq!(snapshot.track_fast_interval_count, 0);
+        assert_eq!(snapshot.track_fast_interval_min_us, 0);
+        assert_eq!(snapshot.track_media_to_wall_clock_ratio_ppm, 1_000_000);
+        assert_eq!(snapshot.track_tempo_window_fast_count, 0);
+        assert_eq!(snapshot.track_tempo_window_slow_count, 0);
+    }
+
+    #[test]
+    fn track_tempo_window_uses_sample_duration_for_fractional_packets() {
+        let mut collector = collector();
+        let start = Instant::now();
+        let mut sent_at = start;
+
+        for index in 0..TRACK_TEMPO_WINDOW_PACKETS {
+            if index > 0 {
+                sent_at += Duration::from_micros(2_500);
+            }
+            collector.record_track_packet(sent_at, sent_at, sent_at, 2, 120, false);
+        }
+
+        let snapshot = collector.snapshot(0, 0, 0, false);
+
+        assert_eq!(snapshot.track_media_duration_sent_ms, 125);
+        assert_eq!(snapshot.track_wall_clock_elapsed_ms, 125);
+        assert_eq!(snapshot.track_media_to_wall_clock_ratio_ppm, 1_000_000);
+        assert_eq!(snapshot.track_tempo_window_count, 1);
+        assert_eq!(snapshot.track_tempo_window_fast_count, 0);
+        assert_eq!(snapshot.track_tempo_window_slow_count, 0);
+        assert_eq!(snapshot.track_tempo_window_min_ratio_ppm, 1_000_000);
+        assert_eq!(snapshot.track_tempo_window_max_ratio_ppm, 1_000_000);
+        assert_eq!(
+            snapshot.expected_track_frame_count,
+            TRACK_TEMPO_WINDOW_PACKETS as u64
+        );
+        assert_eq!(
+            snapshot.sent_track_frame_count,
+            TRACK_TEMPO_WINDOW_PACKETS as u64
+        );
+        assert_eq!(snapshot.frame_deficit_count, 0);
+    }
+
+    #[test]
+    fn prepared_track_drop_count_excludes_rebuilt_source_frames() {
+        let mut collector = collector();
+
+        collector.record_prepared_playout_queue_event(prepared_track_event(
+            PreparedPlayoutQueueEventKind::DroppedBeforeSend,
+            PreparedPlayoutQueueEventReason::Pause,
+            120,
+        ));
+        collector.record_prepared_playout_queue_event(prepared_track_event(
+            PreparedPlayoutQueueEventKind::Rebuilt,
+            PreparedPlayoutQueueEventReason::Pause,
+            120,
+        ));
+
+        let snapshot = collector.snapshot(0, 0, 0, false);
+        assert_eq!(snapshot.prepared_track_packet_drop_count, 0);
+        assert_eq!(snapshot.prepared_packet_rebuild_count, 1);
+        assert_eq!(snapshot.dropped_frame_count, 0);
+        assert_eq!(snapshot.frame_deficit_count, 0);
+    }
+
+    #[test]
+    fn prepared_track_drop_count_excludes_controlled_stop_drain() {
+        let mut collector = collector();
+
+        collector.record_prepared_playout_queue_event(prepared_track_event(
+            PreparedPlayoutQueueEventKind::DroppedBeforeSend,
+            PreparedPlayoutQueueEventReason::Stop,
+            120,
+        ));
+        collector.record_restored_source_frames(1, 120);
+
+        let snapshot = collector.snapshot(0, 0, 1, false);
+        assert_eq!(snapshot.prepared_track_packet_drop_count, 0);
+        assert_eq!(snapshot.restored_source_frame_count, 1);
+        assert_eq!(snapshot.dropped_frame_count, 0);
+        assert_eq!(snapshot.frame_deficit_count, 0);
+        assert_eq!(snapshot.reconnect_interruptions, 1);
+    }
+
+    #[test]
+    fn prepared_track_drop_count_keeps_unmatched_source_frames() {
+        let mut collector = collector();
+
+        collector.record_prepared_playout_queue_event(prepared_track_event(
+            PreparedPlayoutQueueEventKind::DroppedBeforeSend,
+            PreparedPlayoutQueueEventReason::Pause,
+            120,
+        ));
+
+        let snapshot = collector.snapshot(0, 0, 0, false);
+        assert_eq!(snapshot.prepared_track_packet_drop_count, 1);
+        assert_eq!(snapshot.dropped_frame_count, 1);
+        assert_eq!(snapshot.frame_deficit_count, 1);
+    }
+
+    #[test]
     fn frame_accounting_counts_silence_drops_and_late_frames() {
         let mut collector = collector();
         let start = Instant::now();
@@ -1658,7 +1858,7 @@ mod tests {
             } else {
                 sent_at
             };
-            collector.record_track_packet(expected_deadline, sent_at, sent_at, 20, false);
+            collector.record_track_packet(expected_deadline, sent_at, sent_at, 20, 960, false);
         }
 
         sent_at += Duration::from_millis(20);
@@ -1675,22 +1875,61 @@ mod tests {
             protection_nonce: Some(10),
             source_frame_epoch: None,
             source_media_position_ms: None,
+            source_media_position_samples: None,
             source_media_byte_position: None,
             committed_heard_media: false,
         });
         collector.record_continuity_silence_packet(sent_at, 20);
         collector.prepared_track_packet_drop_count = 1;
-        collector.record_egress_dropped_music_frames(2, 40);
+        collector.prepared_silence_packet_drop_count = 2;
+        collector.record_egress_dropped_music_frames(2, 1_920);
 
         let snapshot = collector.snapshot(0, 0, 0, false);
-        assert_eq!(snapshot.expected_track_frame_count, 10);
+        assert_eq!(snapshot.expected_track_frame_count, 14);
         assert_eq!(snapshot.sent_track_frame_count, 10);
         assert_eq!(snapshot.silence_frame_count, 1);
-        assert_eq!(snapshot.frame_deficit_count, 0);
-        assert_eq!(snapshot.dropped_frame_count, 3);
+        assert_eq!(snapshot.frame_deficit_count, 3);
+        assert_eq!(snapshot.dropped_frame_count, 5);
+        assert_eq!(snapshot.prepared_silence_packet_drop_count, 2);
         assert_eq!(snapshot.egress_dropped_music_frame_count, 2);
         assert_eq!(snapshot.egress_dropped_music_duration_ms, 40);
+        assert_eq!(snapshot.egress_dropped_music_duration_samples, 1_920);
         assert_eq!(snapshot.late_frame_count, 1);
+    }
+
+    #[test]
+    fn source_frame_accounting_preserves_fractional_duration_samples() {
+        let mut collector = collector();
+
+        collector.record_skipped_source_frames(2, 240);
+        collector.record_restored_source_frames(3, 720);
+        collector.record_discarded_source_frames(
+            PreparedPlayoutQueueEventReason::Interruption,
+            2,
+            360,
+        );
+        collector.record_discarded_source_frames(PreparedPlayoutQueueEventReason::Stop, 1, 120);
+        collector.record_egress_dropped_music_frames(2, 240);
+
+        let snapshot = collector.snapshot(0, 0, 0, false);
+        assert_eq!(snapshot.skipped_source_frame_count, 2);
+        assert_eq!(snapshot.skipped_source_duration_samples, 240);
+        assert_eq!(snapshot.skipped_source_duration_ms, 5);
+        assert_eq!(snapshot.restored_source_frame_count, 3);
+        assert_eq!(snapshot.restored_source_duration_samples, 720);
+        assert_eq!(snapshot.restored_source_duration_ms, 15);
+        assert_eq!(snapshot.discarded_source_frame_count, 3);
+        assert_eq!(snapshot.discarded_source_duration_samples, 480);
+        assert_eq!(snapshot.discarded_source_duration_ms, 10);
+        assert_eq!(snapshot.stop_discarded_source_frame_count, 1);
+        assert_eq!(snapshot.stop_discarded_source_duration_samples, 120);
+        assert_eq!(snapshot.stop_discarded_source_duration_ms, 2);
+        assert_eq!(snapshot.interruption_discarded_source_frame_count, 2);
+        assert_eq!(snapshot.interruption_discarded_source_duration_samples, 360);
+        assert_eq!(snapshot.interruption_discarded_source_duration_ms, 7);
+        assert_eq!(snapshot.egress_dropped_music_frame_count, 2);
+        assert_eq!(snapshot.egress_dropped_music_duration_samples, 240);
+        assert_eq!(snapshot.egress_dropped_music_duration_ms, 5);
     }
 
     #[test]
@@ -1727,7 +1966,7 @@ mod tests {
             if index > 0 {
                 sent_at += Duration::from_millis(20);
             }
-            collector.record_track_packet(sent_at, sent_at, sent_at, 20, false);
+            collector.record_track_packet(sent_at, sent_at, sent_at, 20, 960, false);
         }
 
         collector.record_resumed_from_pause();
@@ -1737,7 +1976,7 @@ mod tests {
             if index > 0 {
                 sent_at += Duration::from_millis(20);
             }
-            collector.record_track_packet(sent_at, sent_at, sent_at, 20, false);
+            collector.record_track_packet(sent_at, sent_at, sent_at, 20, 960, false);
         }
 
         let snapshot = collector.snapshot(0, 0, 0, false);
@@ -1751,7 +1990,7 @@ mod tests {
     }
 
     #[test]
-    fn track_tempo_window_excludes_dave_recovery_silence_from_active_tempo() {
+    fn track_tempo_window_excludes_source_underrun_silence_from_active_tempo() {
         let mut collector = collector();
         let start = Instant::now();
         let mut sent_at = start;
@@ -1760,10 +1999,10 @@ mod tests {
             if index > 0 {
                 sent_at += Duration::from_millis(20);
             }
-            collector.record_track_packet(sent_at, sent_at, sent_at, 20, false);
+            collector.record_track_packet(sent_at, sent_at, sent_at, 20, 960, false);
         }
 
-        collector.record_media_clock_reset(MediaClockResetReason::DaveTransitionRecovery);
+        collector.record_media_clock_reset(MediaClockResetReason::SourceUnderrun);
         for _ in 0..8 {
             sent_at += Duration::from_millis(20);
             collector.record_continuity_silence_packet(sent_at, 20);
@@ -1771,7 +2010,7 @@ mod tests {
 
         for _ in 0..60 {
             sent_at += Duration::from_millis(20);
-            collector.record_track_packet(sent_at, sent_at, sent_at, 20, false);
+            collector.record_track_packet(sent_at, sent_at, sent_at, 20, 960, false);
         }
 
         let snapshot = collector.snapshot(0, 0, 0, false);
@@ -1783,7 +2022,7 @@ mod tests {
         assert_eq!(snapshot.track_tempo_window_min_ratio_ppm, 1_000_000);
         assert_eq!(snapshot.track_tempo_window_max_ratio_ppm, 1_000_000);
         assert_eq!(snapshot.continuity_silence_packet_count, 8);
-        assert_eq!(snapshot.dave_transition_recovery_reset_count, 1);
+        assert_eq!(snapshot.source_underrun_reset_count, 1);
         assert_eq!(snapshot.controlled_media_interruption_count, 1);
     }
 

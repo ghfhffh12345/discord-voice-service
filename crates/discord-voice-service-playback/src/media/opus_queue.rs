@@ -1,6 +1,9 @@
 use std::collections::VecDeque;
+use std::time::Duration;
 
 use bytes::Bytes;
+
+pub const OPUS_SAMPLE_RATE_HZ: u64 = 48_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OpusPacketDuration {
@@ -14,6 +17,7 @@ pub struct OpusFrame {
     pub duration_ms: u64,
     pub duration_samples: u32,
     pub source_position_ms: u64,
+    pub source_position_samples: u64,
     pub source_byte_position: Option<u64>,
     pub epoch: u64,
 }
@@ -26,6 +30,7 @@ impl OpusFrame {
             duration_ms,
             duration_samples,
             source_position_ms: 0,
+            source_position_samples: 0,
             source_byte_position: None,
             epoch: 0,
         }
@@ -37,6 +42,7 @@ impl OpusFrame {
             duration_ms,
             duration_samples,
             source_position_ms: 0,
+            source_position_samples: 0,
             source_byte_position: None,
             epoch: 0,
         }
@@ -49,6 +55,21 @@ impl OpusFrame {
         epoch: u64,
     ) -> Self {
         self.source_position_ms = source_position_ms;
+        self.source_position_samples = samples_from_duration_ms_u64(source_position_ms);
+        self.source_byte_position = source_byte_position;
+        self.epoch = epoch;
+        self
+    }
+
+    pub fn with_exact_metadata(
+        mut self,
+        source_position_ms: u64,
+        source_position_samples: u64,
+        source_byte_position: Option<u64>,
+        epoch: u64,
+    ) -> Self {
+        self.source_position_ms = source_position_ms;
+        self.source_position_samples = source_position_samples;
         self.source_byte_position = source_byte_position;
         self.epoch = epoch;
         self
@@ -70,6 +91,7 @@ impl PartialEq for OpusFrame {
             && self.duration_ms == other.duration_ms
             && self.duration_samples == other.duration_samples
             && self.source_position_ms == other.source_position_ms
+            && self.source_position_samples == other.source_position_samples
             && self.source_byte_position == other.source_byte_position
             && self.epoch == other.epoch
     }
@@ -78,10 +100,21 @@ impl PartialEq for OpusFrame {
 impl Eq for OpusFrame {}
 
 pub fn samples_from_duration_ms(duration_ms: u64) -> u32 {
-    duration_ms
-        .saturating_mul(48)
+    samples_from_duration_ms_u64(duration_ms)
         .try_into()
         .unwrap_or(u32::MAX)
+}
+
+pub fn samples_from_duration_ms_u64(duration_ms: u64) -> u64 {
+    duration_ms.saturating_mul(OPUS_SAMPLE_RATE_HZ / 1_000)
+}
+
+pub fn duration_ms_from_samples(duration_samples: u64) -> u64 {
+    duration_samples.saturating_mul(1_000) / OPUS_SAMPLE_RATE_HZ
+}
+
+pub fn duration_from_samples(duration_samples: u64) -> Duration {
+    Duration::from_nanos(duration_samples.saturating_mul(1_000_000_000) / OPUS_SAMPLE_RATE_HZ)
 }
 
 pub fn opus_packet_duration(packet: &[u8]) -> Option<OpusPacketDuration> {
@@ -113,7 +146,7 @@ pub fn opus_packet_duration(packet: &[u8]) -> Option<OpusPacketDuration> {
 
     let samples = samples_per_frame.checked_mul(frames)?.try_into().ok()?;
     Some(OpusPacketDuration {
-        ms: u64::from(samples) / 48,
+        ms: duration_ms_from_samples(u64::from(samples)),
         samples,
     })
 }
@@ -122,8 +155,7 @@ pub fn opus_packet_duration(packet: &[u8]) -> Option<OpusPacketDuration> {
 pub struct OpusFrameQueue {
     capacity: usize,
     max_bytes: usize,
-    max_duration_ms: u64,
-    duration_ms: u64,
+    max_duration_samples: u64,
     duration_samples: u64,
     bytes: usize,
     inner: VecDeque<OpusFrame>,
@@ -142,8 +174,7 @@ impl OpusFrameQueue {
         Self {
             capacity,
             max_bytes,
-            max_duration_ms,
-            duration_ms: 0,
+            max_duration_samples: samples_from_duration_ms_u64(max_duration_ms),
             duration_samples: 0,
             bytes: 0,
             inner: VecDeque::with_capacity(capacity),
@@ -151,17 +182,10 @@ impl OpusFrameQueue {
     }
 
     pub fn push(&mut self, frame: OpusFrame) -> Result<(), OpusFrame> {
-        if self.inner.len() >= self.capacity {
-            return Err(frame);
-        }
-        if self.bytes.saturating_add(frame.byte_len()) > self.max_bytes {
-            return Err(frame);
-        }
-        if self.duration_ms.saturating_add(frame.duration_ms) > self.max_duration_ms {
+        if !self.can_fit_frame(&frame) {
             return Err(frame);
         }
 
-        self.duration_ms = self.duration_ms.saturating_add(frame.duration_ms);
         self.duration_samples = self
             .duration_samples
             .saturating_add(u64::from(frame.duration_samples));
@@ -171,17 +195,10 @@ impl OpusFrameQueue {
     }
 
     pub fn push_front(&mut self, frame: OpusFrame) -> Result<(), OpusFrame> {
-        if self.inner.len() >= self.capacity {
-            return Err(frame);
-        }
-        if self.bytes.saturating_add(frame.byte_len()) > self.max_bytes {
-            return Err(frame);
-        }
-        if self.duration_ms.saturating_add(frame.duration_ms) > self.max_duration_ms {
+        if !self.can_fit_frame(&frame) {
             return Err(frame);
         }
 
-        self.duration_ms = self.duration_ms.saturating_add(frame.duration_ms);
         self.duration_samples = self
             .duration_samples
             .saturating_add(u64::from(frame.duration_samples));
@@ -192,7 +209,6 @@ impl OpusFrameQueue {
 
     pub fn pop(&mut self) -> Option<OpusFrame> {
         let frame = self.inner.pop_front()?;
-        self.duration_ms = self.duration_ms.saturating_sub(frame.duration_ms);
         self.duration_samples = self
             .duration_samples
             .saturating_sub(u64::from(frame.duration_samples));
@@ -211,7 +227,20 @@ impl OpusFrameQueue {
     pub fn is_full(&self) -> bool {
         self.inner.len() >= self.capacity
             || self.bytes >= self.max_bytes
-            || self.duration_ms >= self.max_duration_ms
+            || self.duration_samples >= self.max_duration_samples
+    }
+
+    pub fn can_fit_frame(&self, frame: &OpusFrame) -> bool {
+        self.can_fit_resource(frame.byte_len(), frame.duration_samples)
+    }
+
+    pub fn can_fit_resource(&self, byte_len: usize, duration_samples: u32) -> bool {
+        self.inner.len() < self.capacity
+            && self.bytes.saturating_add(byte_len) <= self.max_bytes
+            && self
+                .duration_samples
+                .saturating_add(u64::from(duration_samples))
+                <= self.max_duration_samples
     }
 
     pub fn capacity(&self) -> usize {
@@ -219,7 +248,7 @@ impl OpusFrameQueue {
     }
 
     pub fn buffered_duration_ms(&self) -> u64 {
-        self.duration_ms
+        duration_ms_from_samples(self.duration_samples)
     }
 
     pub fn buffered_samples(&self) -> u64 {
@@ -258,11 +287,9 @@ impl OpusFrameQueue {
     }
 
     fn recalculate_depth(&mut self) {
-        self.duration_ms = 0;
         self.duration_samples = 0;
         self.bytes = 0;
         for frame in &self.inner {
-            self.duration_ms = self.duration_ms.saturating_add(frame.duration_ms);
             self.duration_samples = self
                 .duration_samples
                 .saturating_add(u64::from(frame.duration_samples));

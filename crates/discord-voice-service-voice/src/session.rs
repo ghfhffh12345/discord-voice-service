@@ -570,14 +570,6 @@ impl ConnectedVoiceSession {
             if let Err(err) = self.process_gateway_event_for_dave(&gateway, event).await {
                 return Err(self.fail_dave_closed(err));
             }
-            if deadline.is_some()
-                && (self.pending_dave_transition.is_some()
-                    || self.pending_dave_local_commit_transition.is_some()
-                    || !self.pending_dave_prepared_transitions.is_empty())
-            {
-                reached_drain_limit = false;
-                break;
-            }
         }
 
         if reached_drain_limit {

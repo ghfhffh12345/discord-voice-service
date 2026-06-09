@@ -242,15 +242,15 @@ async fn voice_udp_transport_uses_frame_duration_for_rtp_timestamps() {
         .unwrap();
 
     transport
-        .send_audio_frame_with_duration_samples(Bytes::from_static(b"sixty-ms"), 2_880)
+        .send_audio_frame_with_duration_samples(Bytes::from_static(b"two-point-five-ms"), 120)
         .await
         .unwrap();
     transport
-        .send_audio_frame_with_duration_samples(Bytes::from_static(b"ten-ms"), 480)
+        .send_audio_frame_with_duration_samples(Bytes::from_static(b"seven-point-five-ms"), 360)
         .await
         .unwrap();
     transport
-        .send_audio_frame_with_duration_samples(Bytes::from_static(b"twenty-ms"), 960)
+        .send_audio_frame_with_duration_samples(Bytes::from_static(b"five-ms"), 240)
         .await
         .unwrap();
 
@@ -262,15 +262,15 @@ async fn voice_udp_transport_uses_frame_duration_for_rtp_timestamps() {
     let (second_header, second_payload) = xchacha_test_context().unprotect_packet(&second).unwrap();
     let (third_header, third_payload) = xchacha_test_context().unprotect_packet(&third).unwrap();
 
-    assert_eq!(first_payload, Bytes::from_static(b"sixty-ms"));
-    assert_eq!(second_payload, Bytes::from_static(b"ten-ms"));
-    assert_eq!(third_payload, Bytes::from_static(b"twenty-ms"));
+    assert_eq!(first_payload, Bytes::from_static(b"two-point-five-ms"));
+    assert_eq!(second_payload, Bytes::from_static(b"seven-point-five-ms"));
+    assert_eq!(third_payload, Bytes::from_static(b"five-ms"));
     assert_eq!(first_header.sequence, 0);
     assert_eq!(second_header.sequence, 1);
     assert_eq!(third_header.sequence, 2);
     assert_eq!(first_header.timestamp, 0);
-    assert_eq!(second_header.timestamp, 2_880);
-    assert_eq!(third_header.timestamp, 3_360);
+    assert_eq!(second_header.timestamp, 120);
+    assert_eq!(third_header.timestamp, 480);
 }
 
 fn xchacha_test_context() -> ProtectionContext {

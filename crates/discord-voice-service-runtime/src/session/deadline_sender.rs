@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
+use discord_voice_service_playback::media::opus_queue::duration_from_samples;
 use discord_voice_service_voice::{PreparedVoicePacket, VoicePreparedPacketSender};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
@@ -56,6 +57,7 @@ pub(crate) struct PreparedMediaFrame {
     pub(crate) duration_ms: u64,
     pub(crate) duration_samples: u32,
     pub(crate) media_position_ms: u64,
+    pub(crate) media_position_samples: u64,
     pub(crate) media_byte_position: Option<u64>,
     pub(crate) epoch: u64,
 }
@@ -312,7 +314,13 @@ where
         let send_started_at = Instant::now();
         self.sink.send_prepared_packet(&command.packet).await?;
         let sent_at = Instant::now();
-        self.next_deadline = Some(sent_at + packet_send_interval(&command.packet));
+        let send_interval = packet_send_interval(&command.packet);
+        let ideal_next_deadline = send_started_at + send_interval;
+        self.next_deadline = Some(if sent_at >= ideal_next_deadline {
+            sent_at + send_interval
+        } else {
+            ideal_next_deadline
+        });
         let record =
             self.metrics
                 .record_sent(expected_deadline, send_started_at, sent_at, &command);
@@ -326,7 +334,7 @@ where
 }
 
 fn packet_send_interval(packet: &PreparedVoicePacket) -> Duration {
-    Duration::from_millis(packet.duration_ms.max(1))
+    duration_from_samples(u64::from(packet.duration_samples)).max(Duration::from_millis(1))
 }
 
 async fn sleep_until_precise(deadline: Instant) {
@@ -415,6 +423,7 @@ mod tests {
                 duration_ms,
                 duration_samples,
                 media_position_ms: u64::from(sequence) * duration_ms,
+                media_position_samples: u64::from(sequence) * u64::from(duration_samples),
                 media_byte_position: None,
                 epoch: 1,
             }),
@@ -499,6 +508,121 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![60, 20, 20]
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deadline_sender_schedules_fractional_millisecond_packet_from_samples() {
+        let commands = vec![
+            prepared_command_with_duration(0, 0, 2, 120),
+            prepared_command_with_duration(1, 120, 2, 120),
+            prepared_command_with_duration(2, 240, 20, 960),
+        ];
+        let (sender, sent) = sender_with_commands(commands, RecordingSink::default());
+
+        let metrics = sender.run_for_ticks(3).await.unwrap();
+
+        let sent = sent
+            .lock()
+            .expect("recording sink lock should not be poisoned")
+            .clone();
+        let actual_intervals = sent
+            .windows(2)
+            .map(|window| window[1].1 - window[0].1)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual_intervals,
+            vec![Duration::from_millis(3), Duration::from_millis(3)]
+        );
+        let scheduled_intervals = metrics
+            .sent()
+            .windows(2)
+            .map(|window| window[1].expected_deadline - window[0].sent_at)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            scheduled_intervals,
+            vec![Duration::from_micros(2_500), Duration::from_micros(2_500)]
+        );
+        assert_eq!(
+            metrics
+                .sent()
+                .iter()
+                .map(|record| (record.duration_ms, record.duration_samples))
+                .collect::<Vec<_>>(),
+            vec![(2, 120), (2, 120), (20, 960)]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deadline_sender_schedules_mixed_duration_sequence_from_samples() {
+        let commands = vec![
+            prepared_command_with_duration(0, 0, 20, 960),
+            prepared_command_with_duration(1, 960, 2, 120),
+            prepared_command_with_duration(2, 1_080, 7, 360),
+            prepared_command_with_duration(3, 1_440, 5, 240),
+        ];
+        let (sender, sent) = sender_with_commands(commands, RecordingSink::default());
+
+        let metrics = sender.run_for_ticks(4).await.unwrap();
+
+        let sent = sent
+            .lock()
+            .expect("recording sink lock should not be poisoned")
+            .clone();
+        let actual_intervals = sent
+            .windows(2)
+            .map(|window| window[1].1 - window[0].1)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual_intervals,
+            vec![
+                Duration::from_millis(20),
+                Duration::from_millis(3),
+                Duration::from_millis(8),
+            ]
+        );
+        let scheduled_intervals = metrics
+            .sent()
+            .windows(2)
+            .map(|window| window[1].expected_deadline - window[0].sent_at)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            scheduled_intervals,
+            vec![
+                Duration::from_millis(20),
+                Duration::from_micros(2_500),
+                Duration::from_micros(7_500),
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deadline_sender_preserves_media_cadence_through_small_send_latency() {
+        let commands = (0..3)
+            .map(|index| prepared_command(index, u32::from(index) * 960))
+            .collect::<Vec<_>>();
+        let (sender, sent) = sender_with_commands(
+            commands,
+            RecordingSink::with_delay(Duration::from_millis(5)),
+        );
+
+        let metrics = sender.run_for_ticks(3).await.unwrap();
+
+        let sent = sent
+            .lock()
+            .expect("recording sink lock should not be poisoned")
+            .clone();
+        let completed_send_intervals = sent
+            .windows(2)
+            .map(|window| window[1].1 - window[0].1)
+            .collect::<Vec<_>>();
+        assert_eq!(completed_send_intervals, vec![DEADLINE_TICK; 2]);
+
+        let started_send_intervals = metrics
+            .sent()
+            .windows(2)
+            .map(|window| window[1].send_started_at - window[0].send_started_at)
+            .collect::<Vec<_>>();
+        assert_eq!(started_send_intervals, vec![DEADLINE_TICK; 2]);
     }
 
     #[tokio::test(start_paused = true)]
@@ -603,6 +727,7 @@ mod tests {
                 duration_ms: 20,
                 duration_samples: 960,
                 media_position_ms: 0,
+                media_position_samples: 0,
                 media_byte_position: None,
                 epoch: 1,
             })
@@ -652,6 +777,7 @@ mod tests {
                 duration_ms: 20,
                 duration_samples: 960,
                 media_position_ms: 0,
+                media_position_samples: 0,
                 media_byte_position: None,
                 epoch: 1,
             })
