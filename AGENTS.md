@@ -27,8 +27,8 @@ Use Conventional Commits on one line, for example `fix(playback): preserve live 
 
 ## Agent-Specific Instructions
 
-Use Serena for repository context and Context7 for library or documentation context. Use `$conventional-commit` when creating commit messages. Treat `docs/superpowers/` as local working material.
+Use Context7 for library or documentation context. Use `$conventional-commit` when creating commit messages.
 
 ## Security & Configuration Tips
 
-Treat `.env` and `browser.json` as secrets. They are ignored by git and must not appear with real values in docs, logs, tests, fixtures, or commits. Do not commit `docs/superpowers/specs/*.md` or `docs/superpowers/plans/*.md`.
+Treat `.env` and `browser.json` as secrets. They are ignored by git and must not appear with real values in docs, logs, tests, fixtures, or commits.
