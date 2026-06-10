@@ -253,7 +253,10 @@ where
 fn post_play_live_contract_state(initial: &LiveContractState) -> LiveContractState {
     let mut state = initial.clone();
     state.saw_track_resolving = false;
+    state.saw_buffering = false;
     state.saw_playing = false;
+    state.saw_paused = false;
+    state.saw_resumed_playing = false;
     state.saw_track_ended = false;
     state
 }
@@ -1667,15 +1670,83 @@ fn observer_threshold_failure_reason(
     stats: &AudioValidationStats,
     expected_duration_ms: u64,
 ) -> &'static str {
+    if stats.observed_packet_count < MIN_OBSERVED_PACKET_COUNT {
+        return "observer_audio_missing_packets";
+    }
+    if stats.decoded_audio_ms < required_observer_decoded_audio_ms(expected_duration_ms) {
+        return "observer_audio_incomplete";
+    }
+    if stats.wall_clock_elapsed_ms == 0 || stats.decoded_audio_to_wall_clock_ratio_ppm == 0 {
+        return "observer_audio_missing_timing";
+    }
+    if stats.decoded_audio_to_wall_clock_ratio_ppm > MEDIA_TO_WALL_CLOCK_MAX_RATIO_PPM {
+        return "observer_audio_tempo_fast";
+    }
+    if stats.decoded_audio_to_wall_clock_ratio_ppm < MEDIA_TO_WALL_CLOCK_MIN_RATIO_PPM {
+        return "observer_audio_tempo_slow";
+    }
+    if stats.non_silent_audio_ms < MIN_NON_SILENT_AUDIO_MS {
+        return "observer_audio_silent";
+    }
+    if stats.rtp_inter_arrival.samples == 0 {
+        return "observer_audio_missing_rtp_intervals";
+    }
+    if unclassified_observer_anomaly_count(
+        stats,
+        "rtp_gap_gte_100ms",
+        stats.rtp_gap_count_gte_100ms,
+    ) != 0
+    {
+        return "observer_audio_rtp_gap";
+    }
     if stats.rtp_buffering_event_count != 0 {
-        "observer_audio_buffered"
-    } else if stats.rtp_speed_change_total_abs_us
+        return "observer_audio_buffered";
+    }
+    if stats.rtp_speed_change_total_abs_us
         > observer_speed_change_total_abs_budget_us(expected_duration_ms)
     {
-        "observer_audio_speed_changed"
-    } else {
-        "observer_audio_incomplete"
+        return "observer_audio_speed_changed";
     }
+    if stats.decoded_audio_tempo_window_count == 0 {
+        return "observer_audio_missing_tempo_windows";
+    }
+    if stats.decoded_audio_tempo_window_fast_count != 0 {
+        return "observer_audio_tempo_fast";
+    }
+    if stats.decoded_audio_tempo_window_slow_count != 0 {
+        return "observer_audio_tempo_slow";
+    }
+    if stats.decoded_audio_short_tempo_window_count == 0 {
+        return "observer_audio_missing_short_tempo_windows";
+    }
+    match stats.decoded_audio_short_tempo_window_fastest.as_ref() {
+        Some(window) if !observer_tempo_window_within_jitter_budget(window) => {
+            return observer_tempo_window_failure_reason(window);
+        }
+        Some(_) => {}
+        None => return "observer_audio_missing_short_tempo_windows",
+    }
+    match stats.decoded_audio_short_tempo_window_slowest.as_ref() {
+        Some(window) if !observer_tempo_window_within_jitter_budget(window) => {
+            return observer_tempo_window_failure_reason(window);
+        }
+        Some(_) => {}
+        None => return "observer_audio_missing_short_tempo_windows",
+    }
+    if observer_post_source_buffer_window_required(expected_duration_ms)
+        && stats.decoded_audio_tempo_window_post_source_buffer_count
+            < MIN_LIVE_POST_SOURCE_TEMPO_WINDOWS
+    {
+        return "observer_audio_insufficient_post_source_tempo_windows";
+    }
+    if stats.rtp_inter_arrival.p95_ms > RTP_INTERVAL_P95_BUDGET_MS
+        || stats.rtp_inter_arrival.p99_ms > RTP_INTERVAL_P99_BUDGET_MS
+        || stats.rtp_inter_arrival.max_ms >= RTP_INTERVAL_MAX_BUDGET_MS
+    {
+        return "observer_audio_rtp_jitter";
+    }
+
+    "observer_audio_incomplete"
 }
 
 fn observer_short_tempo_windows_within_jitter_budget(stats: &AudioValidationStats) -> bool {
@@ -1690,19 +1761,33 @@ fn observer_short_tempo_windows_within_jitter_budget(stats: &AudioValidationStat
 }
 
 fn observer_tempo_window_within_jitter_budget(window: &AudioTempoWindowEvidence) -> bool {
-    let (min_ratio_ppm, max_ratio_ppm) =
-        if window.window_packet_count >= OBSERVER_STRICT_SHORT_WINDOW_MIN_PACKETS {
-            (
-                OBSERVER_SHORT_WINDOW_MIN_RATIO_PPM,
-                OBSERVER_SHORT_WINDOW_MAX_RATIO_PPM,
-            )
-        } else {
-            (
-                OBSERVER_MICRO_WINDOW_MIN_RATIO_PPM,
-                OBSERVER_MICRO_WINDOW_MAX_RATIO_PPM,
-            )
-        };
+    let (min_ratio_ppm, max_ratio_ppm) = observer_tempo_window_ratio_bounds(window);
     window.ratio_ppm >= min_ratio_ppm && window.ratio_ppm <= max_ratio_ppm
+}
+
+fn observer_tempo_window_failure_reason(window: &AudioTempoWindowEvidence) -> &'static str {
+    let (min_ratio_ppm, max_ratio_ppm) = observer_tempo_window_ratio_bounds(window);
+    if window.ratio_ppm > max_ratio_ppm {
+        "observer_audio_short_tempo_fast"
+    } else if window.ratio_ppm < min_ratio_ppm {
+        "observer_audio_short_tempo_slow"
+    } else {
+        "observer_audio_short_tempo_inconsistent"
+    }
+}
+
+fn observer_tempo_window_ratio_bounds(window: &AudioTempoWindowEvidence) -> (u64, u64) {
+    if window.window_packet_count >= OBSERVER_STRICT_SHORT_WINDOW_MIN_PACKETS {
+        (
+            OBSERVER_SHORT_WINDOW_MIN_RATIO_PPM,
+            OBSERVER_SHORT_WINDOW_MAX_RATIO_PPM,
+        )
+    } else {
+        (
+            OBSERVER_MICRO_WINDOW_MIN_RATIO_PPM,
+            OBSERVER_MICRO_WINDOW_MAX_RATIO_PPM,
+        )
+    }
 }
 
 fn observer_speed_change_total_abs_budget_us(expected_duration_ms: u64) -> u64 {
@@ -2533,6 +2618,7 @@ async fn wait_for_reconnect_rollover_probe_resumed(
                 saw_reconnecting = true;
             }
             SessionEventKind::VoiceReady => {
+                validate_interrupt_probe_video_id(&event, expected_video_id, "ReconnectRollover")?;
                 if saw_reconnecting {
                     saw_voice_ready = true;
                 }
@@ -4514,7 +4600,10 @@ fn build_success_evidence(
         saw_voice_connecting: validated.live_contract.saw_voice_connecting,
         saw_voice_ready: validated.live_contract.saw_voice_ready,
         saw_track_resolving: validated.live_contract.saw_track_resolving,
+        saw_buffering: validated.live_contract.saw_buffering,
         saw_playing: validated.live_contract.saw_playing,
+        saw_paused: validated.live_contract.saw_paused,
+        saw_resumed_playing: validated.live_contract.saw_resumed_playing,
         saw_track_ended: validated.live_contract.saw_track_ended,
         observed_packet_count: validated.audio_stats.observed_packet_count,
         decoded_audio_ms: validated.audio_stats.decoded_audio_ms,
@@ -4676,7 +4765,10 @@ fn build_failure_evidence(
         saw_voice_connecting: live_contract.is_some_and(|state| state.saw_voice_connecting),
         saw_voice_ready: live_contract.is_some_and(|state| state.saw_voice_ready),
         saw_track_resolving: live_contract.is_some_and(|state| state.saw_track_resolving),
+        saw_buffering: live_contract.is_some_and(|state| state.saw_buffering),
         saw_playing: live_contract.is_some_and(|state| state.saw_playing),
+        saw_paused: live_contract.is_some_and(|state| state.saw_paused),
+        saw_resumed_playing: live_contract.is_some_and(|state| state.saw_resumed_playing),
         saw_track_ended: live_contract.is_some_and(|state| state.saw_track_ended),
         observed_packet_count: audio_stats.map_or(0, |stats| stats.observed_packet_count),
         decoded_audio_ms: audio_stats.map_or(0, |stats| stats.decoded_audio_ms),
@@ -4799,6 +4891,26 @@ fn finish_with_failure(
 }
 
 fn classify_failure_reason(error: &anyhow::Error) -> String {
+    const OBSERVER_AUDIO_FAILURE_REASONS: &[&str] = &[
+        "observer_audio_missing_packets",
+        "observer_audio_incomplete",
+        "observer_audio_missing_timing",
+        "observer_audio_tempo_fast",
+        "observer_audio_tempo_slow",
+        "observer_audio_silent",
+        "observer_audio_missing_rtp_intervals",
+        "observer_audio_rtp_gap",
+        "observer_audio_buffered",
+        "observer_audio_speed_changed",
+        "observer_audio_missing_tempo_windows",
+        "observer_audio_missing_short_tempo_windows",
+        "observer_audio_short_tempo_fast",
+        "observer_audio_short_tempo_slow",
+        "observer_audio_short_tempo_inconsistent",
+        "observer_audio_insufficient_post_source_tempo_windows",
+        "observer_audio_rtp_jitter",
+    ];
+
     let message = error.to_string().to_lowercase();
     if message.contains("speaking 0")
         || message.contains("microphone speaking")
@@ -4812,12 +4924,14 @@ fn classify_failure_reason(error: &anyhow::Error) -> String {
         || message.contains("resumed service audio")
     {
         "observer_resume_failed".to_owned()
+    } else if let Some(reason) = OBSERVER_AUDIO_FAILURE_REASONS
+        .iter()
+        .copied()
+        .find(|reason| message.contains(reason))
+    {
+        reason.to_owned()
     } else if message.contains("observer") && message.contains("timed out") {
         "observer_timeout".to_owned()
-    } else if message.contains("observer_audio_buffered") {
-        "observer_audio_buffered".to_owned()
-    } else if message.contains("observer_audio_speed_changed") {
-        "observer_audio_speed_changed".to_owned()
     } else if message.contains("sender_source_skipped_ahead")
         || message.contains("skipped source")
         || message.contains("skipped-source")
@@ -4831,6 +4945,8 @@ fn classify_failure_reason(error: &anyhow::Error) -> String {
         "observer_speaker_mapping_missing".to_owned()
     } else if message.contains("trackended")
         || message.contains("playing")
+        || message.contains("paused")
+        || message.contains("buffering")
         || message.contains("voiceready")
         || message.contains("event stream")
     {
@@ -6446,6 +6562,9 @@ mod tests {
             Ok(event(SessionEventKind::VoiceConnecting, None)),
             Ok(event(SessionEventKind::VoiceReady, None)),
             Ok(event(SessionEventKind::TrackResolving, Some("video"))),
+            Ok(event(SessionEventKind::Buffering, Some("video"))),
+            Ok(event(SessionEventKind::Playing, Some("video"))),
+            Ok(event(SessionEventKind::Paused, Some("video"))),
             Ok(event(SessionEventKind::Playing, Some("video"))),
             Ok(event(SessionEventKind::TrackEnded, Some("video"))),
         ]);
@@ -6461,40 +6580,52 @@ mod tests {
             .await
             .expect("remaining events should satisfy the play-completion contract");
         assert!(final_state.saw_voice_ready);
+        assert!(final_state.saw_buffering);
         assert!(final_state.saw_playing);
+        assert!(final_state.saw_paused);
+        assert!(final_state.saw_resumed_playing);
         assert!(final_state.saw_track_ended);
     }
 
     #[tokio::test]
-    async fn play_completed_contract_requires_post_play_playing_after_pre_play_playing() {
-        let mut events = stream::iter(vec![
-            Ok(event(SessionEventKind::Playing, Some("video"))),
-            Ok(event(SessionEventKind::VoiceReady, None)),
-            Ok(event(SessionEventKind::TrackResolving, Some("video"))),
-            Ok(event(SessionEventKind::Playing, Some("video"))),
-            Ok(event(SessionEventKind::TrackEnded, Some("video"))),
-        ]);
-
-        let initial =
-            wait_for_initial_voice_ready(&mut events, "video", LiveContractState::default())
-                .await
-                .expect("voice ready should preserve earlier playing progress");
-        assert!(initial.saw_voice_ready);
-        assert!(initial.saw_playing);
+    async fn post_play_contract_resets_pre_play_track_progress() {
+        let initial = LiveContractState {
+            saw_voice_ready: true,
+            saw_track_resolving: true,
+            saw_buffering: true,
+            saw_playing: true,
+            saw_paused: true,
+            saw_resumed_playing: true,
+            saw_track_ended: true,
+            ..LiveContractState::default()
+        };
 
         let post_play_state = post_play_live_contract_state(&initial);
         assert!(post_play_state.saw_voice_ready);
-        assert!(
-            !post_play_state.saw_playing,
-            "pre-Play Playing must not satisfy the post-Play contract",
-        );
+        assert!(!post_play_state.saw_track_resolving);
+        assert!(!post_play_state.saw_buffering);
+        assert!(!post_play_state.saw_playing);
+        assert!(!post_play_state.saw_paused);
+        assert!(!post_play_state.saw_resumed_playing);
         assert!(!post_play_state.saw_track_ended);
+
+        let mut events = stream::iter(vec![
+            Ok(event(SessionEventKind::TrackResolving, Some("video"))),
+            Ok(event(SessionEventKind::Buffering, Some("video"))),
+            Ok(event(SessionEventKind::Playing, Some("video"))),
+            Ok(event(SessionEventKind::Paused, Some("video"))),
+            Ok(event(SessionEventKind::Playing, Some("video"))),
+            Ok(event(SessionEventKind::TrackEnded, Some("video"))),
+        ]);
 
         let final_state = wait_for_play_completed_contract(&mut events, "video", post_play_state)
             .await
             .expect("a post-Play TrackEnded event should satisfy the play-completion contract");
         assert!(final_state.saw_voice_ready);
+        assert!(final_state.saw_buffering);
         assert!(final_state.saw_playing);
+        assert!(final_state.saw_paused);
+        assert!(final_state.saw_resumed_playing);
         assert!(final_state.saw_track_ended);
     }
 
@@ -7479,7 +7610,10 @@ mod tests {
             live_contract: Some(LiveContractState {
                 saw_voice_ready: true,
                 saw_track_resolving: true,
+                saw_buffering: true,
                 saw_playing: true,
+                saw_paused: true,
+                saw_resumed_playing: true,
                 saw_track_ended: true,
                 ..LiveContractState::default()
             }),
@@ -7504,7 +7638,10 @@ mod tests {
         );
 
         assert!(evidence.saw_voice_ready);
+        assert!(evidence.saw_buffering);
         assert!(evidence.saw_playing);
+        assert!(evidence.saw_paused);
+        assert!(evidence.saw_resumed_playing);
         assert!(evidence.saw_track_ended);
         assert!(!evidence.observer_pause_self_mute_observed);
         assert!(evidence.observer_pause_speaking_stopped);
@@ -7587,6 +7724,8 @@ mod tests {
     async fn failure_evidence_keeps_play_progress_from_snapshot_updates() {
         let initial = LiveContractState {
             saw_voice_ready: true,
+            saw_track_resolving: true,
+            saw_buffering: true,
             saw_playing: false,
             saw_track_ended: false,
             ..LiveContractState::default()

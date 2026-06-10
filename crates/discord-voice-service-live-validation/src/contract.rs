@@ -41,7 +41,10 @@ pub struct LiveContractState {
     pub saw_voice_connecting: bool,
     pub saw_voice_ready: bool,
     pub saw_track_resolving: bool,
+    pub saw_buffering: bool,
     pub saw_playing: bool,
+    pub saw_paused: bool,
+    pub saw_resumed_playing: bool,
     pub saw_track_ended: bool,
 }
 
@@ -86,7 +89,10 @@ pub struct LiveValidationEvidence {
     pub saw_voice_connecting: bool,
     pub saw_voice_ready: bool,
     pub saw_track_resolving: bool,
+    pub saw_buffering: bool,
     pub saw_playing: bool,
+    pub saw_paused: bool,
+    pub saw_resumed_playing: bool,
     pub saw_track_ended: bool,
     pub observed_packet_count: u64,
     pub decoded_audio_ms: u64,
@@ -766,6 +772,7 @@ impl LiveContractState {
 
         match kind {
             SessionEventKind::VoiceConnecting
+            | SessionEventKind::VoiceReady
             | SessionEventKind::TrackResolving
             | SessionEventKind::Buffering
             | SessionEventKind::Stopped
@@ -777,31 +784,68 @@ impl LiveContractState {
                 );
             }
             SessionEventKind::VoiceConnecting => {
+                validate_expected_video_id_if_present(&event, expected_video_id, kind)?;
                 self.saw_voice_connecting = true;
             }
             SessionEventKind::VoiceReady => {
+                validate_expected_video_id_if_present(&event, expected_video_id, kind)?;
                 self.saw_voice_ready = true;
             }
             SessionEventKind::TrackResolving => {
                 validate_expected_video_id(&event, expected_video_id, kind)?;
                 self.saw_track_resolving = true;
             }
+            SessionEventKind::Buffering => {
+                if !self.saw_track_resolving {
+                    anyhow::bail!("Buffering observed before TrackResolving");
+                }
+                validate_expected_video_id(&event, expected_video_id, kind)?;
+                self.saw_buffering = true;
+            }
             SessionEventKind::Playing if !self.saw_playing => {
+                if !self.saw_track_resolving {
+                    anyhow::bail!("Playing observed before TrackResolving");
+                }
+                if !self.saw_buffering {
+                    anyhow::bail!("Playing observed before Buffering");
+                }
                 validate_expected_video_id(&event, expected_video_id, kind)?;
                 self.saw_playing = true;
             }
             SessionEventKind::Playing => {
                 validate_expected_video_id(&event, expected_video_id, kind)?;
+                if self.saw_paused {
+                    self.saw_resumed_playing = true;
+                }
+            }
+            SessionEventKind::Paused => {
+                if !self.saw_playing {
+                    anyhow::bail!("Paused observed before Playing");
+                }
+                if self.saw_track_ended {
+                    anyhow::bail!("Paused observed after TrackEnded");
+                }
+                validate_expected_video_id(&event, expected_video_id, kind)?;
+                self.saw_paused = true;
             }
             SessionEventKind::TrackEnded => {
                 if !self.saw_voice_ready {
                     anyhow::bail!("TrackEnded observed before VoiceReady");
                 }
+                if !self.saw_track_resolving {
+                    anyhow::bail!("TrackEnded observed before TrackResolving");
+                }
+                if !self.saw_buffering {
+                    anyhow::bail!("TrackEnded observed before Buffering");
+                }
                 if !self.saw_playing {
                     anyhow::bail!("TrackEnded observed before Playing");
                 }
-                if !self.saw_track_resolving {
-                    anyhow::bail!("TrackEnded observed before TrackResolving");
+                if !self.saw_paused {
+                    anyhow::bail!("TrackEnded observed before Paused");
+                }
+                if !self.saw_resumed_playing {
+                    anyhow::bail!("TrackEnded observed before Playing after Resume");
                 }
                 validate_expected_video_id(&event, expected_video_id, kind)?;
                 self.saw_track_ended = true;
@@ -818,6 +862,7 @@ impl LiveContractState {
                 );
             }
             SessionEventKind::VoiceReconnecting if self.saw_playing && !self.saw_track_ended => {
+                validate_expected_video_id(&event, expected_video_id, kind)?;
                 anyhow::bail!(
                     "VoiceReconnecting observed: {}",
                     display_event_message(&event)
@@ -891,8 +936,17 @@ impl LiveContractState {
         if !self.saw_track_resolving {
             missing.push("TrackResolving");
         }
+        if !self.saw_buffering {
+            missing.push("Buffering");
+        }
         if !self.saw_playing {
             missing.push("Playing");
+        }
+        if !self.saw_paused {
+            missing.push("Paused");
+        }
+        if !self.saw_resumed_playing {
+            missing.push("Playing after Resume");
         }
         if !self.saw_track_ended {
             missing.push("TrackEnded");
@@ -912,12 +966,35 @@ fn validate_expected_video_id(
     }
 
     let observed = if current_video_id.is_empty() {
-        "none".to_owned()
+        "none"
     } else {
-        current_video_id.to_owned()
+        current_video_id
     };
     anyhow::bail!(
         "{} observed wrong current_video_id: expected video `{expected_video_id}`, got `{observed}`",
+        kind.as_str_name()
+    );
+}
+
+fn validate_expected_video_id_if_present(
+    event: &SessionEvent,
+    expected_video_id: &str,
+    kind: SessionEventKind,
+) -> Result<()> {
+    let Some(current_video_id) = event
+        .current_video_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+    if current_video_id == expected_video_id {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "{} observed wrong current_video_id: expected video `{expected_video_id}`, got `{current_video_id}`",
         kind.as_str_name()
     );
 }

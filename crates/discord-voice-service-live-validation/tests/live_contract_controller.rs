@@ -1,4 +1,4 @@
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 use anyhow::Result;
 use discord_voice_service_live_validation::{
@@ -234,7 +234,10 @@ fn evidence_json_captures_receive_side_success_contract() {
         saw_voice_connecting: true,
         saw_voice_ready: true,
         saw_track_resolving: true,
+        saw_buffering: true,
         saw_playing: true,
+        saw_paused: true,
+        saw_resumed_playing: true,
         saw_track_ended: true,
         observed_packet_count: 144,
         decoded_audio_ms: 3200,
@@ -327,7 +330,10 @@ fn evidence_json_captures_receive_side_success_contract() {
             "saw_voice_connecting": true,
             "saw_voice_ready": true,
             "saw_track_resolving": true,
+            "saw_buffering": true,
             "saw_playing": true,
+            "saw_paused": true,
+            "saw_resumed_playing": true,
             "saw_track_ended": true,
             "observed_packet_count": 144,
             "decoded_audio_ms": 3200,
@@ -386,6 +392,21 @@ fn live_contract_requires_voice_ready_before_track_end() {
     let mut state = LiveContractState::default();
 
     state
+        .observe_event(
+            event(SessionEventKind::TrackResolving, Some("video")),
+            "video",
+        )
+        .unwrap();
+    state
+        .observe_event(event(SessionEventKind::Buffering, Some("video")), "video")
+        .unwrap();
+    state
+        .observe_event(event(SessionEventKind::Playing, Some("video")), "video")
+        .unwrap();
+    state
+        .observe_event(event(SessionEventKind::Paused, Some("video")), "video")
+        .unwrap();
+    state
         .observe_event(event(SessionEventKind::Playing, Some("video")), "video")
         .unwrap();
 
@@ -403,6 +424,15 @@ fn live_contract_requires_playing_before_track_end() {
     state
         .observe_event(event(SessionEventKind::VoiceReady, None), "video")
         .unwrap();
+    state
+        .observe_event(
+            event(SessionEventKind::TrackResolving, Some("video")),
+            "video",
+        )
+        .unwrap();
+    state
+        .observe_event(event(SessionEventKind::Buffering, Some("video")), "video")
+        .unwrap();
 
     let error = state
         .observe_event(event(SessionEventKind::TrackEnded, Some("video")), "video")
@@ -412,7 +442,7 @@ fn live_contract_requires_playing_before_track_end() {
 }
 
 #[test]
-fn live_contract_passes_when_track_ends_after_voice_ready_and_playing() {
+fn live_contract_passes_when_track_ends_after_pause_resume_sequence() {
     let mut state = LiveContractState::default();
 
     state
@@ -424,11 +454,20 @@ fn live_contract_passes_when_track_ends_after_voice_ready_and_playing() {
             "video",
         )
         .unwrap();
+    state
+        .observe_event(event(SessionEventKind::Buffering, Some("video")), "video")
+        .unwrap();
     assert!(
         !state
             .observe_event(event(SessionEventKind::Playing, Some("video")), "video")
             .unwrap()
     );
+    state
+        .observe_event(event(SessionEventKind::Paused, Some("video")), "video")
+        .unwrap();
+    state
+        .observe_event(event(SessionEventKind::Playing, Some("video")), "video")
+        .unwrap();
 
     assert!(
         state
@@ -438,7 +477,41 @@ fn live_contract_passes_when_track_ends_after_voice_ready_and_playing() {
 }
 
 #[test]
-fn live_contract_fails_when_track_end_video_id_differs_after_playing() {
+fn live_contract_fails_when_voice_ready_video_id_differs_from_expected() {
+    let mut state = LiveContractState::default();
+
+    let error = state
+        .observe_event(
+            event(SessionEventKind::VoiceReady, Some("other-video")),
+            "video",
+        )
+        .expect_err("wrong ready video should fail");
+
+    assert!(error.to_string().contains("expected video"));
+}
+
+#[test]
+fn live_contract_fails_when_buffering_video_id_differs_from_expected() {
+    let mut state = LiveContractState::default();
+
+    state
+        .observe_event(
+            event(SessionEventKind::TrackResolving, Some("video")),
+            "video",
+        )
+        .unwrap();
+    let error = state
+        .observe_event(
+            event(SessionEventKind::Buffering, Some("other-video")),
+            "video",
+        )
+        .expect_err("wrong buffering video should fail");
+
+    assert!(error.to_string().contains("expected video"));
+}
+
+#[test]
+fn live_contract_fails_when_track_end_video_id_differs_after_resume() {
     let mut state = LiveContractState::default();
 
     state
@@ -449,6 +522,15 @@ fn live_contract_fails_when_track_end_video_id_differs_after_playing() {
             event(SessionEventKind::TrackResolving, Some("video")),
             "video",
         )
+        .unwrap();
+    state
+        .observe_event(event(SessionEventKind::Buffering, Some("video")), "video")
+        .unwrap();
+    state
+        .observe_event(event(SessionEventKind::Playing, Some("video")), "video")
+        .unwrap();
+    state
+        .observe_event(event(SessionEventKind::Paused, Some("video")), "video")
         .unwrap();
     state
         .observe_event(event(SessionEventKind::Playing, Some("video")), "video")
@@ -477,6 +559,9 @@ fn live_contract_fails_when_playing_video_id_differs_from_expected() {
             "video",
         )
         .unwrap();
+    state
+        .observe_event(event(SessionEventKind::Buffering, Some("video")), "video")
+        .unwrap();
 
     let error = state
         .observe_event(
@@ -500,6 +585,9 @@ fn live_contract_fails_on_reconnecting_after_playing() {
             event(SessionEventKind::TrackResolving, Some("video")),
             "video",
         )
+        .unwrap();
+    state
+        .observe_event(event(SessionEventKind::Buffering, Some("video")), "video")
         .unwrap();
     state
         .observe_event(event(SessionEventKind::Playing, Some("video")), "video")
@@ -578,7 +666,10 @@ fn success_evidence_is_emitted_even_when_cleanup_confirmation_lags() {
                 saw_voice_connecting: false,
                 saw_voice_ready: false,
                 saw_track_resolving: false,
+                saw_buffering: false,
                 saw_playing: false,
+                saw_paused: false,
+                saw_resumed_playing: false,
                 saw_track_ended: true,
                 observed_packet_count: 0,
                 decoded_audio_ms: 0,

@@ -1,14 +1,17 @@
 use std::fs;
 
+const AUTHORITATIVE_EVIDENCE_CONTRACT: &str = "Passing `staging_live_check` plus the strict success evidence artifact is the authoritative live-staging signal; manual listening is not part of the acceptance criteria.";
 const LOCAL_LIVE_STAGING_CONTRACT: &str = "For local real-Discord live staging, run `scripts/ci/run_local_live_staging.sh`; the helper loads secrets from `.env`, loads `BROWSER_JSON` from `./browser.json`, starts a disposable local `ytmusic-service` container and CPU-contention container, waits for `ytmusic-service` gRPC readiness, then starts a locally built `discord-voice-service` binary inside a CPU-limited container with the HTTP read stress profile before running observer validation.";
 const LOCAL_LIVE_STAGING_IMAGE_OVERRIDE_CONTRACT: &str = "For reproducible local live staging, optionally set `YTMUSIC_SERVICE_IMAGE_REF`; otherwise the helper defaults to `ghcr.io/ghfhffh12345/ytmusic-service:latest`.";
 const OBSERVER_SECRET_CONTRACT: &str = "Protected live staging requires `OBSERVER_BOT_TOKEN` for the muted, non-deafened observer identity that validates receive-side audio.";
-const RECEIVE_SIDE_SUCCESS_CONTRACT: &str = "Live-staging success requires observer receive-side proof: authentic voice context, VoiceReady, Playing, pause without leaving the voice channel, no service audio or speaking state during the paused interval, resume without voice-channel rejoin, natural TrackEnded, at least 120 observed packets, at least 3000 ms decoded audio, at least 1000 ms non-silent audio, and no reconnect/interruption/fatal error during validation.";
-const PLAYBACK_METRICS_SUCCESS_CONTRACT: &str = "Live-staging success requires service-side playback stability metrics from `GetPlaybackMetrics`, including RTP interval stats, sender lateness, buffer depth, refill durations, underruns, inserted silence, and interruption counters.";
+const SERVICE_EVENT_SUCCESS_CONTRACT: &str = "Live-staging success requires strict service-event proof for the expected `TEST_VIDEO_ID`: `VoiceConnecting`, `VoiceReady`, `TrackResolving`, `Buffering`, initial `Playing`, `Paused`, resumed `Playing`, and natural `TrackEnded`, plus ignored invalid `Resume` and ignored redundant `Pause` checks.";
+const RECEIVE_SIDE_SUCCESS_CONTRACT: &str = "Live-staging success requires observer receive-side proof: authentic voice context, pause without leaving the voice channel, no service audio or speaking state during the paused interval, explicit RTP stop-silence at the pause boundary, resume without voice-channel rejoin, at least 120 observed packets, decoded audio near the expected track duration, at least 1000 ms non-silent audio, constant 980000..=1020000 ppm aggregate and rolling tempo, no steady-playback RTP buffering, no unclassified >=100 ms RTP gaps, and no reconnect/interruption/fatal error during validation.";
+const PLAYBACK_METRICS_SUCCESS_CONTRACT: &str = "Live-staging success requires service-side playback stability metrics from `GetPlaybackMetrics`, including raw send-event and prepared-queue evidence, RTP interval stats, sender lateness, bounded buffer depth, refill durations, zero underruns, zero rebuffers, zero dropped/late/deficit frames, zero inserted silence, zero skipped source media, and no tempo rebases.";
 const CONSTRAINED_PROFILE_SUCCESS_CONTRACT: &str = "Live-staging success runs a constrained profile with CPU contention, a service CPU limit, and slow/jittery HTTP media reads configured by the `LIVE_STAGING_*` variables.";
 const SINGLE_TRACK_SUCCESS_CONTRACT: &str = "Live-staging success waits for the natural end of the single `TEST_VIDEO_ID` session before the run is treated as release-ready.";
-const ACTIVE_INTERRUPT_SUCCESS_CONTRACT: &str = "After natural playback metrics are captured, live-staging success also starts fresh probe playbacks and validates active `UpdateVoiceContext` reconnect rollover, `Stop`, and `LeaveVoice` while those probes are actively Playing.";
-const EVIDENCE_ARTIFACT_CONTRACT: &str = "Live-staging always uploads a structured evidence artifact summarizing the constrained profile, slow/jittery HTTP read settings, ignored invalid Resume, ignored redundant Pause, pause silence, resume packets, active reconnect rollover, active Stop, active LeaveVoice, observed packets, decoded audio, non-silent audio, natural playback stability metrics, reconnect probe metrics, and failure_reason.";
+const ACTIVE_INTERRUPT_SUCCESS_CONTRACT: &str = "After natural playback metrics are captured, live-staging success also starts fresh probe playbacks and validates active `UpdateVoiceContext` reconnect rollover, `Stop`, and `LeaveVoice` while those probes are actively `Playing`.";
+const EVIDENCE_ARTIFACT_CONTRACT: &str = "Live-staging always uploads a structured evidence artifact summarizing the constrained profile, slow/jittery HTTP read settings, ignored invalid `Resume`, ignored redundant `Pause`, observed service events, pause silence, resume packets, active reconnect rollover, active `Stop`, active `LeaveVoice`, observed packets, decoded audio, non-silent audio, receive-side tempo/buffering/gap counters, natural playback stability metrics, reconnect probe metrics, and `failure_reason`.";
+const STRICT_EVIDENCE_RUNNER_CONTRACT: &str = "The runner rejects missing, non-success, or internally inconsistent evidence; a non-empty artifact alone is not sufficient.";
 
 #[test]
 fn readme_publishes_the_hosted_live_staging_contract() {
@@ -28,12 +31,15 @@ fn readme_publishes_the_hosted_live_staging_contract() {
     assert!(readme.contains(LOCAL_LIVE_STAGING_CONTRACT));
     assert!(readme.contains(LOCAL_LIVE_STAGING_IMAGE_OVERRIDE_CONTRACT));
     assert!(readme.contains(OBSERVER_SECRET_CONTRACT));
+    assert!(readme.contains(AUTHORITATIVE_EVIDENCE_CONTRACT));
+    assert!(readme.contains(SERVICE_EVENT_SUCCESS_CONTRACT));
     assert!(readme.contains(RECEIVE_SIDE_SUCCESS_CONTRACT));
     assert!(readme.contains(PLAYBACK_METRICS_SUCCESS_CONTRACT));
     assert!(readme.contains(CONSTRAINED_PROFILE_SUCCESS_CONTRACT));
     assert!(readme.contains(SINGLE_TRACK_SUCCESS_CONTRACT));
     assert!(readme.contains(ACTIVE_INTERRUPT_SUCCESS_CONTRACT));
     assert!(readme.contains(EVIDENCE_ARTIFACT_CONTRACT));
+    assert!(readme.contains(STRICT_EVIDENCE_RUNNER_CONTRACT));
     assert!(readme.contains("scripts/ci/run_local_live_staging.sh"));
     assert!(readme.contains("protected `live-staging` environment"));
     assert!(readme.contains("candidate manifest digest"));

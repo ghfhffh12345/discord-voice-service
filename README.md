@@ -32,7 +32,7 @@ The main bot should continue to own commands and high-level playback decisions. 
 - One gRPC listener on `DISCORD_VOICE_SERVICE_BIND_ADDR`
 - Standard gRPC health checks on the same listener
 - `discordvoice.v1.DiscordVoiceControl` with these RPCs: `JoinVoice`, `UpdateVoiceContext`, `Play`, `Pause`, `Resume`, `Stop`, `LeaveVoice`, `GetState`, `GetPlaybackMetrics`, `SubscribeEvents`
-- Runtime event emission for voice/session state transitions such as `VoiceConnecting`, `VoiceReady`, `TrackResolving`, `Playing`, and `TrackEnded`
+- Runtime event emission for voice/session state transitions such as `VoiceConnecting`, `VoiceReady`, `TrackResolving`, `Buffering`, `Playing`, `Paused`, and `TrackEnded`
 - A real runtime playback path that connects to a Discord voice endpoint, performs UDP discovery, sends speaking updates, and emits Opus RTP frames for supported sources
 - Distroless container packaging in [`Containerfile`](Containerfile)
 - A branch and PR gate in [`.github/workflows/fake-peer-ci.yml`](.github/workflows/fake-peer-ci.yml) that runs the fake-peer verification suite on pushes, pull requests, and merge-queue checks
@@ -175,13 +175,15 @@ For manual `workflow_dispatch` live-staging runs, provide `discord_voice_service
 
 For reproducible staging, pin `YTMUSIC_SERVICE_IMAGE_REF` to an immutable tag or digest instead of relying on `:latest`.
 
-During live staging, human listeners may remain in the channel while the staging bot validates playback against the dedicated validation track.
+Passing `staging_live_check` plus the strict success evidence artifact is the authoritative live-staging signal; manual listening is not part of the acceptance criteria.
 Live-staging success waits for the natural end of the single `TEST_VIDEO_ID` session before the run is treated as release-ready.
-Live-staging success requires observer receive-side proof: authentic voice context, VoiceReady, Playing, pause without leaving the voice channel, no service audio or speaking state during the paused interval, resume without voice-channel rejoin, natural TrackEnded, at least 120 observed packets, at least 3000 ms decoded audio, at least 1000 ms non-silent audio, and no reconnect/interruption/fatal error during validation.
-Live-staging success requires service-side playback stability metrics from `GetPlaybackMetrics`, including RTP interval stats, sender lateness, buffer depth, refill durations, underruns, inserted silence, and interruption counters.
+Live-staging success requires strict service-event proof for the expected `TEST_VIDEO_ID`: `VoiceConnecting`, `VoiceReady`, `TrackResolving`, `Buffering`, initial `Playing`, `Paused`, resumed `Playing`, and natural `TrackEnded`, plus ignored invalid `Resume` and ignored redundant `Pause` checks.
+Live-staging success requires observer receive-side proof: authentic voice context, pause without leaving the voice channel, no service audio or speaking state during the paused interval, explicit RTP stop-silence at the pause boundary, resume without voice-channel rejoin, at least 120 observed packets, decoded audio near the expected track duration, at least 1000 ms non-silent audio, constant 980000..=1020000 ppm aggregate and rolling tempo, no steady-playback RTP buffering, no unclassified >=100 ms RTP gaps, and no reconnect/interruption/fatal error during validation.
+Live-staging success requires service-side playback stability metrics from `GetPlaybackMetrics`, including raw send-event and prepared-queue evidence, RTP interval stats, sender lateness, bounded buffer depth, refill durations, zero underruns, zero rebuffers, zero dropped/late/deficit frames, zero inserted silence, zero skipped source media, and no tempo rebases.
 Live-staging success runs a constrained profile with CPU contention, a service CPU limit, and slow/jittery HTTP media reads configured by the `LIVE_STAGING_*` variables.
-After natural playback metrics are captured, live-staging success also starts fresh probe playbacks and validates active `UpdateVoiceContext` reconnect rollover, `Stop`, and `LeaveVoice` while those probes are actively Playing.
-Live-staging always uploads a structured evidence artifact summarizing the constrained profile, slow/jittery HTTP read settings, ignored invalid Resume, ignored redundant Pause, pause silence, resume packets, active reconnect rollover, active Stop, active LeaveVoice, observed packets, decoded audio, non-silent audio, natural playback stability metrics, reconnect probe metrics, and failure_reason.
+After natural playback metrics are captured, live-staging success also starts fresh probe playbacks and validates active `UpdateVoiceContext` reconnect rollover, `Stop`, and `LeaveVoice` while those probes are actively `Playing`.
+Live-staging always uploads a structured evidence artifact summarizing the constrained profile, slow/jittery HTTP read settings, ignored invalid `Resume`, ignored redundant `Pause`, observed service events, pause silence, resume packets, active reconnect rollover, active `Stop`, active `LeaveVoice`, observed packets, decoded audio, non-silent audio, receive-side tempo/buffering/gap counters, natural playback stability metrics, reconnect probe metrics, and `failure_reason`.
+The runner rejects missing, non-success, or internally inconsistent evidence; a non-empty artifact alone is not sufficient.
 
 The workflow intentionally starts the live dependencies itself instead of assuming external staging processes:
 
@@ -199,12 +201,12 @@ Every successful live staging validation should record this evidence in the impl
 - commit SHA tested
 - runner type used
 - candidate manifest digest
-- whether authentic voice context was acquired
-- whether `VoiceReady`, `Playing`, and `TrackEnded` were observed through the natural end of the validation track
+- whether `VoiceReady`, `TrackResolving`, `Buffering`, initial `Playing`, `Paused`, resumed `Playing`, and `TrackEnded` were observed for the expected video through the natural end of the validation track
 - whether active probe playbacks validated `UpdateVoiceContext` reconnect rollover, `Stop`, and `LeaveVoice`
 - constrained profile name, service CPU limit, CPU-contention worker count, and HTTP read delay/jitter settings
-- observed packet count, decoded audio duration, and non-silent audio duration from the uploaded observer artifact
-- playback stability metrics from `GetPlaybackMetrics`, including RTP interval stats, sender lateness, buffer depth, refill durations, underruns, inserted silence, and interruption counters
+- observed packet count, decoded audio duration, non-silent audio duration, receive-side tempo ratios/windows, RTP buffering count, and RTP gap count from the uploaded observer artifact
+- playback stability metrics from `GetPlaybackMetrics`, including RTP interval stats, sender lateness, buffer depth, refill durations, underruns, rebuffers, dropped/late/deficit frames, inserted silence, skipped source media, and tempo rebases
+- whether the strict success evidence validator accepted the artifact
 - whether cleanup succeeded
 
 ## Rollback

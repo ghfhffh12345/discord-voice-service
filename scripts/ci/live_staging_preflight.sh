@@ -24,6 +24,7 @@ required_tools=(
   docker
   cargo
   rustc
+  python3
   skopeo
 )
 

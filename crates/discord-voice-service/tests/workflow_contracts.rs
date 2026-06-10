@@ -1,25 +1,30 @@
 use std::fs;
 
-const OCCUPIED_LISTENER_CONTRACT: &str = "During live staging, human listeners may remain in the channel while the staging bot validates playback against the dedicated validation track.";
+const AUTHORITATIVE_EVIDENCE_CONTRACT: &str = "Passing `staging_live_check` plus the strict success evidence artifact is the authoritative live-staging signal; manual listening is not part of the acceptance criteria.";
 const NATURAL_END_SUCCESS_CONTRACT: &str = "Live-staging success waits for the natural end of the single `TEST_VIDEO_ID` session before the run is treated as release-ready.";
 const LOCAL_LIVE_STAGING_CONTRACT: &str = "For local real-Discord live staging, run `scripts/ci/run_local_live_staging.sh`; the helper loads secrets from `.env`, loads `BROWSER_JSON` from `./browser.json`, starts a disposable local `ytmusic-service` container and CPU-contention container, waits for `ytmusic-service` gRPC readiness, then starts a locally built `discord-voice-service` binary inside a CPU-limited container with the HTTP read stress profile before running observer validation.";
 const OBSERVER_SECRET_CONTRACT: &str = "Protected live staging requires `OBSERVER_BOT_TOKEN` for the muted, non-deafened observer identity that validates receive-side audio.";
-const RECEIVE_SIDE_SUCCESS_CONTRACT: &str = "Live-staging success requires observer receive-side proof: authentic voice context, VoiceReady, Playing, pause without leaving the voice channel, no service audio or speaking state during the paused interval, resume without voice-channel rejoin, natural TrackEnded, at least 120 observed packets, at least 3000 ms decoded audio, at least 1000 ms non-silent audio, and no reconnect/interruption/fatal error during validation.";
-const PLAYBACK_METRICS_SUCCESS_CONTRACT: &str = "Live-staging success requires service-side playback stability metrics from `GetPlaybackMetrics`, including RTP interval stats, sender lateness, buffer depth, refill durations, underruns, inserted silence, and interruption counters.";
+const SERVICE_EVENT_SUCCESS_CONTRACT: &str = "Live-staging success requires strict service-event proof for the expected `TEST_VIDEO_ID`: `VoiceConnecting`, `VoiceReady`, `TrackResolving`, `Buffering`, initial `Playing`, `Paused`, resumed `Playing`, and natural `TrackEnded`, plus ignored invalid `Resume` and ignored redundant `Pause` checks.";
+const RECEIVE_SIDE_SUCCESS_CONTRACT: &str = "Live-staging success requires observer receive-side proof: authentic voice context, pause without leaving the voice channel, no service audio or speaking state during the paused interval, explicit RTP stop-silence at the pause boundary, resume without voice-channel rejoin, at least 120 observed packets, decoded audio near the expected track duration, at least 1000 ms non-silent audio, constant 980000..=1020000 ppm aggregate and rolling tempo, no steady-playback RTP buffering, no unclassified >=100 ms RTP gaps, and no reconnect/interruption/fatal error during validation.";
+const PLAYBACK_METRICS_SUCCESS_CONTRACT: &str = "Live-staging success requires service-side playback stability metrics from `GetPlaybackMetrics`, including raw send-event and prepared-queue evidence, RTP interval stats, sender lateness, bounded buffer depth, refill durations, zero underruns, zero rebuffers, zero dropped/late/deficit frames, zero inserted silence, zero skipped source media, and no tempo rebases.";
 const CONSTRAINED_PROFILE_SUCCESS_CONTRACT: &str = "Live-staging success runs a constrained profile with CPU contention, a service CPU limit, and slow/jittery HTTP media reads configured by the `LIVE_STAGING_*` variables.";
-const ACTIVE_INTERRUPT_SUCCESS_CONTRACT: &str = "After natural playback metrics are captured, live-staging success also starts fresh probe playbacks and validates active `UpdateVoiceContext` reconnect rollover, `Stop`, and `LeaveVoice` while those probes are actively Playing.";
-const EVIDENCE_ARTIFACT_CONTRACT: &str = "Live-staging always uploads a structured evidence artifact summarizing the constrained profile, slow/jittery HTTP read settings, ignored invalid Resume, ignored redundant Pause, pause silence, resume packets, active reconnect rollover, active Stop, active LeaveVoice, observed packets, decoded audio, non-silent audio, natural playback stability metrics, reconnect probe metrics, and failure_reason.";
+const ACTIVE_INTERRUPT_SUCCESS_CONTRACT: &str = "After natural playback metrics are captured, live-staging success also starts fresh probe playbacks and validates active `UpdateVoiceContext` reconnect rollover, `Stop`, and `LeaveVoice` while those probes are actively `Playing`.";
+const EVIDENCE_ARTIFACT_CONTRACT: &str = "Live-staging always uploads a structured evidence artifact summarizing the constrained profile, slow/jittery HTTP read settings, ignored invalid `Resume`, ignored redundant `Pause`, observed service events, pause silence, resume packets, active reconnect rollover, active `Stop`, active `LeaveVoice`, observed packets, decoded audio, non-silent audio, receive-side tempo/buffering/gap counters, natural playback stability metrics, reconnect probe metrics, and `failure_reason`.";
+const STRICT_EVIDENCE_RUNNER_CONTRACT: &str = "The runner rejects missing, non-success, or internally inconsistent evidence; a non-empty artifact alone is not sufficient.";
 
 #[test]
 fn live_staging_workflow_uses_github_hosted_runner_and_secret_browser_json() {
     let _ = (
+        AUTHORITATIVE_EVIDENCE_CONTRACT,
         LOCAL_LIVE_STAGING_CONTRACT,
         OBSERVER_SECRET_CONTRACT,
+        SERVICE_EVENT_SUCCESS_CONTRACT,
         RECEIVE_SIDE_SUCCESS_CONTRACT,
         PLAYBACK_METRICS_SUCCESS_CONTRACT,
         CONSTRAINED_PROFILE_SUCCESS_CONTRACT,
         ACTIVE_INTERRUPT_SUCCESS_CONTRACT,
         EVIDENCE_ARTIFACT_CONTRACT,
+        STRICT_EVIDENCE_RUNNER_CONTRACT,
     );
     let workflow = fs::read_to_string("../../.github/workflows/live-staging.yml")
         .expect("live-staging workflow should exist");
@@ -81,6 +86,7 @@ fn live_staging_workflow_uses_github_hosted_runner_and_secret_browser_json() {
     assert!(preflight.contains("LIVE_STAGING_CPU_CONTENTION_WORKERS"));
     assert!(preflight.contains("LIVE_STAGING_HTTP_READ_DELAY_MS"));
     assert!(preflight.contains("LIVE_STAGING_HTTP_READ_JITTER_MS"));
+    assert!(preflight.contains("python3"));
     assert!(!preflight.contains(&["LIVE_STAGING", "_LONG_TRACK", "_MIN_PACKETS"].concat()));
     assert!(!preflight.contains("OBSERVER_APPLICATION_ID"));
     assert!(!preflight.contains("STAGING_BROWSER_JSON_SOURCE_PATH"));
@@ -114,8 +120,21 @@ fn live_staging_workflow_uses_github_hosted_runner_and_secret_browser_json() {
     ));
     assert!(run_script.contains("\"validated_constrained_profile\":false"));
     assert!(run_script.contains("\"validated_slow_jittery_http\":false"));
+    assert!(run_script.contains("validate_live_staging_evidence.py"));
+    assert!(run_script.contains("validate_success_evidence \"${validation_evidence_path}\""));
+    assert!(run_script.contains("\"saw_buffering\":false"));
+    assert!(run_script.contains("\"saw_paused\":false"));
+    assert!(run_script.contains("\"saw_resumed_playing\":false"));
     assert!(!run_script.contains(&["validated_", "long", "_track", "_playback"].concat()));
     assert!(!run_script.contains(&["long", "_track", "_metrics"].concat()));
+    let evidence_validator =
+        fs::read_to_string("../../scripts/ci/validate_live_staging_evidence.py")
+            .expect("strict evidence validator should exist");
+    assert!(evidence_validator.contains("REQUIRED_TOP_LEVEL_TRUE"));
+    assert!(evidence_validator.contains("saw_paused"));
+    assert!(evidence_validator.contains("observer_rtp_buffering_event_count"));
+    assert!(evidence_validator.contains("track_tempo_window_fast_count"));
+    assert!(evidence_validator.contains("failure_reason"));
 
     assert!(local_helper.contains(source_env));
     assert!(!local_helper.contains("set -a"));
@@ -221,6 +240,15 @@ fn live_staging_workflow_uses_github_hosted_runner_and_secret_browser_json() {
     );
     assert!(!local_helper.contains(&["LIVE_STAGING", "_LONG_TRACK", "_MIN_PACKETS"].concat()));
     assert!(local_helper.contains("LIVE_VALIDATION_EVIDENCE_PATH=\"${validation_evidence_path}\""));
+    assert!(
+        local_helper
+            .contains("python3 must be available for strict live validation evidence checks")
+    );
+    assert!(local_helper.contains("validate_live_staging_evidence.py"));
+    assert!(local_helper.contains("validate_success_evidence \"${validation_evidence_path}\""));
+    assert!(local_helper.contains("\"saw_buffering\":false"));
+    assert!(local_helper.contains("\"saw_paused\":false"));
+    assert!(local_helper.contains("\"saw_resumed_playing\":false"));
     assert!(local_helper.contains(
         "DISCORD_VOICE_SERVICE_HTTP_READ_DELAY_MS=\"${live_staging_http_read_delay_ms}\""
     ));
@@ -327,16 +355,18 @@ fn live_staging_runner_doc_matches_the_live_validation_contract() {
     let doc = fs::read_to_string("../../docs/operations/live-staging-runner.md")
         .expect("live staging runner doc should exist");
 
-    assert!(doc.contains(OCCUPIED_LISTENER_CONTRACT));
+    assert!(doc.contains(AUTHORITATIVE_EVIDENCE_CONTRACT));
     assert!(doc.contains(NATURAL_END_SUCCESS_CONTRACT));
     assert!(doc.contains(LOCAL_LIVE_STAGING_CONTRACT));
     assert!(doc.contains(OBSERVER_SECRET_CONTRACT));
+    assert!(doc.contains(SERVICE_EVENT_SUCCESS_CONTRACT));
     assert!(doc.contains(RECEIVE_SIDE_SUCCESS_CONTRACT));
     assert!(doc.contains(PLAYBACK_METRICS_SUCCESS_CONTRACT));
     assert!(doc.contains(CONSTRAINED_PROFILE_SUCCESS_CONTRACT));
     assert!(doc.contains("rather than a second validation track"));
     assert!(doc.contains(ACTIVE_INTERRUPT_SUCCESS_CONTRACT));
     assert!(doc.contains(EVIDENCE_ARTIFACT_CONTRACT));
+    assert!(doc.contains(STRICT_EVIDENCE_RUNNER_CONTRACT));
     assert!(!doc.contains(&["TEST_LONG", "_VIDEO_ID"].concat()));
     assert!(!doc.contains(&["LIVE_STAGING", "_LONG_TRACK", "_MIN_PACKETS"].concat()));
     assert!(!doc.contains("verifies the already-running `ytmusic-service` endpoint"));
