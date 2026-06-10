@@ -42,6 +42,12 @@ pub struct AudioValidationStats {
     pub rtp_fast_interval_count: u64,
     pub rtp_fast_interval_min_ms: u64,
     pub rtp_fast_interval_min_us: u64,
+    pub rtp_buffering_event_count: u64,
+    pub rtp_buffering_total_us: u64,
+    pub rtp_buffering_max_us: u64,
+    pub rtp_speed_change_total_abs_us: u64,
+    pub rtp_speed_change_total_fast_us: u64,
+    pub rtp_speed_change_total_slow_us: u64,
     pub observer_anomalies: Vec<AudioObserverAnomaly>,
     pub decoded_audio_tempo_window_count: u64,
     pub decoded_audio_tempo_window_post_source_buffer_count: u64,
@@ -115,6 +121,10 @@ impl ObserverPlaybackSegment {
             Self::PostResumeSteady => "post_resume_steady_playback",
             Self::NaturalEndDrain => "natural_end_drain",
         }
+    }
+
+    fn is_steady_playback(self) -> bool {
+        matches!(self, Self::PrePauseSteady | Self::PostResumeSteady)
     }
 }
 
@@ -328,6 +338,50 @@ impl AudioValidationAccumulator {
                 });
             }
             if let Some(previous_duration) = self.last_packet_duration {
+                if self.segment.is_steady_playback() {
+                    let interval_us = duration_us(interval);
+                    let previous_duration_us = duration_us(previous_duration);
+                    let jitter_allowance_us = duration_us(LOCAL_OBSERVER_JITTER_ALLOWANCE);
+
+                    if interval >= OBSERVER_GAP_THRESHOLD {
+                        let buffering_us = interval_us.saturating_sub(previous_duration_us);
+                        self.stats.rtp_buffering_event_count =
+                            self.stats.rtp_buffering_event_count.saturating_add(1);
+                        self.stats.rtp_buffering_total_us = self
+                            .stats
+                            .rtp_buffering_total_us
+                            .saturating_add(buffering_us);
+                        self.stats.rtp_buffering_max_us =
+                            self.stats.rtp_buffering_max_us.max(buffering_us);
+                    }
+
+                    if interval_us + jitter_allowance_us < previous_duration_us {
+                        let fast_us = previous_duration_us
+                            .saturating_sub(interval_us)
+                            .saturating_sub(jitter_allowance_us);
+                        self.stats.rtp_speed_change_total_fast_us = self
+                            .stats
+                            .rtp_speed_change_total_fast_us
+                            .saturating_add(fast_us);
+                        self.stats.rtp_speed_change_total_abs_us = self
+                            .stats
+                            .rtp_speed_change_total_abs_us
+                            .saturating_add(fast_us);
+                    } else if interval_us > previous_duration_us + jitter_allowance_us {
+                        let slow_us = interval_us
+                            .saturating_sub(previous_duration_us)
+                            .saturating_sub(jitter_allowance_us);
+                        self.stats.rtp_speed_change_total_slow_us = self
+                            .stats
+                            .rtp_speed_change_total_slow_us
+                            .saturating_add(slow_us);
+                        self.stats.rtp_speed_change_total_abs_us = self
+                            .stats
+                            .rtp_speed_change_total_abs_us
+                            .saturating_add(slow_us);
+                    }
+                }
+
                 self.active_wall_clock_elapsed = self
                     .active_wall_clock_elapsed
                     .saturating_sub(previous_duration)

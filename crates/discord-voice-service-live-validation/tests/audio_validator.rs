@@ -254,6 +254,140 @@ fn audio_validator_counts_local_fast_interval_without_whole_window_ratio_gate() 
     assert_eq!(stats.decoded_audio_tempo_window_slow_count, 0);
     assert_eq!(stats.decoded_audio_tempo_window_min_ratio_ppm, 1_000_000);
     assert_eq!(stats.decoded_audio_tempo_window_max_ratio_ppm, 1_000_000);
+    assert_eq!(stats.rtp_speed_change_total_fast_us, 250);
+    assert_eq!(stats.rtp_speed_change_total_slow_us, 250);
+    assert_eq!(stats.rtp_speed_change_total_abs_us, 500);
+}
+
+#[test]
+fn audio_validator_totals_receive_side_speed_change_after_jitter_allowance() {
+    let mut demux = WebmOpusDemux::default();
+    demux.push_bytes(load_fixture_bytes("audio-itag250.webm"));
+    let packets = demux.drain_packets().expect("fixture should demux");
+    assert!(!packets.is_empty(), "fixture should yield opus packets");
+
+    let mut accumulator = AudioValidationAccumulator::new();
+    let start = Instant::now();
+    let mut observed_at = start;
+    let mut rtp_timestamp = 0u32;
+
+    for (index, packet) in packets.iter().cycle().take(6).enumerate() {
+        if index > 0 {
+            let interval = match index {
+                1 | 2 => Duration::from_millis(18),
+                4 | 5 => Duration::from_millis(22),
+                _ => Duration::from_millis(20),
+            };
+            observed_at += interval;
+        }
+        accumulator
+            .observe_packet_at(
+                ObservedOpusPacket {
+                    sequence: index as u16,
+                    timestamp: rtp_timestamp,
+                    payload: packet.data.as_ref(),
+                },
+                observed_at,
+            )
+            .expect("fixture packet should decode");
+        rtp_timestamp = rtp_timestamp.wrapping_add(packet.duration_samples);
+    }
+
+    let stats = accumulator.into_stats().expect("stats should be present");
+    assert_eq!(stats.rtp_buffering_event_count, 0);
+    assert_eq!(stats.rtp_speed_change_total_fast_us, 2_500);
+    assert_eq!(stats.rtp_speed_change_total_slow_us, 2_500);
+    assert_eq!(stats.rtp_speed_change_total_abs_us, 5_000);
+}
+
+#[test]
+fn audio_validator_counts_steady_playback_buffering_from_actual_packet_gap() {
+    let mut demux = WebmOpusDemux::default();
+    demux.push_bytes(load_fixture_bytes("audio-itag250.webm"));
+    let packets = demux.drain_packets().expect("fixture should demux");
+    assert!(!packets.is_empty(), "fixture should yield opus packets");
+
+    let mut accumulator = AudioValidationAccumulator::new();
+    let start = Instant::now();
+    let mut observed_at = start;
+    let mut rtp_timestamp = 0u32;
+
+    for (index, packet) in packets.iter().cycle().take(3).enumerate() {
+        if index > 0 {
+            observed_at += if index == 1 {
+                Duration::from_millis(120)
+            } else {
+                Duration::from_millis(20)
+            };
+        }
+        accumulator
+            .observe_packet_at(
+                ObservedOpusPacket {
+                    sequence: index as u16,
+                    timestamp: rtp_timestamp,
+                    payload: packet.data.as_ref(),
+                },
+                observed_at,
+            )
+            .expect("fixture packet should decode");
+        rtp_timestamp = rtp_timestamp.wrapping_add(packet.duration_samples);
+    }
+
+    let stats = accumulator.into_stats().expect("stats should be present");
+    assert_eq!(stats.rtp_gap_count_gte_100ms, 1);
+    assert_eq!(stats.rtp_buffering_event_count, 1);
+    assert_eq!(stats.rtp_buffering_total_us, 100_000);
+    assert_eq!(stats.rtp_buffering_max_us, 100_000);
+    assert_eq!(stats.rtp_speed_change_total_slow_us, 99_250);
+    assert_eq!(stats.rtp_speed_change_total_abs_us, 99_250);
+}
+
+#[test]
+fn audio_validator_excludes_controlled_pause_gap_from_buffering_and_speed_change_totals() {
+    let mut demux = WebmOpusDemux::default();
+    demux.push_bytes(load_fixture_bytes("audio-itag250.webm"));
+    let packets = demux.drain_packets().expect("fixture should demux");
+    assert!(
+        packets.len() >= 2,
+        "fixture should yield at least two opus packets"
+    );
+
+    let mut accumulator = AudioValidationAccumulator::new();
+    let start = Instant::now();
+    let mut rtp_timestamp = 0u32;
+
+    accumulator
+        .observe_packet_at(
+            ObservedOpusPacket {
+                sequence: 0,
+                timestamp: rtp_timestamp,
+                payload: packets[0].data.as_ref(),
+            },
+            start,
+        )
+        .expect("first fixture packet should decode");
+    rtp_timestamp = rtp_timestamp.wrapping_add(packets[0].duration_samples);
+
+    accumulator.start_controlled_pause();
+    accumulator
+        .observe_packet_at(
+            ObservedOpusPacket {
+                sequence: 1,
+                timestamp: rtp_timestamp,
+                payload: packets[1].data.as_ref(),
+            },
+            start + Duration::from_secs(3),
+        )
+        .expect("controlled-pause packet should decode");
+
+    let stats = accumulator.into_stats().expect("stats should be present");
+    assert_eq!(stats.rtp_gap_count_gte_100ms, 1);
+    assert_eq!(stats.rtp_buffering_event_count, 0);
+    assert_eq!(stats.rtp_speed_change_total_abs_us, 0);
+    assert_eq!(
+        stats.observer_anomalies[0].classification,
+        "controlled_pause"
+    );
 }
 
 #[test]
