@@ -113,16 +113,18 @@ impl PlaybackQueueDepthStatsSnapshot {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum PlaybackSendCommandKind {
     Track,
     ScheduledSilence,
     BoundarySilence,
+    #[default]
     OtherBoundary,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum PreparedTrackQueueSamplePhase {
+    #[default]
     ActivePrePause,
     ActivePostResume,
 }
@@ -144,12 +146,6 @@ pub struct PlaybackSendEventSnapshot {
     pub source_media_position_samples: Option<u64>,
     pub source_media_byte_position: Option<u64>,
     pub committed_heard_media: bool,
-}
-
-impl Default for PlaybackSendCommandKind {
-    fn default() -> Self {
-        Self::OtherBoundary
-    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -231,12 +227,6 @@ fn prepared_playout_track_drop_identity(
         source_media_position_samples: event.source_media_position_samples?,
         source_media_byte_position: event.source_media_byte_position,
     })
-}
-
-impl Default for PreparedTrackQueueSamplePhase {
-    fn default() -> Self {
-        Self::ActivePrePause
-    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -594,6 +584,7 @@ pub(crate) struct PlaybackStabilityCollector {
 }
 
 impl PlaybackStabilityCollector {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         playback_epoch: u64,
         video_id: String,

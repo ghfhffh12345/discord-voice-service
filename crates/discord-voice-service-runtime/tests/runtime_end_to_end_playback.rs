@@ -863,7 +863,7 @@ async fn runtime_end_to_end_playback_pause_stops_audio_until_resume_without_burs
         fake_voice
             .speaking_state_count_at_least(0, speaking_zeros_before_pause + 1)
             .await
-            >= speaking_zeros_before_pause + 1,
+            > speaking_zeros_before_pause,
         "pause must send Speaking 0 after its silence tail"
     );
     assert!(
@@ -931,7 +931,7 @@ async fn runtime_end_to_end_playback_pause_stops_audio_until_resume_without_burs
         fake_voice
             .speaking_state_count_at_least(1, speaking_ones_before_resume + 1)
             .await
-            >= speaking_ones_before_resume + 1,
+            > speaking_ones_before_resume,
         "resume must send Speaking 1 before resumed media"
     );
     let speaking_one_times = fake_voice
@@ -1010,7 +1010,7 @@ async fn runtime_end_to_end_playback_pause_resume_without_voice_context_refresh_
         fake_voice
             .speaking_state_count_at_least(0, speaking_zeros_before_pause + 1)
             .await
-            >= speaking_zeros_before_pause + 1,
+            > speaking_zeros_before_pause,
         "pause must send Speaking 0 after its silence tail"
     );
     assert!(
@@ -1055,7 +1055,7 @@ async fn runtime_end_to_end_playback_pause_resume_without_voice_context_refresh_
         fake_voice
             .speaking_state_count_at_least(1, speaking_ones_before_resume + 1)
             .await
-            >= speaking_ones_before_resume + 1,
+            > speaking_ones_before_resume,
         "resume without transport rebuild must still prepare a fresh Speaking 1"
     );
     let speaking_one_times = fake_voice

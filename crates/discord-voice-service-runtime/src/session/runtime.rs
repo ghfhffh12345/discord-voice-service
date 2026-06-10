@@ -179,6 +179,7 @@ impl PreparedPlayoutQueue {
         }
     }
 
+    #[allow(clippy::result_large_err)]
     fn push(&mut self, prepared: PreparedTrackPlayout) -> Result<(), PreparedTrackPlayout> {
         let frame = &prepared.frame;
         if self
@@ -975,6 +976,15 @@ impl VoiceSessionRuntime {
         let event = {
             let mut state = self.state.write().await;
             if self.playback_interrupted(playback_epoch) {
+                return Ok(());
+            }
+            if matches!(state.state, SessionState::Paused) {
+                tracing::debug!(
+                    %video_id,
+                    playback_epoch,
+                    event_kind = ?kind,
+                    "runtime ignoring stale playback state while paused"
+                );
                 return Ok(());
             }
             state.current_video_id = Some(video_id.to_owned());
@@ -2157,8 +2167,7 @@ impl VoiceSessionRuntime {
     }
 
     fn begin_playback(&self) -> u64 {
-        let epoch = self.playback_epoch.fetch_add(1, Ordering::SeqCst) + 1;
-        epoch
+        self.playback_epoch.fetch_add(1, Ordering::SeqCst) + 1
     }
 
     fn invalidate_playback(&self) {
@@ -2701,6 +2710,7 @@ impl LiveMediaDriver {
         Ok(sent_records)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record_deadline_send_metric(
         &self,
         pacer: &mut AudioPacer,
@@ -3299,6 +3309,7 @@ impl LiveMediaDriver {
         Ok(latest_source_depth)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn drain_commands(
         &mut self,
         deadline_sender: &mut LiveDeadlineSender,
@@ -3338,6 +3349,7 @@ impl LiveMediaDriver {
         let duration_samples = u64::from(frame.duration_samples);
         let mut restored = true;
         let mut frame_for_credit = Some(frame.clone());
+        #[allow(clippy::collapsible_if)]
         if let Err(frame) = self.egress_buffer.push_front(frame) {
             if let Err(frame) =
                 restore_live_source_frame(&self.source_buffer, frame, &self.metrics_tx).await
@@ -3599,6 +3611,7 @@ impl LiveMediaDriver {
         Ok(latest_source_depth)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn apply_command(
         &mut self,
         command: MediaCommand,

@@ -431,6 +431,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::type_complexity)]
     fn sender_with_commands(
         commands: Vec<PreparedPlayoutCommand>,
         sink: RecordingSink,

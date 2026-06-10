@@ -585,19 +585,14 @@ impl From<ProtoPlaybackQueueDepthStatsSnapshot> for PlaybackQueueDepthStatsSnaps
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum PlaybackSendCommandKind {
     Track,
     ScheduledSilence,
     BoundarySilence,
     OtherBoundary,
+    #[default]
     Unspecified,
-}
-
-impl Default for PlaybackSendCommandKind {
-    fn default() -> Self {
-        Self::Unspecified
-    }
 }
 
 impl PlaybackSendCommandKind {
@@ -612,17 +607,12 @@ impl PlaybackSendCommandKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum PreparedTrackQueueSamplePhase {
     ActivePrePause,
     ActivePostResume,
+    #[default]
     Unspecified,
-}
-
-impl Default for PreparedTrackQueueSamplePhase {
-    fn default() -> Self {
-        Self::Unspecified
-    }
 }
 
 impl PreparedTrackQueueSamplePhase {
@@ -635,19 +625,14 @@ impl PreparedTrackQueueSamplePhase {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum PreparedPlayoutQueueEventKind {
     Enqueued,
     DequeuedToDeadlineSender,
     DroppedBeforeSend,
     Rebuilt,
+    #[default]
     Unspecified,
-}
-
-impl Default for PreparedPlayoutQueueEventKind {
-    fn default() -> Self {
-        Self::Unspecified
-    }
 }
 
 impl PreparedPlayoutQueueEventKind {
@@ -664,7 +649,7 @@ impl PreparedPlayoutQueueEventKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum PreparedPlayoutQueueEventReason {
     SteadyPlayback,
     Pause,
@@ -674,13 +659,8 @@ pub enum PreparedPlayoutQueueEventReason {
     SourceUnderrun,
     NaturalEnd,
     Interruption,
+    #[default]
     Unspecified,
-}
-
-impl Default for PreparedPlayoutQueueEventReason {
-    fn default() -> Self {
-        Self::Unspecified
-    }
 }
 
 impl PreparedPlayoutQueueEventReason {

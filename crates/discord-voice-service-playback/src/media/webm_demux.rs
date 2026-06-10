@@ -193,11 +193,8 @@ impl WebmDemuxState {
         let mut block_data = None;
 
         for child in children {
-            match child {
-                MatroskaSpec::Block(data) => {
-                    block_data = Some(data);
-                }
-                _ => {}
+            if let MatroskaSpec::Block(data) = child {
+                block_data = Some(data);
             }
         }
 
