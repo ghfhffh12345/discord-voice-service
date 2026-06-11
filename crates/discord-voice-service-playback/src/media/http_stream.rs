@@ -25,6 +25,8 @@ pub struct HttpOpusStream {
     url: String,
     response: Option<reqwest::Response>,
     response_start: u64,
+    response_end: Option<u64>,
+    resource_end: Option<u64>,
     pending: BytesMut,
     position: PlaybackPosition,
     metrics: HttpOpusStreamMetrics,
@@ -62,6 +64,8 @@ impl HttpOpusStream {
             url: url.into(),
             response: None,
             response_start: 0,
+            response_end: None,
+            resource_end: None,
             pending: BytesMut::new(),
             position: PlaybackPosition::default(),
             metrics: HttpOpusStreamMetrics::default(),
@@ -81,6 +85,8 @@ impl HttpOpusStream {
         self.position.set_byte_offset(byte_offset);
         self.response = None;
         self.response_start = byte_offset;
+        self.response_end = None;
+        self.resource_end = None;
         self.pending.clear();
     }
 
@@ -94,7 +100,11 @@ impl HttpOpusStream {
             if self.response.is_none() {
                 match self.open_response().await? {
                     Some(response) => {
-                        self.response_start = self.position.byte_offset();
+                        let response_start = self.position.byte_offset();
+                        let extent = response_extent(&response, response_start)?;
+                        self.response_start = response_start;
+                        self.response_end = extent.response_end;
+                        self.resource_end = extent.resource_end;
                         self.response = Some(response);
                     }
                     None => return Ok(None),
@@ -109,22 +119,50 @@ impl HttpOpusStream {
                 Ok(Some(chunk)) => self.pending.extend_from_slice(&chunk),
                 Ok(None) => {
                     self.response = None;
+                    if self.should_reopen_after_response_eof()? {
+                        self.response_end = None;
+                        continue;
+                    }
+                    self.response_end = None;
+                    self.resource_end = None;
                     return Ok(None);
                 }
                 Err(_err) if !self.pending.is_empty() => {
                     self.response = None;
+                    self.response_end = None;
                 }
                 Err(_err) if self.position.byte_offset() > self.response_start => {
                     self.response = None;
+                    self.response_end = None;
                     self.metrics.read_error_reopen_count =
                         self.metrics.read_error_reopen_count.saturating_add(1);
                 }
                 Err(err) => {
                     self.response = None;
+                    self.response_end = None;
                     return Err(err.into());
                 }
             }
         }
+    }
+
+    fn should_reopen_after_response_eof(&self) -> Result<bool, PlaybackError> {
+        let position = self.position.byte_offset();
+        let ended_before_response_end = self
+            .response_end
+            .is_some_and(|response_end| position < response_end);
+        let ended_before_resource_end = self
+            .resource_end
+            .is_some_and(|resource_end| position < resource_end);
+        if !ended_before_response_end && !ended_before_resource_end {
+            return Ok(false);
+        }
+        if position <= self.response_start {
+            return Err(PlaybackError::MediaParseDetail(
+                "playback source response ended before advancing".into(),
+            ));
+        }
+        Ok(true)
     }
 
     async fn open_response(&mut self) -> Result<Option<reqwest::Response>, PlaybackError> {
@@ -220,4 +258,71 @@ fn validate_resume_response(
     }
 
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ResponseExtent {
+    response_end: Option<u64>,
+    resource_end: Option<u64>,
+}
+
+fn response_extent(
+    response: &reqwest::Response,
+    response_start: u64,
+) -> Result<ResponseExtent, PlaybackError> {
+    let content_length_end = response
+        .content_length()
+        .map(|length| response_start.saturating_add(length));
+
+    let Some(content_range) = response.headers().get(CONTENT_RANGE) else {
+        return Ok(ResponseExtent {
+            response_end: content_length_end,
+            resource_end: None,
+        });
+    };
+    let content_range = content_range.to_str().map_err(|_| {
+        PlaybackError::MediaParseDetail(
+            "range response had invalid Content-Range header".to_owned(),
+        )
+    })?;
+    let Some(parsed) = parse_content_range(content_range) else {
+        return Err(PlaybackError::MediaParseDetail(format!(
+            "range response had unsupported Content-Range header: {content_range}"
+        )));
+    };
+    if parsed.start != response_start {
+        return Err(PlaybackError::MediaParseDetail(format!(
+            "range response started at byte {}, expected {response_start}",
+            parsed.start
+        )));
+    }
+
+    Ok(ResponseExtent {
+        response_end: Some(parsed.end.saturating_add(1)),
+        resource_end: parsed.complete_length,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ParsedContentRange {
+    start: u64,
+    end: u64,
+    complete_length: Option<u64>,
+}
+
+fn parse_content_range(value: &str) -> Option<ParsedContentRange> {
+    let value = value.strip_prefix("bytes ")?;
+    let (range, complete_length) = value.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    let start = start.parse().ok()?;
+    let end = end.parse().ok()?;
+    let complete_length = match complete_length {
+        "*" => None,
+        value => Some(value.parse().ok()?),
+    };
+    Some(ParsedContentRange {
+        start,
+        end,
+        complete_length,
+    })
 }

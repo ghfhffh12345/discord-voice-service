@@ -19,6 +19,7 @@ use discord_voice_service_test_support::fake_discord::{FakeDiscordPeer, Observed
 use discord_voice_service_test_support::fake_ytmusic::FakeYtMusic;
 use discord_voice_service_test_support::fixtures::{
     spawn_stream_server, spawn_stream_server_with_chunk_jitter,
+    spawn_stream_server_with_initial_partial_content,
 };
 use discord_voice_service_voice::test_support::parse_rtp_header;
 use futures::StreamExt;
@@ -442,6 +443,72 @@ async fn runtime_end_to_end_playback_packets_hold_near_20ms_cadence_without_refi
     assert_eq!(metrics.http_retry_count, 0);
     assert_eq!(metrics.range_reopen_count, 0);
     assert_eq!(metrics.url_reresolve_count, 0);
+}
+
+#[tokio::test]
+async fn runtime_end_to_end_playback_reopens_initial_partial_content_before_playing() {
+    let fake_yt = FakeYtMusic::spawn().await;
+    let http = spawn_stream_server_with_initial_partial_content("audio-long.webm", 16 * 1024).await;
+    fake_yt.set_playable_url(http.url()).await;
+    let fake_voice = FakeDiscordPeer::spawn().await;
+    let supervisor = Supervisor::with_ytmusic_endpoint(fake_yt.endpoint())
+        .await
+        .unwrap();
+    let mut stream = subscribe_events(supervisor.clone()).await;
+
+    supervisor
+        .send(Command::JoinVoice {
+            voice: fake_voice.voice_context("1", "2", "user-1", "session-1", "token-1"),
+        })
+        .await
+        .unwrap();
+
+    let play_supervisor = supervisor.clone();
+    let play_task = tokio::spawn(async move {
+        play_supervisor
+            .send(Command::Play {
+                video_id: "video-1".into(),
+            })
+            .await
+    });
+
+    let startup_events = collect_events_with_timeout(&mut stream, 5, Duration::from_secs(8)).await;
+    assert_eq!(
+        startup_events[0].kind,
+        SessionEventKind::VoiceConnecting as i32
+    );
+    assert_eq!(startup_events[1].kind, SessionEventKind::VoiceReady as i32);
+    assert_eq!(
+        startup_events[2].kind,
+        SessionEventKind::TrackResolving as i32
+    );
+    assert_eq!(startup_events[3].kind, SessionEventKind::Buffering as i32);
+    assert_eq!(startup_events[4].kind, SessionEventKind::Playing as i32);
+
+    assert!(
+        http.request_count().await >= 2,
+        "initial bounded 206 must be followed by a range resume before playback starts"
+    );
+
+    let timestamps = fake_voice.non_silence_audio_frame_times_at_least(50).await;
+    let intervals = intervals_between(&timestamps[..50]);
+    let stats = interval_stats(&intervals);
+    assert_fake_udp_observed_intervals_not_bursty(&stats, "initial partial content playback");
+
+    supervisor.send(Command::Stop).await.unwrap();
+    play_task.await.unwrap().unwrap();
+
+    let metrics = supervisor
+        .playback_metrics()
+        .await
+        .expect("playback should publish stability metrics");
+    assert!(
+        metrics.range_reopen_count >= 1,
+        "initial partial-content response should be continued with Range: {metrics:?}"
+    );
+    assert_eq!(metrics.read_error_reopen_count, 0);
+    assert_eq!(metrics.buffer_underrun_count, 0);
+    assert_eq!(metrics.playout_underrun_count, 0);
 }
 
 #[tokio::test]

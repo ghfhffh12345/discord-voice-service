@@ -3025,6 +3025,25 @@ impl LiveMediaDriver {
             };
 
             if gateway_drain.dave_transition_count > 0 {
+                let ready_source_depth = current_source_depth(&self.source_buffer).await?;
+                let ready_sent_records = self
+                    .drain_ready_deadline_outcomes(
+                        &mut deadline_sender,
+                        &mut pending_deadline_commands,
+                        ready_source_depth,
+                    )
+                    .await?;
+                for sent_record in ready_sent_records {
+                    self.record_deadline_send_metric(
+                        &mut pacer,
+                        &mut packet_index,
+                        sent_record,
+                        Duration::ZERO,
+                        VoiceGatewayDrainReport::default(),
+                        ready_source_depth,
+                        self.prepared_playout_depth_with_pending(&pending_deadline_commands),
+                    );
+                }
                 self.rebuild_prepared_playout_for_dave_transition(
                     &mut deadline_sender,
                     &mut pending_deadline_commands,
@@ -4281,6 +4300,32 @@ mod tests {
         assert!(
             !run_loop.contains(&["send_current_slot", "_packet(packet)"].concat()),
             "live driver must not send the current-slot packet through the broad session path"
+        );
+    }
+
+    #[test]
+    fn live_driver_drains_ready_deadline_outcomes_before_normal_dave_rebuild() {
+        let source = include_str!("runtime.rs");
+        let run_loop = source
+            .split("async fn run_loop")
+            .nth(1)
+            .and_then(|tail| tail.split("fn playback_is_current").next())
+            .expect("runtime should have a live media run loop");
+        let normal_dave_rebuild = run_loop
+            .split("if gateway_drain.dave_transition_count > 0 {")
+            .nth(1)
+            .and_then(|tail| tail.split("let latest_source_depth = self").next())
+            .expect("live loop should rebuild prepared playout after normal DAVE drains");
+        let drain_outcomes = normal_dave_rebuild
+            .find("drain_ready_deadline_outcomes")
+            .expect("normal DAVE rebuild should first account ready deadline outcomes");
+        let rebuild = normal_dave_rebuild
+            .find("rebuild_prepared_playout_for_dave_transition")
+            .expect("normal DAVE branch should rebuild prepared playout");
+
+        assert!(
+            drain_outcomes < rebuild,
+            "normal DAVE rebuild must account already-sent deadline outcomes before restoring pending frames"
         );
     }
 

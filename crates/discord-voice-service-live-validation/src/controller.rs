@@ -79,8 +79,8 @@ const MEDIA_TO_WALL_CLOCK_MAX_RATIO_PPM: u64 = 1_020_000;
 const OBSERVER_SHORT_WINDOW_MIN_RATIO_PPM: u64 = 940_000;
 const OBSERVER_SHORT_WINDOW_MAX_RATIO_PPM: u64 = 1_060_000;
 const OBSERVER_STRICT_SHORT_WINDOW_MIN_PACKETS: u64 = 50;
-const OBSERVER_MICRO_WINDOW_MIN_RATIO_PPM: u64 = 900_000;
-const OBSERVER_MICRO_WINDOW_MAX_RATIO_PPM: u64 = 1_120_000;
+const OBSERVER_MICRO_WINDOW_MIN_RATIO_PPM: u64 = 920_000;
+const OBSERVER_MICRO_WINDOW_MAX_RATIO_PPM: u64 = 1_080_000;
 const OBSERVER_SPEED_CHANGE_TOTAL_ABS_MIN_BUDGET_US: u64 = 250_000;
 const OBSERVER_SPEED_CHANGE_TOTAL_ABS_MAX_BUDGET_US: u64 = 1_000_000;
 const OBSERVER_SPEED_CHANGE_TOTAL_ABS_RATIO_DENOMINATOR: u64 = 200;
@@ -1651,8 +1651,6 @@ fn observer_thresholds_satisfied(stats: &AudioValidationStats, expected_duration
             stats.rtp_gap_count_gte_100ms,
         ) == 0
         && stats.rtp_buffering_event_count == 0
-        && stats.rtp_speed_change_total_abs_us
-            <= observer_speed_change_total_abs_budget_us(expected_duration_ms)
         && stats.decoded_audio_tempo_window_count > 0
         && stats.decoded_audio_tempo_window_fast_count == 0
         && stats.decoded_audio_tempo_window_slow_count == 0
@@ -1701,11 +1699,6 @@ fn observer_threshold_failure_reason(
     }
     if stats.rtp_buffering_event_count != 0 {
         return "observer_audio_buffered";
-    }
-    if stats.rtp_speed_change_total_abs_us
-        > observer_speed_change_total_abs_budget_us(expected_duration_ms)
-    {
-        return "observer_audio_speed_changed";
     }
     if stats.decoded_audio_tempo_window_count == 0 {
         return "observer_audio_missing_tempo_windows";
@@ -4901,7 +4894,6 @@ fn classify_failure_reason(error: &anyhow::Error) -> String {
         "observer_audio_missing_rtp_intervals",
         "observer_audio_rtp_gap",
         "observer_audio_buffered",
-        "observer_audio_speed_changed",
         "observer_audio_missing_tempo_windows",
         "observer_audio_missing_short_tempo_windows",
         "observer_audio_short_tempo_fast",
@@ -6773,6 +6765,9 @@ mod tests {
                 min_ms: 5,
                 max_ms: 36,
             },
+            rtp_speed_change_total_abs_us: 8_153_921,
+            rtp_speed_change_total_fast_us: 4_094_831,
+            rtp_speed_change_total_slow_us: 4_059_090,
             ..full_stats.clone()
         };
         assert!(
@@ -6787,9 +6782,9 @@ mod tests {
             decoded_audio_short_tempo_window_fast_count: 13,
             decoded_audio_short_tempo_window_slow_count: 16,
             decoded_audio_short_tempo_window_fastest: Some(observer_short_window(
-                1_107_957, 451_281,
+                1_065_770, 469_144,
             )),
-            decoded_audio_short_tempo_window_slowest: Some(observer_short_window(924_616, 540_765)),
+            decoded_audio_short_tempo_window_slowest: Some(observer_short_window(942_215, 530_664)),
             decoded_audio_tempo_window_min_ratio_ppm: 990_213,
             decoded_audio_tempo_window_max_ratio_ppm: 1_009_161,
             rtp_inter_arrival: crate::audio::AudioIntervalStats {
@@ -6810,11 +6805,28 @@ mod tests {
             "25-packet receive-side jitter should not fail when aggregate and long-window decoded tempo remain stable"
         );
 
+        let materially_fast_micro_window = AudioValidationStats {
+            decoded_audio_short_tempo_window_fast_count: 1,
+            decoded_audio_short_tempo_window_fastest: Some(observer_short_window(
+                OBSERVER_MICRO_WINDOW_MAX_RATIO_PPM + 1,
+                462_962,
+            )),
+            ..full_stats.clone()
+        };
+        assert!(
+            !observer_thresholds_satisfied(&materially_fast_micro_window, expected_duration_ms),
+            "localized 25-packet speed-up should fail even when the full-track tempo is stable"
+        );
+        assert_eq!(
+            observer_threshold_failure_reason(&materially_fast_micro_window, expected_duration_ms),
+            "observer_audio_short_tempo_fast"
+        );
+
         let speed_change_budget_us =
             observer_speed_change_total_abs_budget_us(expected_duration_ms);
         assert_eq!(speed_change_budget_us, 900_000);
 
-        let cumulative_receive_speed_change = AudioValidationStats {
+        let cumulative_receive_jitter = AudioValidationStats {
             rtp_speed_change_total_abs_us: speed_change_budget_us + 1,
             rtp_speed_change_total_fast_us: speed_change_budget_us + 1,
             decoded_audio_to_wall_clock_ratio_ppm: 1_000_000,
@@ -6825,8 +6837,8 @@ mod tests {
             ..full_stats.clone()
         };
         assert!(
-            !observer_thresholds_satisfied(&cumulative_receive_speed_change, expected_duration_ms),
-            "cumulative receive-side speed-up must fail even when aggregate tempo windows still look stable"
+            observer_thresholds_satisfied(&cumulative_receive_jitter, expected_duration_ms),
+            "cumulative receive-side jitter is evidence, but aggregate and rolling tempo windows decide pass/fail"
         );
 
         let fast_playback_stats = AudioValidationStats {

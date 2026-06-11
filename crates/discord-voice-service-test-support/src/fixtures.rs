@@ -52,6 +52,18 @@ pub async fn spawn_stream_server_with_chunk_jitter(
     .await
 }
 
+pub async fn spawn_stream_server_with_initial_partial_content(
+    path: &str,
+    bytes_before_close: usize,
+) -> RangeServer {
+    let payload = load_fixture_bytes(path);
+    spawn_test_server(
+        ServerBehavior::InitialPartialContent { bytes_before_close },
+        payload,
+    )
+    .await
+}
+
 pub async fn spawn_hanging_server() -> RangeServer {
     spawn_test_server(ServerBehavior::HangBeforeResponse, Bytes::new()).await
 }
@@ -77,6 +89,17 @@ pub async fn spawn_range_server_with_partial_body_then_close(
     let payload = load_fixture_bytes("audio-itag250.webm").repeat(4);
     spawn_test_server(
         ServerBehavior::PartialBodyThenCloseOnce { bytes_before_close },
+        payload.into(),
+    )
+    .await
+}
+
+pub async fn spawn_range_server_with_initial_partial_content(
+    bytes_before_close: usize,
+) -> RangeServer {
+    let payload = load_fixture_bytes("audio-itag250.webm").repeat(4);
+    spawn_test_server(
+        ServerBehavior::InitialPartialContent { bytes_before_close },
         payload.into(),
     )
     .await
@@ -192,12 +215,39 @@ async fn spawn_test_server(behavior: ServerBehavior, payload: Bytes) -> RangeSer
                         content_length,
                     )
                 }
+                ServerBehavior::InitialPartialContent { bytes_before_close }
+                    if request_number == 1 =>
+                {
+                    let end = (start as usize)
+                        .saturating_add(bytes_before_close)
+                        .min(payload.len());
+                    (
+                        payload.get(start as usize..end).unwrap_or(&[]),
+                        "HTTP/1.1 206 Partial Content",
+                        Some(format!(
+                            "bytes {start}-{}/{}",
+                            end.saturating_sub(1),
+                            payload.len()
+                        )),
+                        end.saturating_sub(start as usize),
+                    )
+                }
                 ServerBehavior::PartialBodyThenCloseOnce { .. } if start > 0 => (
                     payload.get(start as usize..).unwrap_or(&[]),
                     "HTTP/1.1 206 Partial Content",
                     Some(format!(
                         "bytes {start}-{}/*",
                         payload.len().saturating_sub(1)
+                    )),
+                    payload.len().saturating_sub(start as usize),
+                ),
+                ServerBehavior::InitialPartialContent { .. } if start > 0 => (
+                    payload.get(start as usize..).unwrap_or(&[]),
+                    "HTTP/1.1 206 Partial Content",
+                    Some(format!(
+                        "bytes {start}-{}/{}",
+                        payload.len().saturating_sub(1),
+                        payload.len()
                     )),
                     payload.len().saturating_sub(start as usize),
                 ),
@@ -302,6 +352,9 @@ enum ServerBehavior {
     HangBeforeResponse,
     HonorRangeWith416AtEof,
     PartialBodyThenCloseOnce {
+        bytes_before_close: usize,
+    },
+    InitialPartialContent {
         bytes_before_close: usize,
     },
     IgnoreRange,
