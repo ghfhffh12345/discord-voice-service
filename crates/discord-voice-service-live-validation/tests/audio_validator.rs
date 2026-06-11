@@ -157,6 +157,7 @@ fn audio_validator_reports_non_silence_for_generated_opus_packet() {
     .expect("encoded packet should decode");
 
     assert_eq!(stats.observed_packet_count, 1);
+    assert_eq!(stats.non_discord_opus_duration_packet_count, 0);
     assert!(stats.decoded_audio_ms > 0);
     assert!(stats.non_silent_audio_ms > 0);
     assert!(stats.max_peak_amplitude > 0.0);
@@ -202,9 +203,64 @@ fn audio_validator_totals_fractional_packet_duration_from_samples() {
         .expect("second 2.5ms packet should decode");
 
     assert_eq!(stats.observed_packet_count, 2);
+    assert_eq!(stats.non_discord_opus_duration_packet_count, 2);
+    assert_eq!(stats.non_discord_opus_duration_min_samples, 120);
+    assert_eq!(stats.non_discord_opus_duration_max_samples, 120);
     assert_eq!(stats.decoded_audio_ms, 5);
     assert_eq!(stats.wall_clock_elapsed_ms, 5);
     assert_eq!(stats.decoded_audio_to_wall_clock_ratio_ppm, 1_000_000);
+}
+
+#[test]
+fn audio_validator_tracks_non_discord_opus_duration_range() {
+    let mut encoder =
+        OpusEncoder::new(48_000, 1, Application::RestrictedLowDelay).expect("create opus encoder");
+
+    let short_pcm = (0..120)
+        .map(|sample| ((sample as f32) * 0.1).sin() * 0.2)
+        .collect::<Vec<_>>();
+    let mut short_encoded = vec![0u8; 1500];
+    let short_encoded_len = encoder
+        .encode(&short_pcm, 120, &mut short_encoded)
+        .expect("encode 2.5ms opus packet");
+    short_encoded.truncate(short_encoded_len);
+
+    let long_pcm = (0..480)
+        .map(|sample| ((sample as f32) * 0.1).sin() * 0.2)
+        .collect::<Vec<_>>();
+    let mut long_encoded = vec![0u8; 1500];
+    let long_encoded_len = encoder
+        .encode(&long_pcm, 480, &mut long_encoded)
+        .expect("encode 10ms opus packet");
+    long_encoded.truncate(long_encoded_len);
+
+    let mut accumulator = AudioValidationAccumulator::new();
+    let start = Instant::now();
+    accumulator
+        .observe_packet_at(
+            ObservedOpusPacket {
+                sequence: 0,
+                timestamp: 0,
+                payload: short_encoded.as_ref(),
+            },
+            start,
+        )
+        .expect("2.5ms packet should decode");
+    let stats = accumulator
+        .observe_packet_at(
+            ObservedOpusPacket {
+                sequence: 1,
+                timestamp: 120,
+                payload: long_encoded.as_ref(),
+            },
+            start + Duration::from_micros(2_500),
+        )
+        .expect("10ms packet should decode");
+
+    assert_eq!(stats.observed_packet_count, 2);
+    assert_eq!(stats.non_discord_opus_duration_packet_count, 2);
+    assert_eq!(stats.non_discord_opus_duration_min_samples, 120);
+    assert_eq!(stats.non_discord_opus_duration_max_samples, 480);
 }
 
 #[test]

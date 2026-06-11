@@ -533,6 +533,7 @@ dependencies = [
  "bytes",
  "discord-voice-service-test-support",
  "http",
+ "opus-rs",
  "reqwest",
  "thiserror 2.0.18",
  "tokio",

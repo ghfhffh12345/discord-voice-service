@@ -8,6 +8,7 @@ use std::{
 };
 
 const SAMPLE_RATE_HZ: i32 = 48_000;
+const DISCORD_OPUS_PACKET_DURATION_SAMPLES: u32 = 960;
 const NON_SILENCE_PEAK_THRESHOLD: f32 = 0.001;
 const OBSERVER_GAP_THRESHOLD: Duration = Duration::from_millis(100);
 // Receiver-side timestamps include Discord/network delivery jitter. Use a
@@ -33,6 +34,9 @@ pub struct ObservedOpusPacket<'a> {
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct AudioValidationStats {
     pub observed_packet_count: u64,
+    pub non_discord_opus_duration_packet_count: u64,
+    pub non_discord_opus_duration_min_samples: u32,
+    pub non_discord_opus_duration_max_samples: u32,
     pub decoded_audio_ms: u64,
     pub wall_clock_elapsed_ms: u64,
     pub decoded_audio_to_wall_clock_ratio_ppm: u64,
@@ -245,6 +249,7 @@ impl AudioValidationAccumulator {
             );
         }
         self.validate_rtp_continuity(packet.sequence, packet.timestamp)?;
+        self.record_opus_duration_evidence(declared_duration.samples);
 
         let packet_peak = pcm
             .iter()
@@ -285,6 +290,31 @@ impl AudioValidationAccumulator {
         self.total_samples += pcm.len();
 
         Ok(self.stats())
+    }
+
+    fn record_opus_duration_evidence(&mut self, duration_samples: u32) {
+        if duration_samples == DISCORD_OPUS_PACKET_DURATION_SAMPLES {
+            return;
+        }
+
+        let previous_count = self.stats.non_discord_opus_duration_packet_count;
+        self.stats.non_discord_opus_duration_packet_count = self
+            .stats
+            .non_discord_opus_duration_packet_count
+            .saturating_add(1);
+        if previous_count == 0 {
+            self.stats.non_discord_opus_duration_min_samples = duration_samples;
+            self.stats.non_discord_opus_duration_max_samples = duration_samples;
+        } else {
+            self.stats.non_discord_opus_duration_min_samples = self
+                .stats
+                .non_discord_opus_duration_min_samples
+                .min(duration_samples);
+            self.stats.non_discord_opus_duration_max_samples = self
+                .stats
+                .non_discord_opus_duration_max_samples
+                .max(duration_samples);
+        }
     }
 
     fn record_inter_arrival(

@@ -1,5 +1,6 @@
 use super::ytmusic_client::YtMusicClient;
 use crate::error::PlaybackError;
+use crate::media::opus_normalizer::DiscordOpusFrameNormalizer;
 use crate::media::opus_queue::{OpusFrame, OpusFrameQueue, samples_from_duration_ms_u64};
 use crate::media::position::{PlaybackPosition, SharedPlaybackPosition, shared_playback_position};
 use crate::media::webm_demux::DemuxedPacket;
@@ -13,6 +14,8 @@ pub struct PlaybackWorker {
     recovery: PlaybackRecovery,
     position: SharedPlaybackPosition,
     prebuffer_target_ms: u64,
+    normalizer: DiscordOpusFrameNormalizer,
+    pending_frames: std::collections::VecDeque<OpusFrame>,
 }
 
 impl PlaybackWorker {
@@ -22,6 +25,8 @@ impl PlaybackWorker {
             recovery: PlaybackRecovery::new(client),
             position: shared_playback_position(PlaybackPosition::default()),
             prebuffer_target_ms: DEFAULT_PREBUFFER_TARGET_MS,
+            normalizer: DiscordOpusFrameNormalizer::new(),
+            pending_frames: std::collections::VecDeque::new(),
         }
     }
 
@@ -42,6 +47,8 @@ impl PlaybackWorker {
             self.position = shared_playback_position(PlaybackPosition::default());
             PlaybackResumePosition::default()
         };
+        self.normalizer = DiscordOpusFrameNormalizer::new();
+        self.pending_frames.clear();
 
         let mut source = self.recovery.recover(video_id, resume_position).await?;
         self.position = source.shared_position();
@@ -59,6 +66,8 @@ impl PlaybackWorker {
         self.current_video_id = None;
         self.recovery.reset();
         self.position = shared_playback_position(PlaybackPosition::default());
+        self.normalizer = DiscordOpusFrameNormalizer::new();
+        self.pending_frames.clear();
     }
 
     pub fn recovery_metrics(&self) -> PlaybackRecoveryMetrics {
@@ -87,16 +96,21 @@ impl PlaybackWorker {
         let target_ms = target_ms.max(1);
         let target_samples = samples_from_duration_ms_u64(target_ms);
         while queue.buffered_samples() < target_samples && !queue.is_full() {
+            if !self.drain_pending_frames(queue)? {
+                break;
+            }
+            if queue.buffered_samples() >= target_samples || queue.is_full() {
+                break;
+            }
+
             if let Some(packet) = source.pending_packets_mut().pop_front() {
-                if !packet_fits(queue, &packet) {
-                    source.pending_packets_mut().push_front(packet);
-                    break;
-                }
                 self.buffer_packet(queue, packet)?;
                 continue;
             }
 
             let Some(chunk) = source.stream_mut().read_chunk().await? else {
+                let frames = self.normalizer.flush()?;
+                self.enqueue_frames(queue, frames)?;
                 break;
             };
 
@@ -109,18 +123,44 @@ impl PlaybackWorker {
 
             let mut packets = packets.into_iter();
             while let Some(packet) = packets.next() {
-                if queue.buffered_samples() < target_samples && !queue.is_full() {
-                    if !packet_fits(queue, &packet) {
-                        source.pending_packets_mut().push_back(packet);
-                        source.pending_packets_mut().extend(packets);
-                        break;
-                    }
-                    self.buffer_packet(queue, packet)?;
-                } else {
+                if queue.buffered_samples() >= target_samples
+                    || queue.is_full()
+                    || !self.pending_frames.is_empty()
+                {
                     source.pending_packets_mut().push_back(packet);
                     source.pending_packets_mut().extend(packets);
                     break;
                 }
+                self.buffer_packet(queue, packet)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn drain_pending_frames(&mut self, queue: &mut OpusFrameQueue) -> Result<bool, PlaybackError> {
+        while let Some(frame) = self.pending_frames.pop_front() {
+            if queue.can_fit_frame(&frame) {
+                queue.push(frame).map_err(|_| PlaybackError::BufferFull)?;
+            } else {
+                self.pending_frames.push_front(frame);
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
+
+    fn enqueue_frames(
+        &mut self,
+        queue: &mut OpusFrameQueue,
+        frames: Vec<OpusFrame>,
+    ) -> Result<(), PlaybackError> {
+        for frame in frames {
+            if queue.can_fit_frame(&frame) {
+                queue.push(frame).map_err(|_| PlaybackError::BufferFull)?;
+            } else {
+                self.pending_frames.push_back(frame);
             }
         }
 
@@ -132,17 +172,8 @@ impl PlaybackWorker {
         queue: &mut OpusFrameQueue,
         packet: DemuxedPacket,
     ) -> Result<(), PlaybackError> {
+        let frames = self.normalizer.push_packet(packet.clone())?;
         self.position.lock().unwrap().record_buffered(&packet);
-        let frame = OpusFrame::with_duration_samples(
-            packet.data.clone(),
-            packet.duration_ms,
-            packet.duration_samples,
-        )
-        .with_exact_metadata(packet.timestamp_ms, packet.timestamp_samples, None, 0);
-        queue.push(frame).map_err(|_| PlaybackError::BufferFull)
+        self.enqueue_frames(queue, frames)
     }
-}
-
-fn packet_fits(queue: &OpusFrameQueue, packet: &DemuxedPacket) -> bool {
-    queue.can_fit_resource(packet.data.len(), packet.duration_samples)
 }

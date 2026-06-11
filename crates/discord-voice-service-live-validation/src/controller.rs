@@ -64,10 +64,11 @@ const PREPARED_TRACK_QUEUE_P5_MIN_DEPTH_MS: u64 = 300;
 const PREPARED_TRACK_QUEUE_P50_MIN_DEPTH_MS: u64 = 340;
 const PREPARED_TRACK_QUEUE_P50_MAX_DEPTH_MS: u64 = 460;
 const TRACK_TEMPO_WINDOW_PACKETS: usize = 50;
+const DISCORD_OPUS_RTP_PACKET_DURATION_SAMPLES: u32 = 960;
 #[cfg(test)]
 const NATURAL_OPUS_FRAME_DURATION_MS: u64 = 20;
 #[cfg(test)]
-const NATURAL_OPUS_FRAME_DURATION_SAMPLES: u32 = 960;
+const NATURAL_OPUS_FRAME_DURATION_SAMPLES: u32 = DISCORD_OPUS_RTP_PACKET_DURATION_SAMPLES;
 const MIN_LIVE_POST_SOURCE_TEMPO_WINDOWS: u64 = 500;
 const SOURCE_POSITION_CONTINUITY_TOLERANCE_MS: u64 = 1;
 const RAW_RATIO_RECOMPUTE_TOLERANCE_PPM: u64 = 2;
@@ -1638,6 +1639,7 @@ fn duration_ms(duration: Duration) -> u64 {
 
 fn observer_thresholds_satisfied(stats: &AudioValidationStats, expected_duration_ms: u64) -> bool {
     stats.observed_packet_count >= MIN_OBSERVED_PACKET_COUNT
+        && stats.non_discord_opus_duration_packet_count == 0
         && stats.decoded_audio_ms >= required_observer_decoded_audio_ms(expected_duration_ms)
         && stats.wall_clock_elapsed_ms > 0
         && stats.decoded_audio_to_wall_clock_ratio_ppm > 0
@@ -1668,6 +1670,9 @@ fn observer_threshold_failure_reason(
     stats: &AudioValidationStats,
     expected_duration_ms: u64,
 ) -> &'static str {
+    if stats.non_discord_opus_duration_packet_count != 0 {
+        return "observer_audio_non_discord_opus_duration";
+    }
     if stats.observed_packet_count < MIN_OBSERVED_PACKET_COUNT {
         return "observer_audio_missing_packets";
     }
@@ -1830,9 +1835,13 @@ fn observer_threshold_error(
         observer_speed_change_total_abs_budget_us(expected_duration_ms);
     match stats {
         Some(stats) => anyhow!(
-            "observer audio proof finished before thresholds (threshold_failure_reason={} observed_packet_count={} decoded_audio_ms={} required_decoded_audio_ms={} expected_duration_ms={} observer_wall_clock_elapsed_ms={} decoded_audio_to_wall_clock_ratio_ppm={} min_ratio_ppm={} max_ratio_ppm={} non_silent_audio_ms={} required_non_silent_audio_ms={} rtp_gap_count_gte_100ms={} unclassified_rtp_gap_count_gte_100ms={} rtp_fast_interval_count={} unclassified_rtp_fast_interval_count={} rtp_fast_interval_min_ms={} rtp_fast_interval_min_us={} rtp_buffering_event_count={} rtp_buffering_total_us={} rtp_buffering_max_us={} rtp_speed_change_total_abs_us={} rtp_speed_change_total_abs_budget_us={} rtp_speed_change_total_fast_us={} rtp_speed_change_total_slow_us={} observer_anomalies={:?} decoded_audio_tempo_window_count={} decoded_audio_tempo_window_post_source_buffer_count={} decoded_audio_tempo_window_min_ratio_ppm={} decoded_audio_tempo_window_max_ratio_ppm={} decoded_audio_tempo_window_fast_count={} decoded_audio_tempo_window_fastest_ratio_ppm={} decoded_audio_tempo_window_slow_count={} decoded_audio_tempo_window_slowest_ratio_ppm={} decoded_audio_short_tempo_window_count={} decoded_audio_short_tempo_window_fast_count={} decoded_audio_short_tempo_window_slow_count={} decoded_audio_short_tempo_window_fastest={:?} decoded_audio_short_tempo_window_slowest={:?} rtp_p95_ms={} rtp_p99_ms={} rtp_max_ms={})",
+            "observer audio proof finished before thresholds (threshold_failure_reason={} observed_packet_count={} non_discord_opus_duration_packet_count={} non_discord_opus_duration_min_samples={} non_discord_opus_duration_max_samples={} expected_discord_opus_duration_samples={} decoded_audio_ms={} required_decoded_audio_ms={} expected_duration_ms={} observer_wall_clock_elapsed_ms={} decoded_audio_to_wall_clock_ratio_ppm={} min_ratio_ppm={} max_ratio_ppm={} non_silent_audio_ms={} required_non_silent_audio_ms={} rtp_gap_count_gte_100ms={} unclassified_rtp_gap_count_gte_100ms={} rtp_fast_interval_count={} unclassified_rtp_fast_interval_count={} rtp_fast_interval_min_ms={} rtp_fast_interval_min_us={} rtp_buffering_event_count={} rtp_buffering_total_us={} rtp_buffering_max_us={} rtp_speed_change_total_abs_us={} rtp_speed_change_total_abs_budget_us={} rtp_speed_change_total_fast_us={} rtp_speed_change_total_slow_us={} observer_anomalies={:?} decoded_audio_tempo_window_count={} decoded_audio_tempo_window_post_source_buffer_count={} decoded_audio_tempo_window_min_ratio_ppm={} decoded_audio_tempo_window_max_ratio_ppm={} decoded_audio_tempo_window_fast_count={} decoded_audio_tempo_window_fastest_ratio_ppm={} decoded_audio_tempo_window_slow_count={} decoded_audio_tempo_window_slowest_ratio_ppm={} decoded_audio_short_tempo_window_count={} decoded_audio_short_tempo_window_fast_count={} decoded_audio_short_tempo_window_slow_count={} decoded_audio_short_tempo_window_fastest={:?} decoded_audio_short_tempo_window_slowest={:?} rtp_p95_ms={} rtp_p99_ms={} rtp_max_ms={})",
             observer_threshold_failure_reason(stats, expected_duration_ms),
             stats.observed_packet_count,
+            stats.non_discord_opus_duration_packet_count,
+            stats.non_discord_opus_duration_min_samples,
+            stats.non_discord_opus_duration_max_samples,
+            DISCORD_OPUS_RTP_PACKET_DURATION_SAMPLES,
             stats.decoded_audio_ms,
             required_decoded_audio_ms,
             expected_duration_ms,
@@ -4886,6 +4895,7 @@ fn finish_with_failure(
 fn classify_failure_reason(error: &anyhow::Error) -> String {
     const OBSERVER_AUDIO_FAILURE_REASONS: &[&str] = &[
         "observer_audio_missing_packets",
+        "observer_audio_non_discord_opus_duration",
         "observer_audio_incomplete",
         "observer_audio_missing_timing",
         "observer_audio_tempo_fast",
@@ -6716,6 +6726,24 @@ mod tests {
             &full_stats,
             expected_duration_ms,
         ));
+
+        let non_discord_opus_duration_stats = AudioValidationStats {
+            non_discord_opus_duration_packet_count: 1,
+            non_discord_opus_duration_min_samples: 120,
+            non_discord_opus_duration_max_samples: 120,
+            ..full_stats.clone()
+        };
+        assert!(!observer_thresholds_satisfied(
+            &non_discord_opus_duration_stats,
+            expected_duration_ms,
+        ));
+        assert_eq!(
+            observer_threshold_failure_reason(
+                &non_discord_opus_duration_stats,
+                expected_duration_ms,
+            ),
+            "observer_audio_non_discord_opus_duration"
+        );
 
         let receive_jitter_with_stable_decoded_tempo = AudioValidationStats {
             rtp_fast_interval_count: 2_147,

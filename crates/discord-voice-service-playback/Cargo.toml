@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 bytes.workspace = true
 http.workspace = true
+opus-rs.workspace = true
 reqwest.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
