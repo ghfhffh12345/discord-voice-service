@@ -21,13 +21,9 @@ Use standard Rust formatting via `rustfmt`; do not hand-align code. Prefer expli
 
 Add integration tests beside the crate behavior they cover, using descriptive snake_case filenames such as `voice_handshake.rs` or `runtime_end_to_end_playback.rs`. Prefer deterministic fake Discord and fake `ytmusic-service` support from `discord-voice-service-test-support`. Live Discord validation belongs in `discord-voice-service-live-validation` or the staging scripts, not in normal unit tests.
 
-## Commit & Pull Request Guidelines
-
-Use Conventional Commits on one line, for example `fix(playback): preserve live media tempo` or `docs: update contributor guide`. PRs should explain the behavior change, list validation run locally, and link any related issue. Include staging evidence for changes that affect live playback, voice connection lifecycle, release workflows, or container behavior.
-
 ## Agent-Specific Instructions
 
-Use Context7 for library or documentation context. Use `$conventional-commit` when creating commit messages.
+Use Serena for repository context and Context7 for library or documentation context. Use `$conventional-commit` when creating commit messages. Treat `docs/superpowers/` as local working material, and do not commit `docs/superpowers/specs/*.md` or `docs/superpowers/plans/*.md`.
 
 ## Security & Configuration Tips
 
