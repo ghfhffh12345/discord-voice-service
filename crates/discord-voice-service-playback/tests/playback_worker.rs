@@ -222,6 +222,97 @@ async fn fill_queue_to_duration_ms_returns_to_passthrough_after_aligned_short_pa
 }
 
 #[tokio::test]
+async fn fill_queue_to_duration_ms_preserves_forward_packet_timestamp_gap() {
+    let fake_yt = FakeYtMusic::spawn().await;
+    let http = spawn_hanging_server().await;
+    let mut worker = PlaybackWorker::new(
+        YtMusicClient::connect(fake_yt.endpoint())
+            .await
+            .expect("client"),
+    );
+    let mut pending_packets = VecDeque::new();
+    pending_packets.push_back(encoded_opus_packet(960, 2, 0, 0));
+    pending_packets.push_back(encoded_opus_packet(960, 2, 1, 1_920));
+    let mut source = PlaybackSource::new(
+        ResolvedPlaybackSource {
+            selected_itag: 250,
+            playable_url: http.url(),
+            approx_duration_ms: None,
+        },
+        HttpOpusStream::new(http.url()),
+        WebmOpusDemux::default(),
+        pending_packets,
+        shared_playback_position(PlaybackPosition::default()),
+    );
+    let mut queue = OpusFrameQueue::new(10);
+
+    worker
+        .fill_queue_to_duration_ms(&mut source, &mut queue, 40)
+        .await
+        .expect("timestamp gap should be filled without HTTP");
+
+    let frames = drain_frames(&mut queue);
+    assert_eq!(frames.len(), 3);
+    assert_eq!(
+        frames
+            .iter()
+            .map(|frame| frame.source_position_samples)
+            .collect::<Vec<_>>(),
+        vec![0, 960, 1_920]
+    );
+    assert!(
+        frames.iter().all(|frame| frame.duration_samples == 960),
+        "all emitted frames should remain Discord-sized: {frames:?}"
+    );
+}
+
+#[tokio::test]
+async fn fill_queue_to_duration_ms_trims_overlapping_packet_samples() {
+    let fake_yt = FakeYtMusic::spawn().await;
+    let http = spawn_hanging_server().await;
+    let mut worker = PlaybackWorker::new(
+        YtMusicClient::connect(fake_yt.endpoint())
+            .await
+            .expect("client"),
+    );
+    let mut pending_packets = VecDeque::new();
+    pending_packets.push_back(encoded_opus_packet(960, 2, 0, 0));
+    pending_packets.push_back(encoded_opus_packet(960, 2, 1, 480));
+    pending_packets.push_back(encoded_opus_packet(960, 2, 2, 1_440));
+    let mut source = PlaybackSource::new(
+        ResolvedPlaybackSource {
+            selected_itag: 250,
+            playable_url: http.url(),
+            approx_duration_ms: None,
+        },
+        HttpOpusStream::new(http.url()),
+        WebmOpusDemux::default(),
+        pending_packets,
+        shared_playback_position(PlaybackPosition::default()),
+    );
+    let mut queue = OpusFrameQueue::new(10);
+
+    worker
+        .fill_queue_to_duration_ms(&mut source, &mut queue, 40)
+        .await
+        .expect("timestamp overlap should be trimmed without HTTP");
+
+    let frames = drain_frames(&mut queue);
+    assert_eq!(frames.len(), 2);
+    assert_eq!(
+        frames
+            .iter()
+            .map(|frame| frame.source_position_samples)
+            .collect::<Vec<_>>(),
+        vec![0, 960]
+    );
+    assert!(
+        frames.iter().all(|frame| frame.duration_samples == 960),
+        "overlap trimming should preserve Discord frame size: {frames:?}"
+    );
+}
+
+#[tokio::test]
 async fn fill_queue_to_duration_ms_stops_at_twenty_ms_sample_cap_without_buffer_full() {
     const TARGET_BUFFER_MS: u64 = 5_000;
     const FRAME_DURATION_MS: u64 = 20;
@@ -379,6 +470,67 @@ async fn prepare_reruns_resolution_when_initial_playable_url_is_stale() {
             .filter(|call| *call == "Decipher")
             .count()
             >= 2
+    );
+}
+
+#[tokio::test]
+async fn fill_queue_recovers_when_steady_stream_read_stalls() {
+    const TARGET_BUFFER_MS: u64 = 5_000;
+
+    let fake = FakeYtMusic::spawn().await;
+    let initial = spawn_stream_server("audio-long.webm").await;
+    let recovered = spawn_stream_server("audio-long.webm").await;
+    let stalled = spawn_hanging_server().await;
+    fake.set_playable_url(initial.url()).await;
+
+    let mut worker = PlaybackWorker::new(
+        YtMusicClient::connect(fake.endpoint())
+            .await
+            .expect("client"),
+    );
+    let mut queue = OpusFrameQueue::with_resource_limits(512, 4 * 1024 * 1024, TARGET_BUFFER_MS);
+    let mut source = worker.prepare("video-1", &mut queue).await.unwrap();
+    let resume_offset = source.position().byte_offset();
+    assert!(resume_offset > 0);
+    assert_eq!(source.position().sent_duration_samples(), 0);
+
+    fake.set_playable_url(recovered.url()).await;
+    source.replace_resolved_stream_at_current_byte_offset(ResolvedPlaybackSource {
+        selected_itag: 250,
+        playable_url: stalled.url(),
+        approx_duration_ms: None,
+    });
+
+    timeout(
+        Duration::from_secs(10),
+        worker.fill_queue_to_duration_ms(&mut source, &mut queue, TARGET_BUFFER_MS),
+    )
+    .await
+    .expect("steady refill should recover before the outer timeout")
+    .expect("steady refill should recover from stalled HTTP");
+
+    assert_eq!(source.playable_url(), recovered.url());
+    assert_eq!(
+        recovered.last_range_header().await,
+        Some(format!("bytes={resume_offset}-"))
+    );
+    assert_eq!(source.position().sent_duration_samples(), 0);
+    assert!(queue.depth().duration_ms >= TARGET_BUFFER_MS);
+    assert_eq!(worker.recovery_metrics().http_retry_count, 1);
+    assert_eq!(worker.recovery_metrics().url_reresolve_count, 1);
+    assert_eq!(
+        fake.calls()
+            .iter()
+            .filter(|call| *call == "GetSong")
+            .count(),
+        2
+    );
+    assert_eq!(
+        fake.calls()
+            .iter()
+            .filter(|call| *call == "Decipher")
+            .count(),
+        2
     );
 }
 
@@ -590,6 +742,14 @@ fn encoded_opus_packets_with_channels(
     }
 
     packets
+}
+
+fn drain_frames(queue: &mut OpusFrameQueue) -> Vec<OpusFrame> {
+    let mut frames = Vec::new();
+    while let Some(frame) = queue.pop() {
+        frames.push(frame);
+    }
+    frames
 }
 
 fn encoded_opus_packet(

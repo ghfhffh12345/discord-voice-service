@@ -12,6 +12,7 @@ const DISCORD_FRAME_MS: u64 = 20;
 const DISCORD_CHANNELS: usize = 2;
 const OPUS_SAMPLE_RATE_HZ: i32 = 48_000;
 const MAX_ENCODED_PACKET_BYTES: usize = 1_500;
+const TIMELINE_DISCONTINUITY_TOLERANCE_SAMPLES: u64 = 120;
 
 pub struct DiscordOpusFrameNormalizer {
     mono_decoder: Option<OpusDecoder>,
@@ -35,8 +36,27 @@ impl DiscordOpusFrameNormalizer {
     }
 
     pub fn push_packet(&mut self, packet: DemuxedPacket) -> Result<Vec<OpusFrame>, PlaybackError> {
-        if self.pending_pcm.is_empty() && is_discord_passthrough_packet(&packet) {
-            return Ok(vec![
+        let alignment = self.align_to_packet_timeline(&packet)?;
+        if alignment.drop_packet {
+            return self.emit_ready_frames();
+        }
+
+        if self.pending_pcm.is_empty()
+            && alignment.trim_start_samples == 0
+            && alignment.gap_samples % u64::from(DISCORD_FRAME_SAMPLES_U32) == 0
+            && is_discord_passthrough_packet(&packet)
+        {
+            let mut frames = Vec::new();
+            if alignment.gap_samples > 0 {
+                self.append_silence_samples(alignment.gap_samples)?;
+                frames.extend(self.emit_ready_frames()?);
+            }
+            self.next_output_position_samples = Some(
+                packet
+                    .timestamp_samples
+                    .saturating_add(u64::from(packet.duration_samples)),
+            );
+            frames.push(
                 OpusFrame::with_duration_samples(
                     packet.data,
                     DISCORD_FRAME_MS,
@@ -48,10 +68,15 @@ impl DiscordOpusFrameNormalizer {
                     None,
                     0,
                 ),
-            ]);
+            );
+            return Ok(frames);
         }
 
-        self.decode_packet(&packet)?;
+        if alignment.gap_samples > 0 {
+            self.append_silence_samples(alignment.gap_samples)?;
+        }
+
+        self.decode_packet(&packet, alignment.trim_start_samples)?;
         self.emit_ready_frames()
     }
 
@@ -65,7 +90,95 @@ impl DiscordOpusFrameNormalizer {
         self.emit_ready_frames()
     }
 
-    fn decode_packet(&mut self, packet: &DemuxedPacket) -> Result<(), PlaybackError> {
+    fn align_to_packet_timeline(
+        &mut self,
+        packet: &DemuxedPacket,
+    ) -> Result<PacketTimelineAlignment, PlaybackError> {
+        let Some(next_output_position_samples) = self.next_output_position_samples else {
+            self.next_output_position_samples = Some(packet.timestamp_samples);
+            return Ok(PacketTimelineAlignment {
+                gap_samples: 0,
+                trim_start_samples: 0,
+                drop_packet: false,
+            });
+        };
+
+        let buffered_until_samples =
+            next_output_position_samples.saturating_add(self.pending_pcm_samples()?);
+        if packet.timestamp_samples > buffered_until_samples {
+            let gap_samples = packet
+                .timestamp_samples
+                .saturating_sub(buffered_until_samples);
+            if gap_samples < TIMELINE_DISCONTINUITY_TOLERANCE_SAMPLES {
+                if self.pending_pcm.is_empty() {
+                    self.next_output_position_samples = Some(packet.timestamp_samples);
+                }
+                return Ok(PacketTimelineAlignment {
+                    gap_samples: 0,
+                    trim_start_samples: 0,
+                    drop_packet: false,
+                });
+            }
+            return Ok(PacketTimelineAlignment {
+                gap_samples,
+                trim_start_samples: 0,
+                drop_packet: false,
+            });
+        }
+
+        let overlap_samples = buffered_until_samples.saturating_sub(packet.timestamp_samples);
+        if overlap_samples < TIMELINE_DISCONTINUITY_TOLERANCE_SAMPLES {
+            if self.pending_pcm.is_empty() {
+                self.next_output_position_samples = Some(packet.timestamp_samples);
+            }
+            return Ok(PacketTimelineAlignment {
+                gap_samples: 0,
+                trim_start_samples: 0,
+                drop_packet: false,
+            });
+        }
+
+        if overlap_samples >= u64::from(packet.duration_samples) {
+            return Ok(PacketTimelineAlignment {
+                gap_samples: 0,
+                trim_start_samples: u64::from(packet.duration_samples),
+                drop_packet: true,
+            });
+        }
+
+        Ok(PacketTimelineAlignment {
+            gap_samples: 0,
+            trim_start_samples: overlap_samples,
+            drop_packet: false,
+        })
+    }
+
+    fn pending_pcm_samples(&self) -> Result<u64, PlaybackError> {
+        let samples = self.pending_pcm.len() / DISCORD_CHANNELS;
+        samples
+            .try_into()
+            .map_err(|_| PlaybackError::MediaParse("pending opus timeline overflow"))
+    }
+
+    fn append_silence_samples(&mut self, samples: u64) -> Result<(), PlaybackError> {
+        let sample_values = samples
+            .checked_mul(DISCORD_CHANNELS as u64)
+            .and_then(|values| usize::try_from(values).ok())
+            .ok_or(PlaybackError::MediaParse("opus timeline gap is too large"))?;
+        let new_len = self
+            .pending_pcm
+            .len()
+            .checked_add(sample_values)
+            .ok_or(PlaybackError::MediaParse("opus timeline gap is too large"))?;
+        self.pending_pcm.resize(new_len, 0.0);
+        Ok(())
+    }
+
+    fn decode_packet(
+        &mut self,
+        packet: &DemuxedPacket,
+        trim_start_samples: u64,
+    ) -> Result<(), PlaybackError> {
         let channels = opus_packet_channels(packet.data.as_ref())
             .ok_or(PlaybackError::MediaParse("unsupported opus channel layout"))?;
         let frame_samples = usize::try_from(packet.duration_samples).map_err(|_| {
@@ -92,14 +205,24 @@ impl DiscordOpusFrameNormalizer {
             )));
         }
 
+        let trim_start_samples = usize::try_from(trim_start_samples)
+            .unwrap_or(usize::MAX)
+            .min(decoded_samples);
+        if trim_start_samples == decoded_samples {
+            return Ok(());
+        }
+
         match channels {
             1 => {
-                for sample in pcm {
+                for sample in pcm.into_iter().skip(trim_start_samples) {
                     self.pending_pcm.push(sample);
                     self.pending_pcm.push(sample);
                 }
             }
-            2 => self.pending_pcm.extend_from_slice(&pcm),
+            2 => {
+                let trim_values = trim_start_samples.saturating_mul(channels);
+                self.pending_pcm.extend_from_slice(&pcm[trim_values..]);
+            }
             _ => {
                 return Err(PlaybackError::MediaParse("unsupported opus channel layout"));
             }
@@ -190,6 +313,13 @@ impl Default for DiscordOpusFrameNormalizer {
     fn default() -> Self {
         Self::new()
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PacketTimelineAlignment {
+    gap_samples: u64,
+    trim_start_samples: u64,
+    drop_packet: bool,
 }
 
 fn opus_packet_channels(packet: &[u8]) -> Option<usize> {

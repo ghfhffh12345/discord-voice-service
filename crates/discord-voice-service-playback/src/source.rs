@@ -63,6 +63,22 @@ impl PlaybackSource {
         &self.resolved.playable_url
     }
 
+    pub fn reset_stream_to_current_byte_offset(&mut self) {
+        let byte_offset = self.stream.position().byte_offset();
+        self.stream.set_resume_offset(byte_offset);
+    }
+
+    pub fn replace_resolved_stream_at_current_byte_offset(
+        &mut self,
+        resolved: ResolvedPlaybackSource,
+    ) {
+        let byte_offset = self.stream.position().byte_offset();
+        let mut stream = HttpOpusStream::new(resolved.playable_url.clone());
+        stream.set_resume_offset(byte_offset);
+        self.resolved = resolved;
+        self.stream = stream;
+    }
+
     pub fn position(&self) -> PlaybackPosition {
         self.live_position()
     }

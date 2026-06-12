@@ -8,6 +8,7 @@ use crate::media::opus_queue::{duration_ms_from_samples, samples_from_duration_m
 use crate::media::position::{PlaybackPosition, shared_playback_position};
 use crate::media::webm_demux::{DemuxedPacket, WebmOpusDemux};
 use crate::source::{PlaybackSource, ResolvedPlaybackSource};
+use bytes::Bytes;
 use reqwest::StatusCode;
 use tokio::time::timeout;
 use tracing::warn;
@@ -92,9 +93,52 @@ impl PlaybackRecovery {
         self.metrics
     }
 
+    pub async fn read_stream_chunk(
+        &mut self,
+        video_id: Option<&str>,
+        source: &mut PlaybackSource,
+    ) -> Result<Option<Bytes>, PlaybackError> {
+        match read_source_chunk_with_timeout(source).await {
+            Ok(chunk) => Ok(chunk),
+            Err(err) if is_steady_state_read_timeout(&err) => {
+                self.metrics.http_retry_count = self.metrics.http_retry_count.saturating_add(1);
+                source.reset_stream_to_current_byte_offset();
+                match read_source_chunk_with_timeout(source).await {
+                    Ok(chunk) => Ok(chunk),
+                    Err(err) if should_reresolve_after_steady_read_failure(&err) => {
+                        self.reresolve_steady_source(video_id, source, err).await?;
+                        read_source_chunk_with_timeout(source).await
+                    }
+                    Err(err) => Err(err),
+                }
+            }
+            Err(err) if should_reresolve_after_steady_read_failure(&err) => {
+                self.reresolve_steady_source(video_id, source, err).await?;
+                read_source_chunk_with_timeout(source).await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     fn remember_source(&mut self, video_id: &str, source: &PlaybackSource) {
         self.last_video_id = Some(video_id.to_owned());
         self.last_resolved = Some(source.resolved().clone());
+    }
+
+    async fn reresolve_steady_source(
+        &mut self,
+        video_id: Option<&str>,
+        source: &mut PlaybackSource,
+        original_err: PlaybackError,
+    ) -> Result<(), PlaybackError> {
+        let Some(video_id) = video_id else {
+            return Err(original_err);
+        };
+        self.metrics.url_reresolve_count = self.metrics.url_reresolve_count.saturating_add(1);
+        let resolved = self.client.resolve_playback_source(video_id).await?;
+        source.replace_resolved_stream_at_current_byte_offset(resolved);
+        self.remember_source(video_id, source);
+        Ok(())
     }
 
     async fn try_reopen_existing(
@@ -258,9 +302,25 @@ async fn read_chunk_with_timeout(
         })?
 }
 
+async fn read_source_chunk_with_timeout(
+    source: &mut PlaybackSource,
+) -> Result<Option<Bytes>, PlaybackError> {
+    let playable_url = source.playable_url().to_owned();
+    read_chunk_with_timeout(source.stream_mut(), &playable_url).await
+}
+
 fn should_reresolve_after_open_failure(err: &PlaybackError) -> bool {
     matches!(err, PlaybackError::Http(err) if err.status().is_some_and(is_stale_source_status))
         || matches!(err, PlaybackError::MediaParseDetail(message) if message.contains("timed out opening playback source"))
+}
+
+fn should_reresolve_after_steady_read_failure(err: &PlaybackError) -> bool {
+    matches!(err, PlaybackError::Http(err) if err.status().is_some_and(is_stale_source_status))
+        || is_steady_state_read_timeout(err)
+}
+
+fn is_steady_state_read_timeout(err: &PlaybackError) -> bool {
+    matches!(err, PlaybackError::MediaParseDetail(message) if message.contains("timed out reading playback source"))
 }
 
 fn is_stale_source_status(status: StatusCode) -> bool {

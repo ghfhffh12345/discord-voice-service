@@ -92,9 +92,9 @@ impl HttpOpusStream {
 
     pub async fn read_chunk(&mut self) -> Result<Option<Bytes>, PlaybackError> {
         loop {
-            if let Some(chunk) = self.take_pending_chunk() {
-                self.apply_read_stress().await;
-                return Ok(Some(chunk));
+            if !self.pending.is_empty() {
+                self.apply_read_stress_before_next_chunk().await;
+                return Ok(self.take_pending_chunk());
             }
 
             if self.response.is_none() {
@@ -199,10 +199,10 @@ impl HttpOpusStream {
         Some(bytes)
     }
 
-    async fn apply_read_stress(&self) {
+    async fn apply_read_stress_before_next_chunk(&self) {
         let delay = self
             .read_stress
-            .delay_for_chunk(self.metrics.bounded_chunk_count);
+            .delay_for_chunk(self.metrics.bounded_chunk_count.saturating_add(1));
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }

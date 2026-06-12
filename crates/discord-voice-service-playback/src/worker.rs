@@ -53,7 +53,13 @@ impl PlaybackWorker {
         let mut source = self.recovery.recover(video_id, resume_position).await?;
         self.position = source.shared_position();
 
-        self.fill_queue(&mut source, queue).await?;
+        self.fill_queue_to_duration_ms_for_video(
+            Some(video_id),
+            &mut source,
+            queue,
+            self.prebuffer_target_ms,
+        )
+        .await?;
         if queue.is_empty() {
             return Err(PlaybackError::MediaParse("unexpected end of stream"));
         }
@@ -93,6 +99,23 @@ impl PlaybackWorker {
         queue: &mut OpusFrameQueue,
         target_ms: u64,
     ) -> Result<(), PlaybackError> {
+        let current_video_id = self.current_video_id.clone();
+        self.fill_queue_to_duration_ms_for_video(
+            current_video_id.as_deref(),
+            source,
+            queue,
+            target_ms,
+        )
+        .await
+    }
+
+    async fn fill_queue_to_duration_ms_for_video(
+        &mut self,
+        video_id: Option<&str>,
+        source: &mut PlaybackSource,
+        queue: &mut OpusFrameQueue,
+        target_ms: u64,
+    ) -> Result<(), PlaybackError> {
         let target_ms = target_ms.max(1);
         let target_samples = samples_from_duration_ms_u64(target_ms);
         while queue.buffered_samples() < target_samples && !queue.is_full() {
@@ -108,7 +131,7 @@ impl PlaybackWorker {
                 continue;
             }
 
-            let Some(chunk) = source.stream_mut().read_chunk().await? else {
+            let Some(chunk) = self.read_stream_chunk(video_id, source).await? else {
                 let frames = self.normalizer.flush()?;
                 self.enqueue_frames(queue, frames)?;
                 break;
@@ -175,5 +198,13 @@ impl PlaybackWorker {
         let frames = self.normalizer.push_packet(packet.clone())?;
         self.position.lock().unwrap().record_buffered(&packet);
         self.enqueue_frames(queue, frames)
+    }
+
+    async fn read_stream_chunk(
+        &mut self,
+        video_id: Option<&str>,
+        source: &mut PlaybackSource,
+    ) -> Result<Option<bytes::Bytes>, PlaybackError> {
+        self.recovery.read_stream_chunk(video_id, source).await
     }
 }

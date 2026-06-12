@@ -7,7 +7,12 @@ use discord_voice_service_test_support::fixtures::{
 use std::time::{Duration, Instant};
 
 use discord_voice_service_playback::YtMusicClient;
+use discord_voice_service_playback::media::http_stream::HttpOpusStream;
+use discord_voice_service_playback::media::position::{PlaybackPosition, shared_playback_position};
+use discord_voice_service_playback::media::webm_demux::WebmOpusDemux;
 use discord_voice_service_playback::recovery::{PlaybackRecovery, PlaybackResumePosition};
+use discord_voice_service_playback::source::{PlaybackSource, ResolvedPlaybackSource};
+use std::collections::VecDeque;
 
 #[tokio::test]
 async fn recovery_reruns_get_song_and_decipher_when_playable_url_is_stale() {
@@ -200,6 +205,81 @@ async fn recovery_fails_when_the_first_media_chunk_never_arrives_within_policy()
             .count(),
         2
     );
+}
+
+#[tokio::test]
+async fn steady_stream_read_reresolves_stale_url_without_advancing_sent_position() {
+    let fake = FakeYtMusic::spawn().await;
+    let http = spawn_stream_server("audio-itag250.webm").await;
+    let expired = spawn_status_server("HTTP/1.1 403 Forbidden").await;
+    fake.set_playable_url(http.url()).await;
+
+    let mut position = PlaybackPosition::default();
+    position.set_sent_duration_samples(960);
+    let mut source = PlaybackSource::new(
+        ResolvedPlaybackSource {
+            selected_itag: 250,
+            playable_url: expired.url(),
+            approx_duration_ms: None,
+        },
+        HttpOpusStream::new(expired.url()),
+        WebmOpusDemux::default(),
+        VecDeque::new(),
+        shared_playback_position(position),
+    );
+    let mut recovery =
+        PlaybackRecovery::new(YtMusicClient::connect(fake.endpoint()).await.unwrap());
+
+    let chunk = recovery
+        .read_stream_chunk(Some("video-1"), &mut source)
+        .await
+        .expect("steady read should reresolve stale URL")
+        .expect("replacement stream should provide media");
+
+    assert!(!chunk.is_empty());
+    assert_eq!(source.playable_url(), http.url());
+    assert_eq!(source.position().sent_duration_samples(), 960);
+    assert_eq!(recovery.metrics().url_reresolve_count, 1);
+    assert_eq!(
+        fake.calls()
+            .iter()
+            .filter(|call| *call == "GetSong")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn steady_stream_read_times_out_instead_of_waiting_forever() {
+    let fake = FakeYtMusic::spawn().await;
+    let http = spawn_hanging_server().await;
+    fake.set_playable_url(http.url()).await;
+
+    let mut source = PlaybackSource::new(
+        ResolvedPlaybackSource {
+            selected_itag: 250,
+            playable_url: http.url(),
+            approx_duration_ms: None,
+        },
+        HttpOpusStream::new(http.url()),
+        WebmOpusDemux::default(),
+        VecDeque::new(),
+        shared_playback_position(PlaybackPosition::default()),
+    );
+    let mut recovery =
+        PlaybackRecovery::new(YtMusicClient::connect(fake.endpoint()).await.unwrap());
+
+    let err = recovery
+        .read_stream_chunk(None, &mut source)
+        .await
+        .map(|_| ())
+        .expect_err("steady read should time out without a video id to reresolve");
+
+    assert!(
+        err.to_string()
+            .contains("timed out reading playback source")
+    );
+    assert_eq!(recovery.metrics().http_retry_count, 1);
 }
 
 fn resume_ms(duration_ms: u64) -> PlaybackResumePosition {
