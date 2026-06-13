@@ -222,7 +222,7 @@ async fn fill_queue_to_duration_ms_returns_to_passthrough_after_aligned_short_pa
 }
 
 #[tokio::test]
-async fn fill_queue_to_duration_ms_preserves_forward_packet_timestamp_gap() {
+async fn fill_queue_to_duration_ms_does_not_insert_silence_for_container_timestamp_gap() {
     let fake_yt = FakeYtMusic::spawn().await;
     let http = spawn_hanging_server().await;
     let mut worker = PlaybackWorker::new(
@@ -252,13 +252,13 @@ async fn fill_queue_to_duration_ms_preserves_forward_packet_timestamp_gap() {
         .expect("timestamp gap should be filled without HTTP");
 
     let frames = drain_frames(&mut queue);
-    assert_eq!(frames.len(), 3);
+    assert_eq!(frames.len(), 2);
     assert_eq!(
         frames
             .iter()
             .map(|frame| frame.source_position_samples)
             .collect::<Vec<_>>(),
-        vec![0, 960, 1_920]
+        vec![0, 960]
     );
     assert!(
         frames.iter().all(|frame| frame.duration_samples == 960),
@@ -267,7 +267,93 @@ async fn fill_queue_to_duration_ms_preserves_forward_packet_timestamp_gap() {
 }
 
 #[tokio::test]
-async fn fill_queue_to_duration_ms_trims_overlapping_packet_samples() {
+async fn fill_queue_to_duration_ms_preserves_repeated_sub_frame_timestamp_gaps() {
+    let fake_yt = FakeYtMusic::spawn().await;
+    let http = spawn_hanging_server().await;
+    let mut worker = PlaybackWorker::new(
+        YtMusicClient::connect(fake_yt.endpoint())
+            .await
+            .expect("client"),
+    );
+    let mut pending_packets = VecDeque::new();
+    for index in 0..10 {
+        pending_packets.push_back(encoded_opus_packet(960, 2, index, index as u64 * 1_056));
+    }
+    let mut source = PlaybackSource::new(
+        ResolvedPlaybackSource {
+            selected_itag: 250,
+            playable_url: http.url(),
+            approx_duration_ms: None,
+        },
+        HttpOpusStream::new(http.url()),
+        WebmOpusDemux::default(),
+        pending_packets,
+        shared_playback_position(PlaybackPosition::default()),
+    );
+    let mut queue = OpusFrameQueue::new(10);
+
+    worker
+        .fill_queue_to_duration_ms(&mut source, &mut queue, 200)
+        .await
+        .expect("small repeated timestamp gaps should be preserved without HTTP");
+
+    let frames = drain_frames(&mut queue);
+    assert_eq!(frames.len(), 10);
+    assert_eq!(
+        frames
+            .iter()
+            .map(|frame| frame.source_position_samples)
+            .collect::<Vec<_>>(),
+        (0..10).map(|index| index * 960).collect::<Vec<_>>(),
+        "sub-frame container timestamp gaps must not stretch Opus-duration playout"
+    );
+}
+
+#[tokio::test]
+async fn fill_queue_to_duration_ms_preserves_repeated_sub_frame_timestamp_overlaps() {
+    let fake_yt = FakeYtMusic::spawn().await;
+    let http = spawn_hanging_server().await;
+    let mut worker = PlaybackWorker::new(
+        YtMusicClient::connect(fake_yt.endpoint())
+            .await
+            .expect("client"),
+    );
+    let mut pending_packets = VecDeque::new();
+    for index in 0..10 {
+        pending_packets.push_back(encoded_opus_packet(960, 2, index, index as u64 * 864));
+    }
+    let mut source = PlaybackSource::new(
+        ResolvedPlaybackSource {
+            selected_itag: 250,
+            playable_url: http.url(),
+            approx_duration_ms: None,
+        },
+        HttpOpusStream::new(http.url()),
+        WebmOpusDemux::default(),
+        pending_packets,
+        shared_playback_position(PlaybackPosition::default()),
+    );
+    let mut queue = OpusFrameQueue::new(10);
+
+    worker
+        .fill_queue_to_duration_ms(&mut source, &mut queue, 200)
+        .await
+        .expect("small repeated timestamp overlaps should not trim audio");
+
+    let frames = drain_frames(&mut queue);
+    assert_eq!(frames.len(), 10);
+    assert_eq!(
+        frames
+            .iter()
+            .map(|frame| frame.source_position_samples)
+            .collect::<Vec<_>>(),
+        (0..10).map(|index| index * 960).collect::<Vec<_>>(),
+        "sub-frame container timestamp overlaps must not remove Opus audio"
+    );
+}
+
+#[tokio::test]
+async fn fill_queue_to_duration_ms_does_not_trim_overlapping_packet_samples() {
     let fake_yt = FakeYtMusic::spawn().await;
     let http = spawn_hanging_server().await;
     let mut worker = PlaybackWorker::new(
@@ -293,18 +379,18 @@ async fn fill_queue_to_duration_ms_trims_overlapping_packet_samples() {
     let mut queue = OpusFrameQueue::new(10);
 
     worker
-        .fill_queue_to_duration_ms(&mut source, &mut queue, 40)
+        .fill_queue_to_duration_ms(&mut source, &mut queue, 60)
         .await
-        .expect("timestamp overlap should be trimmed without HTTP");
+        .expect("timestamp overlap should not trim Opus-duration audio");
 
     let frames = drain_frames(&mut queue);
-    assert_eq!(frames.len(), 2);
+    assert_eq!(frames.len(), 3);
     assert_eq!(
         frames
             .iter()
             .map(|frame| frame.source_position_samples)
             .collect::<Vec<_>>(),
-        vec![0, 960]
+        vec![0, 960, 1_920]
     );
     assert!(
         frames.iter().all(|frame| frame.duration_samples == 960),
